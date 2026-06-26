@@ -5,6 +5,19 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review qa` now FORWARDS a `-m claude:<model>` / `-m codex:<model>` suffix to the tester
+  spawn, and reaps the ephemeral-worktree trust entry it seeds (review-cli#60).** A model suffix
+  used to be REJECTED as "not yet forwarded"; now `resolved_tester_model` extracts it (precedence:
+  `REVIEW_QA_TESTER_MODEL` env > a `-m` suffix matching the resolved backend > the backend default)
+  and the spawn passes `claude --model <m>` / `codex -m <m>`, so `review qa -m claude:claude-opus-4-8`
+  runs the claude tester on opus instead of its default model. Separately, the per-run trust entry
+  `_ensure_workspace_trusted` seeds in `~/.claude.json` for each throwaway qa worktree is now
+  removed after the run (`_remove_workspace_trust`, in a `finally`) — so default qa runs no longer
+  accumulate dead `/tmp/review-qa-wt-*` trusted paths. Reap is doubly conservative: it runs ONLY
+  for an ephemeral `review-qa-wt-*` worktree (never the user's real `--in-place` checkout), and it
+  removes ONLY an entry still holding just the flags review seeds, leaving an entry a real claude
+  session enriched.
+
 - **The reviewer board can now resolve a seat by CAPABILITY or ROLE from the shared
   `agent-tools/lib/contracts/models.yaml` manifest (rig-cli#8 consumer side, review-cli#78).**
   The new `reviewlib/manifest.py` reads the ecosystem's single source of truth for per-model
