@@ -126,7 +126,7 @@ def allowed_hosts() -> set[str]:
 
 
 def _session_index(gap: float) -> dict[str, dparser.Session]:
-    sessions = dparser.load_sessions(log_dir(), gap_seconds=gap)
+    sessions = dparser.load_sessions_cached(log_dir(), gap_seconds=gap)
     return {s.session_id: s for s in sessions}
 
 
@@ -311,7 +311,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
             if path == "/api/runs":
                 gap = self._gap(qs)
-                sessions = dparser.load_sessions(log_dir(), gap_seconds=gap)
+                sessions = dparser.load_sessions_cached(log_dir(), gap_seconds=gap)
                 return self._send_json([_merge_annotation(s.to_summary(), s.session_id) for s in sessions])
             if path.startswith("/api/runs/"):
                 sid = path[len("/api/runs/"):]
@@ -323,7 +323,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 detail = _merge_annotation(detail, sid)
                 return self._send_json(detail)
             if path == "/api/stats":
-                sessions = dparser.load_sessions(log_dir(), gap_seconds=self._gap(qs))
+                sessions = dparser.load_sessions_cached(log_dir(), gap_seconds=self._gap(qs))
                 stats = dparser.compute_stats(sessions)
                 # Tasks/overseer rollups come from the store, layered on top of stats.
                 anns = dstore.all_annotations()
@@ -573,8 +573,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._send_sse_event("log", payload):
                 return False
         # Session-level `run` events: the affected sessions, summary shape == /api/runs so
-        # the front-end can refresh a row (or the whole list) in place.
-        sessions = dparser.load_sessions(ld, gap_seconds=gap)
+        # the front-end can refresh a row (or the whole list) in place. Cached: this is only
+        # reached after the snapshot diff already saw a change, so the dir signature has moved
+        # and the loader re-parses — then refreshes the cache so the next /api/runs reuses it.
+        sessions = dparser.load_sessions_cached(ld, gap_seconds=gap)
         # Only the sessions whose window overlaps a changed file are "live"; cheap heuristic
         # = re-emit the newest few summaries (the changed files are almost always the newest).
         for s in sessions[:_SSE_RECENT_RUNS]:
