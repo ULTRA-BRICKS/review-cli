@@ -5,6 +5,7 @@ decomposition — zero behaviour change). Each backend builds a TEXT payload and
 returns a ReviewResult. `_ANNOUNCE_LOGS` is a module-global toggled on by the
 panel modes so streamed calls print their live-log path to stderr.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -26,7 +27,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from .process import _run, _run_streamed, _safe_log_header, git_repo_env, strip_control_sequences, write_sidecar_log
+from .process import (
+    _run,
+    _run_streamed,
+    _safe_log_header,
+    git_repo_env,
+    strip_control_sequences,
+    write_sidecar_log,
+)
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -37,6 +45,8 @@ GEMINI_ENV_FALLBACKS = (
 # the user knows what to `tail -f`. Enabled by the panel modes (--just-ask/--quorum/
 # --brainstorm); the plain single-diff review path keeps stderr quiet.
 _ANNOUNCE_LOGS = False
+
+
 @dataclass(frozen=True)
 class ReviewResult:
     model: str
@@ -75,7 +85,8 @@ def _payload(prompt: str, diff: str = "") -> str:
             f"[review-cli] WARNING: payload is {len(out)} bytes — nearing the ~1 MB "
             "ARG_MAX ceiling; opencode (argv-only) and claude-p's inner exec may fail. "
             "Use fewer --max-rounds or a smaller diff.",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
     return out
 
@@ -152,8 +163,10 @@ def call_backend(
     else:
         effort_param = sig.parameters.get("effort")
         accepts_effort = (
-            (effort_param is not None and effort_param.kind != inspect.Parameter.POSITIONAL_ONLY)
-            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            effort_param is not None
+            and effort_param.kind != inspect.Parameter.POSITIONAL_ONLY
+        ) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
         )
     prompt = _prompt_with_effort(prompt, effort)
     if accepts_effort:
@@ -162,8 +175,14 @@ def call_backend(
 
 
 def review_with_images(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
-    images: tuple[Path, ...] = (), effort: str | None = None,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
+    images: tuple[Path, ...] = (),
+    effort: str | None = None,
 ) -> ReviewResult:
     """Run a backend with raw image attachments when that backend safely supports them.
 
@@ -174,21 +193,35 @@ def review_with_images(
     backend = resolve_backend(model)
     if images and backend is review_claude:
         unpaid = unpaid_provider_result(
-            model, backend="claude", command=_claude_api_command(model),
-            round_no=round_no, provider=_claude_gateway_provider_from_env(),
+            model,
+            backend="claude",
+            command=_claude_api_command(model),
+            round_no=round_no,
+            provider=_claude_gateway_provider_from_env(),
         )
         if unpaid is not None:
             return unpaid
-        return review_claude_cli_with_images(model, prompt, diff, cwd, timeout, round_no, images, effort=effort)
-    return call_backend(backend, model, prompt, diff, cwd, timeout, round_no, effort=effort)
+        return review_claude_cli_with_images(
+            model, prompt, diff, cwd, timeout, round_no, images, effort=effort
+        )
+    return call_backend(
+        backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
+    )
 
 
 def review_codex(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     codex_model = model.split(":", 1)[1] if ":" in model else None
-    unpaid = unpaid_provider_result(model, backend="codex", command="codex", round_no=round_no)
+    unpaid = unpaid_provider_result(
+        model, backend="codex", command="codex", round_no=round_no
+    )
     if unpaid is not None:
         return unpaid
     argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
@@ -200,11 +233,24 @@ def review_codex(
     argv.append("-")
     command = " ".join(argv[:-1]) + " -"
     proc = _run_streamed(
-        argv, cwd=cwd, input_text=_payload(prompt, diff), timeout=timeout,
-        backend="codex", round_no=round_no, announce=_ANNOUNCE_LOGS,
-        header_argv0=f"codex -m {_safe_log_header(codex_model)}" if codex_model else None,
+        argv,
+        cwd=cwd,
+        input_text=_payload(prompt, diff),
+        timeout=timeout,
+        backend="codex",
+        round_no=round_no,
+        announce=_ANNOUNCE_LOGS,
+        header_argv0=f"codex -m {_safe_log_header(codex_model)}"
+        if codex_model
+        else None,
     )
-    return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+    return ReviewResult(
+        model=model,
+        command=command,
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
 
 
 # Every capability the read-only reviewer agent MUST deny. This is the security boundary
@@ -243,13 +289,16 @@ _READONLY_AGENT_DENIED_PERMISSIONS = (
     "skill",
 )
 
+
 # The canonical, safe read-only-reviewer agent. SINGLE SOURCE OF TRUTH: the permission
 # block is GENERATED from `_READONLY_AGENT_DENIED_PERMISSIONS` (not duplicated as a
 # literal), so the validator (which reads that tuple) and the writer can never drift — a
 # deny key added to the tuple is both enforced AND written. Both the "create when missing"
 # and "rewrite a permissive/tampered one" paths write THIS exact content.
 def _build_readonly_agent_markdown() -> str:
-    perm_lines = "\n".join(f"  {name}: deny" for name in _READONLY_AGENT_DENIED_PERMISSIONS)
+    perm_lines = "\n".join(
+        f"  {name}: deny" for name in _READONLY_AGENT_DENIED_PERMISSIONS
+    )
     return (
         "---\n"
         "description: Read-only code reviewer for diff inspection.\n"
@@ -387,7 +436,8 @@ def _ensure_opencode_readonly_agent(_project: Path, _oc_model: str) -> None:
             f"[review-cli] opencode: the global read-only-reviewer agent at {agent} is "
             "not strictly read-only (its permissions grant or omit a deny for a write/exec "
             "capability); rewriting it to the canonical deny-all definition for safety.",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
     agent.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(agent, _READONLY_AGENT_MARKDOWN)
@@ -404,7 +454,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
     PERMISSIVE defaults (bash/edit/write). Writing to a temp file in the SAME directory and
     `os.replace`-ing it in is atomic on POSIX, so the read-only guarantee holds under
     concurrency. The temp file is cleaned up on any write failure."""
-    fd, tmp_name = tempfile.mkstemp(prefix=".read-only-reviewer.", suffix=".tmp", dir=str(path.parent))
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".read-only-reviewer.", suffix=".tmp", dir=str(path.parent)
+    )
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -457,8 +509,12 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
     # wedged `git rev-parse` (TimeoutExpired) must degrade to "not a repo" (False), never a
     # raw traceback — same defensive catch as cli._is_git_repo.
     try:
-        proc = _run(["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"], cwd=cwd,
-                    env=git_repo_env(cwd), timeout=10)
+        proc = _run(
+            ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
     if not (proc.returncode == 0 and proc.stdout.strip() == "true"):
@@ -468,14 +524,20 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
             f"[review-cli] opencode: {cwd} ships its own opencode config "
             "(.opencode/ or opencode.json) which could override the read-only agent; "
             "running diff-only in an isolated dir for safety.",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
         return False
     return True
 
 
 def review_opencode(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
@@ -526,15 +588,29 @@ def review_opencode(
         if variant:
             argv += ["--variant", variant]
         argv.append(message)
-        proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no,
-                             announce=_ANNOUNCE_LOGS,
-                             header_argv0=f"opencode -m {_safe_log_header(oc_model)}")
-        return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+        proc = _run_streamed(
+            argv,
+            cwd=cwd,
+            timeout=timeout,
+            backend="opencode",
+            round_no=round_no,
+            announce=_ANNOUNCE_LOGS,
+            header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
+        )
+        return ReviewResult(
+            model=model,
+            command=command,
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
 
     # FALLBACK: cwd is not a git repo (e.g. a panel `--just-ask` run from a scratch
     # dir) — there is nothing to read, so keep the old isolated empty-temp-dir posture
     # and review the diff/prompt alone.
-    command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
+    command = (
+        f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
+    )
     with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
         # Strip the repo-pinning git env: a leaked GIT_DIR/GIT_WORK_TREE would make `git init`
@@ -564,10 +640,22 @@ def review_opencode(
         if variant:
             argv += ["--variant", variant]
         argv.append(message)
-        proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no,
-                             announce=_ANNOUNCE_LOGS,
-                             header_argv0=f"opencode -m {_safe_log_header(oc_model)}")
-    return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+        proc = _run_streamed(
+            argv,
+            cwd=tmp,
+            timeout=timeout,
+            backend="opencode",
+            round_no=round_no,
+            announce=_ANNOUNCE_LOGS,
+            header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
+        )
+    return ReviewResult(
+        model=model,
+        command=command,
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
 
 
 def _read_env_key(env_file: Path, var: str = "GEMINI_API_KEY") -> str | None:
@@ -620,7 +708,9 @@ def _gemini_key() -> str:
     key = _resolve_key(("GEMINI_API_KEY", "GOOGLE_API_KEY"), "GEMINI_API_KEY")
     if key:
         return key
-    raise RuntimeError("GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+    raise RuntimeError(
+        "GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+    )
 
 
 # NOTE: `_anthropic_key` / `_openai_key` were added in 30163c5 ONLY for the REST vision
@@ -631,11 +721,20 @@ def _gemini_key() -> str:
 
 
 def review_gemini(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
-    gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+    gemini_model = (
+        model.split(":", 1)[1]
+        if ":" in model
+        else os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+    )
     command = f"Gemini API {gemini_model}"
     # Gemini is a REST backend — it never goes through `_run_streamed`, so it must emit
     # its own per-call sidecar log or the dashboard parser (which reads ONLY `.log`
@@ -649,7 +748,9 @@ def review_gemini(
     # would leave that auth failure invisible — `run_panel` would turn it into an
     # internal 127 with no `.log` (codex P2). Now the auth failure emits a sidecar too.
     started = datetime.now(timezone.utc)
-    unpaid = unpaid_provider_result(model, backend="gemini", command=command, round_no=round_no, started=started)
+    unpaid = unpaid_provider_result(
+        model, backend="gemini", command=command, round_no=round_no, started=started
+    )
     if unpaid is not None:
         return unpaid
     try:
@@ -671,14 +772,37 @@ def review_gemini(
         parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
         usage = payload.get("usageMetadata", {})
-        stdout = text.strip() + f"\n\nprompt_tokens={usage.get('promptTokenCount', 0)} output_tokens={usage.get('candidatesTokenCount', 0)}\n"
-        _emit_rest_log("gemini", command, round_no=round_no, returncode=0, stdout=stdout, stderr="", started=started)
-        return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
+        stdout = (
+            text.strip()
+            + f"\n\nprompt_tokens={usage.get('promptTokenCount', 0)} output_tokens={usage.get('candidatesTokenCount', 0)}\n"
+        )
+        _emit_rest_log(
+            "gemini",
+            command,
+            round_no=round_no,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=0, stdout=stdout, stderr=""
+        )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         rc = exc.code or 1
-        _emit_rest_log("gemini", command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
-        return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
+        _emit_rest_log(
+            "gemini",
+            command,
+            round_no=round_no,
+            returncode=rc,
+            stdout="",
+            stderr=body_text,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=rc, stdout="", stderr=body_text
+        )
     except Exception as exc:  # noqa: BLE001
         # Anything other than an HTTPError: a missing API key (RuntimeError from
         # `_gemini_key()`), a network/DNS/socket-timeout error (URLError), or a malformed
@@ -692,12 +816,31 @@ def review_gemini(
         # consistent with the subprocess backends (codex P2). rc 124 = the timeout code.
         if _is_timeout_error(exc):
             _emit_rest_log(
-                "gemini", command, round_no=round_no, returncode=124, stdout="", stderr=err,
-                started=started, timed_out=True, timeout_secs=timeout,
+                "gemini",
+                command,
+                round_no=round_no,
+                returncode=124,
+                stdout="",
+                stderr=err,
+                started=started,
+                timed_out=True,
+                timeout_secs=timeout,
             )
-            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
-        _emit_rest_log("gemini", command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
+            return ReviewResult(
+                model=model, command=command, returncode=124, stdout="", stderr=err
+            )
+        _emit_rest_log(
+            "gemini",
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=err,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=err
+        )
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -712,8 +855,16 @@ def _is_timeout_error(exc: BaseException) -> bool:
 
 
 def _emit_rest_log(
-    backend: str, argv0: str, *, round_no: int, returncode: int, stdout: str, stderr: str,
-    started: datetime | None = None, timed_out: bool = False, timeout_secs: int | None = None,
+    backend: str,
+    argv0: str,
+    *,
+    round_no: int,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    started: datetime | None = None,
+    timed_out: bool = False,
+    timeout_secs: int | None = None,
 ) -> None:
     """Best-effort sidecar log for a NON-subprocess (REST) backend run.
 
@@ -728,8 +879,15 @@ def _emit_rest_log(
     records a TIMEOUT marker so a REST timeout counts as a timeout, not a generic error."""
     try:
         write_sidecar_log(
-            backend, round_no=round_no, argv0=argv0, returncode=returncode, stdout=stdout,
-            stderr=stderr, started=started, timed_out=timed_out, timeout_secs=timeout_secs,
+            backend,
+            round_no=round_no,
+            argv0=argv0,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            started=started,
+            timed_out=timed_out,
+            timeout_secs=timeout_secs,
         )
     except Exception:  # noqa: BLE001 - logging is best-effort; it must NEVER change the
         # review outcome. Beyond OSError (read-only / full log dir), a provider can return
@@ -738,7 +896,6 @@ def _emit_rest_log(
         # of the REST backends, an unswallowed error would flip a successful ReviewResult
         # into a failure (codex P3). Swallow everything; a missing sidecar only loses a log.
         pass
-
 
 
 # --- Backend transport mode (api | cli) ----------------------------------------
@@ -835,13 +992,26 @@ def _parse_openai_usage(payload: object) -> tuple[int, int]:
         return 0, 0
     prompt = usage.get("prompt_tokens", 0)
     output = usage.get("completion_tokens", 0)
-    return (prompt if isinstance(prompt, int) else 0, output if isinstance(output, int) else 0)
+    return (
+        prompt if isinstance(prompt, int) else 0,
+        output if isinstance(output, int) else 0,
+    )
 
 
 def _openai_compatible_request(
-    *, model: str, api_model: str, label: str, base_url: str, key: str,
-    prompt: str, diff: str, timeout: int, backend: str, round_no: int = 0,
-    extra_body: dict | None = None, extra_headers: dict | None = None,
+    *,
+    model: str,
+    api_model: str,
+    label: str,
+    base_url: str,
+    key: str,
+    prompt: str,
+    diff: str,
+    timeout: int,
+    backend: str,
+    round_no: int = 0,
+    extra_body: dict | None = None,
+    extra_headers: dict | None = None,
 ) -> ReviewResult:
     """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
 
@@ -899,7 +1069,11 @@ def _openai_compatible_request(
     # `authorization` that would be a DISTINCT dict key — can never shadow the real bearer
     # key or content type. The canonical pair is then the only authority for those names.
     _reserved = {"authorization", "content-type"}
-    headers = {str(k): str(v) for k, v in (extra_headers or {}).items() if str(k).lower() not in _reserved}
+    headers = {
+        str(k): str(v)
+        for k, v in (extra_headers or {}).items()
+        if str(k).lower() not in _reserved
+    }
     headers["Content-Type"] = "application/json"
     headers["Authorization"] = f"Bearer {key}"
     headers.setdefault("Accept", "application/json")
@@ -917,21 +1091,51 @@ def _openai_compatible_request(
             # mode_review write a "reviewed" stamp and satisfy the commit gate with an
             # empty result. Fail-closed: map it to a non-zero dead-backend result.
             stderr = f"{label} API returned no assistant content: {raw[:500]}"
-            _emit_rest_log(backend, command, round_no=round_no, returncode=1, stdout="", stderr=stderr, started=started)
-            return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
+            _emit_rest_log(
+                backend,
+                command,
+                round_no=round_no,
+                returncode=1,
+                stdout="",
+                stderr=stderr,
+                started=started,
+            )
+            return ReviewResult(
+                model=model, command=command, returncode=1, stdout="", stderr=stderr
+            )
         prompt_tokens, output_tokens = _parse_openai_usage(payload)
         stdout = text.strip() + (
             f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
         )
-        _emit_rest_log(backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr="", started=started)
-        return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
+        _emit_rest_log(
+            backend,
+            command,
+            round_no=round_no,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=0, stdout=stdout, stderr=""
+        )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         rc = exc.code or 1
         if _is_payment_preflight_denial(rc, body_text):
             _cache_payment_preflight_denial(model, rc, body_text)
-        _emit_rest_log(backend, command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
-        return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
+        _emit_rest_log(
+            backend,
+            command,
+            round_no=round_no,
+            returncode=rc,
+            stdout="",
+            stderr=body_text,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=rc, stdout="", stderr=body_text
+        )
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # Connection refused / DNS failure / socket timeout — no HTTP status. URLError
         # and TimeoutError are both OSError subclasses; the wide catch normalises any
@@ -940,18 +1144,47 @@ def _openai_compatible_request(
         err = f"{label} API request failed: {exc}"
         if _is_timeout_error(exc):
             _emit_rest_log(
-                backend, command, round_no=round_no, returncode=124, stdout="", stderr=err,
-                started=started, timed_out=True, timeout_secs=timeout,
+                backend,
+                command,
+                round_no=round_no,
+                returncode=124,
+                stdout="",
+                stderr=err,
+                started=started,
+                timed_out=True,
+                timeout_secs=timeout,
             )
-            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
-        _emit_rest_log(backend, command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
+            return ReviewResult(
+                model=model, command=command, returncode=124, stdout="", stderr=err
+            )
+        _emit_rest_log(
+            backend,
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=err,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=err
+        )
     except (json.JSONDecodeError, ValueError) as exc:
         # 2xx with a non-JSON / truncated body — the provider returned garbage. Treat
         # it as a failed call rather than letting the decode error escape.
         err = f"{label} API returned a malformed response: {exc}"
-        _emit_rest_log(backend, command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
+        _emit_rest_log(
+            backend,
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=err,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=err
+        )
 
 
 # z.ai (Zhipu / GLM) — OpenAI-compatible /chat/completions, Bearer-keyed.
@@ -971,14 +1204,21 @@ def _zai_key() -> str:
     key = _resolve_key(("ZAI_API_KEY", "ZHIPU_API_KEY"), "ZAI_API_KEY")
     if key:
         return key
-    raise RuntimeError("ZAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+    raise RuntimeError(
+        "ZAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+    )
 
 
 ZAI_SUPPORTED_MODES = ("api",)  # z.ai is REST-only; no z.ai CLI exists.
 
 
 def review_zai(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
@@ -991,21 +1231,39 @@ def review_zai(
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log — like review_gemini, these are real (failed) run attempts and must be
     # visible in the dashboard, never raise out of run_panel as an invisible internal 127.
-    zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
+    zai_model = (
+        model.split(":", 1)[1]
+        if ":" in model
+        else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
+    )
     command = f"z.ai API {zai_model}"
-    unpaid = unpaid_provider_result(model, backend="z.ai", command=command, round_no=round_no)
+    unpaid = unpaid_provider_result(
+        model, backend="z.ai", command=command, round_no=round_no
+    )
     if unpaid is not None:
         return unpaid
     try:
         resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
         key = _zai_key()
     except RuntimeError as exc:
-        _emit_rest_log("z.ai", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+        _emit_rest_log(
+            "z.ai", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc)
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
+        )
     base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
     return _openai_compatible_request(
-        model=model, api_model=zai_model, label="z.ai", base_url=base_url, key=key,
-        prompt=prompt, diff=diff, timeout=timeout, backend="z.ai", round_no=round_no,
+        model=model,
+        api_model=zai_model,
+        label="z.ai",
+        base_url=base_url,
+        key=key,
+        prompt=prompt,
+        diff=diff,
+        timeout=timeout,
+        backend="z.ai",
+        round_no=round_no,
     )
 
 
@@ -1055,7 +1313,12 @@ def _commandcode_key() -> str:
 
 
 def review_commandcode(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
@@ -1068,17 +1331,32 @@ def review_commandcode(
     # an invisible internal 127 raised out of run_panel.
     has_suffix = ":" in model
     env_model = os.environ.get("COMMANDCODE_MODEL")
-    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMANDCODE_DEFAULT_MODEL)
+    cc_model = (
+        model.split(":", 1)[1]
+        if has_suffix
+        else (env_model or COMMANDCODE_DEFAULT_MODEL)
+    )
     command = f"commandcode API {cc_model}"
-    unpaid = unpaid_provider_result(model, backend="commandcode", command=command, round_no=round_no)
+    unpaid = unpaid_provider_result(
+        model, backend="commandcode", command=command, round_no=round_no
+    )
     if unpaid is not None:
         return unpaid
     try:
         resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
         key = _commandcode_key()
     except RuntimeError as exc:
-        _emit_rest_log("commandcode", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+        _emit_rest_log(
+            "commandcode",
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
+        )
     preflight = provider_preflight_result(
         model, backend="commandcode", command=command, round_no=round_no
     )
@@ -1086,8 +1364,16 @@ def review_commandcode(
         return preflight
     base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
     return _openai_compatible_request(
-        model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
-        prompt=prompt, diff=diff, timeout=timeout, backend="commandcode", round_no=round_no,
+        model=model,
+        api_model=cc_model,
+        label="commandcode",
+        base_url=base_url,
+        key=key,
+        prompt=prompt,
+        diff=diff,
+        timeout=timeout,
+        backend="commandcode",
+        round_no=round_no,
     )
 
 
@@ -1158,11 +1444,18 @@ def _header_value_is_safe(value: str) -> bool:
         value.encode("latin-1")
     except UnicodeEncodeError:
         return False
-    return not any((ord(ch) < 0x20 and ch != "\t") or 0x7F <= ord(ch) <= 0x9F for ch in value)
+    return not any(
+        (ord(ch) < 0x20 and ch != "\t") or 0x7F <= ord(ch) <= 0x9F for ch in value
+    )
 
 
 def review_openrouter(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
@@ -1185,19 +1478,40 @@ def review_openrouter(
     env_model = os.environ.get("OPENROUTER_MODEL", "").strip()
     or_model = suffix or env_model or OPENROUTER_DEFAULT_MODEL
     command = f"openrouter API {or_model}"
-    unpaid = unpaid_provider_result(model, backend="openrouter", command=command, round_no=round_no)
+    unpaid = unpaid_provider_result(
+        model, backend="openrouter", command=command, round_no=round_no
+    )
     if unpaid is not None:
         return unpaid
     try:
         resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
         key = _openrouter_key()
     except RuntimeError as exc:
-        _emit_rest_log("openrouter", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
-    base_url = os.environ.get("OPENROUTER_BASE_URL", "").strip() or OPENROUTER_DEFAULT_BASE_URL
+        _emit_rest_log(
+            "openrouter",
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
+        )
+    base_url = (
+        os.environ.get("OPENROUTER_BASE_URL", "").strip() or OPENROUTER_DEFAULT_BASE_URL
+    )
     return _openai_compatible_request(
-        model=model, api_model=or_model, label="openrouter", base_url=base_url, key=key,
-        prompt=prompt, diff=diff, timeout=timeout, backend="openrouter", round_no=round_no,
+        model=model,
+        api_model=or_model,
+        label="openrouter",
+        base_url=base_url,
+        key=key,
+        prompt=prompt,
+        diff=diff,
+        timeout=timeout,
+        backend="openrouter",
+        round_no=round_no,
         extra_headers=_openrouter_extra_headers(),
     )
 
@@ -1261,7 +1575,12 @@ def _anthropic_gateway_provider(base_url: str) -> str | None:
 
 
 def review_claude_api(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     """Anthropic Messages API backend — works WITHOUT the claude CLI (needs only a
@@ -1280,17 +1599,35 @@ def review_claude_api(
     cfg = _anthropic_api_config()
     command = f"Anthropic API {claude_model}"
     started = datetime.now(timezone.utc)
-    gateway_provider = _anthropic_gateway_provider(cfg["base"]) if cfg is not None else None
+    gateway_provider = (
+        _anthropic_gateway_provider(cfg["base"]) if cfg is not None else None
+    )
     unpaid = unpaid_provider_result(
-        model, backend="claude", command=command, round_no=round_no,
-        started=started, provider=gateway_provider,
+        model,
+        backend="claude",
+        command=command,
+        round_no=round_no,
+        started=started,
+        provider=gateway_provider,
     )
     if unpaid is not None:
         return unpaid
     if cfg is None:
-        stderr = "claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured"
-        _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=stderr, started=started)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
+        stderr = (
+            "claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured"
+        )
+        _emit_rest_log(
+            "claude",
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=stderr,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=stderr
+        )
     try:
         max_tokens = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
     except ValueError:
@@ -1316,7 +1653,8 @@ def review_claude_api(
             payload = json.loads(response.read().decode("utf-8"))
         parts = payload.get("content", []) if isinstance(payload, dict) else []
         text = "".join(
-            p.get("text", "") for p in parts
+            p.get("text", "")
+            for p in parts
             if isinstance(p, dict) and p.get("type") == "text"
         )
         usage = payload.get("usage") if isinstance(payload, dict) else None
@@ -1327,33 +1665,95 @@ def review_claude_api(
         )
         # Empty success is a failure for the panel/moderator fallback path.
         rc = 0 if text.strip() else 1
-        _emit_rest_log("claude", command, round_no=round_no, returncode=rc, stdout=stdout, stderr="", started=started)
-        return ReviewResult(model=model, command=command, returncode=rc, stdout=stdout, stderr="")
+        _emit_rest_log(
+            "claude",
+            command,
+            round_no=round_no,
+            returncode=rc,
+            stdout=stdout,
+            stderr="",
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=rc, stdout=stdout, stderr=""
+        )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         rc = exc.code or 1
-        _emit_rest_log("claude", command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
-        return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
+        _emit_rest_log(
+            "claude",
+            command,
+            round_no=round_no,
+            returncode=rc,
+            stdout="",
+            stderr=body_text,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=rc, stdout="", stderr=body_text
+        )
     except urllib.error.URLError as exc:
         err = str(exc)
         if _is_timeout_error(exc):
-            _emit_rest_log("claude", command, round_no=round_no, returncode=124, stdout="", stderr=err,
-                           started=started, timed_out=True, timeout_secs=timeout)
-            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
-        _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
+            _emit_rest_log(
+                "claude",
+                command,
+                round_no=round_no,
+                returncode=124,
+                stdout="",
+                stderr=err,
+                started=started,
+                timed_out=True,
+                timeout_secs=timeout,
+            )
+            return ReviewResult(
+                model=model, command=command, returncode=124, stdout="", stderr=err
+            )
+        _emit_rest_log(
+            "claude",
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=err,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=err
+        )
     except (ValueError, OSError) as exc:
         # malformed / non-JSON 2xx body, or a read/decode/timeout failure — surface
         # as a normal backend result, not an uncaught exception. (URLError, a
         # subclass of OSError, is handled above; this catches the rest.)
         if _is_timeout_error(exc):
             err = str(exc)
-            _emit_rest_log("claude", command, round_no=round_no, returncode=124, stdout="", stderr=err,
-                           started=started, timed_out=True, timeout_secs=timeout)
-            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
+            _emit_rest_log(
+                "claude",
+                command,
+                round_no=round_no,
+                returncode=124,
+                stdout="",
+                stderr=err,
+                started=started,
+                timed_out=True,
+                timeout_secs=timeout,
+            )
+            return ReviewResult(
+                model=model, command=command, returncode=124, stdout="", stderr=err
+            )
         err = f"claude API: malformed or unreadable response: {exc}"
-        _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
+        _emit_rest_log(
+            "claude",
+            command,
+            round_no=round_no,
+            returncode=1,
+            stdout="",
+            stderr=err,
+            started=started,
+        )
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="", stderr=err
+        )
 
 
 def _have_claude_cli() -> bool:
@@ -1382,9 +1782,13 @@ def _claude_runtime_gateway_provider() -> str | None:
     return _claude_gateway_provider_from_env()
 
 
-
 def review_claude(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     """Dispatch the claude/opus backend between the API and CLI variants.
@@ -1401,19 +1805,24 @@ def review_claude(
     log lands in the right brainstorm round (the dashboard parser keys on it) — the CLI
     variant via _run_streamed, the API variant via its own _emit_rest_log sidecar."""
     unpaid = unpaid_provider_result(
-        model, backend="claude", command=_claude_api_command(model),
-        round_no=round_no, provider=_claude_runtime_gateway_provider(),
+        model,
+        backend="claude",
+        command=_claude_api_command(model),
+        round_no=round_no,
+        provider=_claude_runtime_gateway_provider(),
     )
     if unpaid is not None:
         return unpaid
     mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
     if mode == "api":
-        return review_claude_api(model, prompt, diff, cwd, timeout, round_no, effort=effort)
+        return review_claude_api(
+            model, prompt, diff, cwd, timeout, round_no, effort=effort
+        )
     if mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None:
-        return review_claude_api(model, prompt, diff, cwd, timeout, round_no, effort=effort)
+        return review_claude_api(
+            model, prompt, diff, cwd, timeout, round_no, effort=effort
+        )
     return review_claude_cli(model, prompt, diff, cwd, timeout, round_no, effort=effort)
-
-
 
 
 def _ensure_workspace_trusted(cwd: Path) -> None:
@@ -1487,7 +1896,9 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
         projects[key] = entry
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(dir=str(cfg.parent), prefix=".claude.", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(
+                dir=str(cfg.parent), prefix=".claude.", suffix=".tmp"
+            )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, cfg)  # atomic: a concurrent reader never sees a half-write
@@ -1511,7 +1922,9 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
 # The exact flag set `_ensure_workspace_trusted` seeds. An entry holding ONLY these (a subset is
 # fine) is one review created and nothing else enriched — safe to reap. Any EXTRA key means a
 # real claude session touched it, so we leave it.
-_REVIEW_SEEDED_TRUST_KEYS = frozenset({"hasTrustDialogAccepted", "hasCompletedProjectOnboarding"})
+_REVIEW_SEEDED_TRUST_KEYS = frozenset(
+    {"hasTrustDialogAccepted", "hasCompletedProjectOnboarding"}
+)
 
 
 def _is_review_seeded_trust_entry(entry: object) -> bool:
@@ -1565,7 +1978,9 @@ def _remove_workspace_trust(cwd: Path) -> None:
         del projects[key]
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(dir=str(cfg.parent), prefix=".claude.", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(
+                dir=str(cfg.parent), prefix=".claude.", suffix=".tmp"
+            )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, cfg)
@@ -1589,8 +2004,20 @@ def _remove_workspace_trust(cwd: Path) -> None:
 # Tools the read-only review seat must never invoke. Shared by the direct `claude`
 # argv and the legacy `claude-p` argv so the two can't drift.
 _CLAUDE_DISALLOWED_TOOLS = (
-    "Edit", "MultiEdit", "Write", "Bash", "Read", "Grep", "Glob", "NotebookEdit",
-    "SlashCommand", "Task", "TodoWrite", "ExitPlanMode", "WebFetch", "WebSearch",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "Bash",
+    "Read",
+    "Grep",
+    "Glob",
+    "NotebookEdit",
+    "SlashCommand",
+    "Task",
+    "TodoWrite",
+    "ExitPlanMode",
+    "WebFetch",
+    "WebSearch",
 )
 
 
@@ -1629,8 +2056,14 @@ def _claude_cli_supports_effort(binary: str) -> bool:
 
 
 def _claude_cli_argv(
-    binary: str, direct: bool, model: str | None, cwd: Path, timeout: int,
-    *, image_dir: Path | None = None, effort: str | None = None,
+    binary: str,
+    direct: bool,
+    model: str | None,
+    cwd: Path,
+    timeout: int,
+    *,
+    image_dir: Path | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """Build the argv for the resolved claude CLI binary.
 
@@ -1649,12 +2082,25 @@ def _claude_cli_argv(
         # --disallowedTools denylist is needed (and its claude-p vocabulary, e.g.
         # MultiEdit/SlashCommand, isn't a real `claude` tool name — review-cli#76).
         tools = "Read" if image_dir is not None else ""
-        system_prompt = _CLAUDE_IMAGE_REVIEW_SYSTEM if image_dir is not None else _CLAUDE_REVIEW_SYSTEM
+        system_prompt = (
+            _CLAUDE_IMAGE_REVIEW_SYSTEM
+            if image_dir is not None
+            else _CLAUDE_REVIEW_SYSTEM
+        )
         argv = [
-            binary, "--print", "--output-format", "text",
-            "--permission-mode", "dontAsk", "--tools", tools,
-            "--strict-mcp-config", "--disable-slash-commands", "--safe-mode",
-            "--append-system-prompt", system_prompt,
+            binary,
+            "--print",
+            "--output-format",
+            "text",
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            tools,
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--safe-mode",
+            "--append-system-prompt",
+            system_prompt,
         ]
         if image_dir is not None:
             argv += ["--add-dir", str(image_dir)]
@@ -1669,10 +2115,22 @@ def _claude_cli_argv(
     # wall-clock cap; review-cli's own streamed runner owns the idle timeout and can keep a
     # chatty/known-alive Fable run going without a hidden 20m wall kill.
     argv = [
-        binary, "--cwd", str(cwd), "--permission-mode", "dontAsk", "--tools", "",
-        "--strict-mcp-config", "--disable-slash-commands", "--safe-mode",
-        "--append-system-prompt", _CLAUDE_REVIEW_SYSTEM,
-        "--disallowedTools", *_CLAUDE_DISALLOWED_TOOLS, "--timeout-sec", "0",
+        binary,
+        "--cwd",
+        str(cwd),
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--safe-mode",
+        "--append-system-prompt",
+        _CLAUDE_REVIEW_SYSTEM,
+        "--disallowedTools",
+        *_CLAUDE_DISALLOWED_TOOLS,
+        "--timeout-sec",
+        "0",
     ]
     if model:
         argv += ["--model", model]
@@ -1725,7 +2183,12 @@ def _claude_cli_env() -> dict[str, str]:
 
 
 def review_claude_cli(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
@@ -1738,8 +2201,14 @@ def review_claude_cli(
     _ensure_workspace_trusted(cwd)
     argv = _claude_cli_argv(binary, direct, claude_model, cwd, timeout, effort=effort)
     proc = _run_streamed(
-        argv, cwd=cwd, input_text=_payload(prompt, diff), env=_claude_cli_env(),
-        timeout=timeout, backend="claude", round_no=round_no, announce=_ANNOUNCE_LOGS,
+        argv,
+        cwd=cwd,
+        input_text=_payload(prompt, diff),
+        env=_claude_cli_env(),
+        timeout=timeout,
+        backend="claude",
+        round_no=round_no,
+        announce=_ANNOUNCE_LOGS,
     )
     # Belt-and-suspenders: strip any terminal control noise the CLI still leaked into the
     # pipe (a stray spinner frame from claude-p, an escape sequence) so it can never
@@ -1757,14 +2226,28 @@ def review_claude_cli(
         command = (
             "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config "
             "--disable-slash-commands --safe-mode --append-system-prompt <read-only-review> "
-            "--disallowedTools " + " ".join(_CLAUDE_DISALLOWED_TOOLS) + " -p  (prompt via stdin)"
+            "--disallowedTools "
+            + " ".join(_CLAUDE_DISALLOWED_TOOLS)
+            + " -p  (prompt via stdin)"
         )
-    return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    return ReviewResult(
+        model=model,
+        command=command,
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def review_claude_cli_with_images(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
-    images: tuple[Path, ...] = (), effort: str | None = None,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
+    images: tuple[Path, ...] = (),
+    effort: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
     claude_model = model.split(":", 1)[1] if ":" in model else None
@@ -1777,12 +2260,21 @@ def review_claude_cli_with_images(
         tmp = Path(tmp_raw)
         staged = _stage_panel_images(images, tmp)
         if not staged:
-            return review_claude_cli(model, prompt, diff, cwd, timeout, round_no, effort=effort)
+            return review_claude_cli(
+                model, prompt, diff, cwd, timeout, round_no, effort=effort
+            )
         _ensure_workspace_trusted(tmp)
-        argv = _claude_cli_argv(binary, True, claude_model, tmp, timeout, image_dir=tmp, effort=effort)
+        argv = _claude_cli_argv(
+            binary, True, claude_model, tmp, timeout, image_dir=tmp, effort=effort
+        )
         proc = _run_streamed(
-            argv, cwd=tmp, input_text=_payload(_prompt_with_panel_images(prompt, staged), diff),
-            env=_claude_cli_env(), timeout=timeout, backend="claude", round_no=round_no,
+            argv,
+            cwd=tmp,
+            input_text=_payload(_prompt_with_panel_images(prompt, staged), diff),
+            env=_claude_cli_env(),
+            timeout=timeout,
+            backend="claude",
+            round_no=round_no,
             announce=_ANNOUNCE_LOGS,
         )
     # The TemporaryDirectory context deleted tmp; remove the trust entry that
@@ -1796,7 +2288,13 @@ def review_claude_cli_with_images(
         "--strict-mcp-config --disable-slash-commands --safe-mode --add-dir <image-dir> "
         "--append-system-prompt <read-only-review>  (prompt via stdin, image @refs)"
     )
-    return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    return ReviewResult(
+        model=model,
+        command=command,
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 # --- Fake backend (TEST-ONLY, env-gated) -------------------------------------------
@@ -1815,11 +2313,21 @@ def review_claude_cli_with_images(
 def _fake_backend_enabled() -> bool:
     # Normalize case so `False`/`FALSE`/`No` are treated as OFF (not just lowercase forms) —
     # otherwise a case-variant false value would silently route every backend to the fake.
-    return os.environ.get("REVIEW_FAKE_BACKEND", "").strip().lower() not in ("", "0", "false", "no")
+    return os.environ.get("REVIEW_FAKE_BACKEND", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
 
 
 def review_fake(
-    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
     """Deterministic, network-free stand-in for a real backend (TEST-ONLY).
@@ -1870,11 +2378,21 @@ def review_fake(
     # SILENTLY either — narrow to OSError (the only thing write_sidecar_log raises on disk) and
     # note it on stderr so a broken log dir is diagnosable.
     try:
-        write_sidecar_log(backend="fake", round_no=round_no, argv0=f"fake:{model}",
-                          returncode=0, stdout=body, stderr="")
+        write_sidecar_log(
+            backend="fake",
+            round_no=round_no,
+            argv0=f"fake:{model}",
+            returncode=0,
+            stdout=body,
+            stderr="",
+        )
     except OSError as exc:
-        print(f"[review-cli] fake sidecar log skipped: {exc}", file=sys.stderr, flush=True)
-    return ReviewResult(model=model, command=f"fake:{model}", returncode=0, stdout=body, stderr="")
+        print(
+            f"[review-cli] fake sidecar log skipped: {exc}", file=sys.stderr, flush=True
+        )
+    return ReviewResult(
+        model=model, command=f"fake:{model}", returncode=0, stdout=body, stderr=""
+    )
 
 
 def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
@@ -1891,20 +2409,29 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
         return review_gemini
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP. `zai`/`glm` plus `zai:<model>`
     # (e.g. zai:glm-5.2). `glm:` prefix also routes here.
-    if (
-        lowered in ("zai", "z.ai", "zhipu", "glm")
-        or lowered.startswith(("zai:", "z.ai:", "glm:", "zhipu:"))
+    if lowered in ("zai", "z.ai", "zhipu", "glm") or lowered.startswith(
+        ("zai:", "z.ai:", "glm:", "zhipu:")
     ):
         return review_zai
     # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
     # The legacy `common-code`/`common_code` spellings still route here as aliases so
     # any pre-rename config keeps working.
     if lowered in (
-        "commandcode", "command-code", "command_code",
-        "common-code", "commoncode", "common_code",
+        "commandcode",
+        "command-code",
+        "command_code",
+        "common-code",
+        "commoncode",
+        "common_code",
     ) or lowered.startswith(
-        ("commandcode:", "command-code:", "command_code:",
-         "common-code:", "commoncode:", "common_code:")
+        (
+            "commandcode:",
+            "command-code:",
+            "command_code:",
+            "common-code:",
+            "commoncode:",
+            "common_code:",
+        )
     ):
         return review_commandcode
     # OpenRouter — OpenAI-compatible API aggregator (keyed HTTP). `openrouter` plus
@@ -1913,6 +2440,16 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
     # either, so the order relative to the opencode catch-all below is irrelevant.
     if lowered == "openrouter" or lowered.startswith("openrouter:"):
         return review_openrouter
+    # xAI (Grok) — unlike zai/commandcode there is no diff-only REST backend for this
+    # provider in this codebase; it is reachable ONLY agentically through opencode's
+    # native `xai` provider (`oc:xai/<model>`, GROK_SEAT). This bare-token branch exists
+    # solely so `default_routes_live`'s under-transport check (`_match_named_backend`
+    # applied to the peeled `effective_provider`, e.g. "xai") sees a named route instead
+    # of None — matching the doc'd extension point ("adding one on a new provider means
+    # giving it a named branch"). A bare `-m xai` (no `oc:`/colon-model) also lands here
+    # and routes through opencode, same as the documented seat form.
+    if lowered == "xai" or lowered.startswith("xai:"):
+        return review_opencode
     # fable IS claude-p. Route any fable form to review_claude defensively, so an
     # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
@@ -1950,7 +2487,7 @@ def effective_provider(model: str) -> str:
     lowered = model.lower()
     for prefix in ("oc:", "opencode:"):
         if lowered.startswith(prefix):
-            lowered = lowered[len(prefix):]
+            lowered = lowered[len(prefix) :]
             break
     if lowered.startswith("fable"):
         return "claude"
@@ -2045,7 +2582,9 @@ def configure_unpaid_providers(raw: object) -> None:
 
 def unpaid_providers() -> frozenset[str]:
     """Providers skipped before dispatch because their subscription/billing is unavailable."""
-    return _CONFIG_UNPAID_PROVIDERS | _parse_provider_names(os.environ.get(_UNPAID_PROVIDERS_ENV))
+    return _CONFIG_UNPAID_PROVIDERS | _parse_provider_names(
+        os.environ.get(_UNPAID_PROVIDERS_ENV)
+    )
 
 
 def provider_marked_unpaid(model: str) -> bool:
@@ -2054,7 +2593,11 @@ def provider_marked_unpaid(model: str) -> bool:
 
 
 def _runtime_unpaid_provider(model: str) -> str | None:
-    provider = _claude_runtime_gateway_provider() if resolve_backend(model) is review_claude else None
+    provider = (
+        _claude_runtime_gateway_provider()
+        if resolve_backend(model) is review_claude
+        else None
+    )
     return _matched_unpaid_provider(model, provider)
 
 
@@ -2102,10 +2645,24 @@ def unpaid_provider_result(
         return None
     stderr = unpaid_provider_error(model, provider)
     try:
-        _emit_rest_log(backend, command, stdout="", stderr=stderr, returncode=1, round_no=round_no, started=started)
+        _emit_rest_log(
+            backend,
+            command,
+            stdout="",
+            stderr=stderr,
+            returncode=1,
+            round_no=round_no,
+            started=started,
+        )
     except OSError as exc:
-        print(f"[review-cli] unpaid-provider sidecar log skipped: {exc}", file=sys.stderr, flush=True)
-    return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
+        print(
+            f"[review-cli] unpaid-provider sidecar log skipped: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return ReviewResult(
+        model=model, command=command, returncode=1, stdout="", stderr=stderr
+    )
 
 
 _PAYMENT_PREFLIGHT_PROVIDERS = frozenset({"commandcode", "fireworks"})
@@ -2166,7 +2723,9 @@ def _oc_config_provider_credentials(provider: str) -> tuple[str | None, str | No
         opts = data.get("provider", {}).get(provider, {}).get("options", {})
         value = opts.get("apiKey", "")
         key = value if isinstance(value, str) and value.strip() else None
-        base_value = opts.get("baseURL") or opts.get("baseUrl") or opts.get("base_url") or ""
+        base_value = (
+            opts.get("baseURL") or opts.get("baseUrl") or opts.get("base_url") or ""
+        )
         base = base_value.strip() if isinstance(base_value, str) else ""
         return key, (base or None)
     except Exception:  # noqa: BLE001
@@ -2195,7 +2754,9 @@ def _models_url_from_base(base_url: str | None, provider: str) -> str | None:
     return base_url.rstrip("/") + "/models"
 
 
-def _payment_preflight_credentials(model: str, provider: str) -> tuple[str | None, str | None]:
+def _payment_preflight_credentials(
+    model: str, provider: str
+) -> tuple[str | None, str | None]:
     if provider == "commandcode":
         if model.lower().startswith(("oc:", "opencode:")):
             config_key, config_base = _oc_config_provider_credentials(provider)
@@ -2223,7 +2784,10 @@ def _payment_preflight_credentials(model: str, provider: str) -> tuple[str | Non
 
 
 def _payment_preflight_cache_key(
-    provider: str, url: str, key: str, scope: str = _PAYMENT_PREFLIGHT_PROVIDER_SCOPE,
+    provider: str,
+    url: str,
+    key: str,
+    scope: str = _PAYMENT_PREFLIGHT_PROVIDER_SCOPE,
 ) -> tuple[str, str, str, str]:
     # Keep the cache key credential-sensitive without storing the credential itself.
     key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -2253,7 +2817,9 @@ def _payment_preflight_reason(provider: str, model: str, code: int | None) -> st
     return f"provider '{provider}' failed payment/availability preflight ({suffix}); skipping {model}"
 
 
-def _cache_payment_preflight_denial(model: str, code: int | None, body: str = "") -> None:
+def _cache_payment_preflight_denial(
+    model: str, code: int | None, body: str = ""
+) -> None:
     provider = effective_provider(model)
     if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
         return
@@ -2274,9 +2840,10 @@ def _cached_payment_preflight_result(
     key: str,
 ) -> tuple[bool, int | None] | None:
     with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-        return (
-            _PAYMENT_PREFLIGHT_CACHE.get(_payment_preflight_cache_key(provider, url, key, model))
-            or _PAYMENT_PREFLIGHT_CACHE.get(_payment_preflight_cache_key(provider, url, key))
+        return _PAYMENT_PREFLIGHT_CACHE.get(
+            _payment_preflight_cache_key(provider, url, key, model)
+        ) or _PAYMENT_PREFLIGHT_CACHE.get(
+            _payment_preflight_cache_key(provider, url, key)
         )
 
 
@@ -2326,10 +2893,9 @@ def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
         with urllib.request.urlopen(req, timeout=_PROVIDER_PREFLIGHT_TIMEOUT_SECONDS):
             with _PAYMENT_PREFLIGHT_CACHE_LOCK:
                 provider_cache_key = _payment_preflight_cache_key(provider, url, key)
-                cached = (
-                    _PAYMENT_PREFLIGHT_CACHE.get(_payment_preflight_cache_key(provider, url, key, model))
-                    or _PAYMENT_PREFLIGHT_CACHE.get(provider_cache_key)
-                )
+                cached = _PAYMENT_PREFLIGHT_CACHE.get(
+                    _payment_preflight_cache_key(provider, url, key, model)
+                ) or _PAYMENT_PREFLIGHT_CACHE.get(provider_cache_key)
                 if cached is not None and cached[0] is True:
                     return _payment_preflight_reason(provider, model, cached[1])
                 if cached is None or cached[0] is False:
@@ -2365,10 +2931,24 @@ def provider_preflight_result(
     if reason is None:
         return None
     try:
-        _emit_rest_log(backend, command, stdout="", stderr=reason, returncode=1, round_no=round_no, started=started)
+        _emit_rest_log(
+            backend,
+            command,
+            stdout="",
+            stderr=reason,
+            returncode=1,
+            round_no=round_no,
+            started=started,
+        )
     except OSError as exc:
-        print(f"[review-cli] provider-preflight sidecar log skipped: {exc}", file=sys.stderr, flush=True)
-    return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=reason)
+        print(
+            f"[review-cli] provider-preflight sidecar log skipped: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return ReviewResult(
+        model=model, command=command, returncode=1, stdout="", stderr=reason
+    )
 
 
 def _oc_auth_file() -> Path:
@@ -2392,10 +2972,19 @@ def _oc_config_file() -> Path:
 
 
 def _oc_auth_has_provider(provider: str) -> bool:
-    """True iff opencode's auth.json carries a non-empty key for *provider*."""
+    """True iff opencode's auth.json carries a usable credential for *provider*.
+
+    opencode's auth.json stores two credential shapes (`opencode providers login`):
+    keyed API auth (`{"type": "api", "key": "..."}`, e.g. deepseek/commandcode/zai) and
+    OAuth (`{"type": "oauth", "access": "...", "refresh": "...", "expires": ...}`, e.g.
+    `xai` via `opencode providers login` -> browser OAuth flow — verified live on this
+    host, `opencode providers list` shows "xAI | oauth"). Checking only `key` made an
+    oauth-authenticated provider (xai/GROK_SEAT) report unavailable even though
+    `opencode run -m xai/grok-4.5` works, silently dropping the seat from every pool.
+    A non-empty `access` token is the oauth equivalent of a non-empty `key`."""
     try:
-        data = json.loads(_oc_auth_file().read_text())
-        return bool(data.get(provider, {}).get("key", ""))
+        entry = json.loads(_oc_auth_file().read_text()).get(provider, {})
+        return bool(entry.get("key", "")) or bool(entry.get("access", ""))
     except Exception:  # noqa: BLE001
         return False
 

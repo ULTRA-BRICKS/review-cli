@@ -5,6 +5,26 @@ semantic versioning.
 
 ## Unreleased
 
+- **New default board seat: Grok 4.5 via opencode's native `xai` provider
+  (`GROK_SEAT = "oc:xai/grok-4.5"`).** Added as priority-10 in `DEFAULT_BOARD`
+  (`reviewlib/config.py`), on-by-default — it participates in every normal
+  `review diff`/`review quorum`/`review brainstorm` run exactly like the existing
+  seats, no opt-in flag required. Agentic (reads the repo read-only, like the other
+  `oc:` seats); unlike Kimi/GLM/Qwen/DeepSeek there is no diff-only REST fallback for
+  this provider, so `reviewlib/backends.py`'s `_match_named_backend` gained a bare
+  `xai`/`xai:` branch solely to satisfy `default_routes_live`'s under-transport check.
+  Fixed a real bug found while wiring this up: `_oc_auth_has_provider` only recognized
+  opencode's keyed-API auth.json shape (`{"type": "api", "key": ...}`) and silently
+  reported an OAuth-authenticated provider (xai's `opencode providers login` flow,
+  `{"type": "oauth", "access": ...}`) as having no credential — the new Grok seat would
+  have reported unavailable on this exact host despite `opencode run -m xai/grok-4.5`
+  working. Now checks a non-empty `access` token too. Placed directly ABOVE the
+  deliberately-slow z.ai GLM last-resort seat (review-cli#65), not below it: the seat's
+  own first dogfooding pass (`review diff` against this change) flagged that appending
+  it after GLM meant deep mid-run failover always paid GLM's pathological-slowness cost
+  before ever reaching Grok. New `grok`/`grok45` aliases in `MODEL_ALIASES`. Board/doc
+  tests, README, and the embedded install-skill text updated for the 11-seat board.
+
 - **A sandboxed caller's unwritable log location no longer kills the whole seat
   (review-cli#162).** `log_dir()` (`~/Library/Logs/review-cli` on macOS,
   `$XDG_STATE_HOME/review-cli/logs` elsewhere) and the per-call log file it opens are

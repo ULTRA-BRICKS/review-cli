@@ -40,6 +40,15 @@ SOL_SEAT = "codex:gpt-5.6-sol"
 # only the diff; no repo access, no tools, no exec), so it needs no `-s read-only` cage.
 GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.2"
 
+# Canonical Grok seat — opencode's NATIVE `xai` provider (oauth-authenticated via
+# `opencode providers login`, verified live 2026-07-22: `opencode models` lists
+# `xai/grok-4.5` and `opencode providers list` shows an active xAI oauth credential on
+# this host). Already agentic (`oc:` prefix) — unlike Kimi/GLM-cc/Qwen/DeepSeek, there is
+# no diff-only REST fallback for this seat because xai is not one of the
+# commandcode/z.ai custom gateways `_agentic()` derives from; it is a first-class
+# opencode provider, so the seat is spelled directly.
+GROK_SEAT = "oc:xai/grok-4.5"
+
 
 def _agentic(seat: str) -> str:
     """Turn a diff-only keyed-HTTP seat (`provider:model`) into its AGENTIC opencode
@@ -102,6 +111,8 @@ MODEL_ALIASES = {
     "fable5": "claude:claude-fable-5",
     "sol": SOL_SEAT,
     "gpt56sol": SOL_SEAT,
+    "grok": GROK_SEAT,
+    "grok45": GROK_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -307,13 +318,22 @@ DEFAULT_BOARD = (
     ),
     # priority 9 — Gemini.
     BoardReviewer("gemini", "contracts", "Gemini"),
-    # priority 10 (LAST-RESORT reserve) — GLM-5.2 (his z.ai subscription, the newest GLM),
+    # priority 10 — Grok 4.5 via opencode's native `xai` provider (agentic, reads the
+    # repo). Placed BEFORE the deliberately-slow z.ai GLM reserve below: this seat's own
+    # dogfooding review of its addition (`review diff` seat, round 1) flagged that
+    # appending it AFTER GLM meant deep mid-run failover always paid GLM's #65
+    # pathological-slowness cost before ever reaching Grok, defeating the point of having
+    # a faster reserve. Role `performance` duplicates GLM-cc's lens (tolerated among
+    # low-priority reserves — only the top-4 pool needs distinct roles, see
+    # test_default_pool_roles_are_distinct_no_lens_lost).
+    BoardReviewer(GROK_SEAT, "performance", "Grok"),
+    # priority 11 (LAST-RESORT reserve) — GLM-5.2 (his z.ai subscription, the newest GLM),
     # AGENTIC through opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of
     # the reserve (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load,
     # so promoting it onto the failover critical path stalls the pool's path to a verdict. It
     # stays on the board (still backfills when every faster reserve is also exhausted), but it
-    # no longer blocks a fast verdict — Qwen / DeepSeek / Gemini are promoted before it. To
-    # re-rank, move this line up; its position IS its priority.
+    # no longer blocks a fast verdict — Qwen / DeepSeek / Gemini / Grok are promoted before it.
+    # To re-rank, move this line up; its position IS its priority.
     BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
 )
 
@@ -428,7 +448,15 @@ def _effort_provider_key(model_or_provider: str) -> str:
 
 # Known route keys a `--effort <provider>=<level>` token may target (for the error message
 # when a token is unrecognised). Derived once from the backend routes.
-_EFFORT_PROVIDER_KEYS = ("codex", "claude", "gemini", "opencode", "commandcode", "zai", "openrouter")
+_EFFORT_PROVIDER_KEYS = (
+    "codex",
+    "claude",
+    "gemini",
+    "opencode",
+    "commandcode",
+    "zai",
+    "openrouter",
+)
 
 
 def _require_provider_key(provider: str) -> str:
@@ -464,7 +492,9 @@ class EffortOverride:
         # this keeps programmatic callers coherent. The result is frozen behind a
         # MappingProxyType so `frozen=True` is not defeated by an in-place dict mutation.
         # Frozen dataclass → object.__setattr__.
-        canonical = {_require_provider_key(key): value for key, value in self.by_provider.items()}
+        canonical = {
+            _require_provider_key(key): value for key, value in self.by_provider.items()
+        }
         object.__setattr__(self, "by_provider", MappingProxyType(canonical))
 
     @property
@@ -504,7 +534,9 @@ def parse_effort_flag(values: list[str] | None) -> EffortOverride:
                 provider, _, level = token.partition("=")
                 provider = provider.strip()
                 if not provider:
-                    raise EffortValueError(f"malformed --effort token {token!r}; expected provider=level")
+                    raise EffortValueError(
+                        f"malformed --effort token {token!r}; expected provider=level"
+                    )
                 by_provider[_require_provider_key(provider)] = _require_effort(level)
             else:
                 default = _require_effort(token)
@@ -512,7 +544,8 @@ def parse_effort_flag(values: list[str] | None) -> EffortOverride:
 
 
 def apply_effort_override(
-    board: list[BoardReviewer], override: EffortOverride | None,
+    board: list[BoardReviewer],
+    override: EffortOverride | None,
 ) -> list[BoardReviewer]:
     """Return a board with each seat's effort resolved through the run-scoped override
     (`override.resolve(model, seat_effort)`). Identity-returns the board when the override
