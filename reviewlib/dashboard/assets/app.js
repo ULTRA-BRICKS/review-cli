@@ -82,9 +82,11 @@ const MODEL_LOGO = {
   windsurf: 'windsurf',
   // HyperIDE
   hyperide: 'hyperide',
-  // z.ai serves Zhipu's GLM — the board's priority-5 `tests` seat (zai:glm-5.2). The shipped
-  // GLM tile carries the brand wordmark so the seat reads as a real logo image alongside its
-  // board siblings, not a bare monogram.
+  // z.ai serves Zhipu's GLM — the board's priority-9 `quality` seat (zai:glm-5.2;
+  // review-cli#fable-seat-reliability: was priority-10 before Fable's demotion added
+  // a still-worse seat below it). The shipped GLM tile carries the brand wordmark so
+  // the seat reads as a real logo image alongside its board siblings, not a bare
+  // monogram.
   glm: 'glm',
   zai: 'glm',
   chatglm: 'glm',
