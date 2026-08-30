@@ -1807,11 +1807,18 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
             )
             from reviewlib.dashboard import server
 
+            orig_cache = server._session_cache
+            server._session_cache = server._SessionCache()
             httpd = server.make_server(0)
             base = f"http://127.0.0.1:{httpd.server_address[1]}"
             t = threading.Thread(target=httpd.serve_forever, daemon=True)
             t.start()
             try:
+                # A genuinely cold first hit serves an empty placeholder immediately and
+                # populates in the background (review-cli#323) — wait for it, then re-request.
+                with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
+                    json.loads(r.read().decode("utf-8"))
+                _wait_for_cache_refresh(server._session_cache, timeout=10.0)
                 with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
                     runs = json.loads(r.read().decode("utf-8"))
                 assert len(runs) == 1, runs
@@ -1823,6 +1830,7 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+                server._session_cache = orig_cache
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
@@ -1876,11 +1884,17 @@ def test_session_cache_is_single_flight_and_invalidates_on_new_run():
             for w in workers:
                 w.join()
 
-            # Single-flight: eight concurrent cold callers => exactly ONE computation.
+            # A genuinely cold cache never blocks a caller (review-cli#323): every one of the
+            # 8 concurrent callers gets the empty placeholder immediately, and — single-flight —
+            # exactly ONE background computation was kicked to populate it (not 8 stampeding).
+            assert set(results) == {0}, results
             assert calls["n"] == 1, (
                 f"expected single-flight (1 compute), got {calls['n']}"
             )
-            assert set(results) == {1}, results  # all saw the same one run
+            _wait_for_cache_refresh(server._session_cache)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "the single background compute must have landed the real (1-row) result"
+            )
 
             # Unchanged log dir => served from cache, no recompute. /api/stats shares the SAME
             # cached parse, so requesting it must not trigger a second load_sessions.
@@ -1946,8 +1960,10 @@ def test_session_cache_window_suppresses_thrash_under_active_writes():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 3600.0
         try:
-            # First call computes once and caches.
-            assert len(server._summaries_for_gap(90.0)) == 1
+            # Warm the cache explicitly (this test is about window-thrash suppression on an
+            # already-warm cache, not the cold-start path — force=True still blocks
+            # synchronously, see test_explicit_prewarm_still_blocks_synchronously).
+            assert len(server._session_cache.get(90.0, force=True)) == 1
             assert calls["n"] == 1
 
             # Simulate the active writer: several new logs land, each bumping the fingerprint.
@@ -1996,6 +2012,13 @@ def test_stats_are_memoized_until_session_list_reparses():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
         try:
+            # Warm the cache explicitly first (force=True still blocks synchronously — this
+            # test is about the derived-stats memo on an established baseline, not the
+            # cold-start path itself, see test_cold_first_request_never_blocks_on_full_parse).
+            server._session_cache.get(90.0, force=True)
+            stat_calls["n"] = (
+                0  # the force=True warm-up above doesn't build derived stats
+            )
             server._cached_stats(90.0)
             server._cached_stats(90.0)
             server._cached_stats(90.0)
@@ -2054,8 +2077,11 @@ def test_stale_read_returns_immediately_and_refreshes_in_background():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
         try:
-            # Warm the cache (this first call IS synchronous — nothing to serve yet).
-            assert len(server._summaries_for_gap(90.0)) == 1
+            # Warm the cache explicitly (force=True still blocks synchronously — see
+            # test_explicit_prewarm_still_blocks_synchronously; an ordinary cold call no
+            # longer blocks here, see test_cold_first_request_never_blocks_on_full_parse,
+            # so this test forces the warm-up itself to isolate the STALE behavior below).
+            assert len(server._session_cache.get(90.0, force=True)) == 1
             # Now make the reparse slow and add a new run; the stale read must come back fast.
             slow["on"] = True
             _write_call_log(
@@ -2078,6 +2104,86 @@ def test_stale_read_returns_immediately_and_refreshes_in_background():
         finally:
             server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
             p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_cold_first_request_never_blocks_on_full_parse():
+    """review-cli#323: on a real 130k-file/10GB install, the FIRST parse ever (nothing
+    cached yet — a fresh server start racing a request before `prewarm_summary_cache`
+    finishes) took ~130s, and a request landing in that window blocked on the SAME lock
+    the prewarm held — `curl -m 150 /api/stats` came back with ZERO bytes after 150s+.
+    The cold case must behave like the already-warm STALE case above: serve an empty
+    placeholder immediately and populate it via a background parse, never block a real
+    request on the full scan — this is the fix, verified WITHOUT ever having warmed the
+    cache first (unlike the sibling stale-read test, which warms it before making it slow)."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        import time as _time
+
+        orig_load = p.load_sessions
+
+        def _slow_load(*a, **k):
+            _time.sleep(1.0)  # stand in for the ~130s real-scale cold parse
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()  # genuinely cold, never warmed
+        p.load_sessions = _slow_load
+        try:
+            t0 = _time.monotonic()
+            cold = server._summaries_for_gap(90.0)
+            elapsed = _time.monotonic() - t0
+            assert elapsed < 0.5, (
+                f"cold first request must not block on the slow parse, took {elapsed:.2f}s"
+            )
+            assert cold == [], (
+                "a genuinely cold cache must serve an empty placeholder, not fabricate data"
+            )
+            stats = server._cached_stats(90.0)
+            assert stats.get("session_count") == 0, stats
+
+            # The background parse lands shortly after and the real run then appears.
+            _wait_for_cache_refresh(server._session_cache, timeout=5.0)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "the background parse must populate the real session once it lands"
+            )
+        finally:
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_explicit_prewarm_still_blocks_synchronously():
+    """The startup prewarm (`force=True`) is deliberately the ONE caller that still blocks —
+    it runs on its own background thread already (never a real request's thread), and it
+    needs the actual parsed data to warm the derived-stats cache too, not an empty
+    placeholder it would just have to immediately redo."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        try:
+            sessions = server._session_cache.get(90.0, force=True)
+            assert len(sessions) == 1, (
+                "an explicit force=True prewarm must synchronously return real data"
+            )
+        finally:
             server._session_cache = orig_cache
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
@@ -2114,6 +2220,9 @@ def test_served_summary_does_not_share_mutable_state_with_cache():
         orig_cache = server._session_cache
         server._session_cache = server._SessionCache()
         try:
+            server._session_cache.get(
+                90.0, force=True
+            )  # warm; not testing cold-start here
             a = server._summaries_for_gap(90.0)
             b = server._summaries_for_gap(90.0)
             assert a and b

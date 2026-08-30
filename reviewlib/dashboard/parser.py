@@ -832,11 +832,21 @@ def cluster_sessions(
     ordered = sorted(calls, key=lambda c: c.started)
     sessions: list[Session] = []
     cur: Session | None = None
+    # Tracks `cur.task_code` incrementally instead of calling the `Session.task_code`
+    # PROPERTY on every iteration — that property scans `cur.calls` from index 0 for the
+    # first truthy task_code, so calling it once per considered call made this loop O(n^2)
+    # in the (common, for a task-less ad-hoc review) case where no call in a growing
+    # session has a task_code: the scan never short-circuits and re-walks the whole
+    # (growing) list every time. Measured live: dominated `load_sessions` at real scale
+    # (review-cli#323 follow-on) even after the per-file parse itself was cached. `cur` is
+    # always brainstorm-less during this loop (brainstorms attach in a separate pass
+    # below), so "first truthy task_code among cur.calls" is exactly what this tracks.
+    cur_task_code: str | None = None
     for call in ordered:
         # Gap is measured from the prior call's END (last write), not its start, so a
         # single invocation whose individual call runs longer than `gap` is not split
         # into multiple sessions. `cur.ended` therefore tracks the max call end-time.
-        same_task = cur is not None and (cur.task_code or "") == (call.task_code or "")
+        same_task = cur is not None and (cur_task_code or "") == (call.task_code or "")
         if (
             cur is None
             or not same_task
@@ -849,8 +859,10 @@ def cluster_sessions(
                 calls=[call],
             )
             sessions.append(cur)
+            cur_task_code = call.task_code
         else:
             cur.calls.append(call)
+            cur_task_code = cur_task_code or call.task_code
             if call.ended_at > cur.ended:
                 cur.ended = call.ended_at
     # Attach each brainstorm.md to the session whose window contains/precedes it.

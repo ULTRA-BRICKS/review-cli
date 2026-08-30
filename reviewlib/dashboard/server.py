@@ -27,6 +27,7 @@ against DNS rebinding, and WRITES additionally require the Origin/Referer to be 
 host (CSRF). This is the spec-web pattern, ported so the dashboard can be exposed over
 Tailscale without dropping the rebinding protection.
 """
+
 from __future__ import annotations
 
 import json
@@ -52,7 +53,11 @@ _ICONS_DIR = ASSETS_DIR / "icons"
 # outside the tree can't be admitted by name — defence in depth alongside the per-request
 # resolve()/relative_to() check in _serve_asset.
 _ICON_NAMES = (
-    frozenset(p.name for p in _ICONS_DIR.glob("mini_*.png") if p.is_file() and not p.is_symlink())
+    frozenset(
+        p.name
+        for p in _ICONS_DIR.glob("mini_*.png")
+        if p.is_file() and not p.is_symlink()
+    )
     if _ICONS_DIR.is_dir()
     else frozenset()
 )
@@ -98,7 +103,9 @@ def _discover_tailscale_hosts() -> set[str]:
 
         exe = shutil.which("tailscale")
         if exe:
-            out = subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=5)
+            out = subprocess.run(
+                [exe, "status", "--json"], capture_output=True, text=True, timeout=5
+            )
             if out.returncode == 0 and out.stdout.strip():
                 data = json.loads(out.stdout)
                 me = (data or {}).get("Self") or {}
@@ -227,7 +234,9 @@ class _SessionCache:
         # never serves a derivation built from a previous parse.
         self._generation = 0
         self._derived: dict[object, tuple[int, object]] = {}
-        self._refreshing = False  # a background reparse is in flight (don't start a second)
+        self._refreshing = (
+            False  # a background reparse is in flight (don't start a second)
+        )
 
     def get(self, gap: float, *, force: bool = False) -> list[dparser.Session]:
         """The cached parsed `Session` list for ``gap``.
@@ -241,65 +250,125 @@ class _SessionCache:
         The returned list and its `Session` objects are the SHARED cached objects — callers must
         treat them as read-only and derive fresh dicts from them (`to_summary()`/`to_detail()`
         build new dicts; `_merge_annotation` copies before mutating)."""
+        self._ensure_fresh(gap, force=force)
         with self._lock:
-            self._ensure_fresh_locked(gap, force=force)
-            return self._sessions  # type: ignore[return-value]  # set by _ensure_fresh_locked
+            return self._sessions  # type: ignore[return-value]  # set by _ensure_fresh
 
-    def get_derived(self, gap: float, key: object, factory: Callable[[list[dparser.Session]], object]) -> object:
+    def get_derived(
+        self,
+        gap: float,
+        key: object,
+        factory: Callable[[list[dparser.Session]], object],
+    ) -> object:
         """A value derived from the cached session list, memoized until the list is reparsed.
 
         ``key`` identifies the derivation (e.g. ``"stats"``); ``factory`` builds it from the
         session list. The result is cached against the current generation and reused for every
         request until the next reparse bumps the generation — this is what makes the ~8s
         un-memoizing ``compute_stats`` cheap on /api/stats without re-running it per request.
-        Computed under the same lock, so concurrent callers share one build (single-flight)."""
+        Best-effort single-flight: concurrent factory() calls racing the SAME fresh
+        generation may redundantly recompute (a much cheaper cost — ~8s aggregation vs. the
+        ~130s parse `_ensure_fresh` already de-stampedes below), but only the first result
+        to land for a generation is kept, so callers never observe a torn/mixed cache."""
+        self._ensure_fresh(gap, force=False)
         with self._lock:
-            self._ensure_fresh_locked(gap, force=False)
+            sessions = self._sessions
+            gen = self._generation
             cached = self._derived.get(key)
-            if cached is None or cached[0] != self._generation:
-                value = factory(self._sessions)  # type: ignore[arg-type]
-                self._derived[key] = (self._generation, value)
-                return value
-            return cached[1]
+            if cached is not None and cached[0] == gen:
+                return cached[1]
+        value = factory(sessions)  # type: ignore[arg-type]  # OUTSIDE the lock — real cost lives here
+        with self._lock:
+            if self._generation == gen:
+                self._derived[key] = (gen, value)
+        return value
 
-    def _ensure_fresh_locked(self, gap: float, *, force: bool) -> None:
-        """Serve-stale-while-revalidate (caller holds the lock).
+    def _ensure_fresh(self, gap: float, *, force: bool) -> None:
+        """Serve-stale-while-revalidate, extended to the COLD case — and critically, the
+        actual expensive parse NEVER runs while `self._lock` is held, for ANY caller
+        (including the explicit `force=True` startup prewarm).
 
-        Blocks for a synchronous reparse ONLY when there is nothing usable to serve; otherwise
-        kicks a background refresh and returns immediately so the request is never slow."""
+        Earlier version of this fix ran the prewarm's synchronous parse INSIDE the lock
+        (`with self._lock: ... dparser.load_sessions(...)`), which meant a REAL request
+        racing that ~130s prewarm blocked trying to acquire the very same lock BEFORE it
+        could even reach the cold-placeholder logic below — completely defeating that fix.
+        Observed live (review-cli#323): a fresh service restart's prewarm held the lock for
+        the full parse, and Alex's browser hit the dashboard during that window and got
+        nothing for 30s+ (would have been the full ~130s+). Now: state decisions happen
+        under a BRIEF lock; the parse itself (sync for force / a different lineage, or
+        async via `_start_background_refresh` for everything else) runs unlocked, so any
+        OTHER caller's lock acquisition — including one that only needs to install a cold
+        empty placeholder and return — is never stuck behind someone else's multi-minute
+        parse.
+
+        Blocks the CALLING thread for a synchronous reparse ONLY for the explicit
+        `force=True` prewarm call, or a DIFFERENT lineage than whatever is cached (no
+        stale-but-correct data of any age exists to serve honestly for a new gap/dir — a
+        full reparse is unavoidable there). A genuinely cold cache for the SAME/no prior
+        lineage does NOT block: it installs an empty placeholder and kicks the same
+        background-refresh machinery used for a stale-but-warm cache."""
         ld = log_dir()
         lineage = (gap, str(ld))
-        fingerprint = _log_dir_fingerprint(ld)
-        if self._must_block(lineage, force=force):
-            # Cold / different lineage / explicit force — no stale data to serve, so compute now.
-            self._reparse_locked(gap, ld, lineage, fingerprint)
-        elif self._should_refresh(lineage, fingerprint):
-            # Usable data exists but the dir changed past the window — serve it and refresh async.
-            self._start_background_refresh(gap, lineage)
-
-    def _reparse_locked(
-        self,
-        gap: float,
-        ld: Path,
-        lineage: tuple[float, str],
-        fingerprint: tuple[int, float, int],
-    ) -> None:
-        """Run the expensive parse and install the result (caller holds the lock)."""
-        self._sessions = dparser.load_sessions(ld, gap_seconds=gap)
-        self._lineage = lineage
-        self._fingerprint = fingerprint
-        self._computed_at = time.monotonic()
-        self._generation += 1
-        self._derived.clear()  # derivations from the previous parse are now stale
+        with self._lock:
+            fingerprint = _log_dir_fingerprint(ld)
+            need_sync_parse = self._must_block(lineage, force=force)
+            if not need_sync_parse:
+                if self._sessions is None:
+                    self._sessions = []
+                    self._lineage = lineage
+                    self._fingerprint = fingerprint
+                    self._computed_at = time.monotonic()
+                    self._generation += 1
+                    self._derived.clear()
+                    # Guard against racing the sync path below (e.g. the startup prewarm's
+                    # own force=True parse still in flight): don't ALSO kick a redundant
+                    # concurrent full parse — one real request already stampeded this
+                    # exact way against a real 130k-file install (review-cli#323 follow-on:
+                    # prewarm's parse + this cold placeholder's background parse ran at the
+                    # same time, doubling disk/CPU contention instead of halving it).
+                    if not self._refreshing:
+                        self._start_background_refresh(gap, lineage)
+                elif self._should_refresh(lineage, fingerprint):
+                    self._start_background_refresh(gap, lineage)
+                return
+            # About to run the expensive parse unlocked (below) — mark it in-flight so a
+            # concurrent cold caller's placeholder path (above) doesn't ALSO start one.
+            self._refreshing = True
+        # need_sync_parse: lock released — run the expensive parse unlocked so no other
+        # caller can ever be stuck waiting on it.
+        try:
+            sessions = dparser.load_sessions(ld, gap_seconds=gap)
+        finally:
+            with self._lock:
+                self._refreshing = False
+        with self._lock:
+            self._sessions = sessions
+            self._lineage = lineage
+            # Re-stat rather than reuse the pre-parse fingerprint: the dir may have grown
+            # further during the (possibly long) unlocked parse; using a stale fingerprint
+            # here would make `_should_refresh` see a "changed" dir on the very next call
+            # and immediately kick a redundant background reparse.
+            self._fingerprint = _log_dir_fingerprint(ld)
+            self._computed_at = time.monotonic()
+            self._generation += 1
+            self._derived.clear()  # derivations from the previous parse are now stale
 
     def _must_block(self, lineage: tuple[float, str], *, force: bool) -> bool:
-        """True iff there is no servable cached list — a sync reparse is unavoidable."""
-        if self._sessions is None or force:
-            return True  # nothing cached yet, or an explicit prewarm/refresh
-        # Different gap or log dir: serving another lineage's data would be wrong, so block.
+        """True iff a synchronous reparse is unavoidable: the explicit prewarm (`force=True`,
+        runs on its own thread, wants real data to warm the derived-stats cache too), or a
+        DIFFERENT lineage than whatever is cached (nothing of any age exists for THIS gap/dir
+        to serve honestly, cold or stale). A cold cache for the SAME/no prior lineage does
+        NOT block here — `_ensure_fresh_locked` serves an empty placeholder and refreshes in
+        the background instead (review-cli#323)."""
+        if force:
+            return True
+        if self._sessions is None:
+            return False
         return self._lineage != lineage
 
-    def _should_refresh(self, lineage: tuple[float, str], fingerprint: tuple[int, float, int]) -> bool:
+    def _should_refresh(
+        self, lineage: tuple[float, str], fingerprint: tuple[int, float, int]
+    ) -> bool:
         """True iff the cached (same-lineage) list is stale enough to refresh in the background."""
         if self._refreshing:
             return False  # a refresh is already in flight — don't pile on
@@ -325,7 +394,11 @@ class _SessionCache:
                 with self._lock:
                     # Only install if still the relevant lineage (a gap/dir change since scheduling
                     # would already have been handled by a blocking reparse on that request).
-                    if self._lineage is None or self._lineage == lineage or self._lineage == fresh_lineage:
+                    if (
+                        self._lineage is None
+                        or self._lineage == lineage
+                        or self._lineage == fresh_lineage
+                    ):
                         self._sessions = sessions
                         self._lineage = fresh_lineage
                         self._fingerprint = fresh_fp
@@ -333,8 +406,11 @@ class _SessionCache:
                         self._generation += 1
                         self._derived.clear()
             except Exception as exc:  # noqa: BLE001 — a failed refresh keeps the last good data
-                print(f"[review dashboard] background cache refresh failed "
-                      f"({type(exc).__name__}: {exc}); serving last good data", flush=True)
+                print(
+                    f"[review dashboard] background cache refresh failed "
+                    f"({type(exc).__name__}: {exc}); serving last good data",
+                    flush=True,
+                )
             finally:
                 with self._lock:
                     self._refreshing = False
@@ -364,7 +440,9 @@ def _cached_stats(gap: float) -> dict:
 
 def _summaries_for_gap(gap: float) -> list[dict]:
     """Annotation-merged run summaries for ``gap`` — the `/api/runs` payload, cached + warm."""
-    return [_merge_annotation(s.to_summary(), s.session_id) for s in _cached_sessions(gap)]
+    return [
+        _merge_annotation(s.to_summary(), s.session_id) for s in _cached_sessions(gap)
+    ]
 
 
 def prewarm_summary_cache(gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS) -> None:
@@ -382,10 +460,15 @@ def prewarm_summary_cache(gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS) -> N
     try:
         for s in _session_cache.get(gap, force=True):
             s.to_summary()  # warm the per-session cached_property (errors/recovery scan) too
-        _cached_stats(gap)  # warm the /api/stats aggregate (the other half of the first paint)
+        _cached_stats(
+            gap
+        )  # warm the /api/stats aggregate (the other half of the first paint)
     except Exception as exc:  # noqa: BLE001 — prewarm is best-effort; never crash startup
-        print(f"[review dashboard] prewarm failed ({type(exc).__name__}: {exc}); "
-              "first load will be cold", flush=True)
+        print(
+            f"[review dashboard] prewarm failed ({type(exc).__name__}: {exc}); "
+            "first load will be cold",
+            flush=True,
+        )
 
 
 def _session_index(gap: float) -> dict[str, dparser.Session]:
@@ -420,7 +503,10 @@ def detect_links_for_cwd(cwd: Path) -> dict:
         # (a fresh repo with no commits), where `rev-parse --abbrev-ref HEAD` errors out.
         out = subprocess.run(
             ["git", "symbolic-ref", "--short", "HEAD"],
-            cwd=str(cwd), capture_output=True, text=True, timeout=10,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         branch = out.stdout.strip() if out.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
@@ -546,7 +632,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return True
 
     def _content_type_is_json(self) -> bool:
-        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        ctype = (
+            (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        )
         return ctype == "application/json"
 
     # ---- routing -------------------------------------------------------------
@@ -560,17 +648,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/" or path == "/index.html":
                 return self._serve_index()
             if path.startswith("/assets/"):
-                return self._serve_asset(path[len("/assets/"):])
+                return self._serve_asset(path[len("/assets/") :])
             if path == "/events":
                 return self._serve_events(self._gap(qs))
             if path == "/api/health":
-                return self._send_json({
-                    "ok": True,
-                    "log_dir": str(log_dir()),
-                    "store_path": str(dstore.store_path()),
-                    "allowed_origins": sorted(allowed_hosts()),
-                    "version": self.server_version,
-                })
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "log_dir": str(log_dir()),
+                        "store_path": str(dstore.store_path()),
+                        "allowed_origins": sorted(allowed_hosts()),
+                        "version": self.server_version,
+                    }
+                )
             if path == "/api/runs":
                 # Derived from the cross-request, single-flight session cache: the ~28s parse +
                 # summary scan over the full log dir runs once per log-dir change, not once per
@@ -579,7 +669,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # feedback/conscious write stays instantly visible.
                 return self._send_json(_summaries_for_gap(self._gap(qs)))
             if path.startswith("/api/runs/"):
-                sid = path[len("/api/runs/"):]
+                sid = path[len("/api/runs/") :]
                 idx = _session_index(self._gap(qs))
                 sess = idx.get(sid)
                 if sess is None:
@@ -596,8 +686,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 stats = dict(_cached_stats(self._gap(qs)))
                 # Tasks/overseer rollups come from the store, layered on top of stats.
                 anns = dstore.all_annotations()
-                stats["conscious_count"] = sum(1 for a in anns.values() if a.get("conscious"))
-                stats["feedback_count"] = sum(1 for a in anns.values() if a.get("feedback"))
+                stats["conscious_count"] = sum(
+                    1 for a in anns.values() if a.get("conscious")
+                )
+                stats["feedback_count"] = sum(
+                    1 for a in anns.values() if a.get("feedback")
+                )
                 return self._send_json(stats)
             if path == "/api/annotations":
                 return self._send_json(dstore.all_annotations())
@@ -624,13 +718,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             length = 0
         if length > _MAX_WRITE_BODY_BYTES:
-            self._error(413, f"request body too large (max {_MAX_WRITE_BODY_BYTES} bytes)")
+            self._error(
+                413, f"request body too large (max {_MAX_WRITE_BODY_BYTES} bytes)"
+            )
             return None
         if length <= 0:
             return {}
         raw = self.rfile.read(length)
-        if len(raw) > _MAX_WRITE_BODY_BYTES:  # defence in depth vs a lying Content-Length
-            self._error(413, f"request body too large (max {_MAX_WRITE_BODY_BYTES} bytes)")
+        if (
+            len(raw) > _MAX_WRITE_BODY_BYTES
+        ):  # defence in depth vs a lying Content-Length
+            self._error(
+                413, f"request body too large (max {_MAX_WRITE_BODY_BYTES} bytes)"
+            )
             return None
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -660,15 +760,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # together with the Host allowlist this stops a malicious page from mutating
         # the local annotation store via the loopback port.
         if not self._origin_is_allowed():
-            return self._error(403, "forbidden: cross-origin write blocked (loopback Origin required)")
+            return self._error(
+                403, "forbidden: cross-origin write blocked (loopback Origin required)"
+            )
         if not self._content_type_is_json():
-            return self._error(415, "unsupported media type: Content-Type must be application/json")
+            return self._error(
+                415, "unsupported media type: Content-Type must be application/json"
+            )
         parsed = urlparse(self.path)
         path = parsed.path
         try:
             if not path.startswith("/api/runs/"):
                 return self._error(404, f"not found: {path}")
-            rest = path[len("/api/runs/"):]
+            rest = path[len("/api/runs/") :]
             if "/" not in rest:
                 return self._error(404, "expected /api/runs/<id>/<action>")
             sid, action = rest.split("/", 1)
@@ -683,16 +787,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return  # _read_write_body already sent a 413/400
             if action == "feedback":
                 rec = dstore.set_feedback(sid, body.get("feedback"))
-                return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
+                return self._send_json(
+                    {"ok": True, "session_id": sid, "annotation": rec}
+                )
             if action == "conscious":
                 rec = dstore.set_conscious(sid, bool(body.get("conscious")))
-                return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
+                return self._send_json(
+                    {"ok": True, "session_id": sid, "annotation": rec}
+                )
             # action == "links"
             try:
                 if body.get("remove"):
-                    rec = dstore.remove_link(sid, pr=body.get("pr"), ticket=body.get("ticket"))
+                    rec = dstore.remove_link(
+                        sid, pr=body.get("pr"), ticket=body.get("ticket")
+                    )
                 else:
-                    rec = dstore.add_link(sid, pr=body.get("pr"), ticket=body.get("ticket"))
+                    rec = dstore.add_link(
+                        sid, pr=body.get("pr"), ticket=body.get("ticket")
+                    )
             except ValueError as exc:
                 return self._error(400, str(exc))
             return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
@@ -823,20 +935,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
     ) -> bool:
         """Push SSE events for the artifacts that changed since ``last``. False on disconnect."""
         ld = log_dir()
-        changed_files = sorted(name for name, sig in snapshot.items() if last.get(name) != sig)
+        changed_files = sorted(
+            name for name, sig in snapshot.items() if last.get(name) != sig
+        )
         # Per-file `log` events: cheapest, most immediate signal that a call is streaming.
         for name in changed_files:
             grew = name in last
             payload = {"filename": name, "grew": grew}
             c = dparser.parse_call_log(ld / name)
             if c is not None:
-                payload.update({
-                    "kind": "call",
-                    "backend": c.backend,
-                    "round": c.round,
-                    "completed": c.completed,
-                    "has_error": c.has_error,
-                })
+                payload.update(
+                    {
+                        "kind": "call",
+                        "backend": c.backend,
+                        "round": c.round,
+                        "completed": c.completed,
+                        "has_error": c.has_error,
+                    }
+                )
             elif name.endswith(".md"):
                 payload["kind"] = "brainstorm"
             if not self._send_sse_event("log", payload):
@@ -861,7 +977,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return self._sse_write(chunk)
 
 
-def make_server(port: int = 0, *, host: str = "127.0.0.1", verbose: bool = False) -> ThreadingHTTPServer:
+def make_server(
+    port: int = 0, *, host: str = "127.0.0.1", verbose: bool = False
+) -> ThreadingHTTPServer:
     """Create (but do not serve) the dashboard server bound to ``host:port``.
 
     Default host is loopback (127.0.0.1); pass ``host="0.0.0.0"`` to expose over Tailscale.
@@ -946,15 +1064,22 @@ def run_dashboard(
     print(f"[review dashboard] logs: {log_dir()}", flush=True)
     print(f"[review dashboard] store: {dstore.store_path()}", flush=True)
     if host in ("0.0.0.0", "::"):
-        print("[review dashboard] bound to all interfaces — reachable over Tailscale. "
-              "Reads open; writes allowed from loopback + the Tailscale host. Ctrl-C to stop.", flush=True)
+        print(
+            "[review dashboard] bound to all interfaces — reachable over Tailscale. "
+            "Reads open; writes allowed from loopback + the Tailscale host. Ctrl-C to stop.",
+            flush=True,
+        )
     else:
-        print("[review dashboard] loopback-only. Pass --host 0.0.0.0 to expose over Tailscale. Ctrl-C to stop.", flush=True)
+        print(
+            "[review dashboard] loopback-only. Pass --host 0.0.0.0 to expose over Tailscale. Ctrl-C to stop.",
+            flush=True,
+        )
     # Warm the session/stats cache in the background so the FIRST page load isn't cold (the real
     # log dir is a ~30s parse). Daemon thread — runs in parallel, never blocks the bind/serve, and
     # dies with the process; a prewarm failure is swallowed inside _prewarm_cache.
     _spawn_prewarm(verbose=verbose)
     if open_browser:
+
         def _open() -> None:
             import webbrowser
 
@@ -962,6 +1087,7 @@ def run_dashboard(
                 webbrowser.open(urls[0])
             except Exception:  # noqa: BLE001
                 pass
+
         threading.Timer(0.4, _open).start()
     # Warm the summary cache off-thread so the FIRST page load hits a populated cache instead
     # of a cold ~28s `to_summary()` scan (the empty/timing-out render this fixes). Daemon so
