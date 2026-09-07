@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.cli import _warn_if_panel_padded  # noqa: E402
-from reviewlib.config import BoardReviewer  # noqa: E402
+from reviewlib.config import BoardReviewer, select_pool_with_reuse  # noqa: E402
 from reviewlib.modes import PERSONAS  # noqa: E402
 from reviewlib.modes import quorum as q_mod  # noqa: E402
 from reviewlib.modes.review import _warn_if_board_reused  # noqa: E402
@@ -96,6 +96,33 @@ def test_board_reused_warning_silent_when_pool_equals_board():
     ]
     out = _captured_stderr(_warn_if_board_reused, board, list(board))
     assert out == ""
+
+
+def test_board_reused_warning_does_not_blame_usage_limit_for_a_hard_cooldown_pad():
+    # task-cli#139, codex review finding: the message used to hardcode "too few
+    # distinct models were under their usage limit" as the cause, but padding also
+    # fires for HARD-unavailable seats (session-limit cooldown) that have nothing to
+    # do with a usage_percent threshold. Drives the REAL selector (not a hand-built
+    # pool) with only one seat reachable and usage_percent given but nothing near its
+    # limit -- proving this is the hard-cooldown path, not the near-limit one -- and
+    # asserts the printed cause is generic, not a false "usage limit" claim.
+    board = [
+        BoardReviewer("opus", "correctness", "Opus"),
+        BoardReviewer("codex", "consistency", "Codex"),
+        BoardReviewer("glm", "quality", "GLM"),
+    ]
+    only_codex = lambda r: r.model == "codex"  # noqa: E731
+    pool = select_pool_with_reuse(
+        board, 3, available=only_codex, usage_percent=lambda _m: 5.0
+    )
+    out = _captured_stderr(_warn_if_board_reused, board, pool)
+    assert "board padded" in out
+    assert "codex x2" in out
+    # The old wording flatly asserted the usage-limit cause, which is FALSE here
+    # (opus/glm are hard-unavailable, not near a usage threshold) -- the fixed
+    # message must not make that specific false claim.
+    assert "too few distinct models were under their usage limit)" not in out
+    assert "reachable" in out
 
 
 # --- quorum's <model>#N labelling + moderator disclosure --------------------------

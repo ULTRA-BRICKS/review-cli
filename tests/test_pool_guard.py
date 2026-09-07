@@ -443,6 +443,77 @@ def test_distinct_key_keeps_other_models_separate():
     assert len(keys) == 4  # opus, fable, gemini, codex-engine all distinct
 
 
+# === reuse_eligible (task-cli#139): a role-lensed board's dispatch will pad a single ===
+# === live seat across the missing roles, so the convergence floor must not block it ===
+
+
+def test_reuse_eligible_single_live_seat_proceeds_below_the_normal_floor():
+    """The exact production incident: a default `review diff` (non-explicit, so the
+    normal floor is MIN_CONVERGE_MODELS=2), only 1 of 6 board seats live (the other 5 in
+    session-limit cooldown). Without `reuse_eligible`, this bails UNSATISFIED/PROPOSE
+    before dispatch ever gets a chance to pad — the pool_guard's own floor was the thing
+    stopping the already-existing reuse mechanism from firing."""
+    live = {"codex"}  # only 1 of 6 live
+    d = evaluate_selection(
+        user_board=DEFAULT_BOARD_SPEC,
+        requested_size=4,
+        explicit=False,
+        candidates=[],
+        available=_avail(live),
+        reason=_reason(DOWN_REASONS),
+        reuse_eligible=True,
+    )
+    assert d.kind == PROCEED, d.text
+
+
+def test_reuse_eligible_explicit_pool_below_the_normal_floor_proceeds():
+    """Same scarcity, but an EXPLICIT `--pool 3` (no -m) — the normal floor would demand
+    3 distinct live models; reuse_eligible=True still proceeds on the single live seat,
+    since the real dispatch will pad it across 3 board roles."""
+    live = {"codex"}
+    d = evaluate_selection(
+        user_board=DEFAULT_BOARD_SPEC,
+        requested_size=3,
+        explicit=True,
+        candidates=[],
+        available=_avail(live),
+        reason=_reason(DOWN_REASONS),
+        reuse_eligible=True,
+    )
+    assert d.kind == PROCEED, d.text
+
+
+def test_reuse_eligible_but_nothing_live_still_unsatisfied():
+    """reuse_eligible doesn't manufacture a seat out of nothing: zero live models still
+    fails, same as today (there's nothing for the reuse selector to pad WITH)."""
+    d = evaluate_selection(
+        user_board=DEFAULT_BOARD_SPEC,
+        requested_size=4,
+        explicit=False,
+        candidates=[],
+        available=_avail(set()),
+        reason=_reason(DOWN_REASONS),
+        reuse_eligible=True,
+    )
+    assert d.kind == UNSATISFIED, d.text
+
+
+def test_reuse_eligible_false_keeps_the_prior_strict_floor():
+    """The default (`reuse_eligible=False`, matching every existing caller/test above)
+    is byte-identical to pre-task-cli#139 behaviour: 1 live seat against the 2-model
+    floor still fails to converge."""
+    live = {"codex"}
+    d = evaluate_selection(
+        user_board=DEFAULT_BOARD_SPEC,
+        requested_size=4,
+        explicit=False,
+        candidates=[],
+        available=_avail(live),
+        reason=_reason(DOWN_REASONS),
+    )
+    assert d.kind != PROCEED, d.kind
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

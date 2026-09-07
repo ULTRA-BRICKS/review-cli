@@ -800,13 +800,27 @@ def select_pool_with_reuse(
          seat is near its limit) the SINGLE seat with the lowest usage
          percentage (ties broken by board priority) — so the board never goes
          empty just because every seat is somewhat depleted.
-      4. Target size `n` = `_effective_pool_size(len(reachable), pool)` — the
-         same clamp `select_pool` uses, based on RAW reachability (the usage
-         threshold shrinks the MODEL pool, not the requested seat count).
+      4. Target size `n`:
+           - `usage_percent is None` -> `_effective_pool_size(len(reachable),
+             pool)`, IDENTICAL to `select_pool`'s clamp (this function is a
+             byte-identical drop-in for a caller that hasn't opted into
+             reuse at all: zero behaviour change).
+           - `usage_percent` given (a caller that HAS opted in) -> for
+             `pool > 0`, `min(pool, len(board))` — capped by the size of the
+             FULL board (the real ceiling on how many distinct role slots
+             exist to pad into), not by `len(reachable)`. Capping by
+             `len(reachable)` was the task-cli#139 bug: with only 1 reachable
+             seat and a `pool` of 3+, `n` collapsed to 1 before the padding
+             loop in step 6 ever got a slot to fill, so a hard-unavailable
+             board (session-limit cooldown, not merely near a usage
+             threshold) never got padded even though the mechanism exists
+             for exactly this. `pool <= 0` ("all") keeps clamping to
+             `len(reachable)` — "all" has no fixed target size to pad
+             towards, so reuse has nothing to pad here (unaffected: this is
+             the same value the near-usage-limit path already used).
       5. The first `min(n, len(candidates))` slots each keep their OWN role, in
          priority order — IDENTICAL to `select_pool`'s output whenever
-         `len(candidates) >= n` (this function is a drop-in when `usage_percent`
-         is None or nothing is excluded/reused: zero behaviour change).
+         `len(candidates) >= n`.
       6. Any remaining slots (`n - len(candidates)`) are filled by cycling back
          through `candidates`' models, each one taking the NEXT board role not
          yet used by an earlier slot (in board priority order) — so a shrunk
@@ -815,10 +829,18 @@ def select_pool_with_reuse(
     reachable = [r for r in board if available(r)]
     if not reachable:
         return []
-    n = _effective_pool_size(len(reachable), pool)
 
     if usage_percent is None:
+        n = _effective_pool_size(len(reachable), pool)
         return list(reachable[:n])
+
+    # Reuse is opted into (usage_percent given): size `n` against the FULL
+    # board when a concrete pool is requested, not just what's reachable —
+    # see step 4 above (task-cli#139).
+    if pool > 0:
+        n = _effective_pool_size(len(board), pool)
+    else:
+        n = len(reachable)
 
     under_limit = [
         r
@@ -836,24 +858,34 @@ def select_pool_with_reuse(
     if extra_needed <= 0:
         return primary
 
-    if not any(r.role for r in board):
-        # A role-less board (every seat has role="" — e.g. a config `models:`
-        # roster with no lens metadata) has no distinct lenses to gain from
-        # reuse: duplicating a model here is pure cost with zero added review
-        # diversity. Leave the pool at its (smaller) primary size instead.
+    if not any(r.role_lens for r in board):
+        # A role-less OR every-role-unknown board (every seat's `role_lens` resolves
+        # empty — either role="" outright, e.g. a config `models:` roster with no lens
+        # metadata, OR a role string that isn't a REVIEW_ROLES key, e.g. a typo) has no
+        # distinct LENSES to gain from reuse: every seat would fall back to the same
+        # generic prompt regardless of its `role` label, so duplicating a model here is
+        # pure cost with zero added review diversity — checked via `role_lens`, not the
+        # raw `role` string, so a typo'd/unknown role doesn't masquerade as a real lens
+        # (codex review finding, task-cli#139). Leave the pool at its (smaller) primary
+        # size instead.
         return primary
 
     used_roles = {r.role for r in primary}
-    # Every DISTINCT board role not yet used by `primary`, in board priority
-    # order, deduped order-preservingly. A real board can carry the SAME role
-    # twice (DEFAULT_BOARD has "consistency" and "quality" each on two seats)
-    # — without the dedup, two padded extras could land on that same role,
-    # dispatching two BYTE-IDENTICAL prompts (same model AND same lens) in
-    # parallel: pure duplicate cost, contradicting this function's own "N
-    # distinct lenses" guarantee (k3 review finding, review-cli#205 round 3).
+    # Every DISTINCT board role not yet used by `primary`, in board priority order,
+    # deduped order-preservingly — restricted to roles with a REAL `role_lens` (codex
+    # review finding, task-cli#139): a typo'd/unknown role resolves to the SAME generic
+    # prompt as every other unknown role, so counting it as its own "distinct" padding
+    # slot would dispatch byte-identical generic-prompt duplicates while mislabeling
+    # them as separate lenses — exactly the cost the dedup two lines below this comment
+    # already guards against for KNOWN duplicate roles. A real board can carry the SAME
+    # known role twice (DEFAULT_BOARD has "consistency" and "quality" each on two seats)
+    # — without the dedup, two padded extras could land on that same role, dispatching
+    # two BYTE-IDENTICAL prompts (same model AND same lens) in parallel: pure duplicate
+    # cost, contradicting this function's own "N distinct lenses" guarantee (k3 review
+    # finding, review-cli#205 round 3).
     role_pool: list[str] = []
     for r in board:
-        if r.role not in used_roles and r.role not in role_pool:
+        if r.role_lens and r.role not in used_roles and r.role not in role_pool:
             role_pool.append(r.role)
 
     extra: list[BoardReviewer] = []
