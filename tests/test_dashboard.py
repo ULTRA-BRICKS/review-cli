@@ -1503,6 +1503,320 @@ def test_writing_the_call_log_cache_does_not_itself_invalidate_the_session_memo(
             p.invalidate_sessions_cache()
 
 
+# --- review-cli#151: the signature/fingerprint scan is bounded by recent activity, not the
+# total historical corpus ------------------------------------------------------------------
+def test_scan_log_dir_entries_stat_count_bounded_by_window_not_total_corpus():
+    """`.stat()` cost must scale with the RECENT window population, not total historical file
+    count (review-cli#151). Counts `.stat()` calls against a synthetic corpus of thousands of
+    old files plus a handful of recent ones (fake `os.scandir` proxies, not real files, so this
+    stays fast) -- counting instead of timing avoids flaking under machine load."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from reviewlib.dashboard import parser as p
+
+    stat_calls = {"n": 0}
+
+    class _FakeEntry:
+        def __init__(self, name: str, mtime: float):
+            self.name = name
+            self._mtime = mtime
+
+        def stat(self):
+            stat_calls["n"] += 1
+            return SimpleNamespace(st_mtime=self._mtime, st_size=100)
+
+    class _FakeScandir:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def __enter__(self):
+            return iter(self._entries)
+
+        def __exit__(self, *exc):
+            return False
+
+    # 5,000 OLD files, all stamped ~200 days before the newest file -- comfortably outside
+    # `_SIGNATURE_WINDOW_SECONDS` (6h) -- plus 7 RECENT files within the last few minutes of the
+    # newest one. Total corpus: 5,007 files; only the 7 recent ones should ever be `.stat()`-ed.
+    newest = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
+    fake_entries = [
+        _FakeEntry(f"{old_stamp}_{i:06d}Z-codex-r0.log", 0.0) for i in range(5000)
+    ]
+    for i in range(7):
+        recent_dt = newest - timedelta(minutes=i)
+        stamp = recent_dt.strftime("%Y%m%dT%H%M%S")
+        fake_entries.append(_FakeEntry(f"{stamp}_000000Z-codex-r{i}.log", 0.0))
+
+    real_scandir = p.os.scandir
+    p.os.scandir = lambda path: _FakeScandir(fake_entries)  # noqa: ARG005
+    try:
+        scan = p._scan_log_dir_entries(Path("/fake/log/dir"))
+    finally:
+        p.os.scandir = real_scandir
+
+    assert stat_calls["n"] == 7, (
+        f"stat() count must scale with the RECENT window population (7), not the total "
+        f"corpus (5007) -- got {stat_calls['n']} stat() calls"
+    )
+    assert scan.total_count == 5007, (
+        "total_count must still see the WHOLE corpus (stat-free)"
+    )
+    assert len(scan.entries) == 7, scan.entries
+    assert {e.name for e in scan.entries} == {e.name for e in fake_entries[-7:]}
+
+
+def test_scan_log_dir_entries_observes_a_live_streaming_file_growing():
+    """A file within the window that GROWS (its mtime moves, its size moves) must be picked up
+    on the very next scan, with no delay/debounce -- the live-streaming invariant this whole
+    caching system exists to protect. (A top-level `os.stat(log_dir)` fast path was considered
+    and rejected: verified directly against ~/Library/Logs/review-cli that appending to an
+    EXISTING file does not bump its parent directory's own mtime on this filesystem -- only
+    per-file windowed `.stat()`-ing catches this.)"""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        stamp = "20260601T100000_000000"
+        path = _write_call_log(ld, stamp, "codex", 0, "partial output so far\n")
+
+        first = p._scan_log_dir_entries(ld)
+        assert len(first.entries) == 1
+        first_entry = first.entries[0]
+
+        # Simulate the writer process appending more streamed content -- content grows, mtime
+        # moves forward, exactly what an in-progress `review` invocation does.
+        import time as _time
+
+        _time.sleep(0.05)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("more streamed output\n[review-cli] EXIT 0\n")
+
+        second = p._scan_log_dir_entries(ld)
+        assert len(second.entries) == 1
+        second_entry = second.entries[0]
+
+        assert second_entry.size > first_entry.size, (
+            "growth wasn't observed: size unchanged after appending to the live file"
+        )
+        assert second_entry.mtime >= first_entry.mtime, (
+            "growth wasn't observed: mtime didn't move forward after appending"
+        )
+        # And the derived signature must move too, so `load_sessions_cached` actually re-parses.
+        assert p._dir_signature(ld) != (1, first_entry.mtime)
+
+
+def test_scan_log_dir_entries_conservatively_stats_a_foreign_named_file():
+    """A name that doesn't start with review-cli's own `YYYYMMDDTHHMMSS` stamp shape (e.g. this
+    project's own log dir also collects `qa-tmp<hash>-<stamp>Z-<hash>.md` scratch files from
+    unrelated tooling, seen live) can't be confidently judged old from its filename alone, so it
+    must always be `.stat()`-ed and counted -- exactly like the pre-fix unbounded scan treated
+    it -- never silently dropped just because the window logic can't parse it."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # A recent, normally-shaped file establishes a recent "newest stamp" anchor...
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        # ...and a foreign-named .md file that doesn't match the stamp shape at all.
+        (ld / "qa-tmpabc123-20260101T000000_000000Z-deadbeef.md").write_text(
+            "unrelated tooling artifact\n", encoding="utf-8"
+        )
+
+        scan = p._scan_log_dir_entries(ld)
+        names = {e.name for e in scan.entries}
+        assert "qa-tmpabc123-20260101T000000_000000Z-deadbeef.md" in names, (
+            "a foreign-named file must always be stat'd/counted, not silently excluded "
+            "just because its age can't be judged from the filename"
+        )
+        assert len(scan.entries) == 2
+
+
+def test_scan_log_dir_entries_survives_a_shape_matching_but_invalid_date():
+    """review-cli#151 review finding (P1): a filename whose leading 15 characters MATCH the
+    `\\d{8}T\\d{6}` digit shape but aren't a real calendar date (e.g. month 13, a corrupted or
+    hand-edited/restored filename) used to crash `datetime.strptime` uncaught, taking down the
+    whole scan -- and with it `/api/runs`, `/api/stats`, and the SSE poller. Such a name must be
+    treated like any other unparseable name: always `.stat()`-ed and counted, never crashing."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        # "20261301" -- month 13 -- matches \d{8}T\d{6} but is not a real date.
+        bogus = ld / "20261301T000000_000000Z-codex-r0.log"
+        bogus.write_text(
+            "[review-cli] codex: fake\n[review-cli] EXIT 0\n", encoding="utf-8"
+        )
+
+        scan = p._scan_log_dir_entries(ld)  # must not raise
+
+        names = {e.name for e in scan.entries}
+        assert bogus.name in names, (
+            "an invalid-but-shaped date must still be stat'd/counted"
+        )
+        assert scan.total_count == 2
+
+
+def test_scan_log_dir_entries_clamps_a_moderately_future_stamp_to_now():
+    """review-cli#151 review finding (P1, round 2 -- Grok): an earlier version of this fix
+    rejected only "implausibly" far-future stamps (a >24h tolerance) as anchor candidates --
+    but a stray/corrupted file stamped just MODERATELY ahead (here: 10h in the future, inside
+    that 24h tolerance but OUTSIDE the 6h window) still slipped through as a valid anchor,
+    shifting the cutoff forward and silently excluding a genuinely-recent, genuinely-live
+    file. The fix clamps the anchor to `min(newest_valid_stamp, now)` instead of trying to
+    reject individual future candidates -- this proves the clamp holds for exactly the gap the
+    rejected approach missed. Uses an injected `now` so the test is fully deterministic (no
+    dependency on the real wall clock, and no dependency on the fixture predating it)."""
+    from reviewlib.dashboard import parser as p
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        real_recent = _write_call_log(
+            ld, "20260601T113000_000000", "codex", 0, "live output\n"
+        )  # 30 minutes before `now`
+        # 10 hours ahead of `now` -- inside a naive "reject only if implausible" tolerance,
+        # but outside the 6h window; exactly the gap the review found.
+        (ld / "20260601T220000_000000Z-poisoned-r0.log").write_text(
+            "[review-cli] poisoned: fake\n[review-cli] EXIT 0\n", encoding="utf-8"
+        )
+
+        scan = p._scan_log_dir_entries(ld, now=now)
+        names = {e.name for e in scan.entries}
+        assert real_recent.name in names, (
+            "a moderately future-dated file (ahead of `now` but not absurdly so) must not "
+            "shift the anchor and hide a genuinely-recent live file from the window"
+        )
+
+
+def test_scan_log_dir_entries_clamps_an_absurdly_future_stamp_too():
+    """The clamp closes the anchor-poisoning failure mode for ANY future distance, not just a
+    moderate one -- unlike the rejected "reject implausible candidates" approach, there is no
+    distance a poisoned stamp can claim that defeats it."""
+    from reviewlib.dashboard import parser as p
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        real_recent = _write_call_log(
+            ld, "20260601T113000_000000", "codex", 0, "live output\n"
+        )
+        (ld / "20990101T000000_000000Z-poisoned-r0.log").write_text(
+            "[review-cli] poisoned: fake\n[review-cli] EXIT 0\n", encoding="utf-8"
+        )
+
+        scan = p._scan_log_dir_entries(ld, now=now)
+        names = {e.name for e in scan.entries}
+        assert real_recent.name in names, (
+            "an absurdly future-dated file must not poison the anchor and hide the real, "
+            "genuinely-recent file from the window"
+        )
+
+
+def test_dir_signature_changes_when_an_old_out_of_window_file_is_deleted():
+    """review-cli#151 review finding (P1): deleting an OLD (out-of-window, never `.stat()`-ed)
+    file must still move `_dir_signature`/`_log_dir_fingerprint` -- otherwise a cached session
+    keeps pointing at a file that no longer exists, with no signal to ever re-parse and drop it.
+    `LogDirScan.total_count` (a stat-free count of ALL matching names) is what catches this."""
+    from datetime import timedelta
+
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        recent_stamp = "20260601T120000_000000"
+        _write_call_log(ld, recent_stamp, "codex", 0, "recent\n", exit_code=0)
+        old_dt = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc) - timedelta(
+            days=10
+        )
+        old_path = _write_call_log(
+            ld, old_dt.strftime("%Y%m%dT%H%M%S_%f"), "gemini", 0, "old\n", exit_code=0
+        )
+
+        before = p._dir_signature(ld)
+        old_path.unlink()
+        after = p._dir_signature(ld)
+
+        assert after != before, (
+            "deleting an old, out-of-window file must still change the signature -- a stale "
+            "cached session referencing a now-gone file would otherwise never be dropped"
+        )
+
+
+def test_log_dir_fingerprint_and_snapshot_logs_share_the_bounded_scan():
+    """`_log_dir_fingerprint` and `DashboardHandler._snapshot_logs` (server.py) are the ACTUAL
+    hot paths -- `_log_dir_fingerprint` runs under `_SessionCache`'s lock on every `/api/runs`,
+    `/api/stats`, session-detail, and write-existence-check request; `_snapshot_logs` runs every
+    `_SSE_POLL_SECONDS` (1s) per connected browser tab. Both must derive from the SAME bounded
+    `dparser._scan_log_dir_entries` this module tests directly above, not a re-implemented (and
+    easily re-regressed) full-corpus scan of their own -- this proves both siblings pick up a
+    just-written file immediately, with the same window-bounded cost model."""
+    from reviewlib.dashboard import server as s
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        fp_before = s._log_dir_fingerprint(ld)
+        snap_before = s.DashboardHandler._snapshot_logs(ld)
+        assert fp_before[0] == 1  # count
+        assert len(snap_before) == 1
+
+        _write_call_log(
+            ld, "20260601T100010_000000", "gemini", 0, "more\n", exit_code=0
+        )
+
+        fp_after = s._log_dir_fingerprint(ld)
+        snap_after = s.DashboardHandler._snapshot_logs(ld)
+        assert fp_after[0] == 2, "fingerprint must see the new file immediately"
+        assert len(snap_after) == 2, "SSE snapshot must see the new file immediately"
+        assert fp_after != fp_before
+
+
+def test_log_dir_fingerprint_total_size_reflects_only_the_windowed_subset():
+    """review-cli#151 review finding (Sonnet, round 3): before this fix, `_log_dir_fingerprint`'s
+    `total_size` summed EVERY matching file's size. After it, `total_size` (`LogDirScan.
+    total_size`) sums only the windowed, `.stat()`-ed subset -- an old, out-of-window file's
+    size is NOT included. This is a real, silent behavior change for any future caller that
+    assumed a full-corpus total; pinned here so a regression back to full summation (or a
+    future misuse of this field as a displayed "N logs, X MB on disk" statistic) is caught."""
+    from datetime import timedelta
+
+    from reviewlib.dashboard import server as s
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        recent_path = _write_call_log(
+            ld, "20260601T120000_000000", "codex", 0, "recent body\n", exit_code=0
+        )
+        old_dt = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc) - timedelta(
+            days=10
+        )
+        old_path = _write_call_log(
+            ld,
+            old_dt.strftime("%Y%m%dT%H%M%S_%f"),
+            "gemini",
+            0,
+            "this old file's bytes must NOT be counted in total_size\n",
+            exit_code=0,
+        )
+        recent_size = recent_path.stat().st_size
+        old_size = old_path.stat().st_size
+        assert old_size != recent_size, (
+            "fixture bug: sizes must differ to prove exclusion"
+        )
+
+        _count, _max_mtime, total_size = s._log_dir_fingerprint(ld)
+
+        assert total_size == recent_size, (
+            f"total_size ({total_size}) must equal ONLY the windowed (recent) file's real "
+            f"size ({recent_size}) -- the old, out-of-window file's size ({old_size}) must "
+            "not be included"
+        )
+
+
 def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
     """`/api/stats` was STILL ~8.5s on a warm session cache: the sessions came back fast, but the
     handler then re-ran the PURE ``compute_stats`` (re-aggregating ~590 sessions / ~30k calls,

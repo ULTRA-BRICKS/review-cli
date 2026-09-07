@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from . import call_log_cache
 
@@ -1283,42 +1284,258 @@ _SESSIONS_CACHE = _SingleFlightCache()
 _STATS_CACHE = _SingleFlightCache()
 
 
-def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
-    """A cheap (entry-count, max-mtime) fingerprint of the log dir — STAT-ONLY, no file reads.
+# review-cli#151: on a long-lived install (147k+ files / 18GB observed live) a naive
+# `os.scandir` + per-entry `.stat()` over the WHOLE log dir measured ~3.9s cold (page cache
+# not warm for this directory) down to ~0.5-0.6s once the OS had cached the recent scans'
+# inodes (both measured directly against the real directory during development) -- and THREE
+# independent call sites each paid that cost on their own: `_dir_signature` (below),
+# `_log_dir_fingerprint` (server.py, the ACTUAL /api/runs+/api/stats invalidation check --
+# called under `_SessionCache`'s lock on every request), and `_snapshot_logs` (server.py, the
+# SSE watcher's 1Hz poll -- a real contributor to sustained CPU regardless of cache state,
+# since even the warm ~0.5-0.6s figure is a large fraction of the 1s poll budget; see its own
+# docstring for the measured before/after). All three exist only to answer "did anything
+# change" -- they don't need to see the WHOLE corpus to answer that honestly. Full rationale
+# (safety of windowing, why a top-level dir-mtime fast path was rejected, the directory-
+# relative anchor) lives on `_scan_log_dir_entries` below -- the shared primitive all three
+# delegate to; read it there rather than re-deriving it at each call site.
+# 6h -- ~18x `_MAX_CALL_WALL` (1200s)'s worst case.
+_SIGNATURE_WINDOW_SECONDS = 6 * 3600.0
+_STAMP_PREFIX_LEN = 15  # len("YYYYMMDDTHHMMSS")
+_STAMP_PREFIX_RE = re.compile(r"^\d{8}T\d{6}$")
 
-    Computing this must be orders of magnitude cheaper than parsing (which opens + reads every
-    file), so a single `os.scandir` pass using the stat already cached on each `DirEntry` is the
-    whole budget. A new/grown/removed/touched artifact moves either the count or the max mtime,
-    so the signature changes exactly when a re-parse is warranted (e.g. a live review streaming
-    its `.log`). Missing dir -> (0, 0.0), a stable signature distinct from any populated dir."""
-    count = 0
-    max_mtime = 0.0
+
+class LogEntry(NamedTuple):
+    name: str
+    mtime: float
+    size: int
+
+
+class LogDirScan(NamedTuple):
+    """`entries`: windowed, `.stat()`-ed artifacts -- see `_scan_log_dir_entries`.
+    `total_count`: ALL `.log`/`.md` names present, INCLUDING ones excluded from `entries` by
+    the window -- stat-free (just the `os.scandir` listing already paid for), so folding it
+    into a signature catches a create/delete of ANY matching file, even one outside the
+    window, without paying for a `.stat()` of it. Without this, deleting an old (out-of-
+    window) file would never move `_dir_signature`/`_log_dir_fingerprint` (it was never
+    counted to begin with), leaving a stale cached session pointing at a now-gone file
+    (review-cli#151 review finding)."""
+
+    entries: list[LogEntry]
+    total_count: int
+
+    @property
+    def max_mtime(self) -> float:
+        """The newest mtime among `entries` (the windowed, `.stat()`-ed subset only -- NOT
+        the whole corpus). `0.0` when `entries` is empty."""
+        return max((e.mtime for e in self.entries), default=0.0)
+
+    @property
+    def total_size(self) -> int:
+        """Sum of `size` over `entries` (the windowed subset only -- NOT the whole corpus'
+        on-disk size). An opaque input to a cache-invalidation fingerprint, not a real corpus
+        total -- never surface this as a displayed "N logs, X MB on disk" statistic without
+        re-deriving it from an unbounded scan."""
+        return sum(e.size for e in self.entries)
+
+
+def _valid_stamp_prefix(stamp_candidate: str) -> str | None:
+    """`stamp_candidate` (an already-`_STAMP_PREFIX_LEN`-sliced, shape-matching filename
+    prefix -- every call site slices+shape-checks before calling this) unchanged, iff it is
+    ALSO a real calendar timestamp -- else `None` (the name goes in the same "can't
+    confidently judge its age" bucket as a foreign/malformed name: during ANCHOR SELECTION in
+    `_scan_log_dir_entries`, never trusted as the window-cutoff anchor). review-cli#151 review
+    finding: shape-matches-but-invalid names (`\\d{8}T\\d{6}` matches "20261301T000000" --
+    month 13 -- but `datetime.strptime` raises `ValueError` on it) used to crash the whole
+    scan uncaught; a corrupted/hand-edited/restored filename must not do that.
+
+    Deliberately does NOT reject a future-dated stamp -- `_scan_log_dir_entries` clamps the
+    anchor to `min(newest_valid_stamp, now)` instead, which closes the future-poisoning
+    failure mode more robustly than rejecting individual candidates here could (see its
+    docstring): rejecting only "implausibly far" future stamps left a gap where a stamp
+    further in the future than the window but not implausible enough to reject could still
+    poison the anchor and hide genuinely-recent live files (review-cli#151 review round 2
+    finding). Also makes this function clock-independent, so a caller can validate a name at
+    any time without needing to pass `now` through it."""
+    try:
+        datetime.strptime(stamp_candidate, "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None
+    return stamp_candidate
+
+
+def _scan_log_dir_entries(
+    log_dir_path: Path,
+    window_seconds: float = _SIGNATURE_WINDOW_SECONDS,
+    *,
+    now: datetime | None = None,
+) -> LogDirScan:
+    """A `LogDirScan` of `log_dir_path`'s `.log`/`.md` artifacts, `.stat()`-ing only the ones
+    that could plausibly still be changing. `window_seconds <= 0` disables the bound (stats
+    every matching entry, the historical unbounded behavior) -- not used by any caller today,
+    kept as an explicit escape hatch matching `review stat --days 0`'s "0 = all history"
+    convention elsewhere in this codebase.
+
+    WHY a bounded window is SAFE here (not just fast): every `.log`/`.md` artifact is
+    write-once by its ORIGINATING writer process -- nothing in this module (or
+    `call_log_cache.py`, or `server.py`) ever re-opens an EXISTING artifact for writing. So a
+    file's mtime can only still be moving while its call is actively streaming, and a call can
+    be actively streaming for at most `_MAX_CALL_WALL` (1200s) past its FILENAME-embedded
+    start stamp (see `_parse_stamp`, `Session.ended_at`). A file whose stamp is older than that
+    is PROVABLY finished and immutable -- it can never move `entries`' contribution to a
+    signature again, so skipping its `.stat()` changes nothing about correctness.
+    `_SIGNATURE_WINDOW_SECONDS` gives that a >>10x safety margin over 1200s (clock skew, a
+    slow/paused writer, a multi-round session whose rounds span a while) while still being
+    tiny next to a real install's total history. `total_count` (see `LogDirScan`) separately
+    covers create/delete of a file OUTSIDE the window, which the write-once argument doesn't
+    by itself protect against.
+
+    This is a DIFFERENT (and safe) idea from cheapening the check via the log dir's OWN
+    top-level `os.stat()` mtime (a single O(1) call) -- that was considered and REJECTED after
+    direct measurement on this machine's real filesystem (APFS): appending to an EXISTING
+    file's content does NOT bump its PARENT directory's mtime, only creating/removing an entry
+    does. A dashboard whose invalidation check trusted the parent dir's mtime would therefore
+    never notice a live review's `.log` growing -- silently regressing the exact "a
+    live-streaming session's freshly appended content must become visible promptly" invariant
+    this whole caching system exists to protect. Per-file filename-window filtering has no
+    such gap: every entry inside the window is still individually `.stat()`-ed.
+
+    Deliberately NOT time-debounced/TTL-cached across calls: every existing caller (and the
+    test suite hardening it, e.g. `test_writing_the_call_log_cache_does_not_itself_invalidate_
+    the_session_memo`) relies on a fresh call reflecting a just-written file IMMEDIATELY, with
+    no "wait a second and try again" — the same live-streaming invariant above. The windowing
+    is what makes paying that cost on every call affordable.
+
+    The cutoff is anchored on `min(newest valid filename stamp in the directory, now)` — the
+    directory's own newest activity, CLAMPED to never run later than the real wall clock
+    (`now`, defaulting to `datetime.now(timezone.utc)`; a caller may inject it for
+    deterministic tests). Two things this clamp buys, together:
+
+      * A directory-relative anchor (not a bare `datetime.now()`) is what makes this testable
+        at all: this project's OWN test fixtures (`_write_call_log` in
+        tests/test_dashboard.py) write fixed, arbitrary "started" stamps, e.g. `20260601T...`,
+        decoupled from whatever the real system clock reads when the test runs. A pure
+        wall-clock anchor would treat every such fixture as ancient-and-immutable and never
+        detect a "new" one being added — exactly the invalidate-on-write behavior several
+        existing tests assert. Since a fixture's fake stamp is always in the PAST relative to
+        the real clock, clamping via `min(...)` never touches it: the fixture's own newest
+        stamp wins, unaffected.
+      * The clamp is what makes a FUTURE-dated stray/corrupted file harmless as an anchor
+        candidate (review-cli#151 review round 2 finding): an earlier version of this fix
+        instead tried to REJECT individual candidates whose stamp was "implausibly" far in
+        the future (`_valid_stamp_prefix` took a `now` and an explicit tolerance) — but a
+        stamp further in the future than the window (`_SIGNATURE_WINDOW_SECONDS`, 6h) without
+        being "implausible" enough to reject under a generous tolerance (needed to avoid
+        rejecting ordinary clock skew) could still become the anchor and shift the cutoff
+        forward, silently excluding every genuinely-recent, genuinely-live file — the
+        window's whole purpose, defeated. Clamping to `min(newest, now)` closes this
+        completely regardless of how far in the future a poisoned stamp claims to be: the
+        anchor can never be later than `now`, so the cutoff can never be later than
+        `now - window_seconds`, so nothing genuinely within the real window is ever excluded
+        by a future-dated name."""
     try:
         with os.scandir(log_dir_path) as it:
-            for entry in it:
-                # Only source artifacts move this signature -- derived data written into
-                # the SAME directory (the persistent call-log cache's db/wal/shm files,
-                # `call_log_cache.py`) must NOT count, or every `load_sessions` call that
-                # writes/updates its own cache invalidates this exact memo on its very next
-                # read, guaranteeing a full re-parse after every productive scan. Same
-                # `Path.suffix` idiom (not a bare `.endswith`) as `_log_dir_fingerprint`/
-                # `_snapshot_logs`, so a dotfile literally named `.log` (suffix `""` under
-                # `Path`) is treated identically by all three -- a prior `endswith` version
-                # of this filter disagreed with its siblings on exactly that edge case.
-                if Path(entry.name).suffix not in (".log", ".md"):
-                    continue
-                count += 1
-                try:
-                    mtime = entry.stat().st_mtime
-                except OSError:
-                    # A racing unlink between scandir and stat: skip it; the next request's
-                    # changed count/mtime will re-sync. Don't let one vanished file crash parse.
-                    continue
-                if mtime > max_mtime:
-                    max_mtime = mtime
+            candidates = [e for e in it if Path(e.name).suffix in (".log", ".md")]
     except (FileNotFoundError, NotADirectoryError):
-        return (0, 0.0)
-    return (count, max_mtime)
+        return LogDirScan(entries=[], total_count=0)
+
+    cutoff: str | None = None
+    if window_seconds > 0:
+        # Anchor selection needs FULL validation (`_valid_stamp_prefix`: strptime) to avoid
+        # the crash failure mode -- but only for as many candidates as it takes to find ONE
+        # that validates, not every candidate in the directory. `datetime.strptime` measured
+        # ~7us/call; running it on all 147k real names (this project's own install) added
+        # ~0.7s back on top of the windowing fix, regressing the very cost this fix exists to
+        # cut. A cheap SHAPE-only pass (regex, no strptime) first narrows to the digit-shaped
+        # names, sorted so the lexicographically-newest (almost always the real newest, and
+        # the only one that matters if it validates) is tried first -- one `strptime` call in
+        # the overwhelmingly common case, a handful in the pathological case of several bad
+        # names clustered at the top.
+        shape_matching = sorted(
+            (
+                e.name[:_STAMP_PREFIX_LEN]
+                for e in candidates
+                if _STAMP_PREFIX_RE.match(e.name[:_STAMP_PREFIX_LEN])
+            ),
+            reverse=True,
+        )
+        newest_stamp = next(
+            (stamp for stamp in shape_matching if _valid_stamp_prefix(stamp)), None
+        )
+        if newest_stamp is not None:
+            newest_dt = datetime.strptime(newest_stamp, "%Y%m%dT%H%M%S").replace(
+                tzinfo=timezone.utc
+            )
+            # Clamp to `now` -- see the docstring's "future-dated name" bullet for why this,
+            # not a per-candidate future-tolerance check, is what actually closes the
+            # anchor-poisoning failure mode.
+            effective_now = now if now is not None else datetime.now(timezone.utc)
+            anchor_dt = min(newest_dt, effective_now)
+            cutoff = (anchor_dt - timedelta(seconds=window_seconds)).strftime(
+                "%Y%m%dT%H%M%S"
+            )
+        # No shape-matching name at all, or none of them validate: every entry falls through
+        # to the always-stat "can't confidently judge its age" branch below, same as today's
+        # unbounded behavior for such a directory (rare: only foreign/malformed names).
+
+    entries: list[LogEntry] = []
+    for e in candidates:
+        if cutoff is not None:
+            # Filtering only needs the CHEAP shape check + a plain string compare against an
+            # already-validated `cutoff` -- no per-candidate `strptime` here. An entry whose
+            # shape matches but whose OWN date is semantically invalid (e.g. month 13) still
+            # gets a real (if not chronologically meaningful) string comparison against
+            # `cutoff`; that's fine, not a correctness gap -- CONFIRMED (review-cli#151 review
+            # round 4 finding, verified): `_CALL_RE` itself is shape-only (no calendar
+            # validation baked into the regex), but `parse_call_log` wraps its downstream
+            # `_parse_stamp(...)` call in `try/except ValueError: return None` specifically so
+            # a shape-matching-but-invalid date can't crash real parsing either -- such a name
+            # NEVER contributes a session regardless of what this scan's filter does with it,
+            # so excluding vs including it here has no effect on what `/api/runs` returns.
+            prefix = e.name[:_STAMP_PREFIX_LEN]
+            if _STAMP_PREFIX_RE.match(prefix) and prefix < cutoff:
+                continue  # provably finished relative to the dir's own newest activity
+        try:
+            st = e.stat()
+        except OSError:
+            # A racing unlink between scandir and stat: skip it; the next scan's changed
+            # count/mtime will re-sync. Don't let one vanished file crash the scan.
+            continue
+        entries.append(LogEntry(e.name, st.st_mtime, st.st_size))
+    return LogDirScan(entries=entries, total_count=len(candidates))
+
+
+def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
+    """A cheap (total-entry-count, max-mtime-in-window) fingerprint of the log dir — STAT-ONLY
+    for the windowed subset, no file reads, and bounded to recent activity for the mtime half
+    (see `_scan_log_dir_entries`), not the whole historical corpus. A new/grown/touched RECENT
+    artifact moves the max mtime; a create/delete of ANY matching artifact (in or out of the
+    window) moves the count, via `LogDirScan.total_count` -- so deleting an old, out-of-window
+    file still invalidates this signature even though that file was never `.stat()`-ed (review-
+    cli#151 review finding: without `total_count`, only in-window changes were ever visible).
+    Missing dir -> (0, 0.0), a stable signature distinct from any populated dir.
+
+    Derived data written into the SAME directory (the persistent call-log cache's db/wal/shm
+    files, `call_log_cache.py`) must NOT count, or every `load_sessions` call that writes/updates
+    its own cache invalidates this exact memo on its very next read, guaranteeing a full re-parse
+    after every productive scan -- `_scan_log_dir_entries`'s `.log`/`.md`-only suffix filter
+    already excludes them (the cache file is `.sqlite3` + WAL/SHM sidecars).
+
+    HONEST LIMITATION (review-cli#151 review round 2, Sonnet finding): the safety argument for
+    windowing rests on `.log`/`.md` artifacts being write-once by their ORIGINATING writer
+    process (see `_scan_log_dir_entries`). If something OTHER than that process modifies an
+    OLD, out-of-window file's mtime/content in place after the fact -- a redaction script, a
+    restore that preserves the filename but bumps mtime, a manual edit -- that change is
+    invisible to this signature: the name still sorts below `cutoff`, so it's excluded from
+    `entries`, and `total_count` (create/delete only) doesn't move either. No code in this
+    repo does this (confirmed: nothing outside the file's own writer ever re-opens an existing
+    `.log`/`.md` for writing), so this requires an EXTERNAL actor bypassing that invariant.
+    Bounded impact if it happens: a cached session goes stale until the next signature-moving
+    event (a new write from a live review), not indefinitely and not for a live-streaming
+    session (which is always within the window) -- never a crash or systemic drift. Not
+    covered by a test (the scenario requires simulating an external process, not just this
+    module's own write path); flagged here rather than silently assumed away."""
+    scan = _scan_log_dir_entries(log_dir_path)
+    return (scan.total_count, scan.max_mtime)
 
 
 def load_sessions_cached(

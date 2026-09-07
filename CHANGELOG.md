@@ -3,6 +3,26 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.1 — 2026-09-08
+
+- **Fix: dashboard cache-invalidation scan no longer scales with total historical log
+  corpus size (task-cli#151).** On a long-lived install (147k+ files / 18GB observed
+  live), `_log_dir_fingerprint` (the `/api/runs`/`/api/stats` invalidation check, run
+  under `_SessionCache`'s lock on every request) and `_snapshot_logs` (the SSE
+  watcher's continuous 1Hz poll) both `os.scandir`+`.stat()`-ed the ENTIRE log
+  directory on every call — measured ~3.9s cold / ~0.5-0.7s warm-cache, and almost
+  certainly the real explanation for the dashboard "sustaining 77% CPU continuously"
+  even with no requests in flight. Unifies this with the parser's own `_dir_signature`
+  onto one shared `_scan_log_dir_entries`, which skips `.stat()` for any file whose
+  filename-embedded stamp is older than a 6h safety-margined window — safe because
+  `.log`/`.md` artifacts are write-once by their originating writer process, so a file
+  that old can never move the signature again. A stat-free `total_count` separately
+  catches create/delete of files outside the window. Directly measured against the
+  real 147k-file directory after the fix: a steady ~0.35-0.4s per scan regardless of
+  cache state. Follow-ups filed: task-cli#155 (`review dashboard status` false
+  "stopped" report, root-caused to a legacy launchd unit outside this repo) and
+  task-cli#156 (the log directory's total lack of retention/rotation).
+
 ## 0.36.0 — 2026-09-07
 
 - **GROK_SEAT is Grok 4.6 via opencode's native xAI OAuth (`oc:xai/grok-4.6`).**

@@ -141,27 +141,27 @@ def _log_dir_fingerprint(ld: Path) -> tuple[int, float, int]:
     summary). That can't run per-request, so the summary list is cached across requests and
     keyed by this fingerprint. A new/changed run bumps the mtime, size, or count, so the
     cache self-invalidates without any explicit wiring — the same stat-only heuristic the
-    SSE watcher already uses (`_snapshot_logs`) to notice activity. Stat-only = no file is
-    opened, so the fingerprint itself is cheap enough to compute on every request."""
-    count = 0
-    max_mtime = 0.0
-    total_size = 0
-    try:
-        entries = list(ld.iterdir())
-    except OSError:
-        return (0, 0.0, 0)
-    for entry in entries:
-        if entry.suffix not in (".log", ".md"):
-            continue
-        try:
-            st = entry.stat()
-        except OSError:
-            continue
-        count += 1
-        total_size += st.st_size
-        if st.st_mtime > max_mtime:
-            max_mtime = st.st_mtime
-    return (count, max_mtime, total_size)
+    SSE watcher already uses (`_snapshot_logs`) to notice activity.
+
+    review-cli#151: this is computed under `_SessionCache._ensure_fresh`'s lock on EVERY
+    request (`/api/runs`, `/api/stats`, session detail, every write's existence-check) — on a
+    long-lived install (147k+ files observed live) a naive full-directory `.stat()` scan
+    measured ~3.9s cold, ~0.5-0.6s with a warm page cache, which meant every request serialized
+    behind that hold of the lock. Delegates to `dparser._scan_log_dir_entries` (measured ~0.30s
+    after this fix, regardless of cache state) — see its docstring for the full rationale
+    (why bounding to recent activity is safe, the `total_count` half that also catches an
+    out-of-window file being deleted, why this is shared with `_snapshot_logs` and the
+    parser's own `_dir_signature` instead of each independently re-scanning the directory).
+    `count`/`total_size` here reflect the SCAN's population (`total_count` all-time, `max_mtime`
+    /`total_size` over the windowed, `.stat()`-ed subset only) — an opaque equality-compared
+    fingerprint, not a displayed corpus statistic; never surface these as "N logs, X MB on
+    disk" without re-deriving them from an unbounded scan. Inherits `_scan_log_dir_entries`'s
+    HONEST LIMITATION (see `_dir_signature`'s docstring, parser.py): an external, non-review-
+    cli process modifying an old out-of-window file in place, without a create/delete, won't
+    move this fingerprint either — the write-once safety argument is unenforced in code,
+    asserted, not verified, and this function inherits that exposure via delegation."""
+    scan = dparser._scan_log_dir_entries(ld)
+    return (scan.total_count, scan.max_mtime, scan.total_size)
 
 
 # Recompute the parsed session list at most once per this window, even while the log dir keeps
@@ -1016,21 +1016,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _snapshot_logs(ld: Path) -> dict[str, tuple[float, int]]:
-        """{filename: (mtime, size)} for the run artifacts in the log dir (cheap stat-only)."""
-        snap: dict[str, tuple[float, int]] = {}
-        try:
-            entries = list(ld.iterdir())
-        except OSError:
-            return snap
-        for entry in entries:
-            if entry.suffix not in (".log", ".md"):
-                continue
-            try:
-                st = entry.stat()
-            except OSError:
-                continue
-            snap[entry.name] = (st.st_mtime, st.st_size)
-        return snap
+        """{filename: (mtime, size)} for the run artifacts in the log dir (cheap stat-only).
+
+        review-cli#151: this runs every `_SSE_POLL_SECONDS` (1s) on its OWN thread for every
+        connected browser tab — a CONTINUOUS cost, independent of request volume. Before this
+        fix, one poll cost ~3.9s cold / ~0.5-0.6s warm-cache on the real 147k-file install
+        (both measured directly); a live snapshot of the unfixed server showed ~47% CPU with
+        no requests in flight, consistent with this poll alone dominating that reading. After
+        the fix, the same scan measures a steady ~0.30s regardless of cache state — a real
+        reduction, not elimination: `os.scandir`'s own readdir over the full name list is an
+        irreducible floor this fix doesn't remove (a per-day-partitioned log layout would;
+        that's a separate, larger change, filed as a follow-up alongside the directory's total
+        lack of retention/rotation). Delegates to `dparser._scan_log_dir_entries`, the SAME
+        scan primitive `_log_dir_fingerprint` and the parser's own `_dir_signature` share —
+        see its docstring for why bounding to recent activity is safe (and for the "external
+        process modifies an old file in place" honest limitation, which applies here too).
+
+        review-cli#151 review round 4 (Sonnet finding): a file present in one poll's snapshot
+        can be ABSENT from the next NOT because it was deleted, but because the window's own
+        anchor moved forward (a newer file appeared) and pushed it out — indistinguishable
+        from a real delete by key-set alone. Confirmed harmless for THIS caller: `_serve_events`
+        only uses `removed` (`last` keys absent from a fresh snapshot) as a boolean trigger
+        for calling `_emit_activity` — it is never passed into it, and `_emit_activity` itself
+        computes its own `changed_files` fresh from `snapshot`/`last` (files present in the
+        NEW snapshot with a moved signature) and never emits any "file removed"/"deleted" SSE
+        event for anything. So an aged-out file triggers, at worst, one extra harmless
+        `_emit_activity` cycle (a re-push of the newest sessions, idempotent for the
+        front-end) — not a false "removed" signal reaching the browser. A future change that
+        starts using `removed` as more than a trigger (e.g. to explicitly report deletions)
+        would need to re-derive it from `total_count`/an actual listing, not from this
+        windowed snapshot's key set."""
+        scan = dparser._scan_log_dir_entries(ld)
+        return {e.name: (e.mtime, e.size) for e in scan.entries}
 
     def _emit_activity(
         self,
