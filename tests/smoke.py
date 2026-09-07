@@ -46,6 +46,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
+        "test_task_branch_binding.py",
     }
 )
 
@@ -839,6 +840,11 @@ _UNIT_FILES = [
     # Diff-identity binding (review-cli#213): repo/diff mismatch detection for
     # `review task CODE --check`'s self-merge-authority gate.
     ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Record-time task-code/branch-binding guard (review-cli#410, conloca/landing
+    # dead-ticket-loop postmortem): `review diff --task '#<n>'` refuses when the
+    # checkout isn't on the issue's own PR branch. A fake `gh` on PATH stands in for
+    # the real GitHub CLI — offline, no network/auth needed.
+    ("test_task_branch_binding.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
     # External SIGTERM/SIGINT child reaper (review-cli#160) and its `--detach`/`jobs`/
     # `status`/`wait` companion feature. Both spawn real subprocesses (a throwaway

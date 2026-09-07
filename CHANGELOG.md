@@ -3,6 +3,42 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.12 — 2026-09-07
+
+- **`review diff --task '#<n>'` now refuses to record a review whose branch doesn't
+  match the issue's own PR (record-time task-code/branch-binding guard).** Postmortem
+  (conloca/landing): before `gh ship` could derive a review-quorum task code from a bare
+  GitHub issue reference (agent-tools#566/#567), the documented workaround was to mint a
+  throwaway ticket and run `review diff -C <shared checkout> --task <code>` — reviewing
+  whatever happened to be uncommitted there, not the PR's own worktree. One resulting
+  ticket reviewed a `package.json` claiming version "0.4.3", a version that never existed
+  on any ref — the diff being recorded had nothing to do with the task code it was
+  credited to. When `--task` names a bare same-repo GitHub issue with exactly one
+  matching open PR, and the CWD's current branch isn't that PR's head branch, `review
+  diff` now refuses BEFORE dispatching any model calls (new `EXIT_TASK_BRANCH_MISMATCH`
+  exit code), naming an existing worktree already on the right branch when one exists.
+  Fail-open when the check can't be trusted (multiple/zero matching PRs, `gh`
+  missing/erroring, a non-`#<n>` code) — this is the SAME diff-identity-pollution class
+  the existing `--check`-time repo/diff mismatch detection guards against
+  (reviewlib.stats "Diff-identity binding"), just caught at record time instead. Escape
+  hatch: `--no-verify-task-branch`. Also refuses a PIPED diff (`git diff X | review diff
+  --task '#<n>'`) under the same code, since the branch check alone can't verify what
+  was piped in; excludes fork PRs (`isCrossRepository`) from the match set so a
+  same-named local branch can't be falsely confirmed against someone else's fork;
+  treats a detached HEAD as "branch unknown" rather than a literal branch named `HEAD`;
+  and scrubs `GH_REPO`/`GITHUB_REPOSITORY` from the `gh pr list` lookup so an ambient
+  value can't redirect it to a foreign repository. Rejects non-ASCII numeral shapes
+  (`#１２３`, `#١٢٣`) `gh ship`'s own derivation never produces; treats losing a
+  previously-known branch entirely (going detached mid-run) as a mismatch, not a
+  silent skip; and only applies to `review diff`'s REQUIRED-diff path, not the optional
+  `--visual` companion review that falls back to a diff-less standalone review on a
+  clean tree. Known coverage gap (tracked, not a regression): the PR/issue lookup keys
+  on GitHub's own `closingIssuesReferences`, which is narrower than `gh ship`'s actual
+  derivation grammar (an anchored `Refs #<n>` mention, or a same-repo issue URL, neither
+  of which need close the issue) — a PR ship.sh would derive a code from via `Refs`
+  alone currently fails this guard's lookup open (same safety direction, just an
+  uncovered shape); widening the grammar match is a follow-up.
+
 ## 0.35.11 — 2026-09-07
 
 - **New default board seat: Grok 4.5 via opencode's native `xai` provider

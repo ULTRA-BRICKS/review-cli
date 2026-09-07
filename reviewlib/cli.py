@@ -153,6 +153,20 @@ EXIT_QA_ENV_UNHEALTHY = (
 # not break; nothing in the live code returns it anymore.
 EXIT_QA_NOT_IMPLEMENTED = 70
 
+# Codes 11/12/13 are CLAIMED by `modes/review.py` (EXIT_COMMIT_REQUIRES_STAGED /
+# EXIT_COMMIT_FAILED / EXIT_COMMIT_DIFF_TRUNCATED) — a codex review finding on this guard's
+# own PR caught an initial `= 11` silently colliding with EXIT_COMMIT_REQUIRES_STAGED, which
+# would have made exit 11 ambiguous between "use --staged" and "wrong task branch" for any
+# script/hook branching on it. 14 is the next free integer (10 is pool_guard.EXIT_UNSATISFIED).
+#
+# 14 is the record-time task-code/branch-binding mismatch class
+# (_task_code_branch_mismatch_warning): `--task #<n>` names a same-repo GitHub issue whose
+# single open PR is on a DIFFERENT branch than the one about to be reviewed/recorded. Distinct
+# from every class above so a script can tell "this diff would pollute the wrong task code's
+# quorum history" apart from a usage error or a real finding. See reviewlib.stats "Diff-identity
+# binding" for the sibling --check-time detection this mirrors at record time.
+EXIT_TASK_BRANCH_MISMATCH = 14
+
 # Codes 11/12 are CLAIMED by `modes/review.py` (EXIT_COMMIT_REQUIRES_STAGED / EXIT_COMMIT_
 # FAILED, the `--commit` checkpoint feature) — defined there, not here, because that mode
 # module can't import from cli.py without a circular import. Recorded here too so the next
@@ -503,6 +517,318 @@ def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
             flush=True,
         )
     return resolved
+
+
+def _is_bare_issue_task_code(task_code: str) -> bool:
+    """True for the exact `#<digits>` shape `gh ship`'s task-code derivation falls back
+    to for a same-repo GitHub issue reference (agent-tools#566/#567) — the ONLY shape
+    the task-code/branch-binding guard (`_task_code_branch_mismatch_warning` and its
+    piped-diff sibling check) ever applies to. Every other shape (`HYP-931`,
+    `SME-ROADMAP-NOTE`, ...) is out of scope and must return False here, not just from
+    the mismatch-warning function — a caller gating a DIFFERENT check (e.g. the piped-
+    diff refusal) on "is this an issue-shaped code" needs the exact same answer, so this
+    is the single source of truth both checks share.
+
+    `str.isdigit()` is Unicode-aware: it accepts non-ASCII numeral forms (fullwidth
+    `＃１２３`, Arabic-Indic `١٢٣`, superscript `²`) that `gh ship`'s own bash-regex
+    derivation (`[0-9]+`) never would, and some of those (superscripts) can't even
+    round-trip through `int()` — a codex review finding on this guard's own PR: without
+    the explicit `isascii()` gate, a caller could construct a code that validates
+    against one issue while the ORIGINAL (non-ASCII) string is what gets recorded as the
+    task code, splitting the record from the code ship.sh would have derived."""
+    digits = task_code[1:]
+    return task_code.startswith("#") and digits.isascii() and digits.isdigit()
+
+
+def _current_branch(cwd: Path) -> str | None:
+    """Best-effort current branch name at `cwd`, or None on any failure (missing git, a
+    wedged process) OR a detached HEAD. This guard is advisory, never a reason to crash
+    — a lookup failure just skips the check (see `_task_code_branch_mismatch_warning`).
+
+    Detached HEAD (`git rev-parse --abbrev-ref HEAD` literally prints `HEAD`, not a real
+    branch name — e.g. a checkout at the PR's own commit SHA, common for CI/review
+    worktrees) is treated as "can't determine a branch", NOT as a branch literally named
+    "HEAD" — a codex review finding on this guard's own PR: without this, a detached
+    checkout sitting at the exact right commit for a matching PR would still get FALSELY
+    refused, because "HEAD" != the PR's real head-ref name."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    branch = proc.stdout.strip()
+    if not branch or branch == "HEAD":
+        return None
+    return branch
+
+
+def _worktree_path_on_branch(cwd: Path, branch: str) -> str | None:
+    """Path of an EXISTING `git worktree` already checked out on `branch`, if any, so a
+    mismatch message can point the caller at the right place instead of just naming the
+    branch. Best-effort: None on any failure or when no such worktree is registered."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "worktree", "list", "--porcelain"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    path: str | None = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree ") :].strip() or None
+        elif line.startswith("branch ") and path:
+            ref = line[len("branch ") :].strip()
+            if ref == f"refs/heads/{branch}":
+                return path
+    return None
+
+
+# `gh pr list`'s own page cap this lookup relies on. A repo with MORE open PRs than this
+# can have the issue's real matching PR sit past the page boundary, so a full page is
+# treated as untrustworthy (see the truncation check below) rather than a confident
+# "zero/one/multiple matches" answer.
+_PR_LOOKUP_LIMIT = 100
+
+
+def _open_prs_referencing_issue(cwd: Path, issue_number: str) -> list[dict] | None:
+    """Open PRs (in the repo at `cwd`) that GitHub itself recognizes as CLOSING issue
+    `#<issue_number>` — i.e. `closingIssuesReferences` (the same "Closes/Fixes/Resolves
+    #<n>" keyword parsing GitHub's own UI uses), via `gh pr list` (repo auto-detected from
+    `cwd`'s git remote — same as every other `gh` invocation in this ecosystem).
+
+    Deliberately NOT a substring/text search over the PR body: an early cut of this
+    function matched any standalone "#<n>" mention anywhere in the body, so a PR that
+    merely DISCUSSED issue #141 in passing (not closing it) would be treated as #141's
+    "own PR" and a legitimate, unrelated branch would get falsely refused (codex review
+    finding on this guard's own PR). `closingIssuesReferences` is GitHub's own authoritative
+    answer to "which PR closes this issue," not a heuristic re-implementation of it.
+
+    Returns None (skip the check entirely) when the lookup itself can't be trusted: `gh`
+    missing/unauthenticated, a non-GitHub remote, a wedged process, unparsable JSON, or a
+    FULL page of `_PR_LOOKUP_LIMIT` results (the real match could be on the next page, and
+    silently treating a truncated read as complete would let a wrong-branch review slip
+    through — the exact pollution this guard exists to catch; also a codex review finding).
+    An empty (non-truncated) list is a real, trustworthy "zero matches" result, distinct
+    from None.
+
+    KNOWN COVERAGE GAP (codex review finding on this guard's own PR, live counterexample:
+    review-cli#396's only open PR, #398, opens with "Refs https://github.com/alex-mextner/
+    review-cli/issues/396" and has an EMPTY `closingIssuesReferences`): `gh ship`'s own
+    task-code derivation (agent-tools#566/#567, ci/ship/ship.sh) accepts a WIDER grammar
+    than GitHub's closing-keyword parsing — an anchored `Refs #<n>`/`Fixes #<n>` token, or
+    a same-repo issue URL, neither of which need actually CLOSE the issue. This function
+    intentionally does NOT replicate that grammar (porting ship.sh's bash regex exactly
+    would be its own source of drift bugs); it only recognizes GitHub's own authoritative
+    closing relationship. The practical effect: for a PR that ship.sh would derive a code
+    from via `Refs #<n>` alone (no closing keyword), THIS guard's lookup returns zero
+    matches and fails open — same safety direction as every other "can't be trusted" case
+    above, just a real, common shape it doesn't yet cover. Widening this to match ship.sh's
+    grammar is a follow-up (review-cli#410's own tracking issue), not blocking here: fail-
+    open on an uncovered shape is the existing designed behavior, not a regression.
+    """
+    # Anchored with the SAME git_repo_env(cwd) the adjacent git calls use (codex review
+    # finding on this guard's own PR): `gh`'s own repo auto-detection reads git remotes,
+    # so a leaked GIT_DIR/GIT_WORK_TREE pointing at a FOREIGN repo could otherwise make
+    # `gh pr list` answer for a different repository than the one `_current_branch`/
+    # `_git_diff` are anchored to. `git_repo_env` returns a full env dict (os.environ
+    # with only the foreign git-pinning vars stripped), so `gh` still gets everything
+    # else it needs (GH_TOKEN, PATH, HOME, ...).
+    #
+    # `git_repo_env` strips GIT_* vars only — it does NOT know about `gh`'s OWN
+    # repo-pinning vars. `GH_REPO` (and its alias `GITHUB_REPOSITORY`, set inside every
+    # GitHub Actions run) override `gh`'s repository auto-detection entirely regardless
+    # of `cwd`, so an ambient `GH_REPO=other-org/other-repo` would make this lookup
+    # silently answer for a FOREIGN repo — a matching issue/PR there could then falsely
+    # confirm or falsely refuse a completely unrelated local branch (codex review finding
+    # on this guard's own PR). Cleared here so this call is anchored to `cwd` alone,
+    # exactly like the git calls beside it.
+    gh_env = dict(git_repo_env(cwd))
+    gh_env.pop("GH_REPO", None)
+    gh_env.pop("GITHUB_REPOSITORY", None)
+    try:
+        proc = _run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--json",
+                "number,headRefName,isCrossRepository,closingIssuesReferences",
+                "--limit",
+                str(_PR_LOOKUP_LIMIT),
+            ],
+            cwd=cwd,
+            env=gh_env,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    import json as _json
+
+    try:
+        prs = _json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(prs, list):
+        return None
+    if len(prs) >= _PR_LOOKUP_LIMIT:
+        return None
+    try:
+        issue_n = int(issue_number)
+    except ValueError:
+        return None
+    # GitHub explicitly supports CROSS-repository closing references ("Fixes
+    # other-org/other-repo#141") — `closingIssuesReferences` entries carry their own
+    # `repository` (owner login + name), which can point OUTSIDE this repo even though
+    # the number matches (codex review finding on this guard's own PR: "a local PR
+    # containing 'Fixes other/repo#141' is therefore treated as the PR for local
+    # #141"). Resolve THIS repo's own identity once so each reference can be checked
+    # against it — None (unresolvable remote) means every reference is treated as
+    # possibly-foreign, i.e. no match is trusted (fail open, not fail confirmed).
+    local_repo = _local_repo_identity(cwd)
+    matches = []
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        # A fork PR's `headRefName` (e.g. "fix/login") can collide with an UNRELATED
+        # local branch of the same name in THIS repo — `headRefName` alone doesn't say
+        # WHICH repository that branch lives in (codex review finding on this guard's
+        # own PR). `isCrossRepository` is `gh`'s own answer to "is the head a fork";
+        # excluding those matches here means such a PR can never falsely confirm a
+        # same-named local branch as clean — it just drops out of the match set (fail-
+        # open: skip the check for that PR rather than trust an unverifiable equality).
+        if pr.get("isCrossRepository") is True:
+            continue
+        closing = pr.get("closingIssuesReferences")
+        if not isinstance(closing, list):
+            continue
+        if any(
+            _closing_ref_is_this_repos_issue(ref, issue_n, local_repo)
+            for ref in closing
+        ):
+            matches.append(pr)
+    return matches
+
+
+def _local_repo_identity(cwd: Path) -> str | None:
+    """`host/owner/repo` for `cwd`'s `origin` remote (via `normalize_repo_remote`), or
+    None if unresolvable. Used to verify a `closingIssuesReferences` entry's own
+    `repository` actually IS this repo, not a same-numbered issue elsewhere."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "remote", "get-url", "origin"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return normalize_repo_remote(proc.stdout.strip())
+
+
+def _closing_ref_is_this_repos_issue(
+    ref: object, issue_n: int, local_repo: str | None
+) -> bool:
+    """True only when `ref` (one `closingIssuesReferences` entry) both matches
+    `issue_n` AND — when its own `repository` field is present — names THIS repo
+    (`local_repo`), not a cross-repository closing reference sharing the same number.
+    A reference with no usable `repository` info, or when `local_repo` itself
+    couldn't be resolved, is treated as untrusted (False) rather than guessed at —
+    fail-open lives in the caller finding zero/multiple matches, not here."""
+    if not isinstance(ref, dict) or ref.get("number") != issue_n:
+        return False
+    repo = ref.get("repository")
+    if not isinstance(repo, dict) or local_repo is None:
+        # No repository info to verify against (or this repo's own identity couldn't
+        # be resolved) — never ASSUME same-repo just because the number matches; that
+        # would reopen exactly the cross-repo collision this function exists to close.
+        return False
+    owner = repo.get("owner")
+    owner_login = owner.get("login") if isinstance(owner, dict) else None
+    name = repo.get("name")
+    if not owner_login or not name or local_repo is None:
+        return False
+    return local_repo.lower().endswith(f"/{owner_login}/{name}".lower())
+
+
+def _task_code_branch_mismatch_warning(cwd: Path, task_code: str) -> str | None:
+    """Refusal text when `--task CODE` names a bare same-repo GitHub issue (`#141`, the
+    shape `gh ship`'s task-code derivation falls back to for repos tracked as plain GitHub
+    issues rather than HYP-<n> Linear tickets — agent-tools#566/#567) but the diff about to
+    be reviewed/recorded at `cwd` is NOT on that issue's own PR branch. None when the check
+    doesn't apply (task code isn't `#<n>`-shaped) or can't be trusted (branch/PR lookup
+    failed, or the issue has zero or more-than-one matching open PR — ambiguous, so this
+    stays fail-open rather than guessing).
+
+    Why this matters: this is the SAME diff-identity-pollution failure class the
+    `--check`-time repo/diff mismatch detection already guards against (reviewlib.stats
+    "Diff-identity binding" — PR #151/#131/HYP-858), just caught at RECORD time instead of
+    check time. Observed live in conloca/landing: before ship.sh could derive a task code
+    from a bare GitHub issue reference, agents worked around "could not derive a task code"
+    by minting a throwaway ticket and running `review diff -C <shared primary checkout>
+    --task <code>` — reviewing whatever happened to be uncommitted in a SHARED, actively-
+    mutating checkout, not the PR's own worktree. One such review (issue #135) reviewed a
+    package.json claiming version "0.4.3", a version that never existed in the repo's
+    history on any ref — direct evidence the diff being recorded had nothing to do with the
+    task code it was credited to. This check stops that at the source: refuse before
+    dispatching any model calls, rather than silently recording a wrong-branch iteration
+    that a later `--check` might or might not catch.
+    """
+    if not _is_bare_issue_task_code(task_code):
+        return None
+    issue_number = task_code[1:]
+    branch = _current_branch(cwd)
+    if branch is None:
+        return None
+    matches = _open_prs_referencing_issue(cwd, issue_number)
+    if not matches or len(matches) != 1:
+        return None
+    pr = matches[0]
+    head = pr.get("headRefName")
+    pr_number = pr.get("number")
+    if not head or head == branch:
+        return None
+    hint_path = _worktree_path_on_branch(cwd, head)
+    msg = (
+        f"[review-cli] --task {task_code} names issue #{issue_number}, whose only open PR "
+        f"(#{pr_number}) is on branch '{head}', but {cwd} is currently on branch "
+        f"'{branch}'.\n"
+        "  Recording a review here would credit this diff to the WRONG task code's "
+        "review-quorum history (the same diff-identity-pollution class as PR #151/#131/"
+        "HYP-858 — reviewlib.stats \"Diff-identity binding\"), just caught at record time "
+        "instead of --check time.\n"
+    )
+    if hint_path:
+        msg += (
+            f"  fix: the diff for #{issue_number} lives at {hint_path} — re-run with "
+            f"-C {hint_path}.\n"
+        )
+    else:
+        msg += (
+            f"  fix: check out '{head}' (or create/enter a worktree on it) and re-run "
+            "-C pointing there.\n"
+        )
+    msg += (
+        "  this check only fires for a SINGLE unambiguous open-PR match; pass a different "
+        "--task CODE if this diff genuinely isn't PR review work for that issue."
+    )
+    return msg
 
 
 # Shared between the `__serve` parser and the managed-service parser so the two surfaces never
@@ -3949,6 +4275,15 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
         parser.add_argument(
             "--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt"
         )
+        parser.add_argument(
+            "--no-verify-task-branch",
+            action="store_true",
+            help="skip the record-time task-code/branch-binding check (a `--task #<n>` "
+            "GitHub-issue code whose single open PR is on a different branch than the "
+            "one being reviewed here). Escape hatch for a diff that genuinely isn't PR "
+            "review work for that issue, or a `gh`/network hiccup; NOT a way around a "
+            "genuine mismatch finding.",
+        )
     # --moderator steers the quorum / brainstorm synthesis only.
     if mode.name in ("quorum", "brainstorm"):
         parser.add_argument(
@@ -3993,6 +4328,7 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset(
         "--project",
         "--retry",
         "--commit",
+        "--no-verify-task-branch",
         # quorum's opt-in adversarial refutation pass (modes/quorum.py).
         "--adversarial-check",
         # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
@@ -4978,6 +5314,28 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # tolerant `--visual` review (which DOES proceed as-is) keep the warning.
     _review_required = mode.name == "review" and (args.staged or args.visual is None)
     cwd = _effective_cwd(args.cwd, warn=not _review_required)
+    # Record-time diff-identity guard (review-cli, conloca/landing dead-ticket-loop
+    # postmortem): only the diff-review mode (visual/panel diffs are context, not the
+    # thing being credited to a task code) and only when a code was actually supplied
+    # (task_code is None for the no-task-required visual/panel paths). The ACTUAL
+    # verification runs later, right after diff acquisition (next to the diff-identity-
+    # binding capture) — not here — because whether this guard even applies depends on
+    # whether a diff will exist at all: `review diff --visual shot.png` on a CLEAN tree
+    # intentionally falls back to a standalone visual review with NO diff (§3 routing),
+    # which will never record anything under the task code, while the SAME flag with a
+    # real unstaged/piped diff present IS a companion review that DOES record (codex
+    # review finding on this guard's own PR, round 2: an earlier fix that gated the
+    # whole guard on "`--visual` absent" over-corrected — it exempted the companion-
+    # with-a-real-diff case too, reopening the exact vulnerability being fixed). Only
+    # `diff.strip()` at the point it's finally known — not `args.visual`, not
+    # `_review_required` — can tell these apart, so the check has to live there.
+    _verify_task_branch = mode.name == "review" and task_code and not getattr(
+        args, "no_verify_task_branch", False
+    )
+    # Branch captured HERE (before diff acquisition) purely so the check below can tell
+    # whether the branch changed WHILE this invocation was preparing to dispatch — not
+    # used to refuse anything at this point.
+    _pre_check_branch = _current_branch(cwd) if _verify_task_branch else None
     is_brainstorm = mode.name == "brainstorm"
     is_visual_subcommand = mode.name == "visual"
     # A "panel mode" is any non-review mode (brainstorm / just-ask / quorum): the diff is
@@ -5283,6 +5641,70 @@ def _dispatch(argv: list[str] | None = None) -> int:
         except RuntimeError:
             diff = ""
     diff = diff or ""
+
+    # Task-code/branch-binding verification runs HERE, immediately adjacent to the diff
+    # capture above (not before it — see `_verify_task_branch`'s comment) and gated on
+    # `diff.strip()`: an EMPTY diff (the standalone-visual-fallback case) will never be
+    # dispatched or recorded under the task code, so there is nothing to protect —
+    # applying the guard there would only produce false refusals (codex review finding,
+    # round 2). A NON-empty diff, whether from `_git_diff` or piped, WILL be recorded,
+    # so both the branch-mismatch check and the piped-diff check apply uniformly here,
+    # at the one point where "is there really a diff" is finally known.
+    if _verify_task_branch and diff.strip():
+        mismatch = _task_code_branch_mismatch_warning(cwd, task_code)
+        if mismatch:
+            print(mismatch, file=sys.stderr, flush=True)
+            return EXIT_TASK_BRANCH_MISMATCH
+        if piped_input is not None and _is_bare_issue_task_code(task_code):
+            # A piped diff (`git diff <anything> | review diff --task '#<n>'`) bypasses
+            # `_git_diff(cwd, ...)` entirely — the branch check above only proves CWD is
+            # on the right branch, it says NOTHING about what the CALLER chose to pipe in,
+            # which can be any diff regardless of branch (codex review finding on this
+            # guard's own PR: "the branch check passes because CWD is on the expected
+            # branch, but the already-read stdin diff skips _git_diff and is recorded
+            # under #141" — the exact TEXT-search false-confidence class this whole guard
+            # exists to close, just moved from PR-body text to diff content). Refuse
+            # rather than silently recording an unverifiable diff under a real task code.
+            print(
+                f"[review-cli] --task {task_code}: refusing to record a PIPED diff "
+                "against a same-repo GitHub issue code — the branch check above cannot "
+                "verify what a piped diff actually contains (it only confirms the "
+                "CURRENT CHECKOUT's branch, not the diff you piped in). Re-run without "
+                "piping (let review diff read the working tree itself), or pass "
+                "--no-verify-task-branch if this piped diff is deliberately not PR "
+                "review work for that issue.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return EXIT_TASK_BRANCH_MISMATCH
+        elif _pre_check_branch is not None:
+            # Re-check: if the branch changed since `_pre_check_branch` was captured
+            # (before diff acquisition ran, which — for the non-piped path — can itself
+            # take a moment), the diff just captured may not be the one a mismatch check
+            # against the OLD branch would have verified. A LOCAL branch comparison
+            # only — no second `gh` round-trip needed, since the PR/issue mapping itself
+            # doesn't change mid-run, only which branch is checked out can. A DIFFERENT
+            # branch OR the loss of a determinable branch entirely (detached HEAD, a git
+            # failure at exactly this moment) both count as "changed" — an earlier cut
+            # only compared when BOTH samples were non-None, so a checkout that went
+            # known-branch -> detached mid-run silently passed (the diff could easily be
+            # from an unrelated commit); `_pre_check_branch is not None` here already
+            # ruled out "started detached", so any difference now — including landing on
+            # None — is itself the anomaly worth refusing on.
+            _post_check_branch = _current_branch(cwd)
+            if _post_check_branch != _pre_check_branch:
+                print(
+                    f"[review-cli] --task {task_code}: branch changed from "
+                    f"'{_pre_check_branch}' to "
+                    f"'{_post_check_branch if _post_check_branch is not None else '(undeterminable — detached HEAD or a git failure)'}' "
+                    f"in {cwd} while this review was starting — refusing rather than "
+                    "recording a diff that may no longer be the one the earlier "
+                    "task-code/branch check verified. Re-run review diff once the "
+                    "checkout is stable.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return EXIT_TASK_BRANCH_MISMATCH
 
     # Diff-identity binding (reviewlib.stats "Diff-identity binding"): captured from
     # the FULL, uncapped diff — computed BEFORE the dispatch-time cap below and before
