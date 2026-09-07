@@ -225,6 +225,56 @@ def test_role_less_board_never_reuses():
     assert result[0].model == "glm-cc"
 
 
+def test_unknown_role_board_never_reuses_task_cli_139():
+    # Codex review finding, task-cli#139: a board whose `role` strings are all
+    # TYPOS/unknown REVIEW_ROLES keys (e.g. a hand-edited config with "typo-a",
+    # "typo-b", "typo-c") is functionally role-less — every seat's `role_lens`
+    # resolves empty, so every seat falls back to the SAME generic prompt
+    # regardless of its `role` label. Before this fix, `any(r.role for r in
+    # board)` treated these non-empty-but-invalid strings as real lenses and
+    # padded anyway: with only Codex reachable and pool=3, it would have
+    # dispatched Codex three times with the IDENTICAL generic prompt while
+    # mislabeling the three seats as three distinct roles "typo-a"/"typo-b"/
+    # "typo-c" -- pure duplicate cost, zero added review diversity, and a
+    # misleading transcript. Must behave exactly like a role-less board: stay
+    # at the smaller un-padded size instead of pretending to pad.
+    board = [
+        BoardReviewer("codex", "typo-a", "Codex"),
+        BoardReviewer("gemini", "typo-b", "Gemini"),
+        BoardReviewer("claude", "typo-c", "Claude"),
+    ]
+    for r in board:
+        assert r.role_lens == "", "sanity: none of these roles are real REVIEW_ROLES keys"
+    only_codex = lambda r: r.model == "codex"  # noqa: E731
+    result = select_pool_with_reuse(
+        board, 3, available=only_codex, usage_percent=_usage({})
+    )
+    assert len(result) == 1  # did NOT pad to 3 identical-generic-prompt duplicates
+    assert result[0].model == "codex"
+
+
+def test_mixed_known_and_unknown_roles_pads_only_into_the_known_lens():
+    # A board mixing one REAL role (correctness) with typo'd ones: reuse must still
+    # fire (the board is NOT functionally role-less -- one seat has a genuine lens),
+    # but the padding loop must never hand out a typo'd role as if it were a distinct
+    # lens -- it should pad short rather than fabricate a "second distinct role" out
+    # of an unknown string.
+    board = [
+        BoardReviewer("codex", "correctness", "Codex"),
+        BoardReviewer("gemini", "typo-b", "Gemini"),
+        BoardReviewer("claude", "typo-c", "Claude"),
+    ]
+    only_codex = lambda r: r.model == "codex"  # noqa: E731
+    result = select_pool_with_reuse(
+        board, 3, available=only_codex, usage_percent=_usage({})
+    )
+    # No unknown role has a real lens to pad into, and codex's own "correctness" role
+    # is already used by the primary slot -- so there is nothing left in role_pool to
+    # pad with, and the result stays at the un-padded size of 1.
+    assert len(result) == 1
+    assert result[0].role == "correctness"
+
+
 # --- expand_flat_models_with_reuse (quorum/just-ask/brainstorm's flat panel) -------
 
 

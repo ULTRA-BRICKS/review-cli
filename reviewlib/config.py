@@ -837,7 +837,10 @@ def select_pool_with_reuse(
     # Reuse is opted into (usage_percent given): size `n` against the FULL
     # board when a concrete pool is requested, not just what's reachable —
     # see step 4 above (task-cli#139).
-    n = _effective_pool_size(len(board), pool) if pool > 0 else len(reachable)
+    if pool > 0:
+        n = _effective_pool_size(len(board), pool)
+    else:
+        n = len(reachable)
 
     under_limit = [
         r
@@ -855,24 +858,34 @@ def select_pool_with_reuse(
     if extra_needed <= 0:
         return primary
 
-    if not any(r.role for r in board):
-        # A role-less board (every seat has role="" — e.g. a config `models:`
-        # roster with no lens metadata) has no distinct lenses to gain from
-        # reuse: duplicating a model here is pure cost with zero added review
-        # diversity. Leave the pool at its (smaller) primary size instead.
+    if not any(r.role_lens for r in board):
+        # A role-less OR every-role-unknown board (every seat's `role_lens` resolves
+        # empty — either role="" outright, e.g. a config `models:` roster with no lens
+        # metadata, OR a role string that isn't a REVIEW_ROLES key, e.g. a typo) has no
+        # distinct LENSES to gain from reuse: every seat would fall back to the same
+        # generic prompt regardless of its `role` label, so duplicating a model here is
+        # pure cost with zero added review diversity — checked via `role_lens`, not the
+        # raw `role` string, so a typo'd/unknown role doesn't masquerade as a real lens
+        # (codex review finding, task-cli#139). Leave the pool at its (smaller) primary
+        # size instead.
         return primary
 
     used_roles = {r.role for r in primary}
-    # Every DISTINCT board role not yet used by `primary`, in board priority
-    # order, deduped order-preservingly. A real board can carry the SAME role
-    # twice (DEFAULT_BOARD has "consistency" and "quality" each on two seats)
-    # — without the dedup, two padded extras could land on that same role,
-    # dispatching two BYTE-IDENTICAL prompts (same model AND same lens) in
-    # parallel: pure duplicate cost, contradicting this function's own "N
-    # distinct lenses" guarantee (k3 review finding, review-cli#205 round 3).
+    # Every DISTINCT board role not yet used by `primary`, in board priority order,
+    # deduped order-preservingly — restricted to roles with a REAL `role_lens` (codex
+    # review finding, task-cli#139): a typo'd/unknown role resolves to the SAME generic
+    # prompt as every other unknown role, so counting it as its own "distinct" padding
+    # slot would dispatch byte-identical generic-prompt duplicates while mislabeling
+    # them as separate lenses — exactly the cost the dedup two lines below this comment
+    # already guards against for KNOWN duplicate roles. A real board can carry the SAME
+    # known role twice (DEFAULT_BOARD has "consistency" and "quality" each on two seats)
+    # — without the dedup, two padded extras could land on that same role, dispatching
+    # two BYTE-IDENTICAL prompts (same model AND same lens) in parallel: pure duplicate
+    # cost, contradicting this function's own "N distinct lenses" guarantee (k3 review
+    # finding, review-cli#205 round 3).
     role_pool: list[str] = []
     for r in board:
-        if r.role not in used_roles and r.role not in role_pool:
+        if r.role_lens and r.role not in used_roles and r.role not in role_pool:
             role_pool.append(r.role)
 
     extra: list[BoardReviewer] = []

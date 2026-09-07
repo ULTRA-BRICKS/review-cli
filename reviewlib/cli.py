@@ -5570,20 +5570,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 # `select_pool_and_reserve_with_reuse` on this board AND that selector
                 # will actually pad it: never for an explicit `-m` board (dispatched
                 # `exact_board`, no reuse — see `usage_percent=None if explicit_models
-                # else _usage_percent` below); only when the board carries role metadata
-                # (a role-less config `models:` roster gains nothing from reuse — same
-                # rule `select_pool_with_reuse` itself applies); and only for a POSITIVE
-                # `effective_pool_size` (codex review finding, task-cli#139 round 3):
-                # `--pool 0`/no-preset means "all reachable seats", and
-                # `select_pool_with_reuse` deliberately does NOT pad for `pool <= 0` (see
-                # its own `n` computation) — relaxing the floor there would let a single
-                # live seat bypass the 2-model convergence floor for a run that ends up
-                # with just that ONE seat/role, zero compensating padding.
-                # `review_pool_size` below is `effective_pool_size` in this exact branch
-                # (not explicit_models), so this mirrors what actually gets passed down.
+                # else _usage_percent` below); only when the board carries at least one
+                # seat with a REAL, resolvable `role_lens` (checked via `role_lens`, not
+                # the raw `role` string — codex review finding, task-cli#139: a board
+                # whose only non-empty roles are typos/unknown REVIEW_ROLES keys gains
+                # nothing from reuse either, same as a role-less `models:` roster,
+                # because every seat would fall back to the identical generic prompt —
+                # `select_pool_with_reuse` itself now applies this exact check); and
+                # only for a POSITIVE `effective_pool_size` (codex review finding,
+                # task-cli#139 round 3): `--pool 0`/no-preset means "all reachable
+                # seats", and `select_pool_with_reuse` deliberately does NOT pad for
+                # `pool <= 0` (see its own `n` computation) — relaxing the floor there
+                # would let a single live seat bypass the 2-model convergence floor for
+                # a run that ends up with just that ONE seat/role, zero compensating
+                # padding. `review_pool_size` below is `effective_pool_size` in this
+                # exact branch (not explicit_models), so this mirrors what actually
+                # gets passed down.
                 reuse_eligible=(
                     not explicit_models
-                    and any(r.role for r in board)
+                    and any(r.role_lens for r in board)
                     and effective_pool_size > 0
                 ),
             )

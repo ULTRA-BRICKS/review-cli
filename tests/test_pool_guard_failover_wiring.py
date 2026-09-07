@@ -36,10 +36,27 @@ from reviewlib.pool_guard import EXIT_UNSATISFIED  # noqa: E402
 
 class _PatchBackends:
     """Save/restore `backends.backend_available` + `.backend_unavailable_reason` +
-    `.runtime_provider_marked_unpaid` around a test body."""
+    `.runtime_provider_marked_unpaid` around a test body.
 
-    def __init__(self, *, available, reason, unpaid=lambda _m: False):
+    `extra_attrs` (codex review finding, task-cli#139 round 3 -- DRY): additional
+    `(obj, attr_name) -> new_value` patches applied/restored the SAME way, for a test
+    that needs to control more than just the three backend globals (e.g. `cli.load_config`
+    or `cli._read_stdin_if_piped` for a full `_dispatch(...)` end-to-end test) without
+    hand-rolling its own save/patch/restore bookkeeping. `env` similarly save/restores
+    os.environ entries (value `None` means "unset on exit")."""
+
+    def __init__(
+        self,
+        *,
+        available,
+        reason,
+        unpaid=lambda _m: False,
+        extra_attrs: dict | None = None,
+        env: dict | None = None,
+    ):
         self._available, self._reason, self._unpaid = available, reason, unpaid
+        self._extra_attrs = dict(extra_attrs or {})
+        self._env = dict(env or {})
 
     def __enter__(self):
         self._saved = (
@@ -50,6 +67,14 @@ class _PatchBackends:
         backends.backend_available = self._available
         backends.backend_unavailable_reason = self._reason
         backends.runtime_provider_marked_unpaid = self._unpaid
+        self._saved_extra = {
+            key: getattr(obj, attr) for key in self._extra_attrs for obj, attr in [key]
+        }
+        for (obj, attr), value in self._extra_attrs.items():
+            setattr(obj, attr, value)
+        self._saved_env = {name: os.environ.get(name) for name in self._env}
+        for name, value in self._env.items():
+            os.environ[name] = value
         return self
 
     def __exit__(self, *exc):
@@ -58,6 +83,13 @@ class _PatchBackends:
             backends.backend_unavailable_reason,
             backends.runtime_provider_marked_unpaid,
         ) = self._saved
+        for (obj, attr), value in self._saved_extra.items():
+            setattr(obj, attr, value)
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         return False
 
 
@@ -205,26 +237,28 @@ def test_pool_zero_with_one_live_seat_still_bails_end_to_end():
     wrongly-proceeding run wouldn't need real credentials to prove the point) and asserts
     the pre-existing safety floor still bails with EXIT_UNSATISFIED, unchanged from
     before task-cli#139."""
-    saved_avail = backends.backend_available
-    saved_reason = backends.backend_unavailable_reason
-    saved_cfg = cli.load_config
-    saved_stdin = cli._read_stdin_if_piped
-    saved_env = os.environ.get("REVIEW_FAKE_BACKEND")
-    backends.backend_available = lambda model: model == "seat-a"
-    backends.backend_unavailable_reason = (
-        lambda model: None if model == "seat-a" else f"{model}: session-limit cooldown"
-    )
-    cli.load_config = lambda: {
-        "board": [
-            {"model": "seat-a", "role": "correctness", "name": "A"},
-            {"model": "seat-b", "role": "consistency", "name": "B"},
-            {"model": "seat-c", "role": "quality", "name": "C"},
-        ]
-    }
-    cli._read_stdin_if_piped = lambda: None
-    os.environ["REVIEW_FAKE_BACKEND"] = "1"
+
+    def _config() -> dict:
+        return {
+            "board": [
+                {"model": "seat-a", "role": "correctness", "name": "A"},
+                {"model": "seat-b", "role": "consistency", "name": "B"},
+                {"model": "seat-c", "role": "quality", "name": "C"},
+            ]
+        }
+
     err = io.StringIO()
-    try:
+    with _PatchBackends(
+        available=lambda model: model == "seat-a",
+        reason=lambda model: (
+            None if model == "seat-a" else f"{model}: session-limit cooldown"
+        ),
+        extra_attrs={
+            (cli, "load_config"): _config,
+            (cli, "_read_stdin_if_piped"): lambda: None,
+        },
+        env={"REVIEW_FAKE_BACKEND": "1"},
+    ):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d) / "repo"
             repo.mkdir()
@@ -248,15 +282,67 @@ def test_pool_zero_with_one_live_seat_still_bails_end_to_end():
                         str(repo),
                     ]
                 )
-    finally:
-        backends.backend_available = saved_avail
-        backends.backend_unavailable_reason = saved_reason
-        cli.load_config = saved_cfg
-        cli._read_stdin_if_piped = saved_stdin
-        if saved_env is None:
-            os.environ.pop("REVIEW_FAKE_BACKEND", None)
-        else:
-            os.environ["REVIEW_FAKE_BACKEND"] = saved_env
+    assert rc == EXIT_UNSATISFIED, (rc, err.getvalue())
+
+
+def test_unknown_role_board_with_one_live_seat_still_bails_end_to_end():
+    """Full `cli._dispatch(...)`, codex review finding (round 4): a board whose `role`
+    strings are all typos/unknown `REVIEW_ROLES` keys is functionally role-less (every
+    seat's `role_lens` resolves empty — see `select_pool_with_reuse`'s matching fix).
+    Before that fix, `reuse_eligible = not explicit_models and any(r.role for r in
+    board)` treated these non-empty-but-invalid strings as real lenses: with only
+    `seat-a` live and `--pool 3`, it would have proceeded past the guard and then
+    `select_pool_with_reuse` would have dispatched `seat-a` three times with the
+    IDENTICAL generic prompt (no seat has a real `role_lens`) while mislabeling the
+    three seats as three distinct roles. This drives the REAL CLI dispatcher end to end
+    and asserts the pre-existing safety floor still bails with EXIT_UNSATISFIED — the
+    fixed board is treated exactly like a role-less one, never a false PROCEED into a
+    paid triple-dispatch of duplicate generic-prompt reviews."""
+
+    def _config() -> dict:
+        return {
+            "board": [
+                {"model": "seat-a", "role": "typo-a", "name": "A"},
+                {"model": "seat-b", "role": "typo-b", "name": "B"},
+                {"model": "seat-c", "role": "typo-c", "name": "C"},
+            ]
+        }
+
+    err = io.StringIO()
+    with _PatchBackends(
+        available=lambda model: model == "seat-a",
+        reason=lambda model: (
+            None if model == "seat-a" else f"{model}: session-limit cooldown"
+        ),
+        extra_attrs={
+            (cli, "load_config"): _config,
+            (cli, "_read_stdin_if_piped"): lambda: None,
+        },
+        env={"REVIEW_FAKE_BACKEND": "1"},
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "t@t"], cwd=str(repo), check=True
+            )
+            subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+            (repo / "f.txt").write_text("x\n")
+            subprocess.run(["git", "add", "f.txt"], cwd=str(repo), check=True)
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                rc = cli._dispatch(
+                    [
+                        "diff",
+                        "--task",
+                        "TEST-1",
+                        "--staged",
+                        "--pool",
+                        "3",
+                        "-C",
+                        str(repo),
+                    ]
+                )
     assert rc == EXIT_UNSATISFIED, (rc, err.getvalue())
 
 
