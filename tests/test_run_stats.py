@@ -1944,15 +1944,24 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
             # ever produces "unavailable sentinel" or "session limit / usage credits";
             # a plain timeout does not currently start a cooldown (round-4 review
             # finding, k3 — see seat_cooldown.py's own docstring).
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode")
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode"
+            )
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode"
+            )
             # Round-4 review finding (k3): a model that's genuinely cooling down but was
             # NEVER attempted for THIS task code must still be excluded — the scoping
             # claim ("never lists an unrelated seat that simply isn't part of this
             # task's history") had no regression coverage; a change that dropped the
             # attempted_models filter and listed every cooling seat machine-wide would
             # otherwise pass the suite unnoticed.
-            _sc.record_cooldown("claude:claude-fable-5", "session limit", now=fixed_now, access_method="cli")
+            _sc.record_cooldown(
+                "claude:claude-fable-5",
+                "session limit",
+                now=fixed_now,
+                access_method="cli",
+            )
 
             result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
             assert result["passed"] is False
@@ -2037,7 +2046,9 @@ def test_quorum_check_min_roles_met_has_no_stalled_models_key_review_cli_221():
             )
             # An unrelated model is cooling down -- must not surface, since the
             # gate PASSED via roles (2 >= min_roles=2) regardless of models.
-            _sc.record_cooldown("gemini", "timed out", now=time.time(), access_method="cli")
+            _sc.record_cooldown(
+                "gemini", "timed out", now=time.time(), access_method="cli"
+            )
             result = _stats.quorum_check(TASK, min_iter=2, min_roles=2)
             assert result["passed"] is True, result  # 2 distinct roles >= 2
             assert "stalled_models" not in result
@@ -3902,8 +3913,12 @@ def test_quorum_check_min_roles_not_met_shows_stalled_models_review_cli_221():
                 passed=True,
             )
             fixed_now = time.time()
-            _sc.record_cooldown("gemini", "timed out", now=fixed_now, access_method="cli")
-            _sc.record_cooldown("gemini", "timed out", now=fixed_now, access_method="cli")
+            _sc.record_cooldown(
+                "gemini", "timed out", now=fixed_now, access_method="cli"
+            )
+            _sc.record_cooldown(
+                "gemini", "timed out", now=fixed_now, access_method="cli"
+            )
             result = _stats.quorum_check(TASK, min_iter=2, min_models=2, min_roles=2)
             assert result["passed"] is False, result  # only 1 distinct role
             assert "stalled_models" in result
@@ -4294,6 +4309,82 @@ def test_quorum_check_zero_iterations_explicit_min_models_carries_min_models_sou
         assert "error" in result
         assert result["min_models"] == 3
         assert result["min_models_source"] == "explicit"
+
+
+# ---------------------------------------------------------------------------
+# review-cli#389: GitHub-issue task codes 105 and #105 are the same key
+#
+# Write path keeps the spelling that was passed (so old records stay readable).
+# Read path aliases all-digit codes with an optional leading '#'. Non-numeric
+# codes (HYP-742) stay exact-match. A failed check names the searched key and
+# any near-miss keys (same digits, different '#').
+# ---------------------------------------------------------------------------
+def _record_passed_iteration(task_code: str, model: str = "codex") -> None:
+    _stats.record_run(
+        task_code=task_code,
+        mode="review",
+        models=[model],
+        duration_seconds=1.0,
+        ok_count=1,
+        fail_count=0,
+        passed=True,
+    )
+
+
+def test_quorum_check_bare_digits_visible_under_hash_prefix_review_cli_389():
+    """record 105, check #105 → finds the iterations (gh ship looks up Closes #105)."""
+    with _TmpStore() as store:
+        for model in ("codex", "gemini", "fable5"):
+            _record_passed_iteration("105", model)
+        assert {r["task_code"] for r in store.records()} == {"105"}
+        result = _stats.quorum_check("#105", min_iter=3, min_models=3)
+        assert result["passed"] is True, result
+        assert result["passed_iterations"] == 3
+        assert result["total_iterations"] == 3
+
+
+def test_quorum_check_hash_prefix_visible_under_bare_digits_review_cli_389():
+    """record #105, check 105 → finds them (the other direction)."""
+    with _TmpStore() as store:
+        for model in ("codex", "gemini", "fable5"):
+            _record_passed_iteration("#105", model)
+        assert {r["task_code"] for r in store.records()} == {"#105"}
+        result = _stats.quorum_check("105", min_iter=3, min_models=3)
+        assert result["passed"] is True, result
+        assert result["passed_iterations"] == 3
+        assert result["total_iterations"] == 3
+
+
+def test_quorum_check_non_numeric_code_is_not_hash_aliased_review_cli_389():
+    """HYP-742 is NOT aliased to #HYP-742."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _record_passed_iteration("HYP-742", model)
+        hashed = _stats.quorum_check("#HYP-742", min_iter=1, min_models=1)
+        assert hashed["passed"] is False
+        assert hashed["passed_iterations"] == 0
+        assert hashed["total_iterations"] == 0
+        assert "near_miss_keys" not in hashed
+        exact = _stats.quorum_check("HYP-742", min_iter=3, min_models=3)
+        assert exact["passed"] is True
+
+
+def test_quorum_check_near_miss_keys_on_failed_check_review_cli_389():
+    """A failed/empty check names the searched key and any near-miss keys
+    (same digits, different '#') so a leftover spelling split is diagnosable."""
+    with _TmpStore():
+        _record_passed_iteration("105", "codex")
+        hashed = _stats.quorum_check("#105", min_iter=3, min_models=3)
+        assert hashed["passed"] is False
+        assert hashed["searched_key"] == "#105"
+        assert hashed["near_miss_keys"] == ["105"]
+        assert hashed["passed_iterations"] == 1
+
+        # Searching the spelling actually in the store: no twin exists, so no
+        # near-miss keys (do not invent a '#' variant that was never written).
+        same = _stats.quorum_check("105", min_iter=3, min_models=3)
+        assert same["passed"] is False
+        assert "near_miss_keys" not in same
 
 
 def test_quorum_check_rejects_zero_or_negative_thresholds_directly():

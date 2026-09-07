@@ -3,6 +3,17 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.3 — 2026-09-08
+
+- **Fix: `review task --check` treats `105` and `#105` as the same GitHub-issue
+  task key (review-cli#389).** Iterations recorded under either spelling are
+  visible to the other, so `gh ship` looking up `#105` from a `Closes #105`
+  trailer no longer reports 0/3 when the reviews ran as `--task 105`. Write
+  path keeps the spelling that was passed (old records are not rewritten).
+  Non-numeric codes (`HYP-742`) are not aliased. A failed check's result dict
+  includes `searched_key` and `near_miss_keys` (same digits, different `#`)
+  when the other spelling exists in the store.
+
 ## 0.36.2 — 2026-09-08
 
 - **`review task CODE --check` zero-role fallback — only for GENUINELY old

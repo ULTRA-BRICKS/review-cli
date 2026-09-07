@@ -134,6 +134,10 @@ from .config import REVIEW_ROLES
 # needs to be load-bearing rather than directional.
 STATS_VERSION = 5
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
+# All-digit GitHub-issue codes, optional leading '#'. ASCII digits only: Python's
+# ``\d`` is Unicode, which would treat a fullwidth digit as an issue number.
+_GITHUB_ISSUE_TASK_RE = re.compile(r"^#?([0-9]+)$")
+
 # `diff --git a/<path> b/<path>` header. Paths containing spaces/special chars are
 # C-quoted by git (`"a/weird\tname"`) and NOT unescaped here — extraction degrades
 # to a best-effort miss for those rare paths rather than a wrong path, which is
@@ -220,6 +224,8 @@ def normalize_task_code(value: str | None) -> str | None:
 
     Task codes are identifiers, not prose: one non-whitespace token, no control
     characters. Preserve case because external trackers may be case-sensitive.
+    A leading ``#`` is kept as written (``#105`` stays ``#105``); GitHub-issue
+    all-digit codes are aliased at READ time — see ``_github_issue_task_keys``.
     """
     if value is None:
         return None
@@ -231,6 +237,30 @@ def normalize_task_code(value: str | None) -> str | None:
             "task code must be one non-whitespace token, max 120 characters"
         )
     return code
+
+
+def _github_issue_twin(code: str) -> str | None:
+    """Other spelling of an all-digit GitHub-issue task code, else None.
+
+    ``105`` ↔ ``#105``. Non-numeric codes (``HYP-742``) have no twin —
+    ``#HYP-742`` is a different key. Used by the dual-key READ path so history
+    recorded under either spelling is visible to the other (review-cli#389).
+    Does not rewrite records.
+    """
+    match = _GITHUB_ISSUE_TASK_RE.fullmatch(code)
+    if match is None:
+        return None
+    digits = match.group(1)
+    hashed = f"#{digits}"
+    return digits if code.startswith("#") else hashed
+
+
+def _github_issue_task_keys(code: str) -> frozenset[str]:
+    """Lookup keys for one task code: itself, plus the ``#`` twin if any."""
+    twin = _github_issue_twin(code)
+    if twin is None:
+        return frozenset({code})
+    return frozenset({code, twin})
 
 
 def stats_path() -> Path:
@@ -439,14 +469,19 @@ def _record_ts_str(record: dict) -> str:
 
 
 def iterations_for_task(task_code: str) -> list[dict]:
-    """Return run records for one task, oldest first, annotated with iteration numbers."""
+    """Return run records for one task, oldest first, annotated with iteration numbers.
+
+    All-digit GitHub-issue codes match both ``105`` and ``#105`` so a check
+    under either spelling sees history recorded under the other (review-cli#389).
+    """
     try:
         clean = normalize_task_code(task_code)
     except ValueError:
         return []
     if clean is None:
         return []
-    records = [r for r in _load_records() if r.get("task_code") == clean]
+    keys = _github_issue_task_keys(clean)
+    records = [r for r in _load_records() if r.get("task_code") in keys]
     records.sort(key=_record_ts_str)
     out: list[dict] = []
     for index, record in enumerate(records, start=1):
@@ -1775,6 +1810,17 @@ def quorum_check(
         mismatched=mismatched,
         clean=clean,
     )
+    if not result["passed"] and clean:
+        # Failed/empty check: name the key we searched and any near-miss keys
+        # in the store (same digits, different '#'). Dual-key READ already
+        # counted those records; this is the diagnostic so a leftover spelling
+        # split is visible on the refusal payload itself (review-cli#389).
+        twin = _github_issue_twin(clean)
+        if twin is not None and any(
+            item.get("task_code") == twin for item in iterations
+        ):
+            result["searched_key"] = clean
+            result["near_miss_keys"] = [twin]
     return result
 
 
