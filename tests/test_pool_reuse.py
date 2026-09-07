@@ -64,29 +64,65 @@ def test_enough_models_with_usage_percent_nothing_excluded_matches_select_pool()
 
 
 def test_raw_scarcity_without_usage_percent_still_clamps_like_select_pool():
-    # Reuse is a USAGE-EXCLUSION recovery mechanism, not a general "not enough
-    # distinct models" one: with no `usage_percent` given at all, only fable
-    # and glm-cc are AVAILABLE (2 of 6), and the pool still clamps to 2 —
-    # identical to plain `select_pool` (no reuse happens).
+    # `usage_percent=None` is the deliberate opt-OUT of reuse entirely (byte-identical
+    # to `select_pool`, see `select_pool_with_reuse`'s docstring step 4) — a caller that
+    # hasn't opted into reuse-awareness at all gets none, regardless of raw scarcity vs.
+    # hard cooldown. With no `usage_percent` given, only fable and glm-cc are AVAILABLE
+    # (2 of 6), and the pool still clamps to 2 — identical to plain `select_pool`.
     available = {"fable", "glm-cc"}
     result = select_pool_with_reuse(BOARD, 4, available=lambda r: r.model in available)
     assert len(result) == 2
     assert [r.model for r in result] == ["fable", "glm-cc"]
 
 
-def test_raw_scarcity_with_usage_percent_but_nothing_excluded_still_clamps():
-    # Same raw scarcity, but usage_percent IS supplied this time with nothing
-    # actually near its limit — still no reuse, because `under_limit` here
-    # equals `reachable` (2 seats), which is < the requested pool of 4 but
-    # reuse only pads the CANDIDATE pool back to `n`, and `n` itself is
-    # clamped to `len(reachable)` = 2 (see `_effective_pool_size`). Reuse
-    # fills a SHRUNK candidate pool up to `n`, it does not grow `n` itself.
+def test_raw_scarcity_with_usage_percent_pads_to_requested_pool_task_cli_139():
+    # Same raw scarcity (only fable/glm-cc reachable, 2 of 6), but
+    # usage_percent IS supplied this time with nothing actually near its
+    # limit — this is the HARD-unavailability case (seats excluded from
+    # `reachable` itself, e.g. a real session-limit cooldown), not the
+    # near-usage-limit case. Before the task-cli#139 fix, `n` collapsed to
+    # `len(reachable)` == 2 here, so the padding loop never ran and the pool
+    # stayed at 2 even though 4 were requested. The fix sizes `n` against the
+    # full board (the real ceiling on how many distinct role slots exist),
+    # so the 2 reachable seats now get reused across 2 more board roles.
     available = {"fable", "glm-cc"}
     result = select_pool_with_reuse(
         BOARD, 4, available=lambda r: r.model in available, usage_percent=_usage({})
     )
-    assert len(result) == 2
-    assert [r.model for r in result] == ["fable", "glm-cc"]
+    assert len(result) == 4
+    models = [r.model for r in result]
+    roles = [r.role for r in result]
+    assert models[:2] == ["fable", "glm-cc"]  # both keep their own role first
+    assert len(set(roles)) == 4  # every slot has a DISTINCT role/lens
+    assert set(models) == {"fable", "glm-cc"}  # only the 2 reachable models used
+
+
+def test_hard_cooldown_single_reachable_seat_pads_across_distinct_roles_task_cli_139():
+    # The exact production incident (task-cli#139, 2026-09-07): Opus/Sonnet/
+    # Fable/GLM are all in session-limit cooldown (`available()` returns
+    # False for them, NOT a usage_percent threshold — no usage_percent is
+    # passed here at all, isolating this from the already-working
+    # near-usage-limit path), only Codex survives. A default `--pool 3`
+    # request must still cover 3 DISTINCT board roles by reusing the one
+    # live seat, not collapse to a single role.
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+        BoardReviewer("oc:zai/glm-5.2", "quality", "GLM"),
+        BoardReviewer("claude:claude-sonnet-5", "quality", "Sonnet"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    ]
+    only_codex = lambda r: r.model == "codex:gpt-5.6-terra"  # noqa: E731
+    # usage_percent given but every model comfortably under_limit — proves
+    # this is the RAW-unavailability path, not the near-usage-limit one.
+    result = select_pool_with_reuse(
+        board, 3, available=only_codex, usage_percent=_usage({})
+    )
+    assert len(result) == 3
+    assert {r.model for r in result} == {"codex:gpt-5.6-terra"}
+    roles = [r.role for r in result]
+    assert len(set(roles)) == 3  # 3 distinct roles, not 1
+    assert roles[0] == "consistency"  # codex keeps its own role first
 
 
 def test_limit_exclusion_shrinks_pool_before_reuse():
@@ -290,6 +326,69 @@ def test_pool_and_reserve_probe_availability_exactly_once():
     # One probe per board seat, not two (pool split + reserve split each
     # re-probing independently would double this).
     assert len(calls) == len(BOARD)
+
+
+# --- integration: the real _mode_review_board / mode_review dispatch path ---------
+# (task-cli#139): a unit test on select_pool_with_reuse alone proves the selector's
+# own math, but not that the fix is actually WIRED all the way through the real
+# dispatch call site — a future refactor could stop passing usage_percent through, or
+# stop calling select_pool_and_reserve_with_reuse, and the unit tests above would stay
+# green while the real `review diff` command reverted to the pre-fix behaviour. This
+# drives `mode_review` end-to-end (fake backend, no network/subprocess) with a
+# hard-cooldown board (only Codex's `available()` returns True) and asserts the run
+# that actually DISPATCHED covers 3 distinct roles, not 1.
+
+
+def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_139():
+    from reviewlib.backends import ReviewResult
+    from reviewlib.modes import review as review_mod
+
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+        BoardReviewer("oc:zai/glm-5.2", "quality", "GLM"),
+        BoardReviewer("claude:claude-sonnet-5", "quality", "Sonnet"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    ]
+
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+        return ReviewResult(
+            model=model, command="fake", returncode=0, stdout=f"ok from {model}", stderr=""
+        )
+
+    import reviewlib.panel as panel_mod
+
+    saved_resolve = panel_mod.resolve_backend
+    saved_available = review_mod.backend_available
+    panel_mod.resolve_backend = lambda _m: _fake_backend
+    # Only Codex is reachable — the exact production incident: Opus/Sonnet/Fable/GLM
+    # in session-limit cooldown (a hard `available()` False, not a usage_percent
+    # threshold).
+    review_mod.backend_available = lambda model: model == "codex:gpt-5.6-terra"
+    outcome_sink: list = []
+    try:
+        rc = review_mod.mode_review(
+            [],
+            "Review this diff.",
+            "+x",
+            REPO_ROOT,
+            5,
+            False,
+            board=board,
+            pool_size=3,
+            outcome_sink=outcome_sink,
+            usage_percent=_usage({}),  # opted in, nothing near its limit
+        )
+    finally:
+        panel_mod.resolve_backend = saved_resolve
+        review_mod.backend_available = saved_available
+
+    assert rc == 0, "a fully-padded pool must not be reported as degraded"
+    assert len(outcome_sink) == 1
+    outcome = outcome_sink[0]
+    assert len(outcome.usable) == 3
+    assert set(outcome.usable_models) == {"codex:gpt-5.6-terra"}
+    assert len(set(outcome.usable_roles)) == 3  # 3 distinct roles, not 1
 
 
 if __name__ == "__main__":

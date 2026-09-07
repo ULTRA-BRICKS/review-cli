@@ -50,7 +50,7 @@ from .config import (
     preset_board,
     preset_names,
     preset_pool_size,
-    split_pool_reserve,
+    select_pool_and_reserve_with_reuse,
 )
 from .usage_limits import usage_percent_for_model
 from .pool_guard import (
@@ -4577,9 +4577,9 @@ def _chain_aware_available(model: str) -> bool:
     its `reviewlib.provider_failover` chain is reachable and paid.
 
     This is THE single liveness predicate every pre-dispatch decision about a seat must
-    share — the pool guard, the startup pool/reserve SPLIT (`split_pool_reserve`, both here
-    for the ETA and in `modes.review._mode_review_board` for the REAL dispatch), and the
-    ETA's `planned_pool`. Before this fix the guard alone became chain-aware while the split
+    share — the pool guard, the startup pool/reserve SPLIT (`select_pool_and_reserve_with_reuse`,
+    both here for the ETA and in `modes.review._mode_review_board` for the REAL dispatch), and
+    the ETA's `planned_pool`. Before this fix the guard alone became chain-aware while the split
     stayed on raw `backend_available`, so the guard could approve a pool size the split then
     silently shrank (a two-seat board where one seat's head is down but its failover
     alternate is live: the guard says 'fine, 2 live', the split — still raw — says '1 live',
@@ -4602,11 +4602,17 @@ def _evaluate_pool_or_bail(
     explicit_models: list[str],
     pool_arg: int | None,
     default_pool: int,
+    reuse_eligible: bool = False,
 ) -> int | None:
     """Pre-dispatch foolproofing (reviewlib.pool_guard): when the resolved review selection
     (`user_seats` = (model, name) pairs — a board OR the flat `-m` list) can't converge,
     print a proposal / targeted error and return its exit code; otherwise return None to
-    proceed. Inert under the fake backend (every seat live -> PROCEED)."""
+    proceed. Inert under the fake backend (every seat live -> PROCEED).
+
+    `reuse_eligible` (task-cli#139): pass True ONLY when the real dispatch this call gates
+    will actually use `select_pool_and_reserve_with_reuse` — a role-lensed, non-`-m` board.
+    See `evaluate_selection`'s own docstring for why this relaxes the convergence floor to
+    "at least 1 live model" instead of the distinct-model count."""
     # A config `pool: N` default is a SOFT target (graceful auto-shrink), NOT a hard request:
     # only an EXPLICIT `-m` / `--pool N` sets `explicit=True` so the guard enforces the
     # requested size and proposes when the live subset can't fill it. A bare `review diff`
@@ -4648,6 +4654,7 @@ def _evaluate_pool_or_bail(
         ),
         available=_chain_aware_available,
         reason=_guard_reason,
+        reuse_eligible=reuse_eligible,
     )
     if decision.kind == PROCEED:
         return None
@@ -5559,6 +5566,26 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 explicit_models,
                 args.pool,
                 _config_default_pool(config) or preset_pool_size(active_preset),
+                # Reuse-eligible iff the real dispatch below will actually use
+                # `select_pool_and_reserve_with_reuse` on this board AND that selector
+                # will actually pad it: never for an explicit `-m` board (dispatched
+                # `exact_board`, no reuse — see `usage_percent=None if explicit_models
+                # else _usage_percent` below); only when the board carries role metadata
+                # (a role-less config `models:` roster gains nothing from reuse — same
+                # rule `select_pool_with_reuse` itself applies); and only for a POSITIVE
+                # `effective_pool_size` (codex review finding, task-cli#139 round 3):
+                # `--pool 0`/no-preset means "all reachable seats", and
+                # `select_pool_with_reuse` deliberately does NOT pad for `pool <= 0` (see
+                # its own `n` computation) — relaxing the floor there would let a single
+                # live seat bypass the 2-model convergence floor for a run that ends up
+                # with just that ONE seat/role, zero compensating padding.
+                # `review_pool_size` below is `effective_pool_size` in this exact branch
+                # (not explicit_models), so this mirrors what actually gets passed down.
+                reuse_eligible=(
+                    not explicit_models
+                    and any(r.role for r in board)
+                    and effective_pool_size > 0
+                ),
             )
             if guard_rc is not None:
                 return guard_rc
@@ -5573,11 +5600,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # Chain-aware (`_chain_aware_available`), matching the pool guard above AND the
             # REAL dispatch split in `modes.review._mode_review_board` — a raw
             # `backend_available` here would let the ETA plan a smaller pool than the guard
-            # just approved (codex P1 on review of #157).
-            planned_pool, _ = split_pool_reserve(
+            # just approved (codex P1 on review of #157). Reuse-aware
+            # (`select_pool_and_reserve_with_reuse`, NOT the plain `split_pool_reserve`) —
+            # matching this branch's own `usage_percent=_usage_percent` dispatch below
+            # (task-cli#139 P2, codex review): the real dispatch pads a shrunk/degraded
+            # board by reusing a live seat across the missing roles, and the planned ETA
+            # must reflect that same padded size, not the smaller unpadded one — otherwise
+            # a one-live-seat, `--pool 3` review dispatches 3 padded roles but announces
+            # and keys its ETA as pool=1.
+            planned_pool, _ = select_pool_and_reserve_with_reuse(
                 board,
                 review_pool_size,
                 lambda r: _chain_aware_available(r.model),
+                usage_percent=_usage_percent,
             )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []

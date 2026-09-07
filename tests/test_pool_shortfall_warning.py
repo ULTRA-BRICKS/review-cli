@@ -5,9 +5,11 @@ requested `pool_size`.
 
 WHY this exists: `_mode_review_board`'s pre-dispatch pool selection
 (`select_pool_and_reserve_with_reuse`) silently returns fewer seats than requested when
-enough higher-priority board seats are unavailable and the usage-limit-based reuse
-padding doesn't apply (it only compensates near-usage-limit exclusion, not raw
-unavailability — see `select_pool_with_reuse`'s docstring). Before this notice, that
+enough higher-priority board seats are unavailable and the reuse padding still can't fill
+the gap — e.g. a role-less board (reuse never applies) or a role-lensed board that runs
+out of distinct roles to pad into before reaching the requested size (as of task-cli#139,
+reuse pads for BOTH near-usage-limit exclusion AND raw hard-unavailability — see
+`select_pool_with_reuse`'s docstring). Before this notice, that
 shrink had ZERO visible signal anywhere an agent or human would actually see it: not in
 stdout (what gets pasted into a PR/TG report), and the existing `outcome.degraded`
 stderr warning only covers a DIFFERENT, rarer case (reserve exhausted DURING dispatch,

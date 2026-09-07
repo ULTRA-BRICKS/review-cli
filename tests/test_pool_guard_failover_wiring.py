@@ -19,8 +19,11 @@ Offline: `backends.backend_available` / `backends.runtime_provider_marked_unpaid
 from __future__ import annotations
 
 import io
+import os
+import subprocess
 import sys
-from contextlib import redirect_stderr
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +31,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import reviewlib.backends as backends  # noqa: E402
 from reviewlib import cli  # noqa: E402
+from reviewlib.pool_guard import EXIT_UNSATISFIED  # noqa: E402
 
 
 class _PatchBackends:
@@ -127,6 +131,133 @@ def test_guard_synthesizes_a_reason_when_the_head_reason_is_blank():
     assert (
         "no provider in its failover chain is currently available" in err.getvalue()
     ), err.getvalue()
+
+
+def test_guard_bails_on_one_live_seat_against_the_real_default_board_without_the_fix():
+    """Reproduces task-cli#139's exact CLI-dispatch-level symptom (codex review finding,
+    P1): against the REAL `DEFAULT_BOARD` (many distinct roles) with only 1 seat live and
+    a `--pool 3` request, the guard call `cli._dispatch` actually makes bails — UNLESS its
+    caller passes `reuse_eligible=True`. This is the control: `reuse_eligible` defaults to
+    False, so a caller that forgets to compute/pass it (a future refactor regression)
+    reverts straight back to the pre-fix bail."""
+    from reviewlib.config import DEFAULT_BOARD
+
+    board_seats = tuple((r.model, r.display) for r in DEFAULT_BOARD)
+
+    def _available(model: str) -> bool:
+        return model == "codex:gpt-5.6-terra"
+
+    with _PatchBackends(
+        available=_available, reason=lambda m: f"{m}: session-limit cooldown"
+    ):
+        rc = cli._evaluate_pool_or_bail(
+            config={},
+            config_models=[],
+            config_has_board=True,
+            user_seats=board_seats,
+            explicit_models=[],
+            pool_arg=3,
+            default_pool=4,
+        )
+    assert rc is not None, "expected the pre-fix strict floor to still bail here"
+
+
+def test_guard_proceeds_on_one_live_seat_against_the_real_default_board_with_reuse_eligible():
+    """The fix, at the exact same CLI-dispatch call site: passing `reuse_eligible=True`
+    (what `cli._dispatch`'s board-path branch now computes for a non-`-m`, role-lensed
+    board — `not explicit_models and any(r.role for r in board)`) makes the SAME
+    scenario above PROCEED, so real dispatch reaches `select_pool_and_reserve_with_reuse`
+    and pads Codex across the requested 3 roles instead of exiting 10 first."""
+    from reviewlib.config import DEFAULT_BOARD
+
+    board_seats = tuple((r.model, r.display) for r in DEFAULT_BOARD)
+    assert any(r.role for r in DEFAULT_BOARD), "sanity: DEFAULT_BOARD carries role metadata"
+
+    def _available(model: str) -> bool:
+        return model == "codex:gpt-5.6-terra"
+
+    with _PatchBackends(
+        available=_available, reason=lambda m: f"{m}: session-limit cooldown"
+    ):
+        rc = cli._evaluate_pool_or_bail(
+            config={},
+            config_models=[],
+            config_has_board=True,
+            user_seats=board_seats,
+            explicit_models=[],
+            pool_arg=3,
+            default_pool=4,
+            reuse_eligible=True,
+        )
+    assert rc is None, "guard bailed even with reuse_eligible=True and 1 live seat"
+
+
+def test_pool_zero_with_one_live_seat_still_bails_end_to_end():
+    """Full `cli._dispatch(["diff", "--pool", "0", ...])`, codex review finding (round
+    3): `--pool 0` means "all reachable seats" and `select_pool_with_reuse` deliberately
+    never pads for `pool <= 0` (there's no fixed target to pad TOWARDS). Before this
+    fix, the board-path branch computed `reuse_eligible = not explicit_models and
+    any(r.role for r in board)` with NO check on the effective pool size, so a `--pool 0`
+    run with only 1 live seat wrongly bypassed the 2-model convergence floor for a run
+    that would have ended up with just that one seat under one role — zero compensating
+    padding, a real regression from the reuse fix. This drives the REAL CLI dispatcher
+    end to end (a real git repo + a real staged diff + `REVIEW_FAKE_BACKEND` so a
+    wrongly-proceeding run wouldn't need real credentials to prove the point) and asserts
+    the pre-existing safety floor still bails with EXIT_UNSATISFIED, unchanged from
+    before task-cli#139."""
+    saved_avail = backends.backend_available
+    saved_reason = backends.backend_unavailable_reason
+    saved_cfg = cli.load_config
+    saved_stdin = cli._read_stdin_if_piped
+    saved_env = os.environ.get("REVIEW_FAKE_BACKEND")
+    backends.backend_available = lambda model: model == "seat-a"
+    backends.backend_unavailable_reason = (
+        lambda model: None if model == "seat-a" else f"{model}: session-limit cooldown"
+    )
+    cli.load_config = lambda: {
+        "board": [
+            {"model": "seat-a", "role": "correctness", "name": "A"},
+            {"model": "seat-b", "role": "consistency", "name": "B"},
+            {"model": "seat-c", "role": "quality", "name": "C"},
+        ]
+    }
+    cli._read_stdin_if_piped = lambda: None
+    os.environ["REVIEW_FAKE_BACKEND"] = "1"
+    err = io.StringIO()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "t@t"], cwd=str(repo), check=True
+            )
+            subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+            (repo / "f.txt").write_text("x\n")
+            subprocess.run(["git", "add", "f.txt"], cwd=str(repo), check=True)
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                rc = cli._dispatch(
+                    [
+                        "diff",
+                        "--task",
+                        "TEST-1",
+                        "--staged",
+                        "--pool",
+                        "0",
+                        "-C",
+                        str(repo),
+                    ]
+                )
+    finally:
+        backends.backend_available = saved_avail
+        backends.backend_unavailable_reason = saved_reason
+        cli.load_config = saved_cfg
+        cli._read_stdin_if_piped = saved_stdin
+        if saved_env is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = saved_env
+    assert rc == EXIT_UNSATISFIED, (rc, err.getvalue())
 
 
 def test_chain_aware_available_agrees_with_the_guard_on_a_head_down_alternate_live_seat():

@@ -488,7 +488,19 @@ def _warn_if_board_reused(
     `pool` is a legitimate duplicate-model board, not reuse.
 
     Mirrors the existing failover promotion message (`run_board_with_failover`'s
-    stderr line) so the duplicated dispatch cost is attributable, not silent."""
+    stderr line) so the duplicated dispatch cost is attributable, not silent.
+
+    The parenthetical cause is deliberately GENERIC ("too few distinct models were
+    reachable"), not "...were under their usage limit" (task-cli#139, codex review
+    finding): `select_pool_with_reuse` pads for TWO distinct reasons — a model near its
+    `usage_percent` threshold (the case this message was originally written for) AND, as
+    of task-cli#139, a model that is hard-unavailable altogether (a session-limit
+    cooldown, a missing key/CLI — nothing to do with usage limits). This function has no
+    visibility into WHICH reason applied (that distinction lives in
+    `select_pool_with_reuse`'s internal `under_limit` split, not exposed to callers), so
+    claiming "usage limit" unconditionally was actively misleading for the hard-cooldown
+    case — a report saying "reused because near its usage limit" while every OTHER seat
+    is actually in cooldown, not merely expensive."""
     board_ids = {id(r) for r in board}
     reused_models = [r.model for r in pool if id(r) not in board_ids]
     if not reused_models:
@@ -497,7 +509,7 @@ def _warn_if_board_reused(
     repeated = ", ".join(f"{m} x{n}" for m, n in counts.items())
     print(
         f"[review-cli] board padded — reusing {repeated} across extra roles "
-        "(too few distinct models were under their usage limit)",
+        "(too few distinct models were reachable/under their usage limit)",
         file=sys.stderr,
         flush=True,
     )
@@ -534,10 +546,13 @@ def _report_pool_shortfall(
     not a gap. Only board seats absent from BOTH `pool` and `reserve` (i.e. genuinely
     unreachable per `backend_unavailable_reason`) count as the gap.
 
-    `pool_size` is the RAW requested size. The selector itself (`select_pool_with_reuse`
-    / `split_pool_reserve` in config.py) clamps it against `len(reachable)` -- the LIVE
-    seat count -- via its own `_effective_pool_size` call, which is a TIGHTER clamp than
-    this notice needs: an operator asking for `--pool 8` against a 4-seat board
+    `pool_size` is the RAW requested size. The selector itself clamps it via its own
+    `_effective_pool_size` call: `split_pool_reserve` (and `select_pool_with_reuse` when
+    `usage_percent` is None) against `len(reachable)` -- the LIVE seat count; as of
+    task-cli#139, `select_pool_with_reuse`'s reuse-aware path (a role-lensed board,
+    `usage_percent` given, a positive `pool`) instead clamps against `len(board)` -- the
+    padding loop can fill roles beyond what's merely reachable. Either way this is a
+    TIGHTER clamp than this notice needs: an operator asking for `--pool 8` against a 4-seat board
     legitimately gets a 4-seat live pool with nothing unavailable. Reporting against the
     raw, unclamped `pool_size` in that case prints an arithmetically nonsensical
     "requested 8, only 3 live -- 1 unavailable" (k3 review finding, round 1: 8-3=5
@@ -570,14 +585,21 @@ def _report_pool_shortfall(
     config.py) is technically reachable, so the selector pads the pool back up with a
     duplicate seat instead of leaving a gap -- `len(pool) >= requested` then true, and
     this function returns before ever inspecting that seat, so the near-limit exclusion
-    is invisible here, not merely mislabeled (Fable review finding, round 2). This is
-    strictly the PADDING-SUCCEEDS case (the function never reaches the code below); the
+    is invisible here, not merely mislabeled (Fable review finding, round 2). As of
+    task-cli#139, the SAME limitation equally covers a HARD-unavailable seat that got
+    padded over rather than excluded for being near a usage limit (`select_pool_with_reuse`
+    now reuses a reachable model across roles when other seats are cooldown/down too, not
+    only when they're merely near their usage threshold) — a fully-padded pool silences
+    this notice exactly the same way whether the other seats were near their limit or
+    genuinely unreachable; `_warn_if_board_reused`'s stderr line is the only signal that
+    ANY padding happened at all in either case (codex review finding, task-cli#139). This
+    is strictly the PADDING-SUCCEEDS case (the function never reaches the code below); the
     padding-FAILS case (a role-less or too-few-role board can't pad at all, so `pool`
-    stays short with the near-limit/role-excluded seats sitting healthy in `reserve`) IS
-    handled below -- see the `reserve` line in the printed notice (Codex review finding,
-    PR #278). (3) This notice prints at pre-dispatch time, before whatever produces a
-    "reviewed via X + Y" summary runs -- an agent that only pastes the final summary (not
-    the full terminal output) still misses it."""
+    stays short with the near-limit/unavailable/role-excluded seats sitting healthy in
+    `reserve`) IS handled below -- see the `reserve` line in the printed notice (Codex
+    review finding, PR #278). (3) This notice prints at pre-dispatch time, before whatever
+    produces a "reviewed via X + Y" summary runs -- an agent that only pastes the final
+    summary (not the full terminal output) still misses it."""
     # `_effective_pool_size` (config.py) is the single source of truth for this clamp
     # (its own docstring: "so the two [select_pool + split_pool_reserve] can never
     # drift") -- re-deriving the rule inline here would let a future change to that

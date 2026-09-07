@@ -3,7 +3,34 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## 0.35.11 — 2026-09-07
+## 0.35.12 — 2026-09-07
+
+- **Fix: role-reuse padding now fires for a HARD-unavailable board (session-limit
+  cooldown), not only for a model merely near its usage limit (task-cli#139).**
+  `select_pool_with_reuse` (`reviewlib/config.py`) lets one live model cover multiple
+  board roles when other role-owning seats can't run — built 2026-08-18 so a quorum gate
+  stays satisfiable by role coverage, not raw model count. It worked for the case it was
+  built for (some seats near their `usage_percent` threshold) but silently never fired for
+  the far more common real-world case: seats fully unreachable (cooldown, missing
+  key/CLI). The bug: its target pool size clamped to `len(reachable)` seats, which
+  collapsed to 1 whenever only one seat was reachable, leaving nothing for the
+  role-padding loop to pad. Fixed by sizing the reuse-aware target against the full board
+  instead (`min(pool, len(board))`) whenever `usage_percent` is given and `pool` is a
+  concrete positive request; `usage_percent=None` and `--pool 0` ("all seats") keep the
+  exact prior behaviour. Three more gaps found by review while fixing this, all fixed in
+  the same PR: (1) the CLI's own pre-dispatch pool guard (`reviewlib/pool_guard.py`) was
+  bailing with exit 10 BEFORE dispatch ever reached the fixed selector, so the selector
+  fix alone was unreachable from a real `review diff` run — added a `reuse_eligible` gate
+  (only for a non-`-m`, role-lensed board, and only for a positive effective pool size,
+  since `select_pool_with_reuse` never pads for `--pool 0`); (2) the planned-ETA pool
+  computation used the non-reuse-aware `split_pool_reserve`, so the announced ETA pool
+  size didn't match what actually dispatched — now uses
+  `select_pool_and_reserve_with_reuse`; (3) the "board padded" stderr notice hardcoded
+  "too few distinct models were under their usage limit" as the cause, which is now
+  sometimes false (a hard-cooldown pad has nothing to do with a usage threshold) — reworded
+  generically. Known follow-up (not fixed here, tracked separately): `--show-board`'s
+  preview display still reports the pre-padding pool composition for this scenario, so it
+  can under-report what a real `review diff` would actually dispatch.
 
 - **New default board seat: Grok 4.5 via opencode's native `xai` provider
   (`GROK_SEAT = "oc:xai/grok-4.5"`).** Added as priority-11 in `DEFAULT_BOARD`

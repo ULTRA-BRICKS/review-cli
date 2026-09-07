@@ -800,13 +800,27 @@ def select_pool_with_reuse(
          seat is near its limit) the SINGLE seat with the lowest usage
          percentage (ties broken by board priority) — so the board never goes
          empty just because every seat is somewhat depleted.
-      4. Target size `n` = `_effective_pool_size(len(reachable), pool)` — the
-         same clamp `select_pool` uses, based on RAW reachability (the usage
-         threshold shrinks the MODEL pool, not the requested seat count).
+      4. Target size `n`:
+           - `usage_percent is None` -> `_effective_pool_size(len(reachable),
+             pool)`, IDENTICAL to `select_pool`'s clamp (this function is a
+             byte-identical drop-in for a caller that hasn't opted into
+             reuse at all: zero behaviour change).
+           - `usage_percent` given (a caller that HAS opted in) -> for
+             `pool > 0`, `min(pool, len(board))` — capped by the size of the
+             FULL board (the real ceiling on how many distinct role slots
+             exist to pad into), not by `len(reachable)`. Capping by
+             `len(reachable)` was the task-cli#139 bug: with only 1 reachable
+             seat and a `pool` of 3+, `n` collapsed to 1 before the padding
+             loop in step 6 ever got a slot to fill, so a hard-unavailable
+             board (session-limit cooldown, not merely near a usage
+             threshold) never got padded even though the mechanism exists
+             for exactly this. `pool <= 0` ("all") keeps clamping to
+             `len(reachable)` — "all" has no fixed target size to pad
+             towards, so reuse has nothing to pad here (unaffected: this is
+             the same value the near-usage-limit path already used).
       5. The first `min(n, len(candidates))` slots each keep their OWN role, in
          priority order — IDENTICAL to `select_pool`'s output whenever
-         `len(candidates) >= n` (this function is a drop-in when `usage_percent`
-         is None or nothing is excluded/reused: zero behaviour change).
+         `len(candidates) >= n`.
       6. Any remaining slots (`n - len(candidates)`) are filled by cycling back
          through `candidates`' models, each one taking the NEXT board role not
          yet used by an earlier slot (in board priority order) — so a shrunk
@@ -815,10 +829,15 @@ def select_pool_with_reuse(
     reachable = [r for r in board if available(r)]
     if not reachable:
         return []
-    n = _effective_pool_size(len(reachable), pool)
 
     if usage_percent is None:
+        n = _effective_pool_size(len(reachable), pool)
         return list(reachable[:n])
+
+    # Reuse is opted into (usage_percent given): size `n` against the FULL
+    # board when a concrete pool is requested, not just what's reachable —
+    # see step 4 above (task-cli#139).
+    n = _effective_pool_size(len(board), pool) if pool > 0 else len(reachable)
 
     under_limit = [
         r

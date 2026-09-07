@@ -4,7 +4,11 @@ WHAT: a pre-dispatch guard. When the user narrows the reviewer set with `-m` or 
 with `--pool N` and the LIVE subset can't satisfy that request — or the default board
 itself can't muster a minimum panel — this turns the (previously silent, degenerate) run
 into an ACTIONABLE outcome:
-  * PROCEED     — the selection has enough distinct live models; run unchanged.
+  * PROCEED     — the selection has enough distinct live models; run unchanged. For a
+                  role-lensed board whose dispatch will use role-reuse padding (see
+                  `evaluate_selection`'s `reuse_eligible`), a SINGLE live model is enough
+                  (task-cli#139) — the reuse-aware selector pads it across the requested
+                  roles, reporting any shortfall rather than refusing to run.
   * PROPOSE     — the request can't converge, but at least one fallback (the default board
                   or a preset) CAN. Print those options, each with its FULL model list
                   annotated live/DOWN + per-seat reason, and exit non-zero so the user
@@ -150,6 +154,7 @@ def evaluate_selection(
     reason: Callable[[str], str | None],
     distinct_key: Callable[[str], str] = default_distinct_key,
     min_converge: int = MIN_CONVERGE_MODELS,
+    reuse_eligible: bool = False,
 ) -> PoolDecision:
     """Decide PROCEED / PROPOSE / UNSATISFIED for a resolved review selection.
 
@@ -157,12 +162,35 @@ def evaluate_selection(
     count, or `--pool N`). `explicit` is True when the user narrowed with -m or sized with
     --pool. The default path (explicit=False) only needs the convergence floor.
 
+    `reuse_eligible` (task-cli#139): True when the ACTUAL dispatch this guard is gating
+    will use `select_pool_and_reserve_with_reuse` (a role-lensed board, config/default
+    board path — never a hand-picked `-m` board, which dispatches `exact_board` with no
+    reuse at all; see `reviewlib.cli`'s call site). Role-reuse lets ONE live model cover
+    MULTIPLE board roles (Alex, 2026-08-18 — built specifically so a single surviving
+    seat during a session-limit cooldown can still produce a real N-role review, per
+    Alex's own repeated request that this "just work"). Before this flag existed, the
+    convergence floor below (`>= required` DISTINCT LIVE MODELS) blocked that exact
+    scenario before dispatch ever got a chance to pad: a healthy role-lensed board with
+    only 1 live model (every other seat in cooldown) failed the >=2 (or >= --pool N)
+    floor and never reached the reuse-aware selector at all — the mechanism existed but
+    was unreachable from the real CLI path. With `reuse_eligible=True`, ANY live model
+    (>= 1) is enough to converge: the worst case is the reuse selector padding to fewer
+    than `requested_size` roles (when the board doesn't have enough distinct roles to
+    fill), which is a soft, clearly-reported shortfall (`_report_pool_shortfall`), never
+    a hard failure — strictly better than refusing to run at all. `reuse_eligible=False`
+    keeps the exact prior behaviour (distinct-live-MODEL floor), used for the `-m`
+    exact-board path and any role-less board (config `models:` with no role metadata),
+    where reuse genuinely cannot add distinct lenses (see
+    `select_pool_with_reuse`'s own "role-less board never reuses" rule).
+
     `candidates` may be a ready sequence OR a zero-arg THUNK. It is realized ONLY on the
     non-PROCEED path, so the happy path never builds the fallback boards (which re-resolve
     presets and can re-emit `load_board` stderr warnings for a malformed config board).
     """
     user = _annotate(user_board, available, reason)
     user_live = _distinct_live(user, distinct_key)
+    if reuse_eligible and user_live >= 1:
+        return PoolDecision(PROCEED, 0, "")
     # The convergence floor never exceeds how many distinct seats the board even HAS: a
     # deliberately configured 1-seat board must run its single model, not demand two, and a
     # `--pool N` past the board size clamps (existing behaviour) rather than nagging. So the
