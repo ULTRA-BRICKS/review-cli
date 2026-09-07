@@ -392,7 +392,7 @@ def test_board_flags_and_listing():
         "oc:zai/glm-5.2",
         # Grok — verifies the 11-seat count below is actually seats 1-11 with Grok present,
         # not merely a matching total (review of #166).
-        "oc:xai/grok-4.5",
+        "oc:xai/grok-4.6",
         "contracts",
         "11 seats",
         "#1",
@@ -410,7 +410,7 @@ def test_board_flags_and_listing():
         "source: preset:heavy",
         "codex:gpt-5.6-sol",
         # Grok — same rationale as the default-board needle above.
-        "oc:xai/grok-4.5",
+        "oc:xai/grok-4.6",
         "12 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")

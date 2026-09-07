@@ -13,6 +13,8 @@ __main__ block; backends are stubbed by reassigning panel module globals.
 
 from __future__ import annotations
 
+import io
+import os
 import sys
 from pathlib import Path
 
@@ -211,6 +213,125 @@ def test_run_moderator_accepts_single_string():
         assert res.model == "codex" and res.returncode == 0
     finally:
         restore()
+
+
+def test_cli_moderator_grok_alias_expands_before_pick_moderators():
+    """`--moderator grok` expands to GROK_SEAT before pick_moderators. grok is not
+    an auto-moderator candidate (MODERATOR_CANDIDATES stays opus/codex/gemini)."""
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from reviewlib import cli
+    from reviewlib.config import GROK_SEAT, MODERATOR_CANDIDATES
+    from reviewlib.modes import quorum as quorum_mod
+
+    assert GROK_SEAT not in MODERATOR_CANDIDATES
+    assert "grok" not in MODERATOR_CANDIDATES
+    captured: dict = {}
+
+    def fake_quorum(question, models, diff, cwd, timeout, moderators, *a, **k):
+        captured["moderators"] = list(moderators)
+        return 0
+
+    saved_q = quorum_mod.mode_quorum
+    saved_cfg = cli.load_config
+    saved_stdin = cli._read_stdin_if_piped
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    old_env = os.environ.get("GEMINI_ENV_FILE")
+    try:
+        quorum_mod.mode_quorum = fake_quorum
+        cli.load_config = lambda: {"models": ["codex"]}
+        cli._read_stdin_if_piped = lambda: None
+        os.environ["REVIEW_FAKE_BACKEND"] = "1"
+        os.environ["REVIEW_TASK_CODE"] = "TEST-415"
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            rc = cli.main(
+                [
+                    "quorum",
+                    "q",
+                    "--task",
+                    "TEST-415",
+                    "--moderator",
+                    "grok",
+                    "-m",
+                    "codex",
+                    "-C",
+                    str(REPO_ROOT),
+                ]
+            )
+        assert rc == 0, rc
+        assert captured["moderators"], captured
+        assert captured["moderators"][0] == GROK_SEAT, captured
+    finally:
+        quorum_mod.mode_quorum = saved_q
+        cli.load_config = saved_cfg
+        cli._read_stdin_if_piped = saved_stdin
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+        if old_env is None:
+            os.environ.pop("GEMINI_ENV_FILE", None)
+        else:
+            os.environ["GEMINI_ENV_FILE"] = old_env
+
+
+def test_sessions_resume_moderator_grok_alias_expands():
+    """`review sessions -s … --moderator grok` expands to GROK_SEAT before
+    pick_moderators, same as the quorum/brainstorm flag."""
+    from types import SimpleNamespace
+
+    from reviewlib import cli
+    from reviewlib.config import GROK_SEAT
+    import reviewlib.sessions as sessions
+
+    captured: dict = {}
+    real_pick = cli.pick_moderators
+
+    def fake_pick(explicit, panel):
+        captured["explicit"] = explicit
+        return real_pick(explicit, panel)
+
+    class FakeSess:
+        session_id = "s1"
+        status = "open"
+        completed_rounds = 1
+        topic = "t"
+        panel = ["codex"]
+        moderator = "codex"
+
+    saved_pick = cli.pick_moderators
+    saved_find = sessions.find_session
+    saved_resume = sessions.resume_session
+    saved_cfg = cli.load_config
+    try:
+        cli.pick_moderators = fake_pick
+        cli.load_config = lambda: {}
+        sessions.find_session = lambda _id: FakeSess()
+        sessions.resume_session = lambda *a, **k: 0
+        ns = SimpleNamespace(
+            resume="s1",
+            model=["codex"],
+            moderator="grok",
+            cwd=str(REPO_ROOT),
+            timeout=1,
+            force=False,
+            diff=False,
+            staged=False,
+        )
+        rc = cli._resume_session_cli(ns)
+        assert rc == 0, rc
+        assert captured["explicit"] == GROK_SEAT, captured
+    finally:
+        cli.pick_moderators = saved_pick
+        sessions.find_session = saved_find
+        sessions.resume_session = saved_resume
+        cli.load_config = saved_cfg
 
 
 if __name__ == "__main__":

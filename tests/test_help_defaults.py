@@ -131,6 +131,17 @@ def test_moderator_help_shows_the_autopick_chain():
     assert "codex" in text and "gemini" in text, text
 
 
+def test_config_help_documents_grok46_aliases():
+    """`review help config` names grok/grok46/grok-4.6 -> GROK_SEAT and pins grok45
+    to Grok 4.5, matching MODEL_ALIASES."""
+    text = cli._help_topic_config()
+    assert "grok46" in text, text
+    assert "grok-4.6" in text, text
+    assert "oc:xai/grok-4.6" in text, text
+    assert "grok45" in text, text
+    assert "oc:xai/grok-4.5" in text, text
+
+
 def test_numeric_defaults_are_concrete():
     # --pool / --timeout are global (top-level); --vision-timeout is a visual flag scoped to
     # the subcommands. Assert each shows its concrete numeric default on the right surface.

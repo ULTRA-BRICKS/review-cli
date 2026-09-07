@@ -855,9 +855,10 @@ exception**: its CLI is broken, so the Gemini vision call stays on the REST API 
 model on whatever backend you pick — review never silently uses a text-only model to "verify"
 an image. (For router backends like opencode, that means selecting a vision model explicitly,
 e.g. `oc:<provider>/<vision-model>`.) Visual defaults are separate from the text reviewer
-board: Opus is tried first, then vision-capable fallbacks including GLM vision
-(`oc:zai/glm-4.5v`). If Opus is unavailable at runtime, review skips to the next visual
-backend instead of failing while a fallback exists. Override with `visual_models:` in
+board: Opus is tried first, then GROK_SEAT (`oc:xai/grok-4.6`), then vision-capable
+fallbacks including GLM vision (`oc:zai/glm-4.5v`). If Opus is unavailable at runtime,
+review skips to the next visual backend instead of failing while a fallback exists.
+Override with `visual_models:` in
 config or `-m` on the command. `--no-local-model` disables the local cache pre-classifier (the
 cost-saver) and forces every cvGate pass-through to the paid AI-vision call.
 
@@ -1128,7 +1129,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
 | `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
-| `oc:xai/grok-4.5` / `grok` / `grok45` | cli | Grok 4.5 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-11 seat |
+| `oc:xai/grok-4.6` / `grok` / `grok46` / `grok-4.6` | cli | Grok 4.6 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-11 seat. `grok45` pins `oc:xai/grok-4.5`. |
 | `omp:<provider>/<model>` / `omp` | cli | `omp -p --no-session --tools read,grep,glob --add-dir <repo> @<payloadfile>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
@@ -1300,9 +1301,10 @@ brainstorm_models:
   - fable5
 
 # Visual review uses a separate priority list from the text reviewer board.
-# Opus is tried first; unavailable/unusable vision calls fall through to the next seat.
+# Opus is tried first; GROK_SEAT is next; unavailable/unusable vision calls fall through.
 visual_models:
   - claude:claude-opus-4-8
+  - oc:xai/grok-4.6
   - oc:zai/glm-4.5v
   - oc:commandcode/moonshotai/Kimi-K2.7-Code
   - gemini
@@ -1380,7 +1382,7 @@ on a fully-keyed environment):
 | 8 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
 | 9 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 10 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
-| 11 | reserve | Grok | `oc:xai/grok-4.5` | `security` | injection, authz, secrets, unsafe deserialization, SSRF, path traversal (opencode's native xai provider, oauth-authenticated; agentic, no diff-only REST fallback exists; placed directly before the slow GLM seat so failover reaches it first, review-cli#165) |
+| 11 | reserve | Grok | `oc:xai/grok-4.6` | `security` | injection, authz, secrets, unsafe deserialization, SSRF, path traversal (opencode's native xai provider, oauth-authenticated; agentic, no diff-only REST fallback exists; placed directly before the slow GLM seat so failover reaches it first, review-cli#165/#415) |
 | 12 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
 | 13 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
 
@@ -1653,8 +1655,9 @@ your setup. This only applies pre-first-byte and only to opencode seats today; s
 seat-cooldown section above. Either reap lets reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
 `board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
 
-**Grok board reviewer (agentic, via opencode's native `xai` provider):** `oc:xai/grok-4.5`
-(`GROK_SEAT`) authenticates through opencode's own xai provider config, same as the
+**Grok board reviewer (agentic, via opencode's native `xai` provider):** `oc:xai/grok-4.6`
+(`GROK_SEAT`; aliases `grok` / `grok46` / `grok-4.6`; `grok45` pins `oc:xai/grok-4.5`)
+authenticates through opencode's own xai provider config, same as the
 commandcode/zai seats above — any of: `opencode providers login` (OAuth, the flow verified
 live on this host — `opencode providers list` shows "xAI | oauth"), an inline
 `options.apiKey` in `~/.config/opencode/opencode.json`'s `xai` provider block, or a plain
@@ -1664,10 +1667,12 @@ diff-only REST fallback in review-cli and no bare/colon-form default model -- `-
 (bare, no model) and `-m xai:grok-4.5` (colon-form; opencode wants `provider/model`, not
 `provider:model`) are NOT valid. A bare `-m xai/grok-4.5` (no `oc:` prefix) DOES also reach
 opencode correctly at runtime via the generic catch-all (any unrecognized id still routes
-to opencode for back-compat) -- but only `oc:xai/grok-4.5` is the documented, DEFAULT-safe
+to opencode for back-compat) -- but only `oc:xai/grok-4.6` is the documented, DEFAULT-safe
 seat spelling that `default_routes_live`'s #25 anti-rot guard accepts; the bare form is
 not protected by that guard and isn't what `GROK_SEAT` uses. Same startup-probe/
 graceful-degradation and idle-timeout behavior as the other agentic seats.
+`--moderator grok` expands to GROK_SEAT. The seat is also on the flat `DEFAULT_MODELS`
+panel (just-ask / quorum / brainstorm) and on `VISUAL_MODELS`.
 
 **Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
 subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock

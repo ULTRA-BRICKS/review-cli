@@ -175,7 +175,7 @@ _CLI_BINARY = {
 # so `select_vision_backend` never picks the text default for `--visual` (codex P).
 _VISION_MODEL_HINTS = (
     "vl", "vision", "-v-", "vlm", "pixtral", "llava", "gpt-4o", "gpt-5",
-    "omni", "multimodal", "kimi-k2.7-code", "glm-4.5v", "glm-4.6v",
+    "omni", "multimodal", "kimi-k2.7-code", "glm-4.5v", "glm-4.6v", "grok-4.6",
 )
 
 

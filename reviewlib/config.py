@@ -87,13 +87,14 @@ FABLE_SEAT = "claude:claude-fable-5"
 GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.2"
 
 # Canonical Grok seat — opencode's NATIVE `xai` provider (oauth-authenticated via
-# `opencode providers login`, verified live 2026-07-22: `opencode models` lists
-# `xai/grok-4.5` and `opencode providers list` shows an active xAI oauth credential on
-# this host). Already agentic (`oc:` prefix) — unlike Kimi/GLM-cc/Qwen/DeepSeek, there is
-# no diff-only REST fallback for this seat because xai is not one of the
-# commandcode/z.ai custom gateways `_agentic()` derives from; it is a first-class
-# opencode provider, so the seat is spelled directly.
-GROK_SEAT = "oc:xai/grok-4.5"
+# `opencode providers login`). `opencode models` lists `xai/grok-4.6`. Already
+# agentic (`oc:` prefix) — unlike Kimi/GLM-cc/Qwen/DeepSeek, there is no
+# diff-only REST fallback because xai is not one of the commandcode/z.ai custom
+# gateways `_agentic()` derives from; it is a first-class opencode provider, so
+# the seat is spelled directly. Image→text capable: VISUAL_MODELS includes this
+# id and `_VISION_MODEL_HINTS` matches the `grok-4.6` substring (not a generic
+# `grok`, which would also match grok-3).
+GROK_SEAT = "oc:xai/grok-4.6"
 
 
 def _agentic(seat: str) -> str:
@@ -133,12 +134,13 @@ def _agentic(seat: str) -> str:
 # Code default keeps a self-sufficient panel (incl. opencode). Personal model
 # preferences live in ~/.config/review-cli/config.yaml (keys: models,
 # brainstorm_models) and override this — see load_config().
-DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT)
+DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT, GROK_SEAT)
 # Visual review uses a separate priority list from the text reviewer board. The visual
 # pipeline selects the first reachable vision-capable backend, so a dead/paywalled Opus is
 # skipped automatically and the next vision seat is promoted.
 VISUAL_MODELS = (
     "claude:claude-opus-4-8",
+    GROK_SEAT,
     "oc:zai/glm-4.5v",
     "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     "gemini",
@@ -168,7 +170,10 @@ MODEL_ALIASES = {
     "sonnet": SONNET_SEAT,
     "sonnet5": SONNET_SEAT,
     "grok": GROK_SEAT,
-    "grok45": GROK_SEAT,
+    "grok46": GROK_SEAT,
+    "grok-4.6": GROK_SEAT,
+    # `grok45` is the Grok 4.5 spelling; it does not track GROK_SEAT.
+    "grok45": "oc:xai/grok-4.5",
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -413,7 +418,7 @@ DEFAULT_BOARD = (
     # above DEFAULT_BOARD) — it stays thin until commandcode/gemini are re-enabled or a
     # new paid seat is added.
     BoardReviewer("gemini", "contracts", "Gemini"),
-    # priority 11 — Grok 4.5 via opencode's native `xai` provider (agentic, reads the
+    # priority 11 — Grok 4.6 via opencode's native `xai` provider (agentic, reads the
     # repo). Placed BEFORE the deliberately-slow z.ai GLM reserve below: this seat's own
     # dogfooding review of its addition (`review diff` seat, round 1) flagged that
     # appending it AFTER GLM meant deep mid-run failover always paid GLM's #65

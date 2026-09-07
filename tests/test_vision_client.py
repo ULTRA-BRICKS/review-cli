@@ -261,6 +261,19 @@ def test_opencode_is_vision_capable():
     assert cap.wire == "opencode-cli"
 
 
+def test_grok_seat_is_vision_and_generic_grok_is_not():
+    """GROK_SEAT (grok-4.6) is vision-capable; a generic `grok` hint would also
+    match grok-3, so the allowlist is the `grok-4.6` substring only."""
+    from reviewlib.config import GROK_SEAT
+
+    assert vc._opencode_model_is_vision(GROK_SEAT) is True
+    assert vc._opencode_model_is_vision("oc:xai/grok-4.6") is True
+    assert vc._opencode_model_is_vision("oc:xai/grok-4.5") is False
+    assert vc._opencode_model_is_vision("oc:xai/grok-3") is False
+    assert "grok-4.6" in vc._VISION_MODEL_HINTS
+    assert "grok" not in vc._VISION_MODEL_HINTS
+
+
 # === routing / capability ========================================================
 def test_build_request_routes_to_cli_or_gemini():
     schema = vc.build_output_schema()

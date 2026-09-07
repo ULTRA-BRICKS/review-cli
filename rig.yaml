@@ -7,5 +7,16 @@
 
 version: 1
 
+# Worktree-only guard: primary checkout stays on the default branch for merge/pull/read-only
+# only; all authoring happens in a separate `git worktree add` tree. Adds ONLY worktree_only
+# on top of the global agent_hooks block (~/.config/rig/config.yaml, enabled/all) — does not
+# change what hooks install, just gates worktree-only-writes (pre-write) + pin-primary-worktree
+# (pre-bash). See rig-cli AGENTS.md "Harness workflow guards" and the
+# RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES / RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE hatches for a
+# deliberate one-off bypass. (Alex, 2026-09-07: agents were editing/branching directly in this
+# primary checkout.)
+agent_hooks:
+  worktree_only: true
+
 ci:
   enabled: false

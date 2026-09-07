@@ -715,6 +715,7 @@ def test_cli_resume_splits_saved_moderator_chain_and_accepts_diff_flag():
     import reviewlib.modes.brainstorm as bs
     from reviewlib import cli
     from reviewlib.backends import ReviewResult
+    from reviewlib.config import _expand_alias
 
     d = _fresh_log_dir()
     os.environ["REVIEW_STATS_FILE"] = str(d / "stats.jsonl")
@@ -750,10 +751,11 @@ def test_cli_resume_splits_saved_moderator_chain_and_accepts_diff_flag():
     finally:
         bs.run_panel, bs.run_moderator = old_panel, old_mod
     # The moderator candidates the resume used must NOT contain the raw `>`-joined string
-    # as a single id (it was split).
+    # as a single id (it was split). The first saved token is alias-expanded (`opus` →
+    # `claude:claude-opus-4-8`) so `--moderator grok` / saved `grok` also resolve.
     flat = [m for cands in seen_mod_candidates for m in cands]
     assert "opus>codex>gemini" not in flat, flat
-    assert any("opus" == m for m in flat), flat
+    assert any(m == _expand_alias("opus") for m in flat), flat
 
 
 def test_force_resynthesize_completed_runs_no_new_rounds():

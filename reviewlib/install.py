@@ -156,7 +156,7 @@ tier and availability.
 
 The default repo-capable gateway seats are agentic `oc:` routes, not diff-only REST:
 `oc:commandcode/moonshotai/Kimi-K2.7-Code`, `oc:commandcode/Qwen/Qwen3.7-Max`,
-`oc:commandcode/deepseek/deepseek-v4-pro`, `oc:zai/glm-5.2`, and `oc:xai/grok-4.5` (Grok,
+`oc:commandcode/deepseek/deepseek-v4-pro`, `oc:zai/glm-5.2`, and `oc:xai/grok-4.6` (Grok,
 via opencode's native xai provider — no diff-only REST fallback exists for it). The
 keyed-HTTP `commandcode:` / `zai:` routes remain for explicit `-m cc` / `-m glm` and
 custom config.

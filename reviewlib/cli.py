@@ -831,6 +831,8 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     # the explicit seed; pick_moderators rebuilds the rest of the priority order.
     saved_mod = sess.moderator.split(">")[0].strip() if sess.moderator else ""
     mod_seed = ns.moderator or (saved_mod or None)
+    if mod_seed:
+        mod_seed = _expand_alias(mod_seed)
     moderators = pick_moderators(mod_seed, models)
     timeout = ns.timeout if ns.timeout is not None else PANEL_TIMEOUT_DEFAULT
 
@@ -4115,7 +4117,8 @@ CONFIG FILE
                        `review qa` uses its timeout as a
                        wall-clock QA cost cap.
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
-  `glm` -> zai:glm-5.2, `cc` -> commandcode, `grok`/`grok45` -> oc:xai/grok-4.5).
+  `glm` -> zai:glm-5.2, `cc` -> commandcode, `grok`/`grok46`/`grok-4.6` -> oc:xai/grok-4.6,
+  `grok45` -> oc:xai/grok-4.5).
 
 SELECTION CASCADE, by mode:
   review diff           : explicit -m requested models  >  explicit --preset  >
@@ -5094,7 +5097,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 # pure noise when nothing is going to answer regardless.
                 models = src
         else:
-            models = src
+            # just-ask (visual/qa also fall through here but ignore `models`):
+            # drop unreachable defaults so a missing xAI OAuth seat cannot fail
+            # the all-usable just-ask exit (review-cli#418). No reuse-padding —
+            # identical prompt, no per-seat lens, a duplicate is pure cost (see
+            # the quorum carve-out above). All-unreachable dispatches `src`
+            # unfiltered so a false-negative probe can still recover per-call.
+            if mode.name == "just-ask":
+                reachable = [m for m in src if _chain_aware_available(m)]
+                models = reachable or src
+            else:
+                models = src
 
     visual_mode = args.visual is not None
     if explicit_models:
@@ -5462,6 +5475,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # with no moderator flag -> None -> pick_moderators falls back to the auto-pick chain
     # (harmless: just-ask ignores the resolved moderators anyway).
     moderator_arg = getattr(args, "moderator", None)
+    if moderator_arg:
+        moderator_arg = _expand_alias(moderator_arg)
     moderators = pick_moderators(moderator_arg, models) if panel_mode else []
     ctx = ModeContext(
         args=args,

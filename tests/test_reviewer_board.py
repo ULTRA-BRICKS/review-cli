@@ -116,13 +116,13 @@ def test_default_board_matches_directive_table():
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
-        # Seat 11 — Grok 4.5 via opencode's native `xai` provider, agentic (oauth-
+        # Seat 11 — Grok 4.6 via opencode's native `xai` provider, agentic (oauth-
         # authenticated, no diff-only fallback route exists for this provider). Sits
         # BEFORE the z.ai GLM last-resort seat so deep mid-run failover reaches a fast
         # reserve before paying GLM's #65 pathological-slowness cost. Role `security`
         # (NOT `performance`, which already has a live paid fallback in Terra) — see the
         # seat's own comment in `reviewlib/config.py`.
-        ("oc:xai/grok-4.5", "security", "Grok"),
+        ("oc:xai/grok-4.6", "security", "Grok"),
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
@@ -162,7 +162,7 @@ def test_default_board_is_priority_ordered():
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
-        "oc:xai/grok-4.5",
+        "oc:xai/grok-4.6",
         "oc:zai/glm-5.2",
         "claude:claude-fable-5",
     ]
@@ -202,11 +202,11 @@ def test_glm_commandcode_seat_is_the_canonical_constant():
 
 
 def test_grok_seat_is_the_canonical_constant_and_resolves_to_opencode():
-    """GROK_SEAT is byte-exact "oc:xai/grok-4.5" (review of #166 — pinned so the seat
-    can't silently drift to a different spelling), sits on the board as "Grok", and
-    resolves through review_opencode end-to-end (not the bare/colon xai forms, which are
-    deliberately NOT routed anywhere — see test_bare_and_colon_xai_forms_are_not_routed)."""
-    assert GROK_SEAT == "oc:xai/grok-4.5"
+    """GROK_SEAT is byte-exact "oc:xai/grok-4.6" (pinned so the seat can't silently
+    drift to a different spelling), sits on the board as "Grok", and resolves through
+    review_opencode end-to-end (not the bare/colon xai forms, which are deliberately
+    NOT routed anywhere — see test_bare_and_colon_xai_forms_are_not_routed)."""
+    assert GROK_SEAT == "oc:xai/grok-4.6"
     seat = next(r for r in DEFAULT_BOARD if r.model == GROK_SEAT)
     assert seat.display == "Grok"
     # `security`, not `performance` (review round 1 of #167, Fable): after review-cli#386
@@ -219,11 +219,15 @@ def test_grok_seat_is_the_canonical_constant_and_resolves_to_opencode():
 
 
 def test_grok_aliases_resolve_to_the_canonical_seat():
-    """The "grok"/"grok45" shorthand aliases both expand to GROK_SEAT byte-exact."""
+    """`grok` / `grok46` / `grok-4.6` expand to GROK_SEAT; `grok45` stays pinned to
+    Grok 4.5 and does not track GROK_SEAT."""
     from reviewlib.config import MODEL_ALIASES
 
     assert MODEL_ALIASES["grok"] == GROK_SEAT
-    assert MODEL_ALIASES["grok45"] == GROK_SEAT
+    assert MODEL_ALIASES["grok46"] == GROK_SEAT
+    assert MODEL_ALIASES["grok-4.6"] == GROK_SEAT
+    assert MODEL_ALIASES["grok45"] == "oc:xai/grok-4.5"
+    assert MODEL_ALIASES["grok45"] != GROK_SEAT
 
 
 def test_bare_and_colon_xai_forms_are_not_named_routes():
@@ -245,7 +249,7 @@ def test_bare_and_colon_xai_forms_are_not_named_routes():
     assert backends._match_named_backend("xai") is None
     assert backends._match_named_backend("xai:grok-4.5") is None
     # But the guard still accepts GROK_SEAT as a safe default (agentic-only exception).
-    assert backends.default_routes_live("oc:xai/grok-4.5") is True
+    assert backends.default_routes_live(GROK_SEAT) is True
 
 
 def test_bare_and_colon_xai_forms_still_hit_the_generic_catch_all():
@@ -371,14 +375,24 @@ def test_oc_selector_rejects_whitespace_and_empty_segments():
     CI check and fail at dispatch. Whitespace is rejected outright, never canonicalised
     away; and an EMPTY segment anywhere (interior `deepseek//v4`, trailing `grok-4.5/`)
     is malformed too, not just the one right after the provider."""
-    for selector in (" xai/grok-4.5", "xai /grok-4.5", "xai\t/grok-4.5", "xai/grok-4.5 "):
+    for selector in (
+        " xai/grok-4.5",
+        "xai /grok-4.5",
+        "xai\t/grok-4.5",
+        "xai/grok-4.5 ",
+    ):
         assert backends._oc_selector_is_well_formed(selector, "xai") is False, selector
         assert backends.default_routes_live(f"oc:{selector}") is False, selector
     for selector in ("xai/grok-4.5/", "commandcode/deepseek//v4"):
-        assert backends._oc_selector_is_well_formed(selector, selector.split("/")[0]) is False
+        assert (
+            backends._oc_selector_is_well_formed(selector, selector.split("/")[0])
+            is False
+        )
     assert backends.default_routes_live("oc: xai/grok-4.5") is False
     assert backends.default_routes_live("opencode:xai\t/grok-4.5") is False
-    assert backends.default_routes_live("oc:commandcode/deepseek/deepseek-v4-pro") is True
+    assert (
+        backends.default_routes_live("oc:commandcode/deepseek/deepseek-v4-pro") is True
+    )
 
 
 def test_glm_commandcode_seat_routes_readonly_through_review_commandcode():
@@ -1080,9 +1094,11 @@ def test_direct_claude_cli_effort_adds_prompt_hint():
 
 
 def test_visual_models_have_separate_priority_from_review_board():
-    """Visual review has its own priority list: Opus first, then vision-capable
-    fallbacks, including a GLM vision model rather than the text-only GLM-5.2 seat."""
+    """Visual review has its own priority list: Opus first, then GROK_SEAT, then
+    vision-capable fallbacks, including a GLM vision model rather than the text-only
+    GLM-5.2 seat."""
     assert VISUAL_MODELS[0] == "claude:claude-opus-4-8", VISUAL_MODELS
+    assert VISUAL_MODELS[1] == GROK_SEAT, VISUAL_MODELS
     assert "commandcode:zai-org/GLM-5.2" not in VISUAL_MODELS, VISUAL_MODELS
     assert any(
         "glm-4.5v" in model.lower() or "glm-4.6v" in model.lower()
@@ -1093,6 +1109,7 @@ def test_visual_models_have_separate_priority_from_review_board():
         or "kimi" in model.lower()
         or "glm-4." in model.lower()
         or "opus" in model.lower()
+        or "grok-4.6" in model.lower()
         or model == "gemini"
         for model in VISUAL_MODELS
     ), VISUAL_MODELS
@@ -1170,8 +1187,13 @@ def test_default_models_routes_kimi_through_commandcode():
     applies before dispatch. The flat panel stays diff-only on purpose: it has no
     reserve/failover, so it keeps the key-only route that needs no opencode install (#24)."""
     assert KIMI_SEAT.startswith("commandcode:"), KIMI_SEAT
-    assert DEFAULT_MODELS == ("codex", "gemini", KIMI_SEAT), DEFAULT_MODELS
-    assert _split_models(list(DEFAULT_MODELS)) == ["codex", "gemini", KIMI_SEAT]
+    assert DEFAULT_MODELS == ("codex", "gemini", KIMI_SEAT, GROK_SEAT), DEFAULT_MODELS
+    assert _split_models(list(DEFAULT_MODELS)) == [
+        "codex",
+        "gemini",
+        KIMI_SEAT,
+        GROK_SEAT,
+    ]
 
 
 def test_every_default_model_routes_live():
@@ -1407,7 +1429,7 @@ def test_select_pool_default_picks_first_four_seats():
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
-        "oc:xai/grok-4.5",
+        "oc:xai/grok-4.6",
         "oc:zai/glm-5.2",
         "claude:claude-fable-5",
     ]
@@ -3554,6 +3576,117 @@ def test_cli_list_defaults_explicit_models_win_over_preset():
     finally:
         cli.load_config = old_load_config
     assert out == ["gemini", "codex"], out
+
+
+def _dispatch_just_ask_capturing_models(*, extra_argv=None):
+    """Run `review just-ask` against built-in DEFAULT_MODELS, capturing the
+    panel the handler actually received. Offline: handler + availability
+    stubs, no backend spawn."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+    from reviewlib.modes import just_ask as just_ask_mod
+
+    captured: dict = {}
+
+    def fake_just_ask(question, models, *a, **k):
+        captured["models"] = list(models)
+        return 0
+
+    saved_ask = just_ask_mod.mode_just_ask
+    saved_cfg = cli.load_config
+    saved_stdin = cli._read_stdin_if_piped
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    old_env = os.environ.get("GEMINI_ENV_FILE")
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
+    try:
+        just_ask_mod.mode_just_ask = fake_just_ask
+        cli.load_config = lambda: {}
+        cli._read_stdin_if_piped = lambda: None
+        os.environ["REVIEW_TASK_CODE"] = "TEST-418"
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        argv = ["just-ask", "q", "--task", "TEST-418", "-C", str(REPO_ROOT)]
+        if extra_argv:
+            argv.extend(extra_argv)
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            captured["rc"] = cli.main(argv)
+    finally:
+        just_ask_mod.mode_just_ask = saved_ask
+        cli.load_config = saved_cfg
+        cli._read_stdin_if_piped = saved_stdin
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+        if old_env is None:
+            os.environ.pop("GEMINI_ENV_FILE", None)
+        else:
+            os.environ["GEMINI_ENV_FILE"] = old_env
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
+    return captured
+
+
+def test_just_ask_default_panel_drops_unavailable_grok_seat():
+    """review-cli#418: adding GROK_SEAT to DEFAULT_MODELS must not fail a
+    default `just-ask` on a host without xAI OAuth. Other reachable defaults
+    still dispatch; the all-usable exit stays 0."""
+    from reviewlib.config import _expand_alias
+
+    assert GROK_SEAT in DEFAULT_MODELS
+    live = [_expand_alias(m) for m in DEFAULT_MODELS if m != GROK_SEAT]
+    saved_avail = backends.backend_available
+    saved_unpaid = backends.runtime_provider_marked_unpaid
+    try:
+        backends.backend_available = lambda model: model != GROK_SEAT
+        backends.runtime_provider_marked_unpaid = lambda _m: False
+        cap = _dispatch_just_ask_capturing_models()
+    finally:
+        backends.backend_available = saved_avail
+        backends.runtime_provider_marked_unpaid = saved_unpaid
+    assert cap["rc"] == 0, cap
+    assert cap["models"] == live, cap
+
+
+def test_just_ask_explicit_dash_m_still_dispatches_unavailable_grok():
+    """Explicit `-m grok` is honored as-is even when the probe says down —
+    the operator asked for that seat."""
+    saved_avail = backends.backend_available
+    saved_unpaid = backends.runtime_provider_marked_unpaid
+    try:
+        backends.backend_available = lambda _model: False
+        backends.runtime_provider_marked_unpaid = lambda _m: False
+        cap = _dispatch_just_ask_capturing_models(extra_argv=["-m", "grok"])
+    finally:
+        backends.backend_available = saved_avail
+        backends.runtime_provider_marked_unpaid = saved_unpaid
+    assert cap["rc"] == 0, cap
+    assert cap["models"] == [GROK_SEAT], cap
+
+
+def test_just_ask_all_unreachable_defaults_still_dispatch_src():
+    """If every default probe is down, dispatch the unfiltered src (same as
+    quorum) so a false-negative probe can still recover per-call."""
+    from reviewlib.config import _expand_alias
+
+    saved_avail = backends.backend_available
+    saved_unpaid = backends.runtime_provider_marked_unpaid
+    try:
+        backends.backend_available = lambda _model: False
+        backends.runtime_provider_marked_unpaid = lambda _m: False
+        cap = _dispatch_just_ask_capturing_models()
+    finally:
+        backends.backend_available = saved_avail
+        backends.runtime_provider_marked_unpaid = saved_unpaid
+    assert cap["rc"] == 0, cap
+    assert cap["models"] == [_expand_alias(m) for m in DEFAULT_MODELS], cap
 
 
 if __name__ == "__main__":

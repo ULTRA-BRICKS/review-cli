@@ -3,6 +3,23 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.0 — 2026-09-07
+
+- **GROK_SEAT is Grok 4.6 via opencode's native xAI OAuth (`oc:xai/grok-4.6`).**
+  Aliases `grok` / `grok46` / `grok-4.6` expand to it; `grok45` stays pinned to
+  `oc:xai/grok-4.5`. The seat remains priority-11 on the diff board and is also
+  on `DEFAULT_MODELS` (just-ask / quorum / brainstorm) and `VISUAL_MODELS`
+  (after Opus). Vision matching uses the `grok-4.6` substring, not a generic
+  `grok` (which would also match grok-3). `--moderator grok` alias-expands
+  before `pick_moderators`; grok is not an auto-moderator candidate. Bare/colon
+  `xai` forms remain unnamed routes. Unavailable hosts drop the seat at the
+  probe. (review-cli#415)
+- **just-ask drops unreachable built-in/config defaults** so a missing xAI OAuth
+  (or any other down seat) cannot fail the all-usable exit while other defaults
+  answered. Explicit `-m` is still honored as-is; if every default is down the
+  unfiltered src still dispatches (same all-unreachable fallback as quorum).
+  (review-cli#418)
+
 ## 0.35.12 — 2026-09-07
 
 - **Fix: role-reuse padding now fires for a HARD-unavailable board (session-limit
@@ -31,6 +48,8 @@ semantic versioning.
   generically. Known follow-up (not fixed here, tracked separately): `--show-board`'s
   preview display still reports the pre-padding pool composition for this scenario, so it
   can under-report what a real `review diff` would actually dispatch.
+
+## 0.35.11 — 2026-09-07
 
 - **New default board seat: Grok 4.5 via opencode's native `xai` provider
   (`GROK_SEAT = "oc:xai/grok-4.5"`).** Added as priority-11 in `DEFAULT_BOARD`
