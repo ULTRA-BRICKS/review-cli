@@ -70,6 +70,7 @@ from reviewlib.config import (  # noqa: E402
     _agentic,
     preset_pool_size,
     select_pool,
+    select_pool_and_reserve_with_reuse,
     split_pool_reserve,
 )
 from reviewlib.panel import (  # noqa: E402
@@ -113,9 +114,14 @@ class _FakeBackends:
     thus be made to fail (rc!=0), return empty (""), or return an "unavailable" sentinel
     body. Records every (model, prompt) actually dispatched in `calls`."""
 
-    def __init__(self, behaviour: dict[str, tuple[int, str]] | None = None):
+    def __init__(
+        self,
+        behaviour: dict[str, tuple[int, str]] | None = None,
+        max_calls: int | None = None,
+    ):
         self.behaviour = behaviour or {}
         self.calls: list[tuple[str, str]] = []
+        self.max_calls = max_calls
 
     def __enter__(self):
         self._old = panel.resolve_backend
@@ -123,6 +129,8 @@ class _FakeBackends:
         def _resolve(_model: str):
             def _backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                 self.calls.append((model, prompt))
+                if self.max_calls is not None and len(self.calls) > self.max_calls:
+                    raise RuntimeError(f"failover loop exceeded {self.max_calls} calls")
                 rc, out = self.behaviour.get(model, (0, f"ok {model}"))
                 return ReviewResult(
                     model=model, command="fake", returncode=rc, stdout=out, stderr=""
@@ -691,6 +699,59 @@ def test_unknown_model_falls_through_to_reserve():
     assert "m-pool" not in outcome.usable_models
     assert "m-reserve" in fb.dispatched
     assert "promoting reserve" in buf.getvalue()
+
+
+def test_midrun_failed_role_fallbacks_do_not_reschedule_earlier_attempt():
+    """Grok fail then Qwen fail must not walk back to Grok (infinite loop)."""
+    grok = BoardReviewer(GROK_SEAT, "security", "Grok")
+    qwen = "oc:commandcode/Qwen/Qwen3.7-Max"
+    glm = "zai:glm-5.2"
+    behaviour = {
+        GROK_SEAT: (1, "quota"),
+        qwen: (1, "quota"),
+        glm: (1, "quota"),
+    }
+    with _FakeBackends(behaviour, max_calls=12) as fb:
+        outcome = run_board_with_failover(
+            [grok], [], PROMPT, "+x", REPO_ROOT, 5
+        )
+    grok_hits = [m for m in fb.dispatched if m == GROK_SEAT]
+    assert grok_hits == [GROK_SEAT], fb.dispatched
+    assert fb.dispatched.count(qwen) <= 1, fb.dispatched
+    assert len(fb.dispatched) <= 6, fb.dispatched
+    assert outcome.degraded
+
+
+def test_midrun_role_fallback_drops_model_from_reserve():
+    """Sol fail schedules Astra as consistency fallback; Opus fail must not
+    also pop Astra from reserve."""
+    sol = BoardReviewer(SOL_SEAT, "consistency", "Sol")
+    opus = BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus")
+    astra = BoardReviewer(ASTRA_SEAT, "consistency", "Astra")
+    terra = BoardReviewer(TERRA_SEAT, "performance", "Terra")
+    with _FakeBackends({SOL_SEAT: (1, "x"), "claude:claude-opus-4-8": (1, "y")}) as fb:
+        outcome = run_board_with_failover(
+            [sol, opus], [astra, terra], PROMPT, "+x", REPO_ROOT, 5
+        )
+    assert fb.dispatched.count(ASTRA_SEAT) == 1, fb.dispatched
+    assert ASTRA_SEAT in outcome.usable_models
+    assert TERRA_SEAT in outcome.usable_models or "correctness" in outcome.usable_roles
+
+
+def test_startup_sol_unavailable_reuse_path_keeps_consistency_via_astra():
+    """Real CLI dispatch uses select_pool_and_reserve_with_reuse, not select_pool."""
+    board = list(DEFAULT_BOARD)
+    available = {r.model for r in board if r.model != SOL_SEAT}
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        board, 4, _avail(available)
+    )
+    assert any(r.role == "consistency" and r.model == ASTRA_SEAT for r in pool), [
+        (r.model, r.role) for r in pool
+    ]
+    assert pool[0].role == "consistency", [r.role for r in pool]
+    assert pool[0].model == ASTRA_SEAT
+    assert SOL_SEAT not in {r.model for r in pool}
+    assert ASTRA_SEAT not in {r.model for r in reserve}
 
 
 if __name__ == "__main__":

@@ -1025,10 +1025,10 @@ def select_pool_and_reserve_with_reuse(
     position than a perfectly healthy overflow seat would be promoted to the
     pool FIRST on mid-run failover, defeating the reason it was excluded to
     begin with (Fable review finding, review-cli#205 round 5)."""
-    reachable = [r for r in board if available(r)]
+    reachable = _seats_with_role_fallback(board, available)
     reachable_ids = {id(r) for r in reachable}
     pool_seats = select_pool_with_reuse(
-        board,
+        reachable,
         pool,
         lambda r: id(r) in reachable_ids,
         usage_percent=usage_percent,

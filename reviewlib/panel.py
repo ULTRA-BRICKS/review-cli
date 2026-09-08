@@ -26,7 +26,7 @@ from .backends import (
 )
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 from .process import set_board_deadline, write_retry_log
-from .role_models import next_role_fallback
+from .role_models import bare_model_id, next_role_fallback
 
 # Overall wall-clock BUDGET (seconds, from the start of a board run) that
 # run_board_with_failover clamps its reserve-promotion idle timeouts against via
@@ -564,6 +564,7 @@ def run_board_with_failover(
     usable_models: list[str] = []
     usable_roles: list[str] = []
     reserve_queue = list(reserve)
+    attempted: set[str] = set()
 
     # If REVIEW_BOARD_DEADLINE_SECONDS names an overall wall-clock budget, arm the
     # process-wide deadline for its duration so a reserve promoted late in this run gets
@@ -583,6 +584,9 @@ def run_board_with_failover(
     try:
         current = list(pool)
         while current:
+            for r in current:
+                attempted.add(r.model)
+                attempted.add(bare_model_id(r.model))
             jobs = [build_board_job(r, base_prompt, diff, images) for r in current]
             # In-seat retry FIRST: each seat retries the SAME model on a TRANSIENT failure
             # (429/529/5xx/timeout/overloaded) with backoff+jitter, before we fall to the
@@ -608,12 +612,8 @@ def run_board_with_failover(
                     # This seat failed — count it as a fail and try to backfill it from
                     # the same-role fallback list before the next-priority reserve.
                     _tally_ok(False)
-                    used = set(usable_models)
-                    used.update(r.model for r in current)
+                    used = set(attempted)
                     used.update(r.model for r in next_round)
-                    used.update(
-                        r.model for r in reserve if r not in reserve_queue
-                    )
                     cand = next_role_fallback(reviewer, used_models=used)
                     if cand is not None:
                         print(
@@ -630,6 +630,14 @@ def run_board_with_failover(
                             delay=0.0,
                             result=result,
                         )
+                        attempted.add(cand.model)
+                        attempted.add(bare_model_id(cand.model))
+                        reserve_queue = [
+                            r
+                            for r in reserve_queue
+                            if r.model not in attempted
+                            and bare_model_id(r.model) not in attempted
+                        ]
                         next_round.append(cand)
                     elif reserve_queue:
                         promoted = reserve_queue.pop(0)
