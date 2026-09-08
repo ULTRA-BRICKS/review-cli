@@ -1303,10 +1303,13 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     dispatch failure rate; it sits last-resort in the raw board
                     instead). Other subcommands reject it.
 --pool N            How many of the selected preset/board's seats to run (default
-                    preset-dependent: 4 for default/heavy, 2 for light); the first N seats run,
+                    preset-dependent: 4 for default/heavy, 2 for light; a recorded
+                    `--task` run floors that to 3 so gh ship can pass); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
                     it. N<=0 (e.g. --pool 0) runs all seats in the selected preset/board.
-                    Ignored for explicit -m.
+                    An explicit `--pool N` below 3 with `--task` still wins but warns.
+                    Ignored for exact multi-model -m; `--task -m` one-model pads that model
+                    across 3 roles.
 --effort LEVEL|PROVIDER=LEVEL
                     Run-scoped reasoning effort, overriding each seat's config effort for
                     THIS run. A bare level (minimal/low/medium/high/xhigh/max) applies to
@@ -1578,14 +1581,14 @@ it they fall back to the reserve.
 ```bash
 review --show-board        # active default preset board (light); add --preset heavy to show Sol (Fable excluded)
 export REVIEW_TASK_CODE=HYP-742
-review diff                # default (light) failover pool: the top 2 AVAILABLE seats by priority
+review diff                # recorded `--task` (via REVIEW_TASK_CODE): light floored to 3 roles
 review diff --pool 0       # run all available light-preset seats
 review diff --preset default --pool 0  # run all 11 default-preset built-in seats (Fable/Sol excluded)
 review diff --preset heavy --pool 0  # run all 12 heavy-preset built-in seats (Fable excluded)
-review diff --pool 2       # run the top 2 available seats (with failover)
+review diff --pool 2       # explicit --pool 2 still wins (warns under --task: below ship floor 3)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
-review diff -m codex -m gemini   # exact requested models; narrows config board metadata if present
+review diff -m grok        # with --task: pad grok across 3 roles; without --task / multi -m: exact
 ```
 
 ### Board vs. models precedence
@@ -1606,12 +1609,13 @@ configured `board:`   >   default preset (light)
   `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
   the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 2 for a bare `review diff` — the light preset, Alex 2026-08-28 — or 4 if
-  you pass `--preset default`; `--pool 0` runs all available seats in the
-  selected preset/board; `--preset heavy --pool 0` currently covers all 12 heavy-preset
-  built-ins — Fable is excluded from every preset, see "Reviewer board" above).
-  `--pool` does not reduce an explicit `-m` list:
-  every requested `-m` seat is attempted.
+  pool (default 2 for a bare unrecorded `review diff` — the light preset, Alex 2026-08-28 —
+  or 4 if you pass `--preset default`; a recorded `--task` run floors light to 3 distinct
+  roles so `review task CODE --check` / gh ship can pass from one run; `--pool 0` runs all
+  available seats in the selected preset/board; `--preset heavy --pool 0` currently covers
+  all 12 heavy-preset built-ins — Fable is excluded from every preset, see "Reviewer board"
+  above). `--pool` does not reduce an explicit multi-model `-m` list: every requested `-m`
+  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles.
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   roster — the configured/default board applies.
 

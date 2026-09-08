@@ -29,7 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from reviewlib.config import ASTRA_SEAT, SOL_SEAT  # noqa: E402
+from reviewlib.config import ASTRA_SEAT, GROK_SEAT, SOL_SEAT  # noqa: E402
 from reviewlib.pool_guard import (  # noqa: E402
     EXIT_UNSATISFIED,
     MIN_CONVERGE_MODELS,
@@ -512,6 +512,38 @@ def test_reuse_eligible_false_keeps_the_prior_strict_floor():
         reason=_reason(DOWN_REASONS),
     )
     assert d.kind != PROCEED, d.kind
+
+
+def test_reuse_eligible_lets_one_live_model_fill_a_three_role_request():
+    """A recorded `--task` light/3-role request with one live engine: without
+    reuse_eligible the guard demands 3 distinct engines and bails; with it, one
+    live model proceeds so dispatch can pad (review-cli#309)."""
+    board = [
+        (GROK_SEAT, "Grok"),
+        ("claude:claude-opus-4-8", "Opus"),
+        ("codex:gpt-6-astra", "Astra"),
+    ]
+    live = {GROK_SEAT}
+    blocked = evaluate_selection(
+        user_board=board,
+        requested_size=3,
+        explicit=True,
+        candidates=[],
+        available=_avail(live),
+        reason=_reason({}),
+        reuse_eligible=False,
+    )
+    assert blocked.kind != PROCEED, blocked.kind
+    allowed = evaluate_selection(
+        user_board=board,
+        requested_size=3,
+        explicit=True,
+        candidates=[],
+        available=_avail(live),
+        reason=_reason({}),
+        reuse_eligible=True,
+    )
+    assert allowed.kind == PROCEED, allowed.text
 
 
 if __name__ == "__main__":

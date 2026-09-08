@@ -430,7 +430,11 @@ def test_board_flags_and_listing():
 
 
 def test_failover_pool_listing():
-    board = review_out("--show-board")
+    # Genuinely bare: no --task AND no $REVIEW_TASK_CODE (review-cli#309 floors a
+    # RECORDED --show-board's pool to the ship min_roles floor; the smoke harness's
+    # own env sets REVIEW_TASK_CODE for every OTHER subprocess call, so this one
+    # override is required to actually exercise the un-floored default).
+    board = review_out("--show-board", env={"REVIEW_TASK_CODE": ""})
     assert_in("live pool", board.lower())
     assert_in("reserve", board)
     # Bare --show-board resolves the light preset (Alex, 2026-08-28): pool 2.

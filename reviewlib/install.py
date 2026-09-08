@@ -81,10 +81,11 @@ the internal ceiling, never raise it past 4h.
 Everything is a subcommand: the diff review is `review diff` (NOT a bare `review`). A bare
 `review` prints the help. The other modes: `brainstorm` / `just-ask` / `quorum`.
 ```
-review diff --task CODE -C <repo>                  # review current unstaged diff across the failover pool (top 2 available; --preset default -> 4)
+review diff --task CODE -C <repo>                  # recorded review: light floored to 3 roles so gh ship can pass (--preset default -> 4)
 review diff --task CODE -C <repo> --staged         # review the staged diff (pre-commit)
 review diff --task CODE -C <repo> --pool 0         # run all available seats in the selected preset/board
-review diff --task CODE -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); narrows config board metadata if present
+review diff --task CODE -C <repo> -m grok          # one model: pad grok across 3 distinct roles
+review diff --task CODE -C <repo> -m codex -m gemini    # multi-model: exact requested backends
 review just-ask "Q" --task CODE -C <repo>          # multi-model answer to a question (no diff needed)
 review quorum "Q" --task CODE -C <repo>            # experts answer + a moderator finds consensus/disagreement
 review brainstorm "TOPIC" --task CODE -C <repo>    # iterative persona ideation in a loop, with a moderator
@@ -119,12 +120,15 @@ prints the result to stdout so you see it live. So whenever you want the review 
 a file, reach for `-o file.md`, never `> file.md`.
 
 ## Reviewer board, presets, and `--pool` (priority-ordered failover pool)
-A plain `review diff` runs the **light preset**: pool 2, medium effort, no Fable/Sol.
-Use `--preset default` for a routine change review (pool 4, high effort), and
-`--preset heavy` for release/risky changes (Sol, Opus, GLM-cc, Kimi at highest effort,
-with the remaining board seats as highest-effort reserve). Fable is excluded from
-every preset (a confirmed ~100% dispatch failure rate) and sits last-resort in the raw
-board instead. The built-in reviewer board is
+A plain unrecorded `review diff` runs the **light preset**: pool 2, medium effort, no Fable/Sol.
+A recorded `review diff --task CODE` floors that pool to **3 distinct board roles** so
+`review task CODE --check` / gh ship can pass from one run (re-running light's top-2 never
+accumulates a 3rd role). Explicit `--pool N` still wins (warns if N<3). `-m one-model` with
+`--task` pads that model across 3 roles via `select_pool_with_reuse`. Use `--preset default`
+for a routine change review (pool 4, high effort), and `--preset heavy` for release/risky
+changes (Sol, Opus, GLM-cc, Kimi at highest effort, with the remaining board seats as
+highest-effort reserve). Fable is excluded from every preset (a confirmed ~100% dispatch
+failure rate) and sits last-resort in the raw board instead. The built-in reviewer board is
 a **priority-ordered** panel where each model also gets its own role/lens. The active pool
 is chosen by **priority + availability** with two failovers so the run keeps its requested
 reviewer count: **startup failover** picks the top N AVAILABLE seats by priority (a
@@ -454,7 +458,13 @@ _CODEX_RECURSION_GUARD_MARKER = "review-cli#180"
 # A codex agent invoking any of these AS A COMMAND is, by definition, either the
 # review-cli#180 loop or an equally unwanted nested-agent spawn — never something a
 # read-only code review legitimately needs to do.
-CODEX_RECURSION_GUARD_FORBIDDEN_COMMANDS = ("review", "codex", "claude", "opencode", "omp")
+CODEX_RECURSION_GUARD_FORBIDDEN_COMMANDS = (
+    "review",
+    "codex",
+    "claude",
+    "opencode",
+    "omp",
+)
 
 
 def _codex_recursion_guard_rules() -> str:

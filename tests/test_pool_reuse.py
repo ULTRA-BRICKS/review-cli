@@ -244,7 +244,9 @@ def test_unknown_role_board_never_reuses_task_cli_139():
         BoardReviewer("claude", "typo-c", "Claude"),
     ]
     for r in board:
-        assert r.role_lens == "", "sanity: none of these roles are real REVIEW_ROLES keys"
+        assert r.role_lens == "", (
+            "sanity: none of these roles are real REVIEW_ROLES keys"
+        )
     only_codex = lambda r: r.model == "codex"  # noqa: E731
     result = select_pool_with_reuse(
         board, 3, available=only_codex, usage_percent=_usage({})
@@ -403,7 +405,11 @@ def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_13
 
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         return ReviewResult(
-            model=model, command="fake", returncode=0, stdout=f"ok from {model}", stderr=""
+            model=model,
+            command="fake",
+            returncode=0,
+            stdout=f"ok from {model}",
+            stderr="",
         )
 
     import reviewlib.panel as panel_mod
@@ -439,6 +445,121 @@ def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_13
     assert len(outcome.usable) == 3
     assert set(outcome.usable_models) == {"codex:gpt-5.6-terra"}
     assert len(set(outcome.usable_roles)) == 3  # 3 distinct roles, not 1
+
+
+def test_light_preset_one_reachable_with_ship_pool_covers_three_roles():
+    """Once a recorded `--task` floors light to pool 3, one reachable light-preset
+    seat must cover 3 distinct roles (the #309 ship-gate gap). usage_percent is
+    required: without it, select_pool_with_reuse clamps to len(reachable)=1."""
+    from reviewlib.config import LIGHT_PRESET_BOARD
+
+    board = list(LIGHT_PRESET_BOARD)
+    live = board[0].model
+    result = select_pool_with_reuse(
+        board, 3, available=lambda r: r.model == live, usage_percent=_usage({})
+    )
+    assert len(set(r.role for r in result)) >= 3, [r.role for r in result]
+    assert {r.model for r in result} == {live}
+
+
+def test_one_seat_explicit_model_board_cannot_pad_without_cloned_roles():
+    """board_from_models(['grok']) is 1 seat, so n=min(3, len(board))=1 and
+    reuse has no unused role to pad into — the --task path must clone roles
+    first (ensure_min_distinct_roles). Pins the ceiling that made `-m grok`
+    skip padding even when usage_percent was passed."""
+    from reviewlib.config import GROK_SEAT, board_from_models
+
+    board = board_from_models([GROK_SEAT], {})
+    assert len(board) == 1
+    result = select_pool_with_reuse(board, 3, usage_percent=_usage({}))
+    assert len(result) == 1
+    assert len({r.role for r in result}) <= 1
+
+
+def test_ensure_min_distinct_roles_lets_one_model_pad_to_ship_floor():
+    from reviewlib.config import (
+        GROK_SEAT,
+        SHIP_MIN_ROLES,
+        board_from_models,
+        ensure_min_distinct_roles,
+    )
+
+    board = board_from_models([GROK_SEAT], {})
+    padded = ensure_min_distinct_roles(board, SHIP_MIN_ROLES)
+    assert {r.model for r in padded} == {GROK_SEAT}
+    assert len({r.role for r in padded if r.role}) >= SHIP_MIN_ROLES
+    result = select_pool_with_reuse(padded, SHIP_MIN_ROLES, usage_percent=_usage({}))
+    assert len(set(r.role for r in result)) >= SHIP_MIN_ROLES
+    assert {r.model for r in result} == {GROK_SEAT}
+
+
+def test_ensure_min_distinct_roles_repairs_every_role_less_seat_without_collision():
+    """review-cli#309 round-2 review finding: a single-seat repair that blindly
+    assigns the source's FIRST known role (with no collision check against roles
+    other seats already carry) can duplicate an existing seat's role and waste a
+    pool slot -- pushing a genuinely distinct cloned role past a positional
+    `pool`/`--pool N` slice, so the SLICED pool ends up short of the requested
+    distinct-role floor even though `ensure_min_distinct_roles` returned enough
+    seats overall. Every role-less/unknown-role seat must be repaired onto its
+    own UNUSED role before any clone is appended."""
+    from reviewlib.config import BoardReviewer, ensure_min_distinct_roles
+
+    # Seat 0 is role-less (e.g. a config `models:` entry with no board metadata);
+    # seat 1 already carries "correctness" (e.g. Opus). A naive single-seat repair
+    # would hand seat 0 the source's first known role too -- also "correctness" --
+    # colliding with seat 1 and yielding only 2 distinct roles across 3 seats.
+    board = [
+        BoardReviewer(model="my-custom", role="", display="Custom", effort="high"),
+        BoardReviewer(
+            model="claude:claude-opus-4-8",
+            role="correctness",
+            display="Opus",
+            effort="high",
+        ),
+    ]
+    padded = ensure_min_distinct_roles(board, 3)
+    sliced = padded[:3]
+    distinct = {r.role for r in sliced if r.role}
+    assert len(distinct) == 3, (
+        [(r.model, r.role) for r in sliced],
+        [(r.model, r.role) for r in padded],
+    )
+
+    # Two role-less seats: BOTH must be repaired (not just seat 0).
+    board2 = [
+        BoardReviewer(model="foo", role="", display="Foo", effort="high"),
+        BoardReviewer(model="bar", role="", display="Bar", effort="high"),
+    ]
+    padded2 = ensure_min_distinct_roles(board2, 3)
+    sliced2 = padded2[:3]
+    distinct2 = {r.role for r in sliced2 if r.role}
+    assert len(distinct2) == 3, [(r.model, r.role) for r in padded2]
+    assert padded2[0].role != padded2[1].role, [(r.model, r.role) for r in padded2]
+
+
+def test_ensure_min_distinct_roles_prefix_dedups_duplicate_known_roles():
+    """Two seats sharing `correctness` + min_roles=3: the sliced prefix must
+    still have 3 distinct roles (the duplicate moves behind the prefix)."""
+    from reviewlib.config import BoardReviewer, ensure_min_distinct_roles
+
+    board = [
+        BoardReviewer("codex", "correctness", "A"),
+        BoardReviewer("gemini", "correctness", "B"),
+    ]
+    padded = ensure_min_distinct_roles(board, 3)
+    assert len({r.role for r in padded[:3] if r.role}) == 3, [
+        (r.model, r.role) for r in padded
+    ]
+
+
+def test_recorded_task_pool_size_floors_light_unless_explicit():
+    from reviewlib.config import recorded_task_pool_size
+
+    assert recorded_task_pool_size(2, explicit_pool=False, recorded=False) == 2
+    assert recorded_task_pool_size(2, explicit_pool=False, recorded=True) == 3
+    assert recorded_task_pool_size(1, explicit_pool=True, recorded=True) == 1
+    assert recorded_task_pool_size(0, explicit_pool=False, recorded=True) == 0
+    assert recorded_task_pool_size(4, explicit_pool=False, recorded=True) == 4
 
 
 if __name__ == "__main__":

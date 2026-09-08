@@ -163,25 +163,26 @@ def evaluate_selection(
     --pool. The default path (explicit=False) only needs the convergence floor.
 
     `reuse_eligible` (task-cli#139): True when the ACTUAL dispatch this guard is gating
-    will use `select_pool_and_reserve_with_reuse` (a role-lensed board, config/default
-    board path — never a hand-picked `-m` board, which dispatches `exact_board` with no
-    reuse at all; see `reviewlib.cli`'s call site). Role-reuse lets ONE live model cover
-    MULTIPLE board roles (Alex, 2026-08-18 — built specifically so a single surviving
-    seat during a session-limit cooldown can still produce a real N-role review, per
-    Alex's own repeated request that this "just work"). Before this flag existed, the
-    convergence floor below (`>= required` DISTINCT LIVE MODELS) blocked that exact
-    scenario before dispatch ever got a chance to pad: a healthy role-lensed board with
-    only 1 live model (every other seat in cooldown) failed the >=2 (or >= --pool N)
-    floor and never reached the reuse-aware selector at all — the mechanism existed but
-    was unreachable from the real CLI path. With `reuse_eligible=True`, ANY live model
-    (>= 1) is enough to converge: the worst case is the reuse selector padding to fewer
-    than `requested_size` roles (when the board doesn't have enough distinct roles to
-    fill), which is a soft, clearly-reported shortfall (`_report_pool_shortfall`), never
-    a hard failure — strictly better than refusing to run at all. `reuse_eligible=False`
-    keeps the exact prior behaviour (distinct-live-MODEL floor), used for the `-m`
-    exact-board path and any role-less board (config `models:` with no role metadata),
-    where reuse genuinely cannot add distinct lenses (see
-    `select_pool_with_reuse`'s own "role-less board never reuses" rule).
+    will use `select_pool_and_reserve_with_reuse` (a role-lensed board — the
+    config/default board path, OR a recorded `--task` one-model `-m` pad that clones
+    that model across ship-floor roles; see `reviewlib.cli`'s `task_role_pad`).
+    Exact `-m` boards without that pad still dispatch `exact_board` with no reuse.
+    Role-reuse lets ONE live model cover MULTIPLE board roles (Alex, 2026-08-18 —
+    built specifically so a single surviving seat during a session-limit cooldown can
+    still produce a real N-role review, per Alex's own repeated request that this
+    "just work"). Before this flag existed, the convergence floor below (`>= required`
+    DISTINCT LIVE MODELS) blocked that exact scenario before dispatch ever got a chance
+    to pad: a healthy role-lensed board with only 1 live model (every other seat in
+    cooldown) failed the >=2 (or >= --pool N) floor and never reached the reuse-aware
+    selector at all — the mechanism existed but was unreachable from the real CLI path.
+    With `reuse_eligible=True`, ANY live model (>= 1) is enough to converge: the worst
+    case is the reuse selector padding to fewer than `requested_size` roles (when the
+    board doesn't have enough distinct roles to fill), which is a soft, clearly-reported
+    shortfall (`_report_pool_shortfall`), never a hard failure — strictly better than
+    refusing to run at all. `reuse_eligible=False` keeps the exact prior behaviour
+    (distinct-live-MODEL floor), used for the exact `-m` path and any role-less board
+    (config `models:` with no role metadata), where reuse genuinely cannot add distinct
+    lenses (see `select_pool_with_reuse`'s own "role-less board never reuses" rule).
 
     `candidates` may be a ready sequence OR a zero-arg THUNK. It is realized ONLY on the
     non-PROCEED path, so the happy path never builds the fallback boards (which re-resolve

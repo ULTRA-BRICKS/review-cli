@@ -2138,7 +2138,8 @@ def test_mode_review_exact_board_runs_unavailable_explicit_seat_and_fails():
 
 # === CLI wiring: explicit -m precedence (no --no-board flag exists) ==============
 def test_cli_explicit_models_disable_board():
-    """An explicit -m must run the flat legacy panel (board=None), NOT the board."""
+    """An explicit one-model `-m` WITH `--task` pads that model across ship-floor
+    roles (review-cli#309) rather than a flat exact 1-seat panel."""
     from reviewlib import cli
 
     captured: dict = {}
@@ -2146,6 +2147,8 @@ def test_cli_explicit_models_disable_board():
     def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
         captured["models"] = models
         captured["board"] = board
+        captured["exact_board"] = kw.get("exact_board")
+        captured["pool_size"] = kw.get("pool_size")
         return 0
 
     old = _review_mod.mode_review
@@ -2155,9 +2158,9 @@ def test_cli_explicit_models_disable_board():
     # Avoid touching a real config file / git diff: feed the diff via stdin and
     # point the env file at nothing so no provider key resolves.
     old_stdin = sys.stdin
-    # ROUTING test (explicit -m disables the board), not a pool-assembly test. The piped diff
-    # is non-empty, so on a backend-less host the review-mode pool guard would bail (exit 10)
-    # before the stubbed handler runs; force every seat live via the fake backend seam.
+    # ROUTING test, not a pool-assembly test. The piped diff is non-empty, so on a
+    # backend-less host the review-mode pool guard would bail (exit 10) before the
+    # stubbed handler runs; force every seat live via the fake backend seam.
     old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -2165,9 +2168,11 @@ def test_cli_explicit_models_disable_board():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        # explicit -m codex -> board must be None
         cli.main(["diff", "--task", "TEST-1", "-m", "codex", "-C", str(REPO_ROOT)])
-        assert captured["board"] is None, captured["board"]
+        assert captured["board"] is not None, captured
+        assert {r.model for r in captured["board"]} == {"codex"}, captured
+        assert len({r.role for r in captured["board"] if r.role}) >= 3, captured
+        assert captured["exact_board"] is not True, captured
         assert captured["models"] == ["codex"], captured["models"]
     finally:
         _review_mod.mode_review = old
@@ -2214,9 +2219,16 @@ def test_cli_explicit_models_override_config_models_and_board():
         sys.stdin = io.StringIO("+added line\n")
         cli.main(["diff", "--task", "TEST-1", "-m", "fable5", "-C", str(REPO_ROOT)])
         assert captured["board"] is not None, captured
-        assert [(r.model, r.role, r.display) for r in captured["board"]] == [
-            ("claude:claude-fable-5", "architect", "Fable"),
-        ], captured
+        assert {r.model for r in captured["board"]} == {"claude:claude-fable-5"}, (
+            captured
+        )
+        first = captured["board"][0]
+        assert (first.model, first.role, first.display) == (
+            "claude:claude-fable-5",
+            "architect",
+            "Fable",
+        ), captured
+        assert len({r.role for r in captured["board"] if r.role}) >= 3, captured
         assert captured["models"] == ["claude:claude-fable-5"], captured
     finally:
         _review_mod.mode_review = old_mode
@@ -2394,8 +2406,9 @@ def test_cli_explicit_model_not_in_config_board_is_still_requested():
         sys.stdin = io.StringIO("+added line\n")
         cli.main(["diff", "--task", "TEST-1", "-m", "gemini", "-C", str(REPO_ROOT)])
         assert captured["models"] == ["gemini"], captured
-        assert [r.model for r in captured["board"]] == ["gemini"], captured
-        assert captured["exact_board"] is True, captured
+        assert {r.model for r in captured["board"]} == {"gemini"}, captured
+        assert len({r.role for r in captured["board"] if r.role}) >= 3, captured
+        assert captured["exact_board"] is not True, captured
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
@@ -2434,8 +2447,8 @@ def test_cli_explicit_models_ignore_malformed_config_board():
         sys.stdin = old_stdin
     assert rc == 0
     assert captured["models"] == ["codex"], captured
-    assert [r.model for r in captured["board"]] == ["codex"], captured
-    assert captured["exact_board"] is True, captured
+    assert {r.model for r in captured["board"]} == {"codex"}, captured
+    assert captured["exact_board"] is not True, captured
 
 
 def test_cli_leading_model_option_before_subcommand_is_honored():
@@ -2465,7 +2478,7 @@ def test_cli_leading_model_option_before_subcommand_is_honored():
         sys.stdin = io.StringIO("+added line\n")
         cli.main(["-m", "fable5", "-C", str(REPO_ROOT), "diff", "--task", "TEST-1"])
         assert captured["board"] is not None, captured
-        assert [r.model for r in captured["board"]] == ["claude:claude-fable-5"], (
+        assert {r.model for r in captured["board"]} == {"claude:claude-fable-5"}, (
             captured
         )
         assert captured["models"] == ["claude:claude-fable-5"], captured
@@ -2816,8 +2829,9 @@ def _capture_default_review_board(argv: list[str]) -> dict:
 
 def test_cli_default_path_passes_full_preset_board_and_default_pool():
     """No -m/--preset -> the full LIGHT-preset board is passed into mode_review (reserve
-    incl.) with pool_size = the light preset pool (2). Bare `review diff` defaults to
-    "light" (Alex, 2026-08-28) — "default"/"heavy" are now opt-in via --preset."""
+    incl.). Bare `review diff --task` floors light's pool 2 to 3 so one recorded
+    iteration can satisfy gh ship (review-cli#309). `--show-board` without --task
+    still shows pool 2."""
     captured = _capture_default_review_board(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
     )
@@ -2826,7 +2840,7 @@ def test_cli_default_path_passes_full_preset_board_and_default_pool():
         "full board passed (reserve incl.)"
     )
     assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
-    assert captured["pool_size"] == 2, captured["pool_size"]
+    assert captured["pool_size"] == 3, captured["pool_size"]
 
 
 def test_cli_builtin_default_uses_light_preset_board():
@@ -2835,7 +2849,7 @@ def test_cli_builtin_default_uses_light_preset_board():
     )
     assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
     assert all(r.effort == "medium" for r in captured["board"])
-    assert captured["pool_size"] == 2
+    assert captured["pool_size"] == 3
 
 
 def test_cli_light_and_heavy_presets_set_board_and_default_pool():
@@ -2852,7 +2866,7 @@ def test_cli_light_and_heavy_presets_set_board_and_default_pool():
     )
     assert [r.model for r in light["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
     assert all(r.effort == "medium" for r in light["board"])
-    assert light["pool_size"] == 2
+    assert light["pool_size"] == 3
 
     heavy = _capture_default_review_board(
         [
@@ -2943,24 +2957,23 @@ def test_explicit_pool_flag_overrides_config_pool():
 
 
 def test_explicit_preset_overrides_config_pool():
-    """An explicit `--preset` sizes the pool from the preset, not the config `pool:` key."""
+    """An explicit `--preset` sizes the pool from the preset, then a recorded
+    `--task` floors light's 2 to 3 — still not the config `pool:` key."""
     cap = _capture_review_with_config(
         ["diff", "--task", "TEST-1", "--preset", "light", "-C", str(REPO_ROOT)],
-        {"pool": 3},
+        {"pool": 5},
     )
-    assert cap["pool_size"] == 2, cap[
-        "pool_size"
-    ]  # light preset pool = 2, not config 3
+    assert cap["pool_size"] == 3, cap["pool_size"]
 
 
 def test_invalid_config_pool_falls_back_to_preset_default():
     """A non-positive / non-int config `pool:` is ignored (falls back to the preset —
-    DEFAULT_PRESET is "light", pool 2, since Alex's 2026-08-28 default change)."""
+    DEFAULT_PRESET is "light", then `--task` floors that 2 to 3)."""
     cap = _capture_review_with_config(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)],
         {"pool": 0},  # 0 = "all" is a CLI-only knob; as a config default it's ignored
     )
-    assert cap["pool_size"] == 2, cap["pool_size"]
+    assert cap["pool_size"] == 3, cap["pool_size"]
 
 
 def test_cli_explicit_preset_overrides_config_board():
@@ -3687,6 +3700,626 @@ def test_just_ask_all_unreachable_defaults_still_dispatch_src():
         backends.runtime_provider_marked_unpaid = saved_unpaid
     assert cap["rc"] == 0, cap
     assert cap["models"] == [_expand_alias(m) for m in DEFAULT_MODELS], cap
+
+
+# --- review-cli#309: recorded --task reviews must satisfy the ship min_roles floor ---
+
+
+def _capture_recorded_review_dispatch(argv: list[str]) -> dict:
+    """Run `cli.main(argv)` with empty config, capturing board-path kwargs.
+
+    Offline: every seat is available and mode_review is stubbed so no model is
+    called. Independent of the machine's ~/.config/review-cli/config.yaml.
+    """
+    import io
+
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        **kw,
+    ):
+        captured["models"] = models
+        captured["board"] = board
+        captured["pool_size"] = pool_size
+        captured["exact_board"] = kw.get("exact_board")
+        captured["usage_percent"] = kw.get("usage_percent")
+        return 0
+
+    old_mode = _review_mod.mode_review
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    old_stdin = sys.stdin
+    _review_mod.mode_review = _fake_mode_review
+    cli.load_config = lambda: {}
+    backends.backend_available = lambda _m: True
+    try:
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        sys.stdin = io.StringIO("+added line\n")
+        captured["rc"] = cli.main(argv)
+    finally:
+        _review_mod.mode_review = old_mode
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+        sys.stdin = old_stdin
+    return captured
+
+
+def test_cli_recorded_task_floors_light_pool_to_ship_min_roles():
+    """`--task` + `--preset light` must run pool >= 3 so one recorded iteration
+    can satisfy default `review task CODE --check` / gh ship (min_roles=3).
+    Light without --task stays 2 (see show-board pin below)."""
+    captured = _capture_recorded_review_dispatch(
+        [
+            "diff",
+            "--task",
+            "309",
+            "--preset",
+            "light",
+            "-C",
+            str(REPO_ROOT),
+        ]
+    )
+    assert captured["rc"] == 0, captured
+    assert captured["pool_size"] == 3, captured
+    assert captured["usage_percent"] is not None, captured
+    assert captured.get("exact_board") is not True, captured
+
+
+def test_cli_recorded_task_single_model_pads_across_ship_min_roles():
+    """`-m grok` WITH `--task` must pad that one model across >=3 distinct
+    board roles (select_pool_with_reuse), not dispatch an exact 1-seat board."""
+    captured = _capture_recorded_review_dispatch(
+        ["diff", "--task", "309", "-m", "grok", "-C", str(REPO_ROOT)]
+    )
+    assert captured["rc"] == 0, captured
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} == {GROK_SEAT}, captured
+    roles = [r.role for r in board if r.role]
+    assert len(set(roles)) >= 3, (roles, captured)
+    assert captured["pool_size"] == 3, captured
+    assert captured["exact_board"] is not True, captured
+    assert captured["usage_percent"] is not None, captured
+
+
+def test_cli_recorded_task_explicit_pool_above_floor_wins_over_single_model_pad():
+    """review-cli#309 review finding: an explicit `--pool N` with N >= SHIP_MIN_ROLES
+    combined with a single `-m` model and `--task` must still WIN over the
+    single-model pad's own SHIP_MIN_ROLES target (documented in this diff's own
+    `--help` text: "`--pool N` still wins"). The model is cloned across N
+    distinct roles (task_role_pad's cloning still applies), not silently
+    clamped back down to 3."""
+    captured = _capture_recorded_review_dispatch(
+        ["diff", "--task", "309", "--pool", "5", "-m", "grok", "-C", str(REPO_ROOT)]
+    )
+    assert captured["rc"] == 0, captured
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} == {GROK_SEAT}, captured
+    roles = [r.role for r in board if r.role]
+    assert len(set(roles)) == 5, (roles, captured)
+    assert captured["pool_size"] == 5, captured
+
+
+def test_show_board_light_preset_keeps_pool_two_without_task():
+    """`--show-board` is not a recorded review: light stays pool 2.
+    Isolated from `$REVIEW_TASK_CODE` so a session env cannot floor this pin."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    old_load_config = cli.load_config
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    cli.load_config = lambda: {}
+    os.environ.pop("REVIEW_TASK_CODE", None)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["diff", "--show-board", "--preset", "light"])
+    finally:
+        cli.load_config = old_load_config
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+    assert rc == 0, buf.getvalue()
+    out = buf.getvalue()
+    assert "top 2 AVAILABLE" in out, out
+
+
+def test_show_board_with_task_floors_light_pool_to_three():
+    """`review diff --task CODE --show-board --preset light` must display pool 3."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(
+                [
+                    "diff",
+                    "--task",
+                    "309",
+                    "--show-board",
+                    "--preset",
+                    "light",
+                ]
+            )
+    finally:
+        cli.load_config = old_load_config
+    assert rc == 0, buf.getvalue()
+    out = buf.getvalue()
+    assert "top 3 AVAILABLE" in out, out
+
+
+def test_cli_recorded_task_short_config_roster_pads_to_ship_min_roles():
+    """A 1-2 model config `models:` roster WITH `--task` must clone unused roles
+    so the board has EXACTLY SHIP_MIN_ROLES (3) distinct lenses -- not the
+    unrelated DEFAULT_POOL_SIZE (4) fallback (review-cli#309 review finding:
+    `>= 3` alone did not catch an over-pad to 4, contradicting CHANGELOG's own
+    "pad to 3" claim for this exact case)."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-C", str(REPO_ROOT)],
+        {"models": ["codex", "gemini"]},
+    )
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} <= {"codex", "gemini"}
+    assert len({r.role for r in board if r.role}) == 3, [
+        (r.model, r.role) for r in board
+    ]
+    assert captured["pool_size"] == 3, captured
+
+
+def test_cli_recorded_task_exact_ship_min_roster_stays_at_own_size():
+    """review-cli#309 round-2 review finding: a config `models:` roster with
+    EXACTLY SHIP_MIN_ROLES (3) entries WITH `--task` must stay at pool 3 -- a
+    strict `config_roster_len < SHIP_MIN_ROLES` comparison let `3 < 3` fall
+    through to the unrelated DEFAULT_POOL_SIZE (4) fallback, synthesizing an
+    unnecessary 4th cloned seat (one extra real paid model dispatch) even
+    though the roster already met the ship floor on its own."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-C", str(REPO_ROOT)],
+        {"models": ["codex", "gemini", "claude:claude-opus-4-8"]},
+    )
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} <= {"codex", "gemini", "claude:claude-opus-4-8"}
+    assert len(board) == 3, [(r.model, r.role) for r in board]
+    assert captured["pool_size"] == 3, captured
+
+
+def test_cli_recorded_task_duplicate_role_roster_prefix_has_distinct_roles():
+    """Two config seats sharing one role + `--task` must not ship a pool prefix
+    with only 2 distinct lenses (review-cli#309). Duplicate-role seats move
+    behind a distinct-role prefix."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-C", str(REPO_ROOT)],
+        {
+            "board": [
+                {"model": "codex", "role": "correctness", "name": "A"},
+                {"model": "gemini", "role": "correctness", "name": "B"},
+            ],
+        },
+    )
+    board = captured["board"]
+    n = captured["pool_size"]
+    assert n >= 3, captured
+    prefix = board[:n]
+    assert len({r.role for r in prefix if r.role}) >= 3, [
+        (r.model, r.role) for r in prefix
+    ]
+
+
+def test_cli_recorded_task_full_board_distinct_count_still_pads_duplicate_prefix():
+    """review-cli#309 round-4 review finding: a board with >= SHIP_MIN_ROLES distinct
+    roles OVERALL can still slice to FEWER distinct roles in the pool-sized PREFIX if a
+    duplicate-role seat sits ahead of a distinct one in priority order. Gating the
+    `ensure_min_distinct_roles` call on the full board's distinct-role count (rather
+    than calling it unconditionally, since it is a safe no-op when the prefix is
+    already fine) missed exactly this shape: 4 seats, 3 distinct roles overall
+    (correctness/security/contracts), but seat #2 duplicates seat #1's role, so a
+    naive positional pool-3 slice only covers 2 distinct roles."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "--pool", "3", "-C", str(REPO_ROOT)],
+        {
+            "pool": 3,
+            "board": [
+                {
+                    "model": "claude:claude-opus-4-8",
+                    "role": "correctness",
+                    "name": "Opus",
+                },
+                {
+                    "model": "claude:claude-sonnet-5",
+                    "role": "correctness",
+                    "name": "Sonnet",
+                },
+                {"model": "oc:xai/grok-4.6", "role": "security", "name": "Grok"},
+                {"model": "gemini", "role": "contracts", "name": "Gemini"},
+            ],
+        },
+    )
+    board = captured["board"]
+    n = captured["pool_size"]
+    assert n == 3, captured
+    prefix = board[:n]
+    assert len({r.role for r in prefix if r.role}) == 3, [
+        (r.model, r.role) for r in prefix
+    ]
+
+
+def test_show_board_task_single_model_shows_padded_roles():
+    """`review diff --task CODE -m grok --show-board` describes the same 3-role
+    pad the run would dispatch, not a 1-seat exact board."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    cli.load_config = lambda: {}
+    backends.backend_available = lambda _m: True
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["diff", "--task", "309", "-m", "grok", "--show-board"])
+    finally:
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+    assert rc == 0, buf.getvalue()
+    out = buf.getvalue()
+    assert "[explicit]" not in out, out
+    assert "top 3 AVAILABLE" in out, out
+    pool_lines = [ln for ln in out.splitlines() if "[pool" in ln]
+    assert len(pool_lines) >= 3, out
+
+
+def test_early_task_and_task_code_pool_floor_decisions_always_agree():
+    """review-cli#309 review finding: `early_task` (the pre-`--show-board`
+    pool-floor computation, ~cli.py line 4946) and `task_code` (the real
+    dispatch's `task_role_pad` gate, ~cli.py line 5034) are two independently
+    re-derived `normalize_task_code(getattr(args, "task", None) or
+    os.environ.get("REVIEW_TASK_CODE"))` calls with no mutation of either
+    source in between -- they can never disagree on whether a recorded run
+    pads to the ship floor. Pin that a single-model `-m` + `--task` run
+    reports the SAME pool size whether observed via `--show-board`
+    (early_task path) or the real dispatch (task_code path)."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    cli.load_config = lambda: {}
+    backends.backend_available = lambda _m: True
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["diff", "--task", "309", "-m", "grok", "--show-board"])
+    finally:
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+    assert rc == 0, buf.getvalue()
+    show_board_pool = len([ln for ln in buf.getvalue().splitlines() if "[pool" in ln])
+
+    captured = _capture_recorded_review_dispatch(
+        ["diff", "--task", "309", "-m", "grok", "-C", str(REPO_ROOT)]
+    )
+    assert captured["rc"] == 0, captured
+    assert captured["pool_size"] == show_board_pool, (captured, show_board_pool)
+
+
+def test_show_board_role_less_config_roster_stays_unpadded():
+    """review-cli#309 review finding: `--show-board --task CODE` must NOT
+    display a padded/repaired board for a role-less config `models:` roster --
+    the real dispatch gate only pads a config/default board when it already
+    carries at least one real `role_lens` (`ensure_min_distinct_roles` would
+    otherwise invent roles the user never configured, see
+    test_unknown_role_board_with_one_live_seat_still_bails_end_to_end). A
+    role-less 2-seat roster showing 4 padded seats would mislead an agent
+    planning off `--show-board`'s output about what `review diff --task CODE`
+    actually dispatches."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    cli.load_config = lambda: {
+        "models": ["totally-unknown-model-1", "totally-unknown-model-2"]
+    }
+    backends.backend_available = lambda _m: True
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["diff", "--task", "309", "--show-board"])
+    finally:
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+    assert rc == 0, buf.getvalue()
+    out = buf.getvalue()
+    assert "(2 seats" in out, out
+    assert "2 filled" in out, out
+    pool_lines = [ln for ln in out.splitlines() if "[pool" in ln]
+    assert len(pool_lines) == 2, out
+
+
+def test_cli_recorded_task_multi_model_stays_exact_despite_config_roster_present():
+    """review-cli#309 round-2 review finding: a multi-model explicit `-m` list
+    must stay exact -- never gain extra cloned seats -- even when `--task` is
+    given and a config `models:`/`board:` roster is ALSO present (Fable review
+    finding, round 2: the prior name/docstring here said "short config
+    roster", but the config below has 4 entries -- not short by
+    `short_config_roster`'s own `config_roster_len <= SHIP_MIN_ROLES`
+    definition, and irrelevant anyway since `short_config_roster` never
+    applies once `explicit_models` is non-empty). Only the SINGLE-model `-m`
+    case (`task_role_pad`) is allowed to pad; the multi-model contract
+    ("explicit -m is honored as-is, never adds extra seats") must hold
+    regardless of `--task` or any config roster."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-m", "codex", "-m", "gemini", "-C", str(REPO_ROOT)],
+        {"models": ["codex", "gemini", "opus", "astra"]},
+    )
+    board = captured["board"]
+    assert board, captured
+    assert len(board) == 2, [(r.model, r.role) for r in board]
+    assert {r.model for r in board} == {"codex", "gemini"}, captured
+    assert captured["pool_size"] == 2, captured
+
+
+def test_cli_recorded_task_explicit_pool_one_stays_one_and_warns():
+    """Explicit `--pool 1` WITH `--task` still wins, but must warn that this
+    run cannot satisfy default `review task --check` / gh ship."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_recorded_review_dispatch(
+            [
+                "diff",
+                "--task",
+                "309",
+                "--pool",
+                "1",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
+    assert captured["rc"] == 0, captured
+    assert captured["pool_size"] == 1, captured
+    warning = err.getvalue().lower()
+    assert "pool 1" in warning or "--pool" in warning, err.getvalue()
+    assert "gh ship" in warning or "min_roles" in warning or "ship" in warning, (
+        err.getvalue()
+    )
+
+
+def test_cli_recorded_task_pool_zero_single_model_warns():
+    """review-cli#309 review finding: `--pool 0` ("all seats") with a single
+    `-m` model + `--task` collapses to that ONE model/seat -- genuinely below
+    the ship floor, same as an explicit `--pool 1` -- and must warn, not
+    silently dispatch an unwarned 1-seat run that can never satisfy `review
+    task CODE --check` / gh ship."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_recorded_review_dispatch(
+            ["diff", "--task", "309", "--pool", "0", "-m", "grok", "-C", str(REPO_ROOT)]
+        )
+    assert captured["rc"] == 0, captured
+    assert captured["models"] == [GROK_SEAT], captured
+    warning = err.getvalue().lower()
+    assert "--pool 0" in warning, err.getvalue()
+    assert "gh ship" in warning or "min_roles" in warning or "ship" in warning, (
+        err.getvalue()
+    )
+
+
+def test_cli_recorded_task_pool_zero_two_models_warns():
+    """review-cli#309 round-2 review finding: the `--pool 0` single-model
+    warning above missed a MULTI (but still sub-floor) explicit `-m` list --
+    `--pool 0 -m a -m b --task` also collapses to just those 2 models/seats,
+    below the ship floor, and must warn the same way."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_recorded_review_dispatch(
+            [
+                "diff",
+                "--task",
+                "309",
+                "--pool",
+                "0",
+                "-m",
+                "codex",
+                "-m",
+                "gemini",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
+    assert captured["rc"] == 0, captured
+    assert captured["models"] == ["codex", "gemini"], captured
+    warning = err.getvalue().lower()
+    assert "--pool 0" in warning, err.getvalue()
+    assert "gh ship" in warning or "min_roles" in warning or "ship" in warning, (
+        err.getvalue()
+    )
+
+
+def test_cli_recorded_task_pool_zero_at_floor_models_does_not_warn():
+    """`--pool 0` with exactly SHIP_MIN_ROLES (3) explicit `-m` models already
+    meets the floor on its own and must NOT warn."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_recorded_review_dispatch(
+            [
+                "diff",
+                "--task",
+                "309",
+                "--pool",
+                "0",
+                "-m",
+                "codex",
+                "-m",
+                "gemini",
+                "-m",
+                "grok",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
+    assert captured["rc"] == 0, captured
+    assert "warning" not in err.getvalue().lower(), err.getvalue()
+
+
+def test_cli_recorded_task_pool_zero_short_config_roster_warns():
+    """review-cli#309 round-3 review finding (pre-commit review): the `--pool 0`
+    warning above only covered an explicit `-m` list -- it missed the MIRROR
+    case, a short config `models:`/`board:` roster with NO `-m` at all.
+    `--pool 0` on a 2-model config roster collapses to just those 2 seats,
+    below the ship floor, and must warn the same way."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_review_with_config(
+            ["diff", "--task", "309", "--pool", "0", "-C", str(REPO_ROOT)],
+            {"models": ["codex", "gemini"]},
+        )
+    assert captured.get("board"), captured
+    warning = err.getvalue().lower()
+    assert "--pool 0" in warning, err.getvalue()
+    assert "gh ship" in warning or "min_roles" in warning or "ship" in warning, (
+        err.getvalue()
+    )
+
+
+def test_cli_recorded_task_pool_zero_at_floor_config_roster_does_not_warn():
+    """`--pool 0` with exactly SHIP_MIN_ROLES (3) config `models:` entries (no
+    `-m`) already meets the floor on its own and must NOT warn (regression
+    guard for the short-config-roster `--pool 0` warning above)."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_review_with_config(
+            ["diff", "--task", "309", "--pool", "0", "-C", str(REPO_ROOT)],
+            {"models": ["codex", "gemini", "grok"]},
+        )
+    assert captured.get("board"), captured
+    assert "warning" not in err.getvalue().lower(), err.getvalue()
+
+
+def test_cli_recorded_task_explicit_config_pool_wins_over_short_roster_pad():
+    """review-cli#309 round-2 review finding: an explicit config `pool:` default
+    must win over the short/exact-config-roster pad the same way an explicit
+    CLI `--pool` does -- it already went through `recorded_task_pool_size`'s
+    floor, so the roster-size heuristic (meant only for the no-real-preference
+    DEFAULT_POOL_SIZE fallback) must not clamp it back down to SHIP_MIN_ROLES."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-C", str(REPO_ROOT)],
+        {"models": ["codex", "gemini", "claude:claude-opus-4-8"], "pool": 5},
+    )
+    assert captured["pool_size"] == 5, captured
+
+
+def test_cli_recorded_task_explicit_config_pool_wins_over_single_model_pad():
+    """review-cli#309 round-2 review finding: an explicit config `pool:` default
+    must win over the single-`-m`-model ship-floor pad too -- the model is
+    cloned across the CONFIGURED pool size, not clamped to SHIP_MIN_ROLES."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-m", "grok", "-C", str(REPO_ROOT)],
+        {"pool": 5},
+    )
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} == {GROK_SEAT}, captured
+    roles = [r.role for r in board if r.role]
+    assert len(set(roles)) == 5, (roles, captured)
+    assert captured["pool_size"] == 5, captured
+
+
+def test_cli_recorded_task_sub_floor_config_pool_still_floors_single_model():
+    """review-cli#309 round-2 review finding (Sonnet, pre-commit review): a
+    SUB-floor explicit config `pool:` (below SHIP_MIN_ROLES) combined with a
+    single `-m` model + `--task` must still floor to SHIP_MIN_ROLES -- it
+    goes through `recorded_task_pool_size`'s `max(resolved, SHIP_MIN_ROLES)`
+    before either pad guard runs, so skipping the pad guards (since an
+    explicit config `pool:` is set) does not leave it silently under-floored."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-m", "grok", "-C", str(REPO_ROOT)],
+        {"pool": 1},
+    )
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} == {GROK_SEAT}, captured
+    roles = [r.role for r in board if r.role]
+    assert len(set(roles)) == 3, (roles, captured)
+    assert captured["pool_size"] == 3, captured
+
+
+def test_cli_recorded_task_sub_floor_config_pool_still_floors_short_roster():
+    """review-cli#309 round-2 review finding (Sonnet, pre-commit review): a
+    SUB-floor explicit config `pool:` combined with a short (2-entry) config
+    `models:` roster + `--task` must still floor to SHIP_MIN_ROLES, same
+    reasoning as the single-model case above."""
+    captured = _capture_review_with_config(
+        ["diff", "--task", "309", "-C", str(REPO_ROOT)],
+        {"pool": 1, "models": ["codex", "gemini"]},
+    )
+    board = captured["board"]
+    assert board, captured
+    assert {r.model for r in board} <= {"codex", "gemini"}
+    assert len({r.role for r in board if r.role}) == 3, [
+        (r.model, r.role) for r in board
+    ]
+    assert captured["pool_size"] == 3, captured
+
+
+def test_cli_recorded_task_pool_zero_default_board_does_not_warn():
+    """`--pool 0` ("all seats") on a real multi-seat default/config board has
+    plenty of distinct roles and must NOT emit the single-model-only warning
+    (regression guard for the `--pool 0` single-model warning above)."""
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_recorded_review_dispatch(
+            ["diff", "--task", "309", "--pool", "0", "-C", str(REPO_ROOT)]
+        )
+    assert captured["rc"] == 0, captured
+    assert "warning" not in err.getvalue().lower(), err.getvalue()
 
 
 if __name__ == "__main__":

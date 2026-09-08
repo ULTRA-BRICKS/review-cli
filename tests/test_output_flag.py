@@ -312,6 +312,18 @@ def test_real_review_result_text_lands_in_file():
         panel.resolve_backend = lambda _m: _fake_backend  # type: ignore[assignment]
         review_mod.resolve_backend = lambda _m: _fake_backend  # type: ignore[assignment]
         backends.backend_available = lambda _m: True  # type: ignore[assignment]
+        # review-cli#309: a single explicit `-m codex --task` now pads across ship-floor
+        # roles (task_role_pad), which routes through the reuse-eligible pool guard --
+        # that path's own liveness probe calls `shutil.which("codex")` for the REAL CLI
+        # presence, independent of the `backend_available` mock above. CI has no codex
+        # CLI installed, so without this the padded clones report "codex not found on
+        # PATH" and the pool guard proposes instead of proceeding.
+        import shutil as _shutil  # noqa: PLC0415
+
+        orig_which = _shutil.which
+        _shutil.which = lambda cmd, *a, **kw: (  # type: ignore[assignment]
+            f"/usr/bin/{cmd}" if cmd == "codex" else orig_which(cmd, *a, **kw)
+        )
         try:
             target = Path(d) / "out.md"
             rc, printed = _run_main(
@@ -325,6 +337,7 @@ def test_real_review_result_text_lands_in_file():
             panel.resolve_backend = orig_panel_resolve
             review_mod.resolve_backend = orig_mode_resolve
             backends.backend_available = orig_avail
+            _shutil.which = orig_which
 
 
 def test_output_file_strips_ansi_escapes():

@@ -636,6 +636,15 @@ def test_cli_staged_review_stamp_survives_concurrent_index_mutation():
                             d.name,
                             "-m",
                             "codex",
+                            # review-cli#309: a single explicit `-m` model WITH `--task`
+                            # now pads across ship-floor roles and dispatches them
+                            # concurrently -- the stub `backend()` above does a real
+                            # `git add -A` on this shared temp repo, so 3 parallel
+                            # invocations race on `.git/index.lock`. This test is about
+                            # stamp identity, not role-padding; `--pool 1` keeps the
+                            # single-seat exact dispatch this fixture was built around.
+                            "--pool",
+                            "1",
                         ]
                     )
                 assert rc == 0, rc

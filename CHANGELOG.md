@@ -3,7 +3,77 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## 0.36.4 — 2026-09-08
+## 0.36.6 — 2026-09-08
+
+- **Fix: a recorded `review diff --task CODE` now covers the ship min_roles floor even
+  under `--preset light` and a single `-m` model (review-cli#309).** `review task CODE
+  --check` / gh ship default to 3 distinct board roles. Light is pool 2 and the board is
+  priority-ordered, so re-running `review diff --task CODE --preset light` never
+  accumulated a 3rd role; `-m grok` dispatched an exact 1-seat board and skipped
+  role-padding. Recorded reviews now take `max(resolved pool, 3)` unless `--pool N` is
+  explicit (N<3 still wins but warns that the run cannot satisfy default `--check` /
+  gh ship). Role-padding is on (`usage_percent` passed into
+  `select_pool_and_reserve_with_reuse`). `-m one-model` with `--task` clones that model
+  onto unused board roles and sets `reuse_eligible` so the pool guard does not demand 2
+  engines. A short config `models:`/`board:` roster is padded the same way. Without
+  `--task`, light stays pool 2 and `-m` stays exact. Does not lower
+  `_DEFAULT_QUORUM_FLOOR`, change `DEFAULT_PRESET`, or pad to the full 11-seat board.
+  **Review-finding follow-ups (same PR):** (1) `--show-board`'s display-only pad gate
+  now checks `any(r.role_lens for r in board)` for a config/default board too, matching
+  the real dispatch gate exactly — a role-less config roster no longer shows a padded
+  board for a run that would actually dispatch unpadded. (2) A short config
+  `models:`/`board:` roster (fewer entries than the ship floor) now pads to the
+  ship floor (`SHIP_MIN_ROLES`, 3) instead of over-padding to the unrelated
+  `DEFAULT_POOL_SIZE` fallback (4) — this doc's own "pad to 3" claim above is now
+  actually what happens for that shape; the existing test tightened from `>= 3` to
+  the exact count. (3) A new end-to-end test drives a real `review diff --task CODE
+  -m <model>` dispatch through `review task CODE --check` (not just `quorum_check()`
+  in isolation), proving the role pad actually clears the same gate `gh ship` runs.
+  **Round-2 review-finding follow-ups (same PR):** (4) The short-config-roster pad
+  gate's `config_roster_len < SHIP_MIN_ROLES` comparison was itself off by one: an
+  EXACTLY-3-entry `models:`/`board:` roster (already at the ship floor) still fell
+  through to the unrelated `DEFAULT_POOL_SIZE` (4) fallback, silently cloning an
+  unnecessary 4th seat — one extra real paid model dispatch on every recorded review
+  using a 3-model roster. Fixed to `<= SHIP_MIN_ROLES` so a roster that already meets
+  the floor stays at its own size. (5) `--pool 0` ("all seats") with an explicit `-m`
+  list under the ship floor (a single model, or 2+ models) collapsed to just those
+  model(s)/seat(s) — genuinely below the floor — without the warning an equivalent
+  explicit low `--pool N` already gives; both now warn identically. (6) An explicit
+  config `pool:` default could be silently overridden back down to `SHIP_MIN_ROLES`
+  by the short-roster and single-model pads above (a pre-commit `review diff
+  --staged` finding on this same PR) even when the config value already satisfied
+  the ship floor on its own; both pads now defer to an explicit config `pool:` the
+  same way they already deferred to an explicit CLI `--pool`. (7) Added a regression
+  test pinning that the two independently re-derived task-code normalizations
+  (`early_task` and `task_code`) always agree, and a test asserting `--pool N >=
+  SHIP_MIN_ROLES` still wins over the single-model pad. (8) Added a test asserting
+  `SHIP_MIN_ROLES` stays equal to `reviewlib.stats._DEFAULT_QUORUM_FLOOR`, enforcing
+  the pre-existing "SYNC: keep equal to" comment. (9) Renamed a misleadingly-named
+  test (`..._multi_model_stays_exact_with_short_config_roster`, whose config
+  fixture had 4 entries — not short) to describe what it actually asserts.
+  (10) A second `review diff --staged` pass on the round-2 diff itself confirmed
+  the config-`pool:`-versus-pad interaction is safe for SUB-floor config values too
+  (e.g. `pool: 1` + a single `-m` model still floors to 3 via
+  `recorded_task_pool_size`, which runs before either pad guard) and added
+  regression tests pinning that; renamed `explicit_models_all_seats` to
+  `pool_zero_below_floor_models` (the prior name backwards-described what it
+  checks); and collapsed the two near-duplicate `--pool` warning `print` blocks
+  into one. (11) A third `review diff --staged` pass found the mirror-image gap
+  to (5): `--pool 0` on a short config `models:`/`board:` roster with NO `-m`
+  (e.g. a 2-model config) also collapsed below the floor with no warning — the
+  warning now checks whichever of the explicit `-m` count or the config roster
+  count actually bounds the "all seats" collapse. Also extracted the
+  `args.pool is None and not explicit_preset and _config_default_pool(config)
+  is None` guard (duplicated verbatim at both pad sites — the same
+  duplication-drift pattern that caused the original bug) into one
+  `_no_deliberate_pool_choice()` helper. (Flagged but out of scope for this PR:
+  an explicit multi-model `-m` list — regardless of `--pool` value, pre-dating
+  this PR entirely — takes the flat non-board dispatch path and records no role
+  data, so `review task CODE --check`'s role-based floor is not actually
+  satisfied by model count alone for that path; tracked as a separate
+  follow-up.)
+
+## 0.36.5 — 2026-09-08
 
 - **Fix: opencode/omp backend seats no longer inherit review-cli's own stdin, which
   could hang the seat forever (review-cli#428).** `_run_streamed`'s Popen call passed

@@ -9,7 +9,7 @@ DEFAULT_MODELS panel is untouched.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from pathlib import Path
@@ -524,6 +524,32 @@ EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
 # seat. The board is NEVER disabled — `--pool` only sizes how many seats run. See
 # select_pool() / panel.run_board_with_failover().
 DEFAULT_POOL_SIZE = 4
+
+# SYNC: keep equal to reviewlib.stats._DEFAULT_QUORUM_FLOOR. That is the default
+# min_roles for `review task CODE --check` / gh ship. Lowering it here would make
+# a recorded `review diff --task` run structurally unable to satisfy the ship gate.
+SHIP_MIN_ROLES = 3
+
+
+def recorded_task_pool_size(
+    resolved: int,
+    *,
+    explicit_pool: bool,
+    recorded: bool,
+    min_roles: int = SHIP_MIN_ROLES,
+) -> int:
+    """Pool size for a recorded `review diff --task` run.
+
+    A recorded review must cover at least `min_roles` distinct board roles so one
+    iteration can satisfy default `review task CODE --check` / gh ship. `--preset
+    light` is pool 2; without this floor, re-running light never accumulates a 3rd
+    role (the board is priority-ordered). An explicit `--pool N` still wins,
+    including N < min_roles and N <= 0 ("all seats"). Unrecorded runs keep
+    `resolved` as-is.
+    """
+    if not recorded or explicit_pool or resolved <= 0:
+        return resolved
+    return max(resolved, min_roles)
 
 
 def preset_names() -> tuple[str, ...]:
@@ -1263,6 +1289,61 @@ def board_from_models(
                 )
             )
     return board
+
+
+def ensure_min_distinct_roles(
+    board: list[BoardReviewer],
+    min_roles: int,
+    *,
+    role_source: Sequence[BoardReviewer] | None = None,
+) -> list[BoardReviewer]:
+    """Return a board whose first `min_roles` known-role seats have DISTINCT
+    roles, so a positional `--pool N` / `select_pool_with_reuse` prefix covers
+    the ship floor. Duplicate-role seats are kept AFTER that prefix (reserve).
+    Role-less seats are repaired onto unused source roles. Never grows the
+    distinct-role prefix past `min_roles` (does not pad to the full board).
+    """
+    if not board or min_roles <= 0:
+        return list(board)
+    source = (
+        list(role_source) if role_source is not None else list(DEFAULT_PRESET_BOARD)
+    )
+    out = [replace(r) for r in board]
+    donor = out[0]
+    source_roles = [r.role for r in source if r.role_lens]
+
+    used_now = {s.role for s in out if s.role_lens}
+    repair_idx = 0
+    for i, seat in enumerate(out):
+        if seat.role_lens:
+            continue
+        while repair_idx < len(source_roles) and source_roles[repair_idx] in used_now:
+            repair_idx += 1
+        if repair_idx >= len(source_roles):
+            break
+        new_role = source_roles[repair_idx]
+        repair_idx += 1
+        out[i] = replace(seat, role=new_role)
+        used_now.add(new_role)
+
+    prefix: list[BoardReviewer] = []
+    used: set[str] = set()
+    leftovers: list[BoardReviewer] = []
+    for seat in out:
+        if seat.role_lens and seat.role not in used and len(prefix) < min_roles:
+            prefix.append(seat)
+            used.add(seat.role)
+        else:
+            leftovers.append(seat)
+
+    for role in source_roles:
+        if len(prefix) >= min_roles:
+            break
+        if role in used:
+            continue
+        prefix.append(replace(donor, role=role))
+        used.add(role)
+    return prefix + leftovers
 
 
 def _split_models(raw: list[str]) -> list[str]:

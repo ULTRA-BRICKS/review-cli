@@ -31,6 +31,7 @@ from .config import (
     DEFAULT_PRESET,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
+    SHIP_MIN_ROLES,
     DEFAULT_PROMPT,
     MODERATOR_CANDIDATES,
     PANEL_TIMEOUT_DEFAULT,
@@ -43,6 +44,7 @@ from .config import (
     _split_models,
     apply_effort_override,
     board_from_models,
+    ensure_min_distinct_roles,
     expand_flat_models_with_reuse,
     load_board,
     load_config,
@@ -50,6 +52,7 @@ from .config import (
     preset_board,
     preset_names,
     preset_pool_size,
+    recorded_task_pool_size,
     select_pool_and_reserve_with_reuse,
 )
 from .usage_limits import usage_percent_for_model
@@ -3872,7 +3875,8 @@ def _add_global_options(
             choices=preset_names(),
             default=None,
             help=(
-                "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
+                "diff-review preset: light = quick/cheap preflight (pool 2, medium effort; "
+                "a recorded `--task` run floors that to 3 distinct roles so gh ship can pass); "
                 "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
                 "heavy = release/risky-change review (pool 4, highest effort, excludes "
                 "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
@@ -3888,10 +3892,13 @@ def _add_global_options(
             "how many of the board's seats to run (default "
             f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
             f"for light — a bare `review diff` uses {preset_pool_size(DEFAULT_PRESET)}, the "
-            f"{DEFAULT_PRESET!r} preset's pool; {DEFAULT_POOL_SIZE} is only the fallback for a "
-            "custom config `models:`/`board:` roster with no `pool:` key set); the "
+            f"{DEFAULT_PRESET!r} preset's pool; a recorded `--task` run floors that to "
+            f"{SHIP_MIN_ROLES} so gh ship can pass; {DEFAULT_POOL_SIZE} is only the fallback "
+            "for a custom config `models:`/`board:` roster with no `pool:` key set); the "
             "first N seats participate, the rest are kept in reserve. The board is "
-            "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
+            "never off — --pool only sizes it. N<=0 means all seats. An explicit `--pool N` "
+            "below 3 with `--task` still wins but warns. Ignored for exact multi-model -m; "
+            "a recorded `--task -m` one-model run pads that model across the ship floor."
         ),
     )
     parser.add_argument(
@@ -4210,12 +4217,17 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   A priority-ordered panel of seats, each model carrying its own
   role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
   {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
-  Fable/Sol. Use `--preset default` for a routine change review (pool 4, high effort)
-  or `--preset heavy` for release/risky changes (Sol/Opus/GLM-cc/Kimi at highest effort;
-  Fable is excluded from every preset — a confirmed ~100% dispatch failure rate, see
-  DEFAULT_BOARD's own comment — and sits last-resort in the raw board instead).
-  `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
-  configured metadata when present, else uses the flat exact panel. To set the priority
+  Fable/Sol. A recorded `review diff --task CODE` floors that pool to {SHIP_MIN_ROLES}
+  distinct roles so `review task CODE --check` / gh ship can pass from one run; explicit
+  `--pool N` still wins (warns if N<{SHIP_MIN_ROLES}). `-m one-model` with `--task` pads
+  that model across {SHIP_MIN_ROLES} roles. Use `--preset default` for a routine change
+  review (pool 4, high effort) or `--preset heavy` for release/risky changes
+  (Sol/Opus/GLM-cc/Kimi at highest effort; Fable is excluded from every preset — a
+  confirmed ~100% dispatch failure rate, see DEFAULT_BOARD's own comment — and sits
+  last-resort in the raw board instead). `--pool N` sizes the selected board (`--pool 0`
+  = all available). Explicit -m never lets config add extra seats; it narrows
+  configured metadata when present, else uses the flat exact panel (unless `--task`
+  pads a single model). To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when
   `models:` is absent), set `board:` in config.yaml (a list of {{model, role, name,
   effort}} entries; `name` is the display label, `role` is a key into the built-in role
@@ -4567,6 +4579,20 @@ def _config_default_pool(config: dict) -> int | None:
     return None
 
 
+def _no_deliberate_pool_choice(args, explicit_preset: bool, config: dict) -> bool:
+    """True when nothing -- CLI `--pool`, `--preset`, or a config `pool:` default --
+    expressed a deliberate pool-size preference, so a ship-floor pad heuristic is
+    free to size the pool itself. (review-cli#309 round-3 review finding: this
+    exact condition was duplicated verbatim at the early show-board-facing pad and
+    the later dispatch-side pad -- the same duplication-drift pattern that caused
+    the original off-by-one bug this PR fixes.)"""
+    return (
+        args.pool is None
+        and not explicit_preset
+        and _config_default_pool(config) is None
+    )
+
+
 def _seats_of(board: list) -> tuple[tuple[str, str], ...]:
     """Board seats as (model, display-name) pairs for the pool-selection guard."""
     return tuple((r.model, r.display) for r in board)
@@ -4691,9 +4717,10 @@ def _evaluate_pool_or_bail(
     proceed. Inert under the fake backend (every seat live -> PROCEED).
 
     `reuse_eligible` (task-cli#139): pass True ONLY when the real dispatch this call gates
-    will actually use `select_pool_and_reserve_with_reuse` — a role-lensed, non-`-m` board.
-    See `evaluate_selection`'s own docstring for why this relaxes the convergence floor to
-    "at least 1 live model" instead of the distinct-model count."""
+    will actually use `select_pool_and_reserve_with_reuse` — a role-lensed board, including
+    a recorded `--task` one-model `-m` pad (review-cli#309). See `evaluate_selection`'s
+    own docstring for why this relaxes the convergence floor to "at least 1 live model"
+    instead of the distinct-model count."""
     # A config `pool: N` default is a SOFT target (graceful auto-shrink), NOT a hard request:
     # only an EXPLICIT `-m` / `--pool N` sets `explicit=True` so the guard enforces the
     # requested size and proposes when the live subset can't fill it. A bare `review diff`
@@ -4980,15 +5007,109 @@ def _dispatch(argv: list[str] | None = None) -> int:
         print("\n".join(effective))
         return 0
 
+    # Optional `--task` (or $REVIEW_TASK_CODE) floors the pool BEFORE --show-board
+    # so `review diff --task CODE --show-board --preset light` displays 3, not 2
+    # (review-cli#309). Missing --task is not fatal here — show-board stays light's 2.
+    raw_early_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
+    early_task: str | None = None
+    if raw_early_task:
+        try:
+            early_task = normalize_task_code(raw_early_task)
+        except ValueError:
+            early_task = None
+    if early_task and mode.name == "review":
+        config_roster_len = (
+            len(config_models)
+            if config_models
+            else len(config.get("board") or [])
+            if config_has_board
+            else None
+        )
+        if args.pool is not None:
+            # `--pool 0` (or negative) means "all seats" and is normally fine for a
+            # multi-seat config/default board (plenty of distinct roles either way).
+            # An explicit `-m` list, or a config `models:`/`board:` roster shorter
+            # than the ship floor, has no MORE seats than that list/roster itself --
+            # "all seats" collapses to exactly that count, genuinely below the ship
+            # floor whenever it is fewer than SHIP_MIN_ROLES, same as an explicit
+            # low `--pool N` (round-3 review finding: the explicit-`-m` warning
+            # above missed the mirror-image case, a short config roster with NO
+            # `-m`, e.g. `--pool 0` on a 2-model `models:` config).
+            below_floor_count = (
+                len(explicit_models)
+                if explicit_models
+                else config_roster_len
+                if config_roster_len is not None
+                else None
+            )
+            pool_zero_below_floor = (
+                args.pool <= 0
+                and below_floor_count is not None
+                and below_floor_count < SHIP_MIN_ROLES
+            )
+            if 0 < args.pool < SHIP_MIN_ROLES or pool_zero_below_floor:
+                subject = (
+                    f'--pool {args.pool} ("all seats") with only '
+                    f"{below_floor_count} available model/seat(s)"
+                    if pool_zero_below_floor
+                    else f"--pool {args.pool}"
+                )
+                print(
+                    f"[review-cli] warning: {subject} is below the default ship "
+                    f"floor of {SHIP_MIN_ROLES} distinct board roles; this run "
+                    "cannot satisfy `review task CODE --check` / gh ship.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            effective_pool_size = recorded_task_pool_size(
+                effective_pool_size,
+                explicit_pool=False,
+                recorded=True,
+            )
+        # A config `models:`/`board:` roster that does not EXCEED the ship floor is,
+        # like the single-model `-m` case above, not a real DEFAULT_POOL_SIZE-seat
+        # roster -- `recorded_task_pool_size`'s `max(resolved, SHIP_MIN_ROLES)` never
+        # LOWERS an already-resolved `effective_pool_size` (DEFAULT_POOL_SIZE 4, the
+        # no-preset/no-`pool:`-key fallback that applies here too), so a 1-3 entry
+        # roster was silently padded past its OWN size to 4 (review-cli#309 round-2
+        # review finding: a strict `< SHIP_MIN_ROLES` missed the EXACTLY-3 case --
+        # `3 < 3` is False -- leaving a 3-model roster at pool 4 instead of its own 3).
+        short_config_roster = (
+            not explicit_models
+            and config_roster_len is not None
+            and config_roster_len <= SHIP_MIN_ROLES
+        )
+        if (
+            (len(explicit_models) == 1 or short_config_roster)
+            and _no_deliberate_pool_choice(args, explicit_preset, config)
+            and effective_pool_size > 1
+        ):
+            # One-model `-m`, or a config roster at or below the ship floor, is not a
+            # DEFAULT_POOL_SIZE-seat roster; floor/cap it to SHIP_MIN_ROLES (a no-op
+            # when the roster is already exactly that size).
+            effective_pool_size = SHIP_MIN_ROLES
+
     if args.show_board:
         # Resolve cwd up front so the agentic/diff-only labels reflect whether opencode
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
+        # `len(explicit_models) <= 1` mirrors the dispatch-side `task_role_pad` gate
+        # (review-cli#309 round-3 review finding): a multi-model explicit `-m` list
+        # stays exact on dispatch (never gains cloned seats), so `--show-board` must
+        # not show it padded either -- a padded display for a run that will actually
+        # dispatch exact would mislead an agent planning off `--show-board`'s output.
         return _show_board(
             config,
             effective_pool_size,
             _effective_cwd(args.cwd),
             preset=active_preset,
             explicit_models=explicit_models,
+            pad_task_roles=bool(
+                early_task
+                and mode.name == "review"
+                and len(explicit_models) <= 1
+                and effective_pool_size > 1
+            ),
         )
 
     piped_input = _read_stdin_if_piped()
@@ -5232,11 +5353,28 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `review visual` pipeline (codex P2). It still fires
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
+    # One explicit `-m` model on a recorded review: force the board path so we can
+    # clone that model onto unused roles and reuse-pad to the ship floor
+    # (review-cli#309). Without --task, `-m` stays exact. `--pool 1` keeps exact
+    # (effective_pool_size > 1 is false) and warns above.
+    task_role_pad = (
+        bool(task_code)
+        and mode.name == "review"
+        and len(explicit_models) == 1
+        and effective_pool_size > 1
+    )
+    if task_role_pad and _no_deliberate_pool_choice(args, explicit_preset, config):
+        # Without `--pool`/`--preset`/config `pool:`, a one-model `-m` pad targets
+        # the ship floor, not DEFAULT_POOL_SIZE 4 (the no-preset fallback `-m` never
+        # consumed).
+        effective_pool_size = SHIP_MIN_ROLES
+
     use_board = not panel_mode and (
         not explicit_models
         or bool(config_models)
         or config_has_board
         or active_preset is not None
+        or task_role_pad
     )
     board: list | None = None
     board_validated = False
@@ -5280,6 +5418,42 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # board mode_review consumes carries the effective effort — no double application.
         if board is not None:
             board = apply_effort_override(board, effort_override)
+            # Recorded `--task` reviews with a short roster (explicit `-m` one-model
+            # OR a 1-2 seat config `models:`/`board:`, but NEVER a multi-model
+            # explicit `-m` list -- that stays exact/never gains extra seats, same
+            # contract as every other explicit -m board) need unused roles cloned
+            # on so select_pool_with_reuse can pad to the ship floor (review-cli#309).
+            # Gating this on the FULL board's distinct-role count (`< SHIP_MIN_ROLES`)
+            # was wrong (review-cli#309 round-4 review finding): `select_pool_with_reuse`
+            # slices the first `pool_size` seats POSITIONALLY, so a board that already
+            # has >= SHIP_MIN_ROLES distinct roles OVERALL can still slice to fewer if a
+            # duplicate-role seat sits ahead of a distinct one in priority order --
+            # exactly the case `ensure_min_distinct_roles`'s own prefix-dedup exists to
+            # fix. Call it whenever the other conditions hold: it is a safe no-op (returns
+            # the same seats in the same order) whenever the first `effective_pool_size`
+            # known-role seats are already distinct.
+            #
+            # `task_role_pad` (a single explicit `-m` model) always repairs/pads --
+            # that ONE seat is deliberately cloned across roles regardless of whether it
+            # started with a role, the entire point of the single-model pad. A config/
+            # default board (not `task_role_pad`) only repairs when it ALREADY carries at
+            # least one real `role_lens` -- mirroring the pre-existing `reuse_eligible`
+            # safety gate below: a board whose EVERY role is a typo/unknown REVIEW_ROLES
+            # key is functionally role-less by user intent and must stay that way rather
+            # than have this repair invent real lenses the user never configured
+            # (test_unknown_role_board_with_one_live_seat_still_bails_end_to_end); repair
+            # is for a SHORT roster missing SOME distinct roles, not for recovering an
+            # entirely-role-less/misconfigured one.
+            if (
+                bool(task_code)
+                and mode.name == "review"
+                and effective_pool_size > 1
+                and (
+                    task_role_pad
+                    or (not explicit_models and any(r.role_lens for r in board))
+                )
+            ):
+                board = ensure_min_distinct_roles(board, effective_pool_size)
         return None
 
     # Panel modes are interactive and long-running, so announce each streamed
@@ -5656,16 +5830,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 config_models,
                 config_has_board,
                 _seats_of(board),
-                explicit_models,
-                args.pool,
+                [] if task_role_pad else explicit_models,
+                effective_pool_size if task_role_pad else args.pool,
                 _config_default_pool(config) or preset_pool_size(active_preset),
                 # Reuse-eligible iff the real dispatch below will actually use
                 # `select_pool_and_reserve_with_reuse` on this board AND that selector
-                # will actually pad it: never for an explicit `-m` board (dispatched
-                # `exact_board`, no reuse — see `usage_percent=None if explicit_models
-                # else _usage_percent` below); only when the board carries at least one
-                # seat with a REAL, resolvable `role_lens` (checked via `role_lens`, not
-                # the raw `role` string — codex review finding, task-cli#139: a board
+                # will actually pad it: never for an exact `-m` board (dispatched
+                # `exact_board`, no reuse) EXCEPT a recorded `--task` one-model pad
+                # (review-cli#309: `-m grok --task` clones that model across 3 roles
+                # and must not demand 3 engines); only when the board carries at least
+                # one seat with a REAL, resolvable `role_lens` (checked via `role_lens`,
+                # not the raw `role` string — codex review finding, task-cli#139: a board
                 # whose only non-empty roles are typos/unknown REVIEW_ROLES keys gains
                 # nothing from reuse either, same as a role-less `models:` roster,
                 # because every seat would fall back to the identical generic prompt —
@@ -5677,22 +5852,23 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 # would let a single live seat bypass the 2-model convergence floor for
                 # a run that ends up with just that ONE seat/role, zero compensating
                 # padding. `review_pool_size` below is `effective_pool_size` in this
-                # exact branch (not explicit_models), so this mirrors what actually
+                # exact branch (not exact `-m`), so this mirrors what actually
                 # gets passed down.
                 reuse_eligible=(
-                    not explicit_models
+                    (not explicit_models or task_role_pad)
                     and any(r.role_lens for r in board)
                     and effective_pool_size > 0
                 ),
             )
             if guard_rc is not None:
                 return guard_rc
-        review_pool_size = len(board) if explicit_models else effective_pool_size
+        exact_m = bool(explicit_models) and not task_role_pad
+        review_pool_size = len(board) if exact_m else effective_pool_size
         # Failover pool. The PLANNED pool keys the up-front ETA: the top `--pool`
         # AVAILABLE seats by priority (startup failover — the same selection mode_review
         # makes). The RECORDED models come from the failover outcome (the seats that
         # actually produced verdicts, after any mid-run backfill), via outcome_sink.
-        if explicit_models:
+        if exact_m:
             planned_pool = list(board)
         else:
             # Chain-aware (`_chain_aware_available`), matching the pool guard above AND the
@@ -5718,16 +5894,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
             board=board,
             pool_size=review_pool_size,
             outcome_sink=outcome_sink,
-            exact_board=bool(explicit_models),
-            # None for an explicit -m board (exact_board — usage-limit awareness
+            exact_board=exact_m,
+            # None for an exact `-m` board (exact_board — usage-limit awareness
             # doesn't apply to a hand-picked, non-failover roster) or when a
             # config/default board is priced out entirely — matches this
             # function's own "explicit -m is honored as-is" precedent above.
-            usage_percent=None if explicit_models else _usage_percent,
+            # A recorded `--task` one-model pad opts IN so select_pool_with_reuse
+            # can fill the cloned role slots (review-cli#309).
+            usage_percent=None if exact_m else _usage_percent,
         )
 
         def _ran_models() -> list[str]:
-            if explicit_models:
+            if exact_m:
                 return [r.model for r in board]
             # The BARE model ids that produced verdicts (a backfilled reserve under its
             # real id), so the stat record keys on what actually ran — not labels.
@@ -5738,7 +5916,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # seat (see `panel.FailoverOutcome.usable_roles`) — including a role filled
             # by the shortage-resilience duplicate-model pad (PR #207), which repeats a
             # `.model` string but always carries its OWN distinct `.role`.
-            if explicit_models:
+            if exact_m:
                 return [r.role for r in board]
             return outcome_sink[0].usable_roles if outcome_sink else []
 
@@ -5830,6 +6008,7 @@ def _show_board(
     *,
     preset: str | None = None,
     explicit_models: list[str] | None = None,
+    pad_task_roles: bool = False,
 ) -> int:
     """Print the active reviewer board as a PRIORITY-ordered failover pool.
 
@@ -5884,6 +6063,22 @@ def _show_board(
     avail = [backends.backend_available(r.model) for r in board]
     available_count = sum(avail)
     exact_board = bool(exact_models)
+    # Mirrors the dispatch-side gate (`validate_board`, above): an explicit `-m`
+    # model (`exact_board`) always repairs/pads -- the whole point of the
+    # single-model pad. A config/default board (no explicit -m) only repairs
+    # when it ALREADY carries at least one real `role_lens`; otherwise this
+    # display would show a padded/repaired board for a role-less config that
+    # the ACTUAL dispatch would never pad (review-cli#309 review finding:
+    # `pad_task_roles` was missing this `any(r.role_lens for r in board)` half
+    # of the real gate, so `--show-board --task CODE` could display a
+    # repaired board for a run that dispatches unpadded).
+    if pad_task_roles and (exact_board or any(r.role_lens for r in board)):
+        board = ensure_min_distinct_roles(
+            board, pool_size if pool_size > 0 else SHIP_MIN_ROLES
+        )
+        exact_board = False
+        avail = [backends.backend_available(r.model) for r in board]
+        available_count = sum(avail)
     pool_filled = (
         len(board) if exact_board else _effective_pool_size(available_count, pool_size)
     )

@@ -933,15 +933,18 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
 
 
 def test_cli_default_board_run_records_preset_pool_size():
-    """A default `review` (no -m, no config models) runs the board sized to the default
-    (light, Alex 2026-08-28) preset's pool (2 seats); the run-stats record must report
-    pool_size == 2, NOT the full board (the slice must feed run-stats, not the pre-slice
-    board)."""
-    r = _run_board_review_and_get_record([])  # default preset (light) pool = 2
+    """A default `review --task CODE` (no -m, no config models) runs the board sized to
+    the ship min_roles floor (review-cli#309): the light preset's raw pool is 2, but a
+    recorded run floors that to 3 so `review task CODE --check` / gh ship can pass from
+    one run. The run-stats record must report pool_size == 3 (the sliced board, not the
+    full preset board, and not the un-floored light pool of 2)."""
+    r = _run_board_review_and_get_record(
+        []
+    )  # default preset (light) recorded -> floored to 3
     assert r["mode"] == "review"
-    assert r["pool_size"] == 2, r  # the sliced board, not the full preset
-    assert len(r["models"]) == 2, r
-    assert "[review] pool=2 (review)" in r["_stderr"]
+    assert r["pool_size"] == 3, r  # the sliced, ship-floored board
+    assert len(r["models"]) == 3, r
+    assert "[review] pool=3 (review)" in r["_stderr"]
 
 
 def test_cli_default_board_run_records_roles_review_cli_221():
@@ -950,18 +953,20 @@ def test_cli_default_board_run_records_roles_review_cli_221():
     reading `outcome_sink[0].usable_roles`, had no coverage distinct from the
     `_run_mode_with_stats(roles_after=lambda: ...)` unit-level test).
 
-    Checks role COUNT and VALIDITY, not which specific 2 seats answered: with the
-    light preset's zero-slack pool of 2 (Alex, 2026-08-28), a real seat-selection
+    Checks role COUNT and VALIDITY, not which specific 3 seats answered: with a
+    recorded review's ship-floored pool of 3 (review-cli#309), a real seat-selection
     signal beyond this test's own stubbing (e.g. live usage-limit-aware reuse) can
-    legitimately pick a different pair of seats than raw board order -- see
+    legitimately pick a different trio of seats than raw board order -- see
     tests/test_run_stats.py::test_cli_failover_backfill_records_actual_models_not_planned
     and rig-cli TaskList #80 for the same pre-existing, already-tracked sensitivity."""
     from reviewlib.config import REVIEW_ROLES
 
-    r = _run_board_review_and_get_record([])  # default preset (light) pool = 2
-    assert len(r["roles"]) == 2, r
+    r = _run_board_review_and_get_record(
+        []
+    )  # default preset (light) recorded -> floored to 3
+    assert len(r["roles"]) == 3, r
     assert set(r["roles"]) <= set(REVIEW_ROLES), r
-    assert len(set(r["roles"])) == 2, r  # 2 DISTINCT roles, not the same role twice
+    assert len(set(r["roles"])) == 3, r  # 3 DISTINCT roles, not a repeat
 
 
 def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
@@ -972,9 +977,11 @@ def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
     default-board dispatch produces are valid `REVIEW_ROLES` keys that
     `_distinct_roles` wouldn't silently filter out (a silent no-op on the most
     common path, invisible to the rest of the suite)."""
-    dispatched = _run_board_review_and_get_record([])  # default preset (light) pool = 2
+    dispatched = _run_board_review_and_get_record(
+        []
+    )  # default preset (light) recorded -> floored to 3
     real_roles = dispatched["roles"]
-    assert len(real_roles) == 2, dispatched
+    assert len(real_roles) == 3, dispatched
 
     with _TmpStore():
         _stats.record_run(
@@ -989,7 +996,77 @@ def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
         )
         result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=2)
         assert result["passed"] is True, result
-        assert result["distinct_roles_passed"] == 2
+        assert result["distinct_roles_passed"] == 3
+
+
+def test_cli_single_model_task_pad_satisfies_check_end_to_end_review_cli_309():
+    """review-cli#309: closes the loop between the single-model `-m` TASK_ROLE_PAD
+    dispatch (test_cli_recorded_task_single_model_pads_across_ship_min_roles proves
+    the board SHAPE in isolation) and the REAL gate it exists to satisfy -- a
+    `review diff --task CODE -m <model>` run's recorded roles must actually pass
+    `review task CODE --check` (the same command `gh ship` runs), not just look
+    right in isolation. Runs the genuine CLI dispatch (real record_run, real
+    quorum_check via the `task --check` subcommand, same repo/diff identity
+    context) end-to-end -- no test before this one proved the padding achieves
+    its purpose rather than merely producing a correctly-shaped board/pool."""
+    from reviewlib import backends as _backends
+    from reviewlib.modes import review as _review_mode
+
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend(0))
+        saved_avail_b = _backends.backend_available
+        saved_avail_p = _panel.backend_available
+        saved_avail_r = _review_mode.backend_available
+        _backends.backend_available = lambda _m: True
+        _panel.backend_available = lambda _m: True
+        _review_mode.backend_available = lambda _m: True
+        saved_cfg = _cli.load_config
+        _cli.load_config = lambda: {}
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(log) / "seat-cooldown.json")
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "grok"])
+            assert rc == 0, err.getvalue()
+            recs = store.records()
+            assert len(recs) == 1, recs
+            rec = recs[0]
+            assert rec["pool_size"] == 3, rec  # ship-floored, task_role_pad
+            assert len(set(rec["roles"])) == 3, rec  # 1 model, 3 distinct lenses
+
+            # The gate this padding exists to satisfy, run for REAL (not a direct
+            # quorum_check() call): same repo/diff context (diff-identity binding,
+            # see reviewlib.stats module docstring) as the recording dispatch above.
+            # `--min-iter 1` isolates the distinct-ROLE floor this test targets from
+            # the (unrelated, default 3) passed-ITERATION floor -- a single dispatch
+            # can only ever produce one passed iteration.
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                check_rc = _cli.main(
+                    ["task", TASK, "--check", "--min-iter", "1", "-C", d.name]
+                )
+            assert check_rc == 0, out.getvalue()
+            payload = out.getvalue()
+            # Must pass on DISTINCT-ROLE grounds -- a single model could never
+            # satisfy a >=2 distinct-MODEL floor, so a pass here that silently fell
+            # back to model-counting would prove nothing about the role pad.
+            assert "role" in payload.lower(), payload
+        finally:
+            restore()
+            _backends.backend_available = saved_avail_b
+            _panel.backend_available = saved_avail_p
+            _review_mode.backend_available = saved_avail_r
+            _cli.load_config = saved_cfg
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+            d.cleanup()
 
 
 def test_cli_board_run_records_explicit_pool_size():
@@ -6247,6 +6324,21 @@ def test_cli_check_json_near_miss_fields_mismatched_review_cli_431():
         assert payload["excluded_mismatched_iterations"] == 1
         assert payload["near_miss_counted"] is False
         assert payload["near_miss_ever_passed"] is True
+
+
+def test_ship_min_roles_stays_synced_with_default_quorum_floor():
+    """review-cli#309 review finding: `reviewlib.config.SHIP_MIN_ROLES` and
+    `reviewlib.stats._DEFAULT_QUORUM_FLOOR` carry a "SYNC: keep equal to"
+    comment on both sides but nothing enforced it -- an edit to one without
+    the other would silently desync a recorded `review diff --task` run's
+    pool floor from the `review task CODE --check` / gh ship quorum floor it
+    exists to satisfy."""
+    from reviewlib.config import SHIP_MIN_ROLES
+
+    assert SHIP_MIN_ROLES == _stats._DEFAULT_QUORUM_FLOOR, (
+        SHIP_MIN_ROLES,
+        _stats._DEFAULT_QUORUM_FLOOR,
+    )
 
 
 # ---------------------------------------------------------------------------
