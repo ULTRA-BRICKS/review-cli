@@ -188,6 +188,24 @@ def test_total_exhaustion_falls_back_to_least_depleted_single_model():
     assert len(set(roles)) == 4  # still 4 distinct lenses, just one model
 
 
+def test_least_depleted_skips_exhausted_family():
+    # Every reachable seat is at 100%. The old least-depleted fallback would
+    # still pick one (board-priority tie-break) and spawn it. Exhausted
+    # families must shrink the pool to empty instead.
+    usage_percent = _usage(
+        {
+            "fable": 100,
+            "sol": 100,
+            "opus": 100,
+            "glm-cc": 100,
+            "kimi": 100,
+            "codex": 100,
+        }
+    )
+    result = select_pool_with_reuse(BOARD, 4, usage_percent=usage_percent)
+    assert result == []
+
+
 def test_unknown_usage_is_not_excluded():
     # opus has NO usage sample (None) — must be treated as "not near limit", never
     # excluded, even though every OTHER seat is deep in its limit.
@@ -311,6 +329,13 @@ def test_flat_total_exhaustion_falls_back_to_single_least_depleted():
     assert result == ["sol", "sol", "sol"]
 
 
+def test_flat_exhausted_does_not_repeat_100_percent_model():
+    models = ["fable", "sol"]
+    usage_percent = _usage({"fable": 100, "sol": 100})
+    result = expand_flat_models_with_reuse(models, 3, usage_percent=usage_percent)
+    assert result == []
+
+
 # --- select_pool_and_reserve_with_reuse (the board-mode dispatch wiring) -----------
 
 
@@ -365,6 +390,27 @@ def test_reserve_ordering_preserves_relative_priority_within_each_group():
         BOARD, 1, usage_percent=usage_percent
     )
     assert [r.model for r in reserve] == ["sol", "glm-cc", "codex", "opus", "kimi"]
+
+
+def test_reserve_omits_exhausted_family():
+    # An exhausted Codex seat (100%) must not land in reserve: after a primary
+    # failure the board path would promote it, and Codex has no backend spawn
+    # guard. Near-limit seats stay last-resort; exhausted ones do not.
+    usage_percent = _usage(
+        {
+            "fable": 10,
+            "sol": 10,
+            "opus": 10,
+            "glm-cc": 10,
+            "kimi": 10,
+            "codex": 100,
+        }
+    )
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        BOARD, 2, usage_percent=usage_percent
+    )
+    assert "codex" not in [r.model for r in pool]
+    assert "codex" not in [r.model for r in reserve]
 
 
 def test_pool_and_reserve_probe_availability_exactly_once():

@@ -3,6 +3,21 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.0 — 2026-09-08
+
+- **Feat: refuse seat spawn when a family's live harness 5-hour or 7-day
+  window is exhausted (review-cli#437).** Pool composition and Claude
+  dispatch now prefer `harness limits --all --json` for Claude Code / Codex
+  usage, falling back to tg-ctl samples for families harness did not report.
+  5-hour / 7-day windows are identified by `window_seconds` (18000 / 604800),
+  not English labels. When the more-restrictive of those windows is at 100%,
+  `allow_spawn_for_model` is false and `review_claude` returns a synthetic
+  sentinel without Popen; `select_pool_with_reuse` no longer picks a 100%
+  family as the least-depleted fallback (the pool shrinks instead). Missing
+  harness / unusable JSON / a non-ok card still fails open. Does not add a
+  fake max-7 concurrent-agent cap; `$REVIEW_MAX_CONCURRENCY` stays a memory
+  semaphore and `DEFAULT_LIMIT_THRESHOLD` stays 70.
+
 ## 0.36.9 — 2026-09-08
 
 - **Board roles name fallback models; `--show-board` lists them (review-cli#445).**

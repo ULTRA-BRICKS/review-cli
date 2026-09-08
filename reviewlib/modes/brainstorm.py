@@ -162,6 +162,11 @@ def mode_brainstorm(
     # otherwise drag a low cap back up to 3 and run rounds the caller did not want.
     loop_end = (start_round - 1) if synthesize_only else max_rounds
     panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
+    # expand_flat_models_with_reuse can shrink a 100%-exhausted panel to [].
+    # `panel[slot % len(panel)]` is then ZeroDivisionError. Fail closed before
+    # any slot assignment or moderator, matching mode_quorum.
+    if not models:
+        return 1
     # OPTIONAL grounding diff: when a working-tree / --staged / piped diff is present,
     # the brainstorm is ABOUT that specific change. The moderator gets it as constant
     # context on EVERY round; personas get it only on the first round of the invocation

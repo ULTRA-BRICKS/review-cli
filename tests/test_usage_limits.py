@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Unit tests for reviewlib.usage_limits — the tg-ctl usage-percent bridge used
-by board/panel reuse-and-exclusion (see test_pool_reuse.py for the consumer).
+"""Unit tests for reviewlib.usage_limits — usage-percent + spawn gate for
+board/panel reuse-and-exclusion (see test_pool_reuse.py for the consumer).
 
-All tests drive `usage_percent_for_model` via its `samples=` parameter (a plain
-list of dicts, matching tg-ctl's `usage-latest.json` shape) — no real
-filesystem/env dependency, so these never touch a live ~/.config/tg-cli file.
-`test_reads_real_usage_file`/`test_merges_samples_across_multiple_chat_files`
-are the exceptions: they prove the actual file-reading path against throwaway
-files via $REVIEW_USAGE_LIMITS_FILE (single-file case) and a real
-~/.config/tg-cli-shaped glob (multi-file merge case).
+tg-ctl path: tests drive `usage_percent_for_model` via `samples=` (a plain
+list of dicts, matching tg-ctl's `usage-latest.json` shape) — no live
+~/.config/tg-cli file. `test_reads_real_usage_file` /
+`test_merges_samples_across_multiple_chat_files` prove the file-reading
+path against throwaway files.
 
-Plain-script harness (mirrors tests/test_moderator.py): each test_* is run by
-__main__, and also pytest-discoverable.
+Harness path: tests inject cards via `cards=` / `runner=` /
+`$REVIEW_HARNESS_LIMITS_JSON` so they never hit the network or the real
+`harness` binary.
+
+Plain-script harness (mirrors tests/test_moderator.py): each test_* is run
+by __main__, and also pytest-discoverable.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import os  # noqa: E402
 
 from reviewlib.usage_limits import (  # noqa: E402
+    allow_spawn_for_model,
     load_snapshot,
     usage_percent_for_model,
 )
@@ -49,6 +52,25 @@ def _sample(
         "percent": percent,
         "resetAt": None,
         "sampledAt": (NOW - age_seconds) * 1000,
+    }
+
+
+
+def _window(name, used_percent, window_seconds):
+    return {
+        "name": name,
+        "used_percent": used_percent,
+        "resets_at": None,
+        "window_seconds": window_seconds,
+    }
+
+
+def _harness_card(provider, windows, *, status="ok", account="a@b"):
+    return {
+        "provider": provider,
+        "account": account,
+        "status": status,
+        "windows": windows,
     }
 
 
@@ -180,7 +202,11 @@ def test_reads_real_usage_file(tmp_path=None):
         encoding="utf-8",
     )
     old_override = os.environ.get("REVIEW_USAGE_LIMITS_FILE")
+    old_harness = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
     os.environ["REVIEW_USAGE_LIMITS_FILE"] = str(usage_file)
+    # Empty harness cards: this test is the tg-ctl file path, so harness
+    # must not report a family (live `harness limits` on this machine would).
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = '{"cards":[]}'
     try:
         assert usage_percent_for_model("codex") == 91
     finally:
@@ -188,11 +214,17 @@ def test_reads_real_usage_file(tmp_path=None):
             os.environ.pop("REVIEW_USAGE_LIMITS_FILE", None)
         else:
             os.environ["REVIEW_USAGE_LIMITS_FILE"] = old_override
+        if old_harness is None:
+            os.environ.pop("REVIEW_HARNESS_LIMITS_JSON", None)
+        else:
+            os.environ["REVIEW_HARNESS_LIMITS_JSON"] = old_harness
 
 
 def test_missing_file_is_unknown():
     old_override = os.environ.get("REVIEW_USAGE_LIMITS_FILE")
+    old_harness = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
     os.environ["REVIEW_USAGE_LIMITS_FILE"] = "/nonexistent/path/usage-latest.json"
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = '{"cards":[]}'
     try:
         assert usage_percent_for_model("codex") is None
     finally:
@@ -200,6 +232,10 @@ def test_missing_file_is_unknown():
             os.environ.pop("REVIEW_USAGE_LIMITS_FILE", None)
         else:
             os.environ["REVIEW_USAGE_LIMITS_FILE"] = old_override
+        if old_harness is None:
+            os.environ.pop("REVIEW_HARNESS_LIMITS_JSON", None)
+        else:
+            os.environ["REVIEW_HARNESS_LIMITS_JSON"] = old_harness
 
 
 def test_merges_samples_across_multiple_chat_files():
@@ -233,6 +269,248 @@ def test_merges_samples_across_multiple_chat_files():
             os.environ["REVIEW_USAGE_LIMITS_DIR"] = old_dir
         if old_file is not None:
             os.environ["REVIEW_USAGE_LIMITS_FILE"] = old_file
+
+
+def test_harness_session_100_refuses_claude_spawn():
+    cards = [
+        _harness_card(
+            "Claude Code",
+            [
+                _window("Session", 100.0, 18000),
+                _window("Weekly", 81.0, 604800),
+            ],
+        )
+    ]
+    assert (
+        usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
+    )
+    assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is False
+
+
+def test_harness_weekly_max_still_allows_spawn():
+    cards = [
+        _harness_card(
+            "Claude Code",
+            [
+                _window("Session", 20.0, 18000),
+                _window("Weekly", 88.0, 604800),
+            ],
+        )
+    ]
+    assert usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 88
+    assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is True
+
+
+def test_harness_missing_card_fails_open():
+    assert allow_spawn_for_model("claude:claude-opus-4-8", cards=[]) is True
+    missing = [
+        _harness_card(
+            "Claude Code",
+            [_window("Session", 100.0, 18000)],
+            status="missing_creds",
+        )
+    ]
+    assert allow_spawn_for_model("claude:claude-opus-4-8", cards=missing) is True
+    unknown = [
+        _harness_card("Claude Code", [_window("Session", None, 18000)])
+    ]
+    assert allow_spawn_for_model("claude:claude-opus-4-8", cards=unknown) is True
+
+
+def test_harness_identifies_windows_by_seconds_not_name():
+    cards = [
+        _harness_card(
+            "Claude Code",
+            [
+                _window("Unexpected session label", 100.0, 5 * 3600),
+                _window("Unexpected weekly label", 10.0, 7 * 86400),
+            ],
+        )
+    ]
+    assert (
+        usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
+    )
+    assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is False
+
+
+def test_harness_runner_inject_never_hits_binary():
+    payload = json.dumps(
+        {
+            "cards": [
+                _harness_card(
+                    "Claude Code",
+                    [_window("Session", 100.0, 18000)],
+                )
+            ]
+        }
+    )
+
+    def runner():
+        return payload
+
+    assert usage_percent_for_model("claude:claude-opus-4-8", runner=runner) == 100
+    assert allow_spawn_for_model("claude:claude-opus-4-8", runner=runner) is False
+
+
+def test_exhausted_5h_does_not_popen_claude():
+    from reviewlib import backends
+    from reviewlib.backends import ReviewResult
+
+    cards = [
+        _harness_card(
+            "Claude Code",
+            [_window("Session", 100.0, 5 * 3600)],
+        )
+    ]
+    calls = []
+
+    def fake_cli(*_a, **_k):
+        calls.append(1)
+        return ReviewResult(
+            model="claude:claude-opus-4-8",
+            command="claude",
+            returncode=0,
+            stdout="should not run",
+            stderr="",
+        )
+
+    saved_cli = backends.review_claude_cli
+    saved_unpaid = backends.unpaid_provider_result
+    saved_json = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
+    saved_logs = os.environ.get("REVIEW_LOG_DIR")
+    saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
+    saved_file = os.environ.get("REVIEW_USAGE_LIMITS_FILE")
+    tmp = tempfile.mkdtemp()
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = json.dumps({"cards": cards})
+    os.environ["REVIEW_LOG_DIR"] = tmp
+    os.environ["REVIEW_CLAUDE_MODE"] = "cli"
+    os.environ["REVIEW_USAGE_LIMITS_FILE"] = str(Path(tmp) / "missing.json")
+    backends.review_claude_cli = fake_cli
+    backends.unpaid_provider_result = lambda *_a, **_k: None
+    try:
+        result = backends.review_claude(
+            "claude:claude-opus-4-8", "prompt", "diff", Path("."), 60
+        )
+    finally:
+        backends.review_claude_cli = saved_cli
+        backends.unpaid_provider_result = saved_unpaid
+        if saved_json is None:
+            os.environ.pop("REVIEW_HARNESS_LIMITS_JSON", None)
+        else:
+            os.environ["REVIEW_HARNESS_LIMITS_JSON"] = saved_json
+        if saved_logs is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_logs
+        if saved_mode is None:
+            os.environ.pop("REVIEW_CLAUDE_MODE", None)
+        else:
+            os.environ["REVIEW_CLAUDE_MODE"] = saved_mode
+        if saved_file is None:
+            os.environ.pop("REVIEW_USAGE_LIMITS_FILE", None)
+        else:
+            os.environ["REVIEW_USAGE_LIMITS_FILE"] = saved_file
+    assert calls == [], "exhausted 5-hour window still dispatched claude"
+    assert result.returncode == 0
+    assert "5-hour" in result.stdout or "5h" in result.stdout
+
+
+def test_composition_closure_with_session_100_excludes_claude_family():
+    # Production _dispatch must pass cards= (not samples= alone, which this
+    # branch treats as disabling live harness). A 100% Session card excludes
+    # the claude family even when tg-ctl samples would keep it; no network.
+    from reviewlib.config import expand_flat_models_with_reuse
+
+    samples = [_sample("claude", "weekly", 10)]
+    cards = [
+        _harness_card(
+            "Claude Code",
+            [_window("Session", 100.0, 18000)],
+        )
+    ]
+    roster = ["claude:claude-opus-4-8", "gemini"]
+
+    def samples_only(model: str) -> float | None:
+        return usage_percent_for_model(model, samples=samples, now=NOW)
+
+    def with_cards(model: str) -> float | None:
+        return usage_percent_for_model(
+            model, samples=samples, cards=cards, now=NOW
+        )
+
+    kept = expand_flat_models_with_reuse(
+        roster, 2, usage_percent=samples_only
+    )
+    assert "claude:claude-opus-4-8" in kept
+
+    excluded = expand_flat_models_with_reuse(
+        roster, 2, usage_percent=with_cards
+    )
+    assert "claude:claude-opus-4-8" not in excluded
+    assert excluded  # gemini remains
+
+
+def test_api_mode_does_not_skip_on_claude_code_quota():
+    # REVIEW_CLAUDE_MODE=api must not return the usage-limit sentinel solely
+    # because a Claude Code harness card is at 100% — that card measures the
+    # CLI subscription, not the paid API account.
+    from reviewlib import backends
+    from reviewlib.backends import ReviewResult
+
+    cards = [
+        _harness_card(
+            "Claude Code",
+            [_window("Session", 100.0, 5 * 3600)],
+        )
+    ]
+    api_calls = []
+
+    def fake_api(*_a, **_k):
+        api_calls.append(1)
+        return ReviewResult(
+            model="claude:claude-opus-4-8",
+            command="api",
+            returncode=0,
+            stdout="API ran",
+            stderr="",
+        )
+
+    saved_api = backends.review_claude_api
+    saved_unpaid = backends.unpaid_provider_result
+    saved_json = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
+    saved_logs = os.environ.get("REVIEW_LOG_DIR")
+    saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
+    saved_file = os.environ.get("REVIEW_USAGE_LIMITS_FILE")
+    saved_cd = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+    tmp = tempfile.mkdtemp()
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = json.dumps({"cards": cards})
+    os.environ["REVIEW_LOG_DIR"] = tmp
+    os.environ["REVIEW_CLAUDE_MODE"] = "api"
+    os.environ["REVIEW_USAGE_LIMITS_FILE"] = str(Path(tmp) / "missing.json")
+    os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(tmp) / "cooldown.json")
+    backends.review_claude_api = fake_api
+    backends.unpaid_provider_result = lambda *_a, **_k: None
+    try:
+        result = backends.review_claude(
+            "claude:claude-opus-4-8", "prompt", "diff", Path("."), 60
+        )
+    finally:
+        backends.review_claude_api = saved_api
+        backends.unpaid_provider_result = saved_unpaid
+        for key, saved in (
+            ("REVIEW_HARNESS_LIMITS_JSON", saved_json),
+            ("REVIEW_LOG_DIR", saved_logs),
+            ("REVIEW_CLAUDE_MODE", saved_mode),
+            ("REVIEW_USAGE_LIMITS_FILE", saved_file),
+            ("REVIEW_SEAT_COOLDOWN_FILE", saved_cd),
+        ):
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+    assert api_calls == [1], "API transport skipped because Claude Code was at 100%"
+    assert result.stdout == "API ran"
+    assert "usage-limit skip" not in result.command
 
 
 if __name__ == "__main__":

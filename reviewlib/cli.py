@@ -5247,10 +5247,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # approach in modes/review.py) — every seat/candidate checked below reads the
     # SAME sample set instead of each re-globbing + re-parsing the tg-ctl usage
     # file independently (and possibly disagreeing mid-selection if it changes).
+    # Load harness cards once too: passing samples= alone disables the live
+    # harness path inside usage_percent_for_model, so composition would ignore
+    # an exhausted Claude Code / Codex card reported only by `harness limits`.
     _usage_snapshot = usage_limits.load_snapshot()
+    _usage_cards = usage_limits.load_harness_cards()
 
     def _usage_percent(model: str) -> float | None:
-        return usage_percent_for_model(model, samples=_usage_snapshot)
+        return usage_percent_for_model(
+            model, samples=_usage_snapshot, cards=_usage_cards
+        )
 
     if explicit_models:
         models = explicit_models

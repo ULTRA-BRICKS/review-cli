@@ -1556,6 +1556,8 @@ classified as chronic rather than defaulting to "success") to the non-claude bac
 is tracked as [review-cli#226](https://github.com/alex-mextner/review-cli/issues/226),
 not done here.
 
+**Pool/spawn consults live `harness limits` 5-hour and 7-day windows.** Board composition and Claude dispatch skip a family whose more-restrictive 5-hour or 7-day window is already at 100% (`harness limits --all --json`, falling back to tg-ctl samples when harness has no card for that family). This is not a concurrent-agent cap; `$REVIEW_MAX_CONCURRENCY` remains the memory semaphore below.
+
 **Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
 model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
 or a cascade of reserve backfills can fan out into enough concurrent agent subprocesses to

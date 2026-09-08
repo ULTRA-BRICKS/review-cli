@@ -461,6 +461,12 @@ def mode_quorum(
         diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
     )
     diff_block = _diff_context_block(dispatch_diff)
+    # expand_flat_models_with_reuse can shrink a 100%-exhausted panel to [].
+    # `all(result_is_usable(r) for r in [])` is vacuously True, so an empty
+    # expert list would otherwise run a moderator on an empty transcript and
+    # exit 0. Fail closed before synthesis.
+    if not models:
+        return 1
     # Every seat gets a persona/role from the SAME rotation brainstorm uses (Alex,
     # 2026-08-18: quorum panels should run "под разными полями" — distinct fields/roles
     # — not just distinct models). `models` can also contain the SAME model more than

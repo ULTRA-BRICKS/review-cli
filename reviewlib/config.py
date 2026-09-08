@@ -832,8 +832,9 @@ def select_pool_with_reuse(
          model/provider) and seats at/above it.
       3. `candidates` = `under_limit` if non-empty; otherwise (every reachable
          seat is near its limit) the SINGLE seat with the lowest usage
-         percentage (ties broken by board priority) — so the board never goes
-         empty just because every seat is somewhat depleted.
+         percentage that is still below 100% (ties broken by board priority).
+         A family at >=100% is never selected; if every reachable seat is
+         exhausted the pool shrinks to empty rather than spawning it.
       4. Target size `n`:
            - `usage_percent is None` -> `_effective_pool_size(len(reachable),
              pool)`, IDENTICAL to `select_pool`'s clamp (this function is a
@@ -884,8 +885,17 @@ def select_pool_with_reuse(
     if under_limit:
         candidates = under_limit
     else:
-        idx = _least_depleted_index([r.model for r in reachable], usage_percent)
-        candidates = [reachable[idx]]
+        not_exhausted = [
+            r
+            for r in reachable
+            if (usage_percent(r.model) or 0.0) < 100.0
+        ]
+        if not not_exhausted:
+            return []
+        idx = _least_depleted_index(
+            [r.model for r in not_exhausted], usage_percent
+        )
+        candidates = [not_exhausted[idx]]
 
     primary = candidates[: min(n, len(candidates))]
     extra_needed = n - len(primary)
@@ -959,13 +969,15 @@ def select_pool_and_reserve_with_reuse(
     model landed in the pool. A seat's reserve MEMBERSHIP does not depend on
     its raw board position: a seat excluded from the pool for being near its
     usage limit is just as eligible a last-resort backfill as one that simply
-    didn't fit under `pool`. Its reserve ORDER does, however, get demoted:
-    under-limit overflow seats are offered FIRST (each keeps its relative
-    board-priority order), near-limit seats LAST (same) — otherwise a
-    near-limit seat sitting at a higher board position than a perfectly
-    healthy overflow seat would be promoted to the pool FIRST on mid-run
-    failover, defeating the reason it was excluded to begin with (Fable
-    review finding, review-cli#205 round 5)."""
+    didn't fit under `pool`. Seats at or above 100% are omitted from reserve
+    entirely — promoting an exhausted Codex family after a primary failure
+    would spawn it, and Codex has no backend-level spawn guard. Its reserve
+    ORDER does, however, get demoted: under-limit overflow seats are offered
+    FIRST (each keeps its relative board-priority order), near-limit seats
+    LAST (same) — otherwise a near-limit seat sitting at a higher board
+    position than a perfectly healthy overflow seat would be promoted to the
+    pool FIRST on mid-run failover, defeating the reason it was excluded to
+    begin with (Fable review finding, review-cli#205 round 5)."""
     reachable = [r for r in board if available(r)]
     reachable_ids = {id(r) for r in reachable}
     pool_seats = select_pool_with_reuse(
@@ -980,6 +992,10 @@ def select_pool_and_reserve_with_reuse(
     if usage_percent is None:
         reserve_seats = unused
     else:
+        # Same <100 check as the primary-pool least-depleted fallback: a
+        # family at 100% must not be promoted after a primary failure
+        # (Codex has no backend spawn guard). Unknown usage (None) stays.
+        unused = [r for r in unused if (usage_percent(r.model) or 0.0) < 100.0]
         # Stable sort: seats keep their relative board-priority order WITHIN
         # each group (under-limit first, near-limit last) — this is a
         # DEMOTION of near-limit seats, not a full re-rank.
@@ -999,10 +1015,11 @@ def expand_flat_models_with_reuse(
     """Reuse-aware padding for a FLAT model list (quorum / just-ask / brainstorm
     — no per-seat role/board concept). Excludes any model at/above
     `limit_threshold` percent of its usage window; if that empties the list,
-    falls back to the SINGLE least-depleted model (repeated for every slot)
-    rather than running nothing. Returns exactly `target` entries (or
-    `len(models)` when `target <= 0`), cycling through the surviving models in
-    their given order.
+    falls back to the SINGLE least-depleted model still below 100% (repeated
+    for every slot). A model at >=100% is never selected; if every model is
+    exhausted the result is empty rather than spawning it. Returns `target`
+    entries (or `len(models)` when `target <= 0`) when any candidate remains,
+    cycling through the surviving models in their given order.
 
     A no-op (returns `models` unchanged) when `usage_percent` is None, `models`
     is empty, or nothing is excluded and `target <= len(models)` — so existing
@@ -1018,8 +1035,13 @@ def expand_flat_models_with_reuse(
     if under_limit:
         pool_models = under_limit
     else:
-        idx = _least_depleted_index(models, usage_percent)
-        pool_models = [models[idx]]
+        not_exhausted = [
+            m for m in models if (usage_percent(m) or 0.0) < 100.0
+        ]
+        if not not_exhausted:
+            return []
+        idx = _least_depleted_index(not_exhausted, usage_percent)
+        pool_models = [not_exhausted[idx]]
 
     return [pool_models[i % len(pool_models)] for i in range(n)]
 

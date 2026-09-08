@@ -41,6 +41,7 @@ from .process import (
     write_sidecar_log,
 )
 from .seat_cooldown import active_cooldown, clear_cooldown, record_cooldown
+from .usage_limits import allow_spawn_for_model, spawn_refuse_reason
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -294,6 +295,9 @@ def review_with_images(
         cooldown = active_cooldown(model, access_method="cli")
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
+        if not allow_spawn_for_model(model):
+            reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            return _usage_limit_skip_result(model, round_no, reason, backend="claude")
         result = review_claude_cli_with_images(
             model, prompt, diff, cwd, timeout, round_no, images, effort=effort
         )
@@ -2546,6 +2550,12 @@ def review_claude(
     cooldown = active_cooldown(model, access_method=access_method)
     if cooldown is not None:
         return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
+    # Claude Code 5h/7d cards measure the CLI subscription, not the paid API
+    # account. Gating the API transport on that card would suppress a valid
+    # Anthropic-compatible call when local Claude Code is exhausted.
+    if not use_api and not allow_spawn_for_model(model):
+        reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+        return _usage_limit_skip_result(model, round_no, reason, backend="claude")
     if use_api:
         result = review_claude_api(
             model, prompt, diff, cwd, timeout, round_no, effort=effort
@@ -3038,6 +3048,26 @@ def _bounded_cooldown_skip_body(model: str, reason: str, remaining: int) -> str:
     overhead_no_model = len(_build("", ""))
     model_budget = max(0, _UNAVAILABLE_MAX_LEN - overhead_no_model)
     return _build(model[:model_budget], "")
+
+
+def _usage_limit_skip_result(
+    model: str, round_no: int, reason: str, *, backend: str
+) -> ReviewResult:
+    """Synthetic skip when a family's 5-hour or 7-day window is exhausted.
+
+    Mirrors `_cooldown_skip_result`'s sentinel shape (rc=0 + unavailable
+    marker) so failover/dashboard treat it as unusable, without Popen."""
+    marker = _UNAVAILABLE_MARKERS[0]
+    stdout = f"{model} {marker} ({reason}).\n"
+    if len(stdout) > _UNAVAILABLE_MAX_LEN:
+        stdout = f"{marker} ({reason}).\n"[:_UNAVAILABLE_MAX_LEN]
+    command = f"usage-limit skip ({backend})"
+    _emit_rest_log(
+        backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr=""
+    )
+    return ReviewResult(
+        model=model, command=command, returncode=0, stdout=stdout, stderr=""
+    )
 
 
 def _cooldown_skip_result(
