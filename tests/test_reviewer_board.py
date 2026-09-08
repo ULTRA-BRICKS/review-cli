@@ -2004,8 +2004,11 @@ def test_mode_review_board_backfills_preflight_skip_from_reserve():
             model=model, command="fake", returncode=0, stdout="ok", stderr=""
         )
 
+    # Role is not a ROLE_FALLBACK_MODELS key, so a failed seat still pops reserve.
     board = [
-        BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "tests", "CommandCode"),
+        BoardReviewer(
+            "commandcode:deepseek/deepseek-v4-pro", "preflight", "CommandCode"
+        ),
         BoardReviewer("codex", "correctness", "Codex"),
     ]
     import reviewlib.panel as panel
@@ -2049,8 +2052,10 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
             model=model, command="fake", returncode=0, stdout="ok", stderr=""
         )
 
+    # Role is not a ROLE_FALLBACK_MODELS key, so failover still reaches reserve
+    # and the reserve's own effort is what gets threaded.
     board = [
-        BoardReviewer("claude:claude-fable-5", "architect", "Fable", effort="xhigh"),
+        BoardReviewer("claude:claude-fable-5", "preflight", "Fable", effort="xhigh"),
         BoardReviewer(SOL_SEAT, "consistency", "Sol", effort="medium"),
     ]
     import reviewlib.panel as panel
