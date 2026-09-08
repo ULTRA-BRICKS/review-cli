@@ -906,6 +906,12 @@ _UNIT_FILES = [
     # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
     # Deterministic — synthetic tmpdirs, no real log dir, no network.
     ("test_call_log_cache.py", {}),
+    # `_run_streamed`'s Popen stdin kwarg (review-cli#428): the argv-only backend
+    # path (opencode/omp: input_text=None) must get stdin=DEVNULL, never a bare
+    # None/inherited fd that could block forever reading review-cli's own stdin;
+    # the codex/claude path (input_text provided) keeps stdin=PIPE. Verified via
+    # a spied subprocess.Popen, no real opencode/omp/codex/claude process.
+    ("test_process.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in

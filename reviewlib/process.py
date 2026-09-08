@@ -1446,7 +1446,16 @@ def _run_streamed(
         proc = subprocess.Popen(
             argv,
             cwd=str(cwd),
-            stdin=subprocess.PIPE if input_text is not None else None,
+            # Never inherit this process's real stdin fd: an argv-only backend
+            # call (opencode/omp -- codex/claude always pass input_text) must
+            # get a closed stdin, not whatever the CALLER's own stdin happens to
+            # be. review-cli routinely runs as a subprocess of an orchestrating
+            # agent whose own stdin is an open, non-EOF pipe/tty; if the child
+            # CLI reads stdin at all (a common non-TTY pattern), a bare `None`
+            # here lets it inherit that fd and block forever at 0% CPU with zero
+            # output (review-cli#428). DEVNULL gives it an immediately-EOF'd
+            # stdin regardless of what the caller's own stdin is doing.
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,

@@ -3,6 +3,24 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.4 — 2026-09-08
+
+- **Fix: opencode/omp backend seats no longer inherit review-cli's own stdin, which
+  could hang the seat forever (review-cli#428).** `_run_streamed`'s Popen call passed
+  `stdin=None` (inherit) whenever `input_text` was `None` — the case for `review_opencode`
+  and `review_omp`, both argv-only backends that never pass `input_text`. review-cli
+  routinely runs as a subprocess of an orchestrating agent whose own stdin is an open,
+  non-EOF pipe/tty; if the opencode/omp CLI reads stdin at all (a common non-TTY CLI
+  pattern), the inherited fd let it block indefinitely at 0% CPU with zero output.
+  Observed live 2026-09-07: an `opencode run` subprocess hung in a stdin-read syscall and
+  had to be killed and relaunched manually with stdin from `/dev/null`. This is very
+  likely the actual root cause behind some of the "opencode/oc:zai stalls with zero
+  output" cases previously band-aided only by the true-silence stall watchdog + cooldown,
+  which detects the symptom and cools the seat down as though the provider's quota were
+  exhausted. `_run_streamed` now always passes `stdin=subprocess.DEVNULL` for the
+  `input_text is None` path — never a bare/inherited `None` — while the codex/claude path
+  (`input_text` provided) keeps `stdin=subprocess.PIPE` unchanged.
+
 ## 0.36.3 — 2026-09-08
 
 - **Fix: `review task --check` treats `105` and `#105` as the same GitHub-issue
