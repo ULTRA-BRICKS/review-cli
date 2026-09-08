@@ -415,7 +415,15 @@ def test_board_flags_and_listing():
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_not_in("claude:claude-fable-5", heavy)
-    assert_not_in("architect", heavy)
+    # Heavy has no architect SEAT (Fable is the only seat that carried that lens).
+    # `--show-board` also prints a Fallbacks-per-role footer that lists every
+    # REVIEW_ROLES key, including architect — so this check is seat lines only.
+    seat_blob = "\n".join(
+        ln
+        for ln in heavy.splitlines()
+        if "[pool" in ln or "[reserve" in ln or "[unavail" in ln or "[explicit]" in ln
+    )
+    assert_not_in("architect", seat_blob)
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
@@ -721,6 +729,8 @@ _UNIT_FILES = [
     # side). All offline — writes a fixture manifest to a temp file + points $REVIEW_MODELS_MANIFEST
     # at it; no network, no real agent-tools checkout, no model call.
     ("test_manifest_capability.py", {}),
+    # Per-role fallback model lists + harness seat resolution (review-cli#445).
+    ("test_role_models.py", {}),
     ("test_review_marker.py", {}),
     # `review diff --staged --commit` (the checkpoint-commit feature): the usage gate
     # (--commit requires --staged), the checkpoint gate shared with the marker/stamp

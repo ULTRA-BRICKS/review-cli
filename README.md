@@ -1296,7 +1296,7 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     Not supported on `dashboard`/`spec-web` (they have their own
                     start/stop lifecycle).
 --list-defaults     Print effective default backends and exit.
---show-board        Print the active reviewer board (model -> role + availability) and exit.
+--show-board        Print the active reviewer board (model -> role + availability) and exit. Also prints per-role fallback model ids (bare names; harness auto-resolved).
 --preset NAME       Diff-review and --show-board preset: light for quick preflight,
                     default for routine review, heavy for release/risky changes with
                     Sol (Fable is excluded from every preset — a confirmed ~100%

@@ -3867,7 +3867,7 @@ def _add_global_options(
     parser.add_argument(
         "--show-board",
         action="store_true",
-        help="print the active reviewer board (model -> role, availability) and exit",
+        help="print the active reviewer board (model -> role, availability) plus per-role fallback model ids and exit",
     )
     if mode is None or mode.name == "review":
         parser.add_argument(
@@ -4216,7 +4216,7 @@ SELECTION CASCADE, by mode:
 
 REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints it live)
   A priority-ordered panel of seats, each model carrying its own
-  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
+  role/lens. The listing also prints per-role fallback model ids (bare names; harness auto-resolved). A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
   {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
   Fable/Sol. A recorded `review diff --task CODE` floors that pool to {SHIP_MIN_ROLES}
   distinct roles so `review task CODE --check` / gh ship can pass from one run; explicit
@@ -6272,6 +6272,9 @@ def _show_board(
             "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
             "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)"
         )
+    from .role_models import format_role_fallback_section
+
+    print(format_role_fallback_section())
     return 0
 
 

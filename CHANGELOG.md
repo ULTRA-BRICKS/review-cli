@@ -3,6 +3,17 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.9 — 2026-09-08
+
+- **Board roles name fallback models; `--show-board` lists them (review-cli#445).**
+  Each `REVIEW_ROLES` key now publishes a `ROLE_FALLBACK_MODELS` tuple of bare
+  model ids (no harness prefix). `review --show-board` still prints harness-prefixed
+  seat lines and adds a Fallbacks-per-role footer of those bare names. A config
+  `model: gpt-6-astra` (or a bare id through `_expand_alias`) auto-resolves to its
+  harness seat (`codex:gpt-6-astra`); already-prefixed seats and existing aliases
+  (`opus`, `glm`, `gemini`, `commandcode`, `codex`) are unchanged. Does not walk
+  these lists at dispatch and does not reorder `DEFAULT_BOARD`.
+
 ## 0.36.8 — 2026-09-08
 
 - **Fix: `review task CODE --check` passes when one padded iteration covers the

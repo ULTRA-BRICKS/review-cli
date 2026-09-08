@@ -210,7 +210,10 @@ MODERATOR_CANDIDATES = ("claude:claude-opus-4-8", "codex", "gemini")
 
 
 def _expand_alias(model: str) -> str:
-    return MODEL_ALIASES.get(model.lower(), model)
+    token = MODEL_ALIASES.get(model.lower(), model)
+    from .role_models import seat_for_model
+
+    return seat_for_model(token)
 
 
 def load_config() -> dict:
