@@ -755,45 +755,63 @@ def _effective_pool_size(seat_count: int, pool: int) -> int:
 def _seats_with_role_fallback(
     board: list[BoardReviewer],
     available: Callable[[BoardReviewer], bool],
+    *,
+    keep_unavailable: bool = False,
+    live_ids: set[int] | None = None,
 ) -> list[BoardReviewer]:
     """Walk `board` in priority order, substituting a same-role fallback when a
     seat is unreachable instead of skipping straight to a different-role next
-    seat. Dedup by model id so a substitute (Astra for Sol) is not also picked
-    as its own later board row."""
+    seat.
+
+    Only a model used as a SUBSTITUTE is omitted later (Astra-for-Sol must not
+    also pick Astra's own row). Two original seats that share a model under
+    different roles stay distinct — reserve membership is seat identity.
+
+    `keep_unavailable`: leave an unreplaceable seat in the result so reuse
+    padding can still size `n` against the original board length.
+    """
     from .role_models import bare_model_id, next_role_fallback
 
     picked: list[BoardReviewer] = []
-    seen: set[str] = set()
+    substitute_models: set[str] = set()
+    picked_models: set[str] = set()
 
-    def _mark(model: str) -> None:
-        seen.add(model)
-        seen.add(bare_model_id(model))
+    def _mark(store: set[str], model: str) -> None:
+        store.add(model)
+        store.add(bare_model_id(model))
 
-    def _seen(model: str) -> bool:
-        return model in seen or bare_model_id(model) in seen
+    def _in(store: set[str], model: str) -> bool:
+        return model in store or bare_model_id(model) in store
 
     for seat in board:
-        if _seen(seat.model):
+        if _in(substitute_models, seat.model):
             continue
         if available(seat):
             picked.append(seat)
-            _mark(seat.model)
+            _mark(picked_models, seat.model)
+            if live_ids is not None:
+                live_ids.add(id(seat))
             continue
-        used = set(seen)
-        used.add(seat.model)
-        used.add(bare_model_id(seat.model))
+        used = set(picked_models)
+        _mark(used, seat.model)
+        replaced = False
         while True:
             cand = next_role_fallback(seat, used_models=used)
             if cand is None:
                 break
-            used.add(cand.model)
-            used.add(bare_model_id(cand.model))
-            if _seen(cand.model):
+            _mark(used, cand.model)
+            if _in(substitute_models, cand.model) or _in(picked_models, cand.model):
                 continue
             if available(cand):
                 picked.append(cand)
-                _mark(cand.model)
+                _mark(picked_models, cand.model)
+                _mark(substitute_models, cand.model)
+                if live_ids is not None:
+                    live_ids.add(id(cand))
+                replaced = True
                 break
+        if not replaced and keep_unavailable:
+            picked.append(seat)
     return picked
 
 
@@ -1025,10 +1043,14 @@ def select_pool_and_reserve_with_reuse(
     position than a perfectly healthy overflow seat would be promoted to the
     pool FIRST on mid-run failover, defeating the reason it was excluded to
     begin with (Fable review finding, review-cli#205 round 5)."""
-    reachable = _seats_with_role_fallback(board, available)
-    reachable_ids = {id(r) for r in reachable}
+    live_ids: set[int] = set()
+    wired = _seats_with_role_fallback(
+        board, available, keep_unavailable=True, live_ids=live_ids
+    )
+    reachable = [r for r in wired if id(r) in live_ids]
+    reachable_ids = live_ids
     pool_seats = select_pool_with_reuse(
-        reachable,
+        wired,
         pool,
         lambda r: id(r) in reachable_ids,
         usage_percent=usage_percent,
