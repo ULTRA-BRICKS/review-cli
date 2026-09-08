@@ -29,6 +29,7 @@ Plain-script harness (mirrors tests/test_failover_pool.py): each test_* is run b
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import random
 import sys
@@ -837,6 +838,12 @@ def test_panel_seat_fatal_falls_to_reserve(tmp_log):
     os.environ["REVIEW_RETRY_COUNT"] = "3"
     try:
         board = list(DEFAULT_BOARD)
+        # Kimi is role quality, which carries a live ROLE_FALLBACK_MODELS entry (Sonnet)
+        # that role-fallback would legitimately claim first (test_failover_pool.py covers
+        # that path separately) -- this test proves the DISTINCT straight-to-reserve path,
+        # so retag the seat with a role carrying no fallback list, same technique
+        # test_reviewer_board.py uses for its own reserve-path tests (review-cli#454).
+        board[3] = dataclasses.replace(board[3], role="preflight")
         pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
         behaviour = {pool[3].model: [(1, "", "401 unauthorized")]}  # fatal, every call
         with _FakeBackends(behaviour) as fb:
