@@ -1309,7 +1309,8 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     it. N<=0 (e.g. --pool 0) runs all seats in the selected preset/board.
                     An explicit `--pool N` below 3 with `--task` still wins but warns.
                     Ignored for exact multi-model -m; `--task -m` one-model pads that model
-                    across 3 roles.
+                    across 3 roles. Recorded `--task --pool 0` still pads a same-role
+                    config roster to the ship floor.
 --effort LEVEL|PROVIDER=LEVEL
                     Run-scoped reasoning effort, overriding each seat's config effort for
                     THIS run. A bare level (minimal/low/medium/high/xhigh/max) applies to
@@ -1612,10 +1613,11 @@ configured `board:`   >   default preset (light)
   pool (default 2 for a bare unrecorded `review diff` — the light preset, Alex 2026-08-28 —
   or 4 if you pass `--preset default`; a recorded `--task` run floors light to 3 distinct
   roles so `review task CODE --check` / gh ship can pass from one run; `--pool 0` runs all
-  available seats in the selected preset/board; `--preset heavy --pool 0` currently covers
+  available seats in the selected preset/board (recorded `--task --pool 0` still pads a
+  same-role config roster to the ship floor); `--preset heavy --pool 0` currently covers
   all 12 heavy-preset built-ins — Fable is excluded from every preset, see "Reviewer board"
   above). `--pool` does not reduce an explicit multi-model `-m` list: every requested `-m`
-  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles.
+  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles (review, just-ask, quorum, and brainstorm).
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   roster — the configured/default board applies.
 

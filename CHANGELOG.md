@@ -3,6 +3,38 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.7 — 2026-09-08
+
+- **Fix: recorded `review diff --task CODE --pool 0` still pads a same-role config
+  roster to the ship floor (review-cli#433).** `--pool 0` ("all seats") sets the
+  effective pool size to 0. Role-repair (`ensure_min_distinct_roles`) was gated on
+  `effective_pool_size > 1` and is a no-op for `min_roles <= 0`, so a 4-seat config
+  roster whose every seat shared one role skipped both the short-roster pad and the
+  seat-count `--pool 0` warning, then dispatched 1 distinct role — failing
+  `review task CODE --check` / gh ship with no diagnostic. All-seats recorded
+  reviews now repair to `SHIP_MIN_ROLES` distinct roles (same pattern as
+  `--show-board`). A sibling warning fires when seat COUNT already meets the floor
+  but the config roster's distinct known roles do not. Does not pad `--pool 0 -m
+  one-model` (stays exact 1-seat) or `--pool 1`, and does not lower
+  `SHIP_MIN_ROLES` / `_DEFAULT_QUORUM_FLOOR`.
+- **Fix: recorded just-ask / quorum / brainstorm `-m one-model --task` pads that
+  model across the ship floor (review-cli#433).** `task_role_pad` was gated on
+  `mode.name == "review"`, so a panel run with one live engine stayed a single
+  seat and could not satisfy `review task CODE --check` / gh ship. One available
+  model now executes every required role via separate role-specific invocations
+  (never shrinking the role list to engine count, never copying one response into
+  several slots). Failed slots are retried once; the run reports
+  `Roles: N/M complete`. Does not lower `SHIP_MIN_ROLES`.
+- **Fix: padded quorum/brainstorm `--task` seats prompt the actual REVIEW_ROLES
+  lens and brainstorm records only completed roles (review-cli#433).** One-model
+  padding passed `roles` to `run_role_slots` for retry/reporting while expert
+  and brainstorm prompts still used the unrelated PERSONAS rotation, so
+  architect/correctness/security were recorded without ever being asked.
+  Brainstorm's `roles_after` also persisted the planned list, so a 2/3-alive
+  round that passed synthesis could satisfy the ship gate for a failed slot.
+  Each padded role's lens is now in that seat's prompt; brainstorm persists
+  `Roles: N/M complete`, not the plan.
+
 ## 0.36.6 — 2026-09-08
 
 - **Fix: a recorded `review diff --task CODE` now covers the ship min_roles floor even

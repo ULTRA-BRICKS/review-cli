@@ -699,6 +699,78 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
     return [r for r in results if r is not None]
 
 
+def run_panel_retry_unusable(
+    jobs: list[PanelJob], cwd: Path, timeout: int
+) -> list[ReviewResult]:
+    """Run jobs in parallel, then retry ONLY the unusable slots (once).
+
+    A usable result is never re-dispatched — copies and retries do not add
+    coverage. Failed slots keep their identity (same job / role label).
+    """
+    results = run_panel(jobs, cwd, timeout)
+    failed = [i for i, r in enumerate(results) if not result_is_usable(r)]
+    if not failed:
+        return results
+    retried = run_panel([jobs[i] for i in failed], cwd, timeout)
+    out = list(results)
+    for index, result in zip(failed, retried):
+        out[index] = result
+    return out
+
+
+def report_roles_complete(roles: list[str], results: list[ReviewResult]) -> str:
+    """`Roles: N/M complete` plus a short reason for each still-unusable slot."""
+    n = sum(1 for r in results if result_is_usable(r))
+    m = len(roles) if roles else len(results)
+    missing: list[str] = []
+    for i, r in enumerate(results):
+        if result_is_usable(r):
+            continue
+        name = roles[i] if i < len(roles) and roles[i] else r.model
+        why = "timed out" if r.returncode == 124 else "failed"
+        missing.append(f"{name} {why}")
+    extra = f"; {'; '.join(missing)}" if missing else ""
+    return f"Roles: {n}/{m} complete{extra}"
+
+
+def completed_role_coverage(
+    roles: list[str],
+    results: list[ReviewResult],
+    models: list[str],
+) -> list[tuple[str, str]]:
+    """Index-aligned (model, role) pairs for usable slots only.
+
+    A failed slot (even after retry) is omitted. Recording the planned list
+    would let a 2/3-alive brainstorm satisfy the ship gate for a lens that
+    never produced a verdict (review-cli#433 P1).
+    """
+    out: list[tuple[str, str]] = []
+    for i, result in enumerate(results):
+        if not result_is_usable(result):
+            continue
+        if i >= len(roles) or not roles[i]:
+            continue
+        model = models[i] if i < len(models) else result.model
+        out.append((model, roles[i]))
+    return out
+
+
+def run_role_slots(
+    jobs: list[PanelJob],
+    cwd: Path,
+    timeout: int,
+    roles: list[str] | None = None,
+) -> list[ReviewResult]:
+    """Dispatch role slots; when `roles` is set, retry failed slots only and
+    report `Roles: N/M complete` on stderr. Without `roles`, identical to
+    `run_panel` (no extra retry, no report)."""
+    if not roles:
+        return run_panel(jobs, cwd, timeout)
+    results = run_panel_retry_unusable(jobs, cwd, timeout)
+    print(report_roles_complete(roles, results), file=sys.stderr, flush=True)
+    return results
+
+
 def run_panel_with_retry(
     jobs: list[PanelJob], cwd: Path, timeout: int
 ) -> list[ReviewResult]:

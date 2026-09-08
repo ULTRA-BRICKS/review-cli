@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..backends import ReviewResult, cap_diff_for_dispatch
+from ..config import REVIEW_ROLES
 from ..panel import (
     PanelJob,
     format_result,
@@ -21,6 +22,7 @@ from ..panel import (
     result_is_usable,
     run_moderator,
     run_panel,
+    run_role_slots,
 )
 from . import PERSONAS, _diff_context_block, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
@@ -345,6 +347,7 @@ def refutation_succeeded(result: ReviewResult) -> bool:
 
 def _seat_assignments(
     models: list[str],
+    roles: list[str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """One (label, persona) pair per seat, computed ONCE and shared by both the
     transcript label and the seat's own prompt (Fable/k3 review finding: computing
@@ -386,7 +389,7 @@ def _seat_assignments(
     occurrence: dict[str, int] = {}
     labels: list[str] = []
     personas: list[tuple[str, str]] = []
-    for model in models:
+    for i, model in enumerate(models):
         # 0-indexed occurrence of THIS model so far -> occ+1 is its 1-indexed seat
         # number, reused directly for both the persona offset and the `#N` label
         # (Fable review finding, round 3: a separate `seen` counter that always
@@ -394,7 +397,18 @@ def _seat_assignments(
         # point is eliminating exactly this class of desync risk).
         occ = occurrence.get(model, 0)
         occurrence[model] = occ + 1
-        persona = PERSONAS[(first_index[model] + occ) % len(PERSONAS)]
+        # A recorded --task pad supplies REVIEW_ROLES ids. Those lenses must be
+        # the ones the expert is asked to apply — PERSONAS is a different set,
+        # and recording architect/correctness/security after prompting staff-
+        # engineer/SRE personas would grant ship-gate credit for work that
+        # never ran (review-cli#433 P1).
+        role = roles[i] if roles and i < len(roles) else ""
+        lens = REVIEW_ROLES.get(role, "") if role else ""
+        persona = (
+            (role, lens)
+            if lens
+            else PERSONAS[(first_index[model] + occ) % len(PERSONAS)]
+        )
         personas.append(persona)
         if seat_counts[model] > 1:
             labels.append(f"{model}#{occ + 1} [{persona[0]}]")
@@ -415,6 +429,7 @@ def mode_quorum(
     diff_from_stdin: bool = False,
     diff_already_capped: bool = False,
     adversarial_check: bool = False,
+    roles: list[str] | None = None,
 ) -> int:
     # codex review finding: the dispatch-time diff cap used to be applied ONLY by
     # cli.py's `_dispatch`, so a caller reaching this function directly (a library
@@ -460,7 +475,7 @@ def mode_quorum(
     # "<model>#N" prefix (via PanelJob.label, which `run_panel` uses to relabel the
     # result), so the transcript and stats can always tell which seat produced which
     # answer even when one model fills several of them.
-    labels, personas = _seat_assignments(models)
+    labels, personas = _seat_assignments(models, roles)
 
     jobs = [
         PanelJob(
@@ -473,7 +488,11 @@ def mode_quorum(
         )
         for i, model in enumerate(models)
     ]
-    expert_results = run_panel(jobs, cwd, timeout)
+    expert_results = (
+        run_role_slots(jobs, cwd, timeout, roles=roles)
+        if roles
+        else run_panel(jobs, cwd, timeout)
+    )
     # glm-5.2 review finding (2026-08 seat-cooldown feature): `run_panel`'s own
     # auto-tally counts a cached-cooldown sentinel (rc=0, non-empty "unavailable"
     # body) as `ok` in run-stats. `run_moderator` (called below) already fixes this
@@ -684,6 +703,7 @@ def _handler(ctx: ModeContext) -> int:
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     diff_already_capped = bool(ctx.extra.get("diff_already_capped", False))
     adversarial_check = bool(getattr(ctx.args, "adversarial_check", False))
+    roles = ctx.extra.get("task_roles") or None
     if images:
         return mode_quorum(
             ctx.with_visual(ctx.args.question),
@@ -697,6 +717,7 @@ def _handler(ctx: ModeContext) -> int:
             diff_from_stdin=diff_from_stdin,
             diff_already_capped=diff_already_capped,
             adversarial_check=adversarial_check,
+            roles=roles,
         )
     return mode_quorum(
         ctx.with_visual(ctx.args.question),
@@ -709,6 +730,7 @@ def _handler(ctx: ModeContext) -> int:
         diff_from_stdin=diff_from_stdin,
         diff_already_capped=diff_already_capped,
         adversarial_check=adversarial_check,
+        roles=roles,
     )
 
 

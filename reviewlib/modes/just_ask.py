@@ -12,12 +12,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..backends import cap_diff_for_dispatch
+from ..config import BoardReviewer
 from ..panel import (
     PanelJob,
+    build_board_job,
     format_result,
     recount_round_by_usability,
     result_is_usable,
     run_panel,
+    run_role_slots,
 )
 from . import _diff_context_block, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
@@ -36,6 +39,7 @@ def mode_just_ask(
     effort_override: "EffortOverride | None" = None,
     diff_from_stdin: bool = False,
     diff_already_capped: bool = False,
+    roles: list[str] | None = None,
 ) -> int:
     # codex review finding: the dispatch-time diff cap used to be applied ONLY by
     # cli.py's `_dispatch`, so a caller reaching this function directly (a library
@@ -59,17 +63,34 @@ def mode_just_ask(
         "Answer this question directly and concisely. Do not edit files or run commands.\n\n"
         f"QUESTION:\n{question}" + _diff_context_block(dispatch_diff)
     )
-    jobs = [
-        PanelJob(
-            model=model,
-            prompt=prompt,
-            diff="",
-            images=visual_images,
-            effort=_run_effort(effort_override, model),
-        )
-        for model in models
-    ]
-    results = run_panel(jobs, cwd, timeout)
+    if roles:
+        jobs = [
+            build_board_job(
+                BoardReviewer(
+                    model,
+                    roles[i] if i < len(roles) else "",
+                    model,
+                    effort=_run_effort(effort_override, model),
+                ),
+                prompt,
+                "",
+                visual_images,
+            )
+            for i, model in enumerate(models)
+        ]
+        results = run_role_slots(jobs, cwd, timeout, roles=roles)
+    else:
+        jobs = [
+            PanelJob(
+                model=model,
+                prompt=prompt,
+                diff="",
+                images=visual_images,
+                effort=_run_effort(effort_override, model),
+            )
+            for model in models
+        ]
+        results = run_panel(jobs, cwd, timeout)
     # glm-5.2 review finding (2026-08 seat-cooldown feature): `run_panel`'s own
     # auto-tally counts a cached-cooldown sentinel (rc=0, non-empty "unavailable"
     # body) as `ok` in run-stats — the same distortion brainstorm's
@@ -95,6 +116,7 @@ def _handler(ctx: ModeContext) -> int:
     images = _visual_images(ctx)
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     diff_already_capped = bool(ctx.extra.get("diff_already_capped", False))
+    roles = ctx.extra.get("task_roles") or None
     if images:
         return mode_just_ask(
             ctx.with_visual(ctx.args.question),
@@ -106,6 +128,7 @@ def _handler(ctx: ModeContext) -> int:
             effort_override=ctx.effort_override,
             diff_from_stdin=diff_from_stdin,
             diff_already_capped=diff_already_capped,
+            roles=roles,
         )
     return mode_just_ask(
         ctx.with_visual(ctx.args.question),
@@ -116,6 +139,7 @@ def _handler(ctx: ModeContext) -> int:
         effort_override=ctx.effort_override,
         diff_from_stdin=diff_from_stdin,
         diff_already_capped=diff_already_capped,
+        roles=roles,
     )
 
 

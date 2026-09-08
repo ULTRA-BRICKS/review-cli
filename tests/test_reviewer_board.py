@@ -3681,7 +3681,10 @@ def test_just_ask_explicit_dash_m_still_dispatches_unavailable_grok():
         backends.backend_available = saved_avail
         backends.runtime_provider_marked_unpaid = saved_unpaid
     assert cap["rc"] == 0, cap
-    assert cap["models"] == [GROK_SEAT], cap
+    from reviewlib.config import SHIP_MIN_ROLES
+
+    assert set(cap["models"]) == {GROK_SEAT}, cap
+    assert len(cap["models"]) >= SHIP_MIN_ROLES, cap
 
 
 def test_just_ask_all_unreachable_defaults_still_dispatch_src():
@@ -4240,6 +4243,50 @@ def test_cli_recorded_task_pool_zero_at_floor_config_roster_does_not_warn():
     assert "warning" not in err.getvalue().lower(), err.getvalue()
 
 
+def test_cli_recorded_task_pool_zero_same_role_roster_pads_roles():
+    """review-cli#433: `--pool 0` with a 4-seat config roster whose every
+    seat shares one role must still pad so the recorded dispatch covers
+    SHIP_MIN_ROLES distinct roles. Seat COUNT is already above the floor,
+    so the short-roster pad and the `--pool 0` seat-count warning both skip;
+    without role-repair the board would dispatch 4 seats / 1 role and fail
+    `review task CODE --check` / gh ship with no diagnostic.
+
+    Fails if `ensure_min_distinct_roles` is skipped for `effective_pool_size
+    == 0` (or called with min_roles<=0, which is a no-op)."""
+    import contextlib
+    import io
+
+    from reviewlib.config import SHIP_MIN_ROLES
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        captured = _capture_review_with_config(
+            ["diff", "--task", "433", "--pool", "0", "-C", str(REPO_ROOT)],
+            {
+                "board": [
+                    {"model": "codex", "role": "correctness", "name": "A"},
+                    {"model": "gemini", "role": "correctness", "name": "B"},
+                    {"model": "oc:xai/grok-4.6", "role": "correctness", "name": "C"},
+                    {
+                        "model": "claude:claude-opus-4-8",
+                        "role": "correctness",
+                        "name": "D",
+                    },
+                ],
+            },
+        )
+    board = captured.get("board")
+    assert board, captured
+    distinct = {r.role for r in board if r.role}
+    assert len(distinct) >= SHIP_MIN_ROLES, [(r.model, r.role) for r in board]
+    warning = err.getvalue().lower()
+    assert "--pool 0" in warning, err.getvalue()
+    assert "role" in warning, err.getvalue()
+    assert "gh ship" in warning or "min_roles" in warning or "ship" in warning, (
+        err.getvalue()
+    )
+
+
 def test_cli_recorded_task_explicit_config_pool_wins_over_short_roster_pad():
     """review-cli#309 round-2 review finding: an explicit config `pool:` default
     must win over the short/exact-config-roster pad the same way an explicit
@@ -4320,6 +4367,406 @@ def test_cli_recorded_task_pool_zero_default_board_does_not_warn():
         )
     assert captured["rc"] == 0, captured
     assert "warning" not in err.getvalue().lower(), err.getvalue()
+
+
+def _capture_panel_task_dispatch(argv: list[str]) -> dict:
+    """Run `cli.main(argv)` for a panel mode, capturing the ModeContext the
+    handler actually received. Offline: empty config, every backend live,
+    handler stubbed so no model is called.
+
+    Fails closed if the CLI never reaches the handler (`rc` set, models/roles
+    absent) so a usage-error path cannot silently look like a 0-role pad.
+    """
+    import contextlib
+    import io
+    from dataclasses import replace
+
+    from reviewlib import cli
+    from reviewlib.modes import registry as reg
+
+    captured: dict = {}
+    sub = argv[0]
+
+    def _fake_handler(ctx):
+        captured["models"] = list(ctx.models)
+        captured["roles"] = list(ctx.extra.get("task_roles") or [])
+        return 0
+
+    orig_modes = reg.MODES
+    orig_load = cli.load_config
+    orig_avail = backends.backend_available
+    orig_stdin = sys.stdin
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    old_env = os.environ.get("GEMINI_ENV_FILE")
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
+    reg.MODES = tuple(
+        replace(m, handler=_fake_handler) if m.subcommand == sub else m
+        for m in orig_modes
+    )
+    cli.load_config = lambda: {}
+    backends.backend_available = lambda _m: True
+    sys.stdin = io.StringIO("")
+    os.environ.pop("REVIEW_TASK_CODE", None)
+    os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    os.environ.pop("REVIEW_FAKE_BACKEND", None)
+    try:
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            captured["rc"] = cli.main(argv)
+    finally:
+        reg.MODES = orig_modes
+        cli.load_config = orig_load
+        backends.backend_available = orig_avail
+        sys.stdin = orig_stdin
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+        if old_env is None:
+            os.environ.pop("GEMINI_ENV_FILE", None)
+        else:
+            os.environ["GEMINI_ENV_FILE"] = old_env
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
+    return captured
+
+
+def test_cli_panel_task_one_model_pads_to_ship_min_roles():
+    """review-cli#433: just-ask / quorum / brainstorm `-m one-model --task`
+    must dispatch SHIP_MIN_ROLES distinct roles on that one engine — never
+    shrink the role list to engine count. Copies of one response do not
+    count as coverage; each role is its own slot.
+
+    Fails if `task_role_pad` stays gated on `mode.name == "review"` (today
+    those three stay a single seat)."""
+    from reviewlib.config import SHIP_MIN_ROLES
+
+    for sub, positional in (
+        ("just-ask", "q"),
+        ("quorum", "q"),
+        ("brainstorm", "topic"),
+    ):
+        captured = _capture_panel_task_dispatch(
+            [sub, positional, "--task", "433", "-m", "grok", "-C", str(REPO_ROOT)]
+        )
+        assert captured.get("rc") == 0, (sub, captured)
+        models = captured.get("models") or []
+        roles = captured.get("roles") or []
+        assert set(models) == {GROK_SEAT}, (sub, models, captured)
+        assert len(models) >= SHIP_MIN_ROLES, (
+            f"{sub} shrank to {len(models)} engine seat(s); "
+            f"need {SHIP_MIN_ROLES} role slots",
+            models,
+        )
+        distinct = {r for r in roles if r}
+        assert len(distinct) >= SHIP_MIN_ROLES, (
+            f"{sub} dispatched {len(distinct)} distinct roles, need {SHIP_MIN_ROLES}",
+            roles,
+            models,
+        )
+
+
+def test_run_panel_retry_unusable_retries_failed_slots_only():
+    """A failed role slot is retried once; usable slots are not re-dispatched.
+    Copies do not add coverage. Report is `Roles: N/M complete`."""
+    from reviewlib import panel as p
+    from reviewlib.backends import ReviewResult
+
+    calls: list[str] = []
+
+    def _fake_call(backend, model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+        calls.append(model)
+        if model == "b" and calls.count("b") == 1:
+            return ReviewResult(
+                model=model, command="fake", returncode=124, stdout="", stderr="timeout"
+            )
+        return ReviewResult(
+            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+        )
+
+    jobs = [
+        p.PanelJob(model="a", prompt="pa"),
+        p.PanelJob(model="b", prompt="pb"),
+        p.PanelJob(model="c", prompt="pc"),
+    ]
+    old_call = p.call_backend
+    old_resolve = p.resolve_backend
+    p.call_backend = _fake_call
+    p.resolve_backend = lambda m: m
+    try:
+        results = p.run_panel_retry_unusable(jobs, Path("."), 10)
+    finally:
+        p.call_backend = old_call
+        p.resolve_backend = old_resolve
+    assert [r.returncode for r in results] == [0, 0, 0], results
+    assert calls.count("a") == 1 and calls.count("c") == 1, calls
+    assert calls.count("b") == 2, calls
+    roles = ["architect", "correctness", "security"]
+    assert p.report_roles_complete(roles, results) == "Roles: 3/3 complete"
+    failed = ReviewResult(
+        model="b [correctness]", command="fake", returncode=124, stdout="", stderr="t"
+    )
+    mixed = [
+        ReviewResult(model="a", command="fake", returncode=0, stdout="ok", stderr=""),
+        failed,
+        ReviewResult(model="c", command="fake", returncode=0, stdout="ok", stderr=""),
+    ]
+    assert (
+        p.report_roles_complete(roles, mixed)
+        == "Roles: 2/3 complete; correctness timed out"
+    )
+
+
+def test_quorum_and_brainstorm_padded_roles_put_review_lenses_in_prompts():
+    """review-cli#433 P1: a one-model quorum/brainstorm pad records
+    architect/correctness/security only if each seat was actually prompted
+    with that REVIEW_ROLES lens. PERSONAS rotation is a different set of
+    lenses — recording the board roles without injecting them is a ship-gate
+    lie."""
+    import contextlib
+    import io
+    import tempfile
+
+    from reviewlib.modes import brainstorm as bs_mod
+    from reviewlib.modes import quorum as q_mod
+
+    roles = ["architect", "correctness", "security"]
+    models = ["m1", "m1", "m1"]
+
+    def _usable(job):
+        return ReviewResult(
+            model=job.label or job.model,
+            command="fake",
+            returncode=0,
+            stdout="ok",
+            stderr="",
+        )
+
+    captured: dict = {}
+
+    def _capture_slots(jobs, cwd, timeout, roles=None):
+        captured["jobs"] = list(jobs)
+        captured["roles"] = list(roles or [])
+        return [_usable(j) for j in jobs]
+
+    def _fake_moderator(candidates, prompt, cwd, timeout, diff="", round_no=0):
+        return ReviewResult(
+            model=candidates[0],
+            command="fake",
+            returncode=0,
+            stdout="DECISION: STOP\n1. QUORUM\nNone.\n2. DISAGREEMENT / NO QUORUM\nNone.\n3. ABSTAINED\nNone.",
+            stderr="",
+        )
+
+    saved_q_slots, saved_q_mod = q_mod.run_role_slots, q_mod.run_moderator
+    q_mod.run_role_slots = _capture_slots
+    q_mod.run_moderator = _fake_moderator
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = q_mod.mode_quorum(
+                "should we ship?",
+                models,
+                "",
+                REPO_ROOT,
+                5,
+                ["mod"],
+                roles=roles,
+            )
+    finally:
+        q_mod.run_role_slots = saved_q_slots
+        q_mod.run_moderator = saved_q_mod
+    assert rc == 0, rc
+    q_jobs = captured["jobs"]
+    assert len(q_jobs) == 3, [j.label for j in q_jobs]
+    for role, job in zip(roles, q_jobs, strict=True):
+        assert REVIEW_ROLES[role] in job.prompt, (
+            f"quorum seat recorded as {role!r} was never asked to apply that lens",
+            job.prompt,
+        )
+
+    captured.clear()
+    saved_b_slots, saved_b_mod = bs_mod.run_role_slots, bs_mod.run_moderator
+    bs_mod.run_role_slots = _capture_slots
+    bs_mod.run_moderator = _fake_moderator
+    saved_log = os.environ.get("REVIEW_LOG_DIR")
+    saved_stats = os.environ.get("REVIEW_STATS_FILE")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["REVIEW_LOG_DIR"] = tmp
+            os.environ["REVIEW_STATS_FILE"] = str(Path(tmp) / "run-stats.jsonl")
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                rc = bs_mod.mode_brainstorm(
+                    "topic",
+                    models,
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    3,
+                    3,
+                    roles=roles,
+                )
+    finally:
+        bs_mod.run_role_slots = saved_b_slots
+        bs_mod.run_moderator = saved_b_mod
+        if saved_log is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_log
+        if saved_stats is None:
+            os.environ.pop("REVIEW_STATS_FILE", None)
+        else:
+            os.environ["REVIEW_STATS_FILE"] = saved_stats
+    assert rc == 0, rc
+    b_jobs = captured["jobs"]
+    assert len(b_jobs) == 3, [j.label for j in b_jobs]
+    for role, job in zip(roles, b_jobs, strict=True):
+        assert REVIEW_ROLES[role] in job.prompt, (
+            f"brainstorm slot recorded as {role!r} was never asked to apply that lens",
+            job.prompt,
+        )
+
+
+def test_brainstorm_records_only_usable_completed_roles():
+    """review-cli#433 P1: a 2/3 brainstorm round is still alive, and a successful
+    synthesis makes the iteration pass. Persist the completed roles (Roles: 2/3
+    complete), not the planned list — a failed slot after retry must not satisfy
+    the ship gate."""
+    import contextlib
+    import io
+    import json
+    import tempfile
+
+    from reviewlib import cli
+    from reviewlib import panel as p
+    from reviewlib.modes import brainstorm as bs_mod
+
+    failed_role = "security"
+
+    def _fake_slots(jobs, cwd, timeout, roles=None):
+        role_list = list(roles or [])
+        results = []
+        for i, job in enumerate(jobs):
+            role = role_list[i] if i < len(role_list) else ""
+            ok = role != failed_role
+            result = ReviewResult(
+                model=job.label or job.model,
+                command="fake",
+                returncode=0 if ok else 124,
+                stdout="ideas" if ok else "",
+                stderr="" if ok else "timeout",
+            )
+            results.append(result)
+            p._tally_result(result.returncode)
+        print(p.report_roles_complete(role_list, results), file=sys.stderr, flush=True)
+        return results
+
+    def _fake_moderator(candidates, prompt, cwd, timeout, diff="", round_no=0):
+        p._tally_result(0)
+        body = (
+            "DECISION: STOP"
+            if "The brainstorm is complete." in prompt
+            else "summary\nDECISION: STOP"
+        )
+        return ReviewResult(
+            model=candidates[0],
+            command="fake",
+            returncode=0,
+            stdout=body,
+            stderr="",
+        )
+
+    saved_slots, saved_mod = bs_mod.run_role_slots, bs_mod.run_moderator
+    saved_load = cli.load_config
+    saved_avail = backends.backend_available
+    saved_stdin = sys.stdin
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    old_env = os.environ.get("GEMINI_ENV_FILE")
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
+    old_log = os.environ.get("REVIEW_LOG_DIR")
+    old_stats = os.environ.get("REVIEW_STATS_FILE")
+    bs_mod.run_role_slots = _fake_slots
+    bs_mod.run_moderator = _fake_moderator
+    cli.load_config = lambda: {}
+    backends.backend_available = lambda _m: True
+    sys.stdin = io.StringIO("")
+    os.environ.pop("REVIEW_TASK_CODE", None)
+    os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    os.environ.pop("REVIEW_FAKE_BACKEND", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            stats_path = Path(tmp) / "run-stats.jsonl"
+            os.environ["REVIEW_LOG_DIR"] = tmp
+            os.environ["REVIEW_STATS_FILE"] = str(stats_path)
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                rc = cli.main(
+                    [
+                        "brainstorm",
+                        "topic",
+                        "--task",
+                        "433",
+                        "-m",
+                        "grok",
+                        "--rounds",
+                        "3",
+                        "--max-rounds",
+                        "3",
+                        "-C",
+                        str(REPO_ROOT),
+                    ]
+                )
+            assert rc == 0, rc
+            assert stats_path.exists(), "expected a recorded brainstorm iteration"
+            recs = [
+                json.loads(ln)
+                for ln in stats_path.read_text().splitlines()
+                if ln.strip()
+            ]
+            assert recs, recs
+            rec = recs[-1]
+            assert rec.get("passed") is True, rec
+            recorded = rec.get("roles") or []
+            assert failed_role not in recorded, (
+                "failed slot was persisted as covered",
+                recorded,
+                rec,
+            )
+            assert recorded, rec
+    finally:
+        bs_mod.run_role_slots = saved_slots
+        bs_mod.run_moderator = saved_mod
+        cli.load_config = saved_load
+        backends.backend_available = saved_avail
+        sys.stdin = saved_stdin
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+        if old_env is None:
+            os.environ.pop("GEMINI_ENV_FILE", None)
+        else:
+            os.environ["GEMINI_ENV_FILE"] = old_env
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
+        if old_log is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = old_log
+        if old_stats is None:
+            os.environ.pop("REVIEW_STATS_FILE", None)
+        else:
+            os.environ["REVIEW_STATS_FILE"] = old_stats
 
 
 if __name__ == "__main__":

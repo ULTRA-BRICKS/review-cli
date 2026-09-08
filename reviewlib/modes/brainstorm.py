@@ -22,13 +22,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..backends import cap_diff_for_dispatch
+from ..config import REVIEW_ROLES
 from ..panel import (
     PanelJob,
+    completed_role_coverage,
     format_result,
     recount_round_by_usability,
     result_is_usable,
     run_moderator,
     run_panel,
+    run_role_slots,
 )
 from ..process import current_task_code, log_dir
 from . import PERSONAS, _run_effort, _visual_images
@@ -131,6 +134,8 @@ def mode_brainstorm(
     synthesize_only: bool = False,
     visual_images: tuple[Path, ...] = (),
     effort_override: "EffortOverride | None" = None,
+    roles: list[str] | None = None,
+    role_coverage: list[tuple[str, str]] | None = None,
 ) -> int:
     """Run (or RESUME) a multi-round brainstorm.
 
@@ -336,9 +341,16 @@ def mode_brainstorm(
                 )
             jobs: list[PanelJob] = []
             # Assign >= 3 distinct personas this round, rotating across the pool.
+            # A recorded --task pad supplies REVIEW_ROLES ids; those lenses must
+            # actually be in the prompt before we persist the role (review-cli#433 P1).
             slot_count = max(3, len(panel))
             for slot in range(slot_count):
-                persona_name, persona_bg = PERSONAS[persona_index % len(PERSONAS)]
+                role = roles[slot] if roles and slot < len(roles) else ""
+                lens = REVIEW_ROLES.get(role, "") if role else ""
+                if lens:
+                    persona_name, persona_bg = role, lens
+                else:
+                    persona_name, persona_bg = PERSONAS[persona_index % len(PERSONAS)]
                 persona_index += 1
                 model = panel[slot % len(panel)]
                 # The shared transcript is fed to backends over STDIN (see the
@@ -367,7 +379,11 @@ def mode_brainstorm(
                     )
                 )
 
-            round_results = run_panel(jobs, cwd, timeout)
+            round_results = (
+                run_role_slots(jobs, cwd, timeout, roles=roles)
+                if roles
+                else run_panel(jobs, cwd, timeout)
+            )
             # Correct the run-stats tally for EVERY round, not only a dead one (codex
             # review finding, 2026-08 seat-cooldown feature): `run_panel` auto-tallies
             # by exit code alone, so a normal round with one cached-cooldown sentinel
@@ -461,6 +477,16 @@ def mode_brainstorm(
                     flush=True,
                 )
                 break
+
+            if roles and role_coverage is not None:
+                slot_models = [panel[s % len(panel)] for s in range(len(round_results))]
+                seen = {r for _, r in role_coverage}
+                for model, role in completed_role_coverage(
+                    roles, round_results, slot_models
+                ):
+                    if role not in seen:
+                        role_coverage.append((model, role))
+                        seen.add(role)
 
             transcript_blocks.append(f"## Round {round_no}\n{round_text}")
             # The nonce'd `<!-- review:round N nonce=... -->` sentinel on its own line right
@@ -610,6 +636,12 @@ def _handler(ctx: ModeContext) -> int:
     }
     if images:
         kwargs["visual_images"] = images
+    roles = ctx.extra.get("task_roles") or None
+    if roles:
+        kwargs["roles"] = roles
+    coverage = ctx.extra.get("role_coverage")
+    if coverage is not None:
+        kwargs["role_coverage"] = coverage
     return mode_brainstorm(
         ctx.with_visual(ctx.args.topic),
         ctx.models,

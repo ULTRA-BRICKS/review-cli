@@ -3898,7 +3898,8 @@ def _add_global_options(
             "first N seats participate, the rest are kept in reserve. The board is "
             "never off — --pool only sizes it. N<=0 means all seats. An explicit `--pool N` "
             "below 3 with `--task` still wins but warns. Ignored for exact multi-model -m; "
-            "a recorded `--task -m` one-model run pads that model across the ship floor."
+            "a recorded `--task -m` one-model run pads that model across the ship floor. "
+            "Recorded `--task --pool 0` still pads a same-role config roster to the ship floor."
         ),
     )
     parser.add_argument(
@@ -4220,12 +4221,14 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   Fable/Sol. A recorded `review diff --task CODE` floors that pool to {SHIP_MIN_ROLES}
   distinct roles so `review task CODE --check` / gh ship can pass from one run; explicit
   `--pool N` still wins (warns if N<{SHIP_MIN_ROLES}). `-m one-model` with `--task` pads
-  that model across {SHIP_MIN_ROLES} roles. Use `--preset default` for a routine change
+  that model across {SHIP_MIN_ROLES} roles for review, just-ask, quorum, and brainstorm.
+  Use `--preset default` for a routine change
   review (pool 4, high effort) or `--preset heavy` for release/risky changes
   (Sol/Opus/GLM-cc/Kimi at highest effort; Fable is excluded from every preset — a
   confirmed ~100% dispatch failure rate, see DEFAULT_BOARD's own comment — and sits
   last-resort in the raw board instead). `--pool N` sizes the selected board (`--pool 0`
-  = all available). Explicit -m never lets config add extra seats; it narrows
+  = all available; recorded `--task --pool 0` still pads a same-role config roster
+  to the ship floor). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel (unless `--task`
   pads a single model). To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when
@@ -5061,6 +5064,44 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+            elif args.pool <= 0 and not explicit_models:
+                # review-cli#433: seat COUNT can already meet the floor while
+                # every seat shares one role. The warning above only checks
+                # count, so load the config roster and warn on role diversity.
+                # Do not fire on the default/preset board (no config roster)
+                # and do not double-warn when the seat-count warning already ran.
+                try:
+                    roster = (
+                        board_from_models(config_models, config)
+                        if config_models
+                        else load_board(config)
+                        if config_has_board
+                        else None
+                    )
+                except BoardConfigError:
+                    roster = None
+                if roster is not None:
+                    # Only a fully-specified roster (every seat has a known
+                    # role_lens) can be "all same role". A `models:` list that
+                    # only partially matches DEFAULT_BOARD metadata (e.g.
+                    # ["codex", "gemini", "grok"] — "codex" has no board seat)
+                    # is a seat-count question, not a role-diversity one.
+                    known = [r for r in roster if r.role_lens]
+                    distinct_roles = len({r.role for r in known})
+                    if (
+                        known
+                        and len(known) == len(roster)
+                        and distinct_roles < SHIP_MIN_ROLES
+                    ):
+                        print(
+                            f'[review-cli] warning: --pool 0 ("all seats") with only '
+                            f"{distinct_roles} distinct board role(s) is below the "
+                            f"default ship floor of {SHIP_MIN_ROLES} distinct board "
+                            "roles; this run cannot satisfy `review task CODE "
+                            "--check` / gh ship.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
         else:
             effective_pool_size = recorded_task_pool_size(
                 effective_pool_size,
@@ -5098,6 +5139,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # stays exact on dispatch (never gains cloned seats), so `--show-board` must
         # not show it padded either -- a padded display for a run that will actually
         # dispatch exact would mislead an agent planning off `--show-board`'s output.
+        # `--pool 0` ("all seats") sets effective_pool_size=0, so the `> 1` half of
+        # that gate would skip a config/default board that dispatch now repairs
+        # (review-cli#433). Pad show-board for `--task --pool 0` with no `-m`, but
+        # still not for `--pool 0 -m grok` (dispatch stays exact 1-seat).
         return _show_board(
             config,
             effective_pool_size,
@@ -5107,8 +5152,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
             pad_task_roles=bool(
                 early_task
                 and mode.name == "review"
-                and len(explicit_models) <= 1
-                and effective_pool_size > 1
+                and (
+                    (len(explicit_models) <= 1 and effective_pool_size > 1)
+                    or (not explicit_models and effective_pool_size <= 0)
+                )
             ),
         )
 
@@ -5353,13 +5400,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `review visual` pipeline (codex P2). It still fires
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
-    # One explicit `-m` model on a recorded review: force the board path so we can
-    # clone that model onto unused roles and reuse-pad to the ship floor
-    # (review-cli#309). Without --task, `-m` stays exact. `--pool 1` keeps exact
-    # (effective_pool_size > 1 is false) and warns above.
+    # One explicit `-m` model on a recorded run: clone that model onto unused
+    # roles and reuse-pad to the ship floor (review-cli#309, extended in
+    # review-cli#433 to just-ask / quorum / brainstorm). `--pool 1` keeps exact
+    # (effective_pool_size > 1 is false) and warns above. Review uses the board
+    # path; panel modes pad the flat `models` list below.
     task_role_pad = (
         bool(task_code)
-        and mode.name == "review"
+        and mode.name in ("review", "just-ask", "quorum", "brainstorm")
         and len(explicit_models) == 1
         and effective_pool_size > 1
     )
@@ -5368,6 +5416,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # the ship floor, not DEFAULT_POOL_SIZE 4 (the no-preset fallback `-m` never
         # consumed).
         effective_pool_size = SHIP_MIN_ROLES
+
+    panel_task_roles: list[str] = []
+    if task_role_pad and panel_mode:
+        # Never shrink the role list to engine count: one live model still
+        # executes every required role via separate role-specific invocations
+        # (review-cli#433). Copies of one response do not fill extra slots.
+        pad_min = effective_pool_size if effective_pool_size > 0 else SHIP_MIN_ROLES
+        padded_board = ensure_min_distinct_roles(
+            board_from_models(explicit_models, config),
+            pad_min,
+        )
+        models = [r.model for r in padded_board]
+        panel_task_roles = [r.role for r in padded_board]
 
     use_board = not panel_mode and (
         not explicit_models
@@ -5444,16 +5505,24 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # (test_unknown_role_board_with_one_live_seat_still_bails_end_to_end); repair
             # is for a SHORT roster missing SOME distinct roles, not for recovering an
             # entirely-role-less/misconfigured one.
+            # `--pool 0` ("all seats") sets effective_pool_size=0. Passing 0 into
+            # ensure_min_distinct_roles is a no-op (min_roles<=0 returns the board
+            # unchanged), and the `> 1` gate skipped the call entirely — a 4-seat
+            # all-same-role config roster then dispatched 1 distinct role
+            # (review-cli#433). All-seats mode still needs the ship-floor prefix.
+            role_repair_min = (
+                effective_pool_size if effective_pool_size > 0 else SHIP_MIN_ROLES
+            )
             if (
                 bool(task_code)
                 and mode.name == "review"
-                and effective_pool_size > 1
+                and role_repair_min > 1
                 and (
                     task_role_pad
                     or (not explicit_models and any(r.role_lens for r in board))
                 )
             ):
-                board = ensure_min_distinct_roles(board, effective_pool_size)
+                board = ensure_min_distinct_roles(board, role_repair_min)
         return None
 
     # Panel modes are interactive and long-running, so announce each streamed
@@ -5744,6 +5813,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             "diff_from_stdin": diff_from_stdin,
             "diff_already_capped": diff_already_capped,
             "stamp_diff_hash": stamp_diff_hash,
+            **({"task_roles": panel_task_roles} if panel_task_roles else {}),
         },
     )
 
@@ -5758,14 +5828,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # Brainstorm dispatches max(3, len(panel)) persona slots PER ROUND, so the real
         # per-round pool — and the ETA key — is the slot count, not len(models) (codex
         # P2: don't undercount a 1-2 model panel). brainstorm_pool mirrors that.
+        bs_pool = brainstorm_pool(models)
+        bs_roles_kw = {}
+        if panel_task_roles:
+            # Persist Roles: N/M complete, not the planned list. A 2/3-alive
+            # round can still pass; recording the failed slot would falsely
+            # satisfy the ship gate (review-cli#433 P1).
+            role_coverage: list[tuple[str, str]] = []
+            ctx.extra["role_coverage"] = role_coverage
+            bs_roles_kw["models_after"] = lambda: [m for m, _ in role_coverage]
+            bs_roles_kw["roles_after"] = lambda: [r for _, r in role_coverage]
         return _run_mode_with_stats(
             mode.stats_mode,
-            brainstorm_pool(models),
+            bs_pool,
             lambda: mode.handler(ctx),
             task_code=task_code,
             repo_id=repo_id,
             diff_files=diff_files,
             diff_sha256=diff_sha256,
+            **bs_roles_kw,
         )
 
     if mode.name == "qa":
@@ -5789,6 +5870,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
     if mode.name not in ("review", "visual"):
         # just-ask / quorum: a flat multi-model panel; pool_size == len(models).
+        panel_roles_kw = {}
+        if panel_task_roles:
+            panel_models = list(models)
+            panel_roles = list(panel_task_roles)
+            panel_roles_kw["models_after"] = lambda: panel_models
+            panel_roles_kw["roles_after"] = lambda: panel_roles
         return _run_mode_with_stats(
             mode.stats_mode,
             models,
@@ -5797,6 +5884,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             repo_id=repo_id,
             diff_files=diff_files,
             diff_sha256=diff_sha256,
+            **panel_roles_kw,
         )
 
     # The review mode. Validate the board now if it wasn't already (the no-visual path);
