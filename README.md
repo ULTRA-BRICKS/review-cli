@@ -254,6 +254,23 @@ otherwise the normal 20m floor applies when the env var is unset. Idle mode trea
 stdout/stderr as progress, including output inherited from child processes; the internal
 review backstop is the hard guard for a chatty but otherwise wedged process tree.
 
+**Heartbeats during a silent wait.** A live backend call can legitimately sit quiet
+for a while (see the idle timeout above), and in-seat retry (`--retry`, default on)
+can double that once for a timeout. To make sure a long silent wait always reads as
+"alive, still waiting" rather than "hung", every STREAMED backend call — regardless of
+mode, including the plain `review diff` path that does not print a `tail -f` log
+pointer — prints a `[review-cli] <backend> round <n>: still waiting, Ns elapsed (...)`
+line to stderr every 60 seconds once the call is actually RUNNING (the trailing note is
+`no output yet`, `producing output`, or `produced output, now idle`). Override with
+`REVIEW_HEARTBEAT_SECONDS=N`; any value `<= 0` (not just a literal `0`) disables
+heartbeats entirely; a positive value below the poll granularity (0.5s) clamps up to
+it. (Scope: this covers the review/panel seat dispatch path, `_run_streamed`, from the
+moment its subprocess spawns — the one implicated in the incident that motivated it.
+Two things it does NOT cover: a seat still queued on `REVIEW_MAX_CONCURRENCY`'s
+concurrency cap, waiting for a slot before it can even spawn; and a handful of short,
+bounded, non-seat subprocess calls elsewhere — e.g. `git worktree add` during QA
+isolation setup — that use the plain, non-streamed runner.)
+
 **Run stats & a startup ETA — never short-timeout `review`.** `review` is
 multi-model and (for the panel modes) multi-round, so it takes **minutes**, and a
 short shell `timeout` around it kills the run before its synthesis — a `brainstorm`

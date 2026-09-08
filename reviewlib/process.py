@@ -9,6 +9,7 @@ and preserves partial output on timeout. See the module docstrings below.
 from __future__ import annotations
 
 import codecs
+import math
 import os
 import re
 import signal
@@ -97,6 +98,45 @@ _MAX_CONCURRENCY_CEILING = 64  # a typo'd env can't pin an absurd number of chil
 _DEFAULT_IDLE_TIMEOUT = 20 * 60
 _SHORT_TIMEOUT_EXACT_THRESHOLD = 60
 _IDLE_TIMEOUT_ENV = "REVIEW_IDLE_TIMEOUT_SECONDS"
+
+# A live call can legitimately sit silent for up to `_DEFAULT_IDLE_TIMEOUT` (20 minutes),
+# and `retry.run_seat_with_retry` permits ONE in-seat retry of a timeout, so a single
+# hung seat can produce up to ~40 minutes of near-total silence to whatever is watching
+# `review diff`'s output, with the only stderr output in between being retry.py's single
+# one-line "transient failure, retrying" announcement -- and the plain `review diff`
+# mode never sets `backends._ANNOUNCE_LOGS` (only the interactive panel modes do), so
+# there is not even a "tail -f this log" pointer to fall back on. This is the code path
+# behind a real reported incident (2026-09-07: an `omp`-harness session's `review diff`
+# sat with zero visible output for 40+ minutes before being killed by hand). The exact
+# call responsible was NOT pinned down from review-cli's own per-call logs for that
+# window -- none of the retained logs there span a continuous ~40-minute silence with a
+# clean EXIT/TIMEOUT footer, and the claude seats that DID cool down around the same
+# time failed FAST (a one-line "You've hit your session limit" message, exit 1 --
+# confirmed in their per-call logs), not via an idle-timeout hang. What IS confirmed
+# from the same window: heavy, sustained multi-seat quota exhaustion across nearly the
+# whole reviewer board (seat-cooldown.json entries + a run-stats.jsonl pool collapse
+# lasting hours) plausibly contributed to whichever call actually hung, and a couple of
+# per-call logs from that window were abandoned mid-write with no closing footer at all
+# (consistent with an externally-killed process, though too short-lived individually to
+# BE the 40-minute hang on their own). Regardless of which specific call caused this
+# report, the underlying gap is real and reproducible independent of root cause: this
+# silent-wait code path can legitimately produce ~40 minutes of near-total caller-visible
+# silence for ANY seat that goes idle, for any reason. A heartbeat line here closes that
+# gap for EVERY caller of `_run_streamed`, independent of `_ANNOUNCE_LOGS`.
+_HEARTBEAT_INTERVAL_ENV = "REVIEW_HEARTBEAT_SECONDS"
+_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
+# Both poll loops in `_run_streamed` check for a due heartbeat once per 0.5s tick (the
+# same granularity they already poll `proc.wait` at), so no configured interval below
+# this floor could ever be honoured faithfully — a caller asking for e.g. 0.1s would
+# actually get one every ~0.5s (codex review finding: silently worse than requested).
+# Clamp UP to the floor instead of either lying about the cadence or rejecting the
+# value outright (round-6 review finding: a config typo like `1e-9999` underflows
+# `float()` to exactly `0.0`, indistinguishable from a literal `0` -- that specific
+# case still disables heartbeats via the `value > 0` check below, same as `0` itself;
+# any value that parses to something POSITIVE, however tiny, is a request for "as
+# often as possible", which this floor honours instead of silently downgrading it to
+# "disabled").
+_MIN_HEARTBEAT_INTERVAL_SECONDS = 0.5
 
 # A reserve seat promoted late in a board run must still get a fair shot, even when
 # almost no wall-clock budget remains — otherwise a tight deadline would starve every
@@ -830,6 +870,228 @@ def _timeout_marker_text(secs: int, kind: str) -> str:
     return f"[review-cli] TIMEOUT after {secs}s {kind} — partial output above]"
 
 
+def heartbeat_interval_seconds() -> float | None:
+    """Seconds between "still waiting" heartbeat lines emitted while a backend call is
+    silently idling (see the poll loops inside `_run_streamed`). Read at CALL time, same
+    convention as `idle_timeout_seconds`'s env reader, so an override applies per-run.
+
+    $REVIEW_HEARTBEAT_SECONDS wins; a missing/blank/non-numeric value falls back to the
+    default; a value <= 0 disables heartbeats entirely (opt-out, mirrors
+    $REVIEW_IDLE_TIMEOUT_SECONDS=0's "0 means disabled" convention). A non-finite value
+    (`nan`/`inf`/`-inf` -- `float()` accepts all three) also falls back to the default
+    rather than being treated as numeric: `nan > 0` is False (would silently disable
+    heartbeats, not "invalid -> default"), and `inf` would schedule the next heartbeat
+    infinitely far away (never fires) -- both recreate the exact silent-hang problem
+    this feature closes (codex review finding, round 1). Any value that parses as
+    POSITIVE, however tiny, is clamped UP to `_MIN_HEARTBEAT_INTERVAL_SECONDS` -- the
+    poll loops that consult this can't honour a cadence finer than their own 0.5s tick
+    (codex review finding, round 6), so a sub-floor request means "as often as
+    possible", not "disabled" and not a broken promise."""
+    raw = os.environ.get(_HEARTBEAT_INTERVAL_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    if not math.isfinite(value):
+        return _DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    if value <= 0:
+        return None
+    return max(value, _MIN_HEARTBEAT_INTERVAL_SECONDS)
+
+
+# A byte received more recently than this counts as "still actively producing" for the
+# heartbeat's wording, rather than "produced output, then went idle" (codex review
+# finding, round 7: a chatty child writing faster than the heartbeat interval was being
+# mislabeled "now idle" while it was, in fact, still streaming). Two poll ticks (the
+# poll loops check every 0.5s) so a byte that landed just before this tick's check still
+# reads as recent.
+_HEARTBEAT_RECENT_OUTPUT_SECONDS = 1.0
+
+
+def _write_stderr_best_effort(text: str) -> None:
+    """Write `text` to stderr without blocking and without holding the Python
+    stream lock.
+
+    `print(..., file=sys.stderr, flush=True)` both takes the stream's internal
+    lock and blocks on a full-but-open pipe. A daemon stuck in that write then
+    holds the lock for every later stderr write in this process, and on some
+    Python versions interpreter shutdown waits forever to flush the same lock
+    (codex P1 on PR 409). A 0-timeout `select` then blocking `os.write` is not
+    enough (grok follow-up): `select` only means "at least one byte free" on
+    Linux, while a POSIX pipe `write` of n <= PIPE_BUF on a blocking fd waits
+    until n bytes are free — an almost-full pager pipe (`review diff 2>&1 | less`)
+    still hangs. Write with the fd briefly marked nonblocking instead, then
+    restore the previous blocking mode; EAGAIN / short write / EPIPE drop this
+    heartbeat. The nonblocking window is a few syscalls; `os.dup` is not a
+    workaround because O_NONBLOCK is per open-file-description. When stderr has
+    no fileno (StringIO in tests, a caller-replaced stream), fall back to a
+    stream write — that path cannot block on a kernel pipe."""
+    stream = sys.stderr
+    fd = None
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = None
+    if fd is not None:
+        data = text.encode("utf-8", "replace")
+        restore_blocking = False
+        try:
+            if os.get_blocking(fd):
+                os.set_blocking(fd, False)
+                restore_blocking = True
+            os.write(fd, data)
+        except (BlockingIOError, OSError):
+            pass
+        finally:
+            if restore_blocking:
+                try:
+                    os.set_blocking(fd, True)
+                except OSError:
+                    pass
+        return
+    try:
+        stream.write(text)
+        stream.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _emit_wait_heartbeat(
+    backend: str,
+    round_no: int,
+    elapsed: float,
+    *,
+    got_output: bool,
+    elapsed_since_output: float | None,
+) -> None:
+    """Print one "still waiting" line to stderr so a caller watching `review diff` /
+    `review quorum` (or any other mode) can always tell a long silent wait is a live,
+    bounded retry and not a hang -- the observability gap a real ~40-minute incident
+    (2026-09-07, see the module comment above `_HEARTBEAT_INTERVAL_ENV`) exposed. Fires
+    regardless of `backends._ANNOUNCE_LOGS` -- that flag only gates the one-time "tail -f
+    this log" pointer for interactive panel modes; liveness is unconditional.
+
+    `elapsed_since_output` (seconds since the last byte arrived, or None before the
+    first byte) drives the wording so a genuinely CHATTY child isn't mislabeled "now
+    idle" just because its heartbeat happened to land between two writes (round-7
+    review finding): recent enough -> "producing output"; older -> "produced output,
+    now idle"; never any -> "no output yet".
+
+    Writes via `_write_stderr_best_effort` so a full pipe cannot block this function
+    or take the Python stream lock (codex P1, PR 409). Still dispatched on a daemon
+    thread from the poll loop: the no-fileno fallback (`stream.write`) can block on a
+    caller-replaced stderr, and keeping the write off the timeout-enforcing thread
+    remains the right isolation. Best-effort even so: a closed/broken stderr must
+    never raise past this function."""
+    if not got_output:
+        state = "no output yet"
+    elif (
+        elapsed_since_output is not None
+        and elapsed_since_output < _HEARTBEAT_RECENT_OUTPUT_SECONDS
+    ):
+        state = "producing output"
+    else:
+        state = "produced output, now idle"
+    _write_stderr_best_effort(
+        f"[review-cli] {backend} round {round_no}: still waiting, "
+        f"{int(elapsed)}s elapsed ({state})\n"
+    )
+
+
+# PROCESS-WIDE bound on CONCURRENTLY IN-FLIGHT heartbeat-write threads, sized to the
+# SAME cap that already bounds concurrently-running backend subprocesses
+# (`max_concurrency()` / `$REVIEW_MAX_CONCURRENCY`) -- built lazily + cached exactly
+# like `_get_concurrency_sem` above, one instance per process. This went through two
+# wrong designs first, both from real review findings:
+#   * per-`_run_streamed`-call state (codex review finding, round 9): bounded any ONE
+#     call's leak to one thread, but a long-lived process making MANY calls (retries,
+#     reserve backfills, a multi-seat board) could still leak one thread per call,
+#     unboundedly over the process's lifetime, since `sys.stderr` is ONE shared fd and
+#     a stuck write on it stays stuck for every later call too.
+#   * a single process-wide SLOT (one boolean "is anyone dispatching right now"):
+#     fixed the unbounded leak, but starved CONCURRENT healthy seats (codex review
+#     finding, round 10) -- panel seats dispatch in parallel, and a slow-but-draining
+#     writer for seat A holding the one slot silently dropped seat B's own, perfectly
+#     healthy, due heartbeat instead of just delaying it.
+# A semaphore sized to `max_concurrency()` fixes both: there can never be more calls
+# simultaneously due for a heartbeat than there are calls simultaneously RUNNING (that
+# count is already capped by the same value via `_get_concurrency_sem`), so this
+# ceiling can never starve a genuinely concurrent, healthy dispatch under normal
+# operation -- while a permanently-stuck stderr still only ever costs at most `cap`
+# leaked daemon threads, a small sane number, never unbounded.
+_HEARTBEAT_SEM_LOCK = threading.Lock()
+_heartbeat_sem: threading.BoundedSemaphore | None = None
+_heartbeat_sem_built = False
+
+
+def _get_heartbeat_sem() -> threading.BoundedSemaphore:
+    """The process-wide heartbeat-thread semaphore, built once and cached. Unlike
+    `_get_concurrency_sem` this NEVER returns None (a disabled subprocess cap,
+    `$REVIEW_MAX_CONCURRENCY<=0`, still gets a bounded heartbeat ceiling -- floored at
+    `_DEFAULT_MAX_CONCURRENCY` -- rather than an unbounded one)."""
+    global _heartbeat_sem, _heartbeat_sem_built
+    with _HEARTBEAT_SEM_LOCK:
+        if not _heartbeat_sem_built:
+            cap = max_concurrency()
+            if cap <= 0:
+                cap = _DEFAULT_MAX_CONCURRENCY
+            _heartbeat_sem = threading.BoundedSemaphore(cap)
+            _heartbeat_sem_built = True
+        return _heartbeat_sem
+
+
+def _reset_heartbeat_sem_for_tests() -> None:
+    """Drop the cached semaphore so a test can change $REVIEW_MAX_CONCURRENCY and
+    rebuild, or start a leak-bound probe with a clean slate. Test-only; production
+    builds the semaphore once per process and never resets it."""
+    global _heartbeat_sem, _heartbeat_sem_built
+    with _HEARTBEAT_SEM_LOCK:
+        _heartbeat_sem = None
+        _heartbeat_sem_built = False
+
+
+def _dispatch_heartbeat(
+    backend: str,
+    round_no: int,
+    elapsed: float,
+    *,
+    got_output: bool,
+    elapsed_since_output: float | None,
+) -> None:
+    """Fire-and-forget: runs `_emit_wait_heartbeat` on its own daemon thread (see that
+    function's docstring for why inline would risk stalling the timeout-enforcing poll
+    loop), but skips spawning a new one when every heartbeat-thread slot is already
+    busy (see the module comment above `_HEARTBEAT_SEM_LOCK` for why this is a bounded
+    semaphore, not a single slot or an unbounded spawn). A write that finishes normally
+    releases its slot immediately, so a healthy dispatch is never meaningfully delayed;
+    a write that never unblocks holds its slot forever -- the next due tick for THAT
+    seat tries again and is dropped the same way, while every OTHER seat still has the
+    remaining slots to itself."""
+    sem = _get_heartbeat_sem()
+    if not sem.acquire(blocking=False):
+        return  # every heartbeat-thread slot is busy right now; the next due tick retries
+
+    def _run_and_release() -> None:
+        try:
+            _emit_wait_heartbeat(
+                backend,
+                round_no,
+                elapsed,
+                got_output=got_output,
+                elapsed_since_output=elapsed_since_output,
+            )
+        finally:
+            sem.release()
+
+    threading.Thread(
+        target=_run_and_release,
+        daemon=True,
+        name="review-cli-heartbeat",  # identifiable for a leak-bound test/probe
+    ).start()
+
+
 # Explicit status footer the dashboard parser reads to decide success/failure. The
 # parser must NOT infer failure from substrings like `error:` in the body — a review's
 # OUTPUT legitimately contains those (it is literally describing errors in the code).
@@ -1334,17 +1596,43 @@ def _run_streamed(
             idle_timeout is not None or liveness_timeout is not None
         )
         if not use_polling:
+            # Polled in 0.5s ticks (same granularity as the idle-mode loop below) rather
+            # than one blocking `proc.wait(timeout=timeout_secs)`, purely so a heartbeat
+            # can fire on this bounded-wall-clock path too (QA/vision callers) — the
+            # actual timeout deadline is unchanged, just observed via short polls instead
+            # of one long wait.
             timeout_marker_kind = "total runtime"
-            try:
-                proc.wait(timeout=timeout_secs)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                timeout_marker_secs = timeout_secs
-                _kill_tree(proc, pgid)
+            wall_started = time.monotonic()
+            heartbeat_interval = heartbeat_interval_seconds()
+            next_heartbeat = (
+                wall_started + heartbeat_interval
+                if heartbeat_interval is not None
+                else None
+            )
+            while True:
                 try:
-                    proc.wait(timeout=3)
+                    proc.wait(timeout=0.5)
+                    break
                 except subprocess.TimeoutExpired:
-                    pass
+                    now = time.monotonic()
+                    if next_heartbeat is not None and now >= next_heartbeat:
+                        _dispatch_heartbeat(
+                            backend,
+                            round_no,
+                            now - wall_started,
+                            got_output=activity["got_output"],
+                            elapsed_since_output=now - activity["last"],
+                        )
+                        next_heartbeat = now + heartbeat_interval
+                    if now - wall_started >= timeout_secs:
+                        timed_out = True
+                        timeout_marker_secs = timeout_secs
+                        _kill_tree(proc, pgid)
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
         else:
             # If idle reaping itself is disabled but a liveness bound was still
             # requested, the idle DIMENSION falls back to the wall-clock timeout
@@ -1386,6 +1674,12 @@ def _run_streamed(
                 liveness_timeout is not None
                 and effective_liveness_timeout < liveness_timeout
             )
+            heartbeat_interval = heartbeat_interval_seconds()
+            next_heartbeat = (
+                loop_started + heartbeat_interval
+                if heartbeat_interval is not None
+                else None
+            )
             while True:
                 try:
                     proc.wait(timeout=0.5)
@@ -1394,6 +1688,20 @@ def _run_streamed(
                     # CPython's GIL makes these single-value reads safe enough; stale
                     # reads are harmless because the next 0.5s poll sees any newer state.
                     elapsed_idle = time.monotonic() - activity["last"]
+                    # Heartbeat: unconditional (independent of the liveness/true-silence/
+                    # idle branches below and of `backends._ANNOUNCE_LOGS`) so a caller
+                    # watching output always sees periodic proof of life during a long
+                    # silent wait, whichever sub-timeout eventually fires.
+                    _now = time.monotonic()
+                    if next_heartbeat is not None and _now >= next_heartbeat:
+                        _dispatch_heartbeat(
+                            backend,
+                            round_no,
+                            _now - loop_started,
+                            got_output=activity["got_output"],
+                            elapsed_since_output=elapsed_idle,
+                        )
+                        next_heartbeat = _now + heartbeat_interval
                     # A backend that has NEVER emitted a byte gets a separate, much
                     # shorter bound when the caller opts in via `liveness_timeout`
                     # (review-cli#153/#159/#179: opencode's zai/glm seat hangs at 0%

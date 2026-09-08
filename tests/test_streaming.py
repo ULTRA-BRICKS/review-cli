@@ -17,6 +17,8 @@ package directly — the RUNTIME behaviour is unchanged.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import threading
@@ -304,6 +306,493 @@ def test_silent_child_can_think_until_requested_timeout():
     assert elapsed >= 1.0, f"silent thinking was cut short after {elapsed:.2f}s"
     assert "done" in result.stdout
     assert "TIMEOUT" not in result.stdout
+
+
+def _capture_stderr():
+    """Redirect the REAL process-level `sys.stderr` (which `_emit_wait_heartbeat`
+    prints to) into an in-memory buffer. A plain `contextlib.redirect_stderr`, not the
+    pytest `capsys` fixture -- this file is also run standalone (its own `__main__`
+    block below calls every `test_*` with zero arguments, mirroring `bin/review`'s
+    fixture-free CI smoke path), so a fixture-typed parameter would break that runner."""
+    return contextlib.redirect_stderr(io.StringIO())
+
+
+def test_heartbeat_fires_periodically_during_silent_idle_wait():
+    """The observability gap behind a real 2026-09-07 incident (an omp-harness session's
+    `review diff` sat with zero visible output for 40+ minutes before being killed by
+    hand): a caller can see NOTHING for up to two consecutive 20-minute idle windows
+    (the initial call plus its one permitted timeout retry) with only a single one-line
+    retry announcement in between. A periodic heartbeat must fire during that wait,
+    independent of `backends._ANNOUNCE_LOGS` (which the plain `review diff` mode never
+    sets, so there is not even a "tail -f this log" pointer to fall back on)."""
+    code = "import time\ntime.sleep(4)\n"
+    argv = [sys.executable, "-c", code]
+
+    buf = io.StringIO()
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="1"), contextlib.redirect_stderr(buf):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=3,
+            backend="fake-heartbeat",
+            round_no=13,
+        )
+
+    err = buf.getvalue()
+    heartbeat_lines = [
+        line
+        for line in err.splitlines()
+        if "fake-heartbeat round 13: still waiting" in line
+    ]
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert len(heartbeat_lines) >= 2, f"expected periodic heartbeats, got: {err!r}"
+    assert "no output yet" in heartbeat_lines[0], heartbeat_lines[0]
+
+
+def test_heartbeat_fires_during_wall_mode_wait():
+    """Bounded wall-clock callers (QA/vision) get the same heartbeat treatment as the
+    idle-mode poll loop -- one shared observability fix, not a one-off."""
+    code = "import time\ntime.sleep(4)\n"
+    argv = [sys.executable, "-c", code]
+
+    buf = io.StringIO()
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="1"), contextlib.redirect_stderr(buf):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=3,
+            backend="fake-wall-heartbeat",
+            round_no=14,
+            timeout_mode="wall",
+        )
+
+    err = buf.getvalue()
+    heartbeat_lines = [
+        line
+        for line in err.splitlines()
+        if "fake-wall-heartbeat round 14: still waiting" in line
+    ]
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert len(heartbeat_lines) >= 2, f"expected periodic heartbeats, got: {err!r}"
+
+
+def test_heartbeat_disabled_via_env_zero():
+    """$REVIEW_HEARTBEAT_SECONDS=0 opts out entirely, mirroring the existing
+    $REVIEW_IDLE_TIMEOUT_SECONDS=0 "0 means disabled" convention."""
+    code = "import time\ntime.sleep(2)\n"
+    argv = [sys.executable, "-c", code]
+
+    buf = io.StringIO()
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="0"), contextlib.redirect_stderr(buf):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=1,
+            backend="fake-no-heartbeat",
+            round_no=15,
+        )
+
+    err = buf.getvalue()
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "still waiting" not in err, err
+
+
+def test_heartbeat_rejects_non_finite_interval_and_falls_back_to_default():
+    """`REVIEW_HEARTBEAT_SECONDS=nan`/`inf` must fall back to the documented default
+    (60s), not silently disable heartbeats (nan -> falsy check misses it) or schedule
+    the next one at infinity (inf -> never fires) -- both would recreate the exact
+    silent-hang problem this feature closes."""
+    assert process.heartbeat_interval_seconds.__module__ == "reviewlib.process"
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="nan"):
+        assert (
+            process.heartbeat_interval_seconds()
+            == process._DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        )
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="inf"):
+        assert (
+            process.heartbeat_interval_seconds()
+            == process._DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        )
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="-inf"):
+        assert (
+            process.heartbeat_interval_seconds()
+            == process._DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        )
+
+
+def test_heartbeat_interval_is_clamped_to_a_minimum_floor():
+    """`REVIEW_HEARTBEAT_SECONDS=0.1` (codex review finding, round 6): the poll loops
+    that consult this only check for a due heartbeat once per 0.5s tick, so a smaller
+    configured interval could never be honoured faithfully -- it must clamp UP to the
+    floor, not silently deliver a slower cadence than requested. A config typo that
+    underflows `float()` to exactly `0.0` (e.g. `1e-9999`) is indistinguishable from a
+    literal `0` and correctly still disables heartbeats (the `value <= 0` branch)."""
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="0.1"):
+        assert (
+            process.heartbeat_interval_seconds()
+            == process._MIN_HEARTBEAT_INTERVAL_SECONDS
+        )
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="1e-9999"):
+        assert process.heartbeat_interval_seconds() is None
+
+
+def test_heartbeat_reports_output_then_idle_state():
+    """Once the child has produced SOME output before going quiet, the heartbeat message
+    must say so (distinct wording from "no output yet") -- the same distinction
+    `_opencode_call_stalled`/true-silence detection already draws elsewhere."""
+    code = "import time\nprint('alive', flush=True)\ntime.sleep(4)\n"
+    argv = [sys.executable, "-c", code]
+
+    buf = io.StringIO()
+    with (
+        _with_env(REVIEW_HEARTBEAT_SECONDS="1", REVIEW_IDLE_TIMEOUT_SECONDS="3"),
+        contextlib.redirect_stderr(buf),
+    ):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=3,
+            backend="fake-heartbeat-output",
+            round_no=16,
+        )
+
+    err = buf.getvalue()
+    heartbeat_lines = [
+        line
+        for line in err.splitlines()
+        if "fake-heartbeat-output round 16: still waiting" in line
+    ]
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert heartbeat_lines, f"expected at least one heartbeat, got: {err!r}"
+    assert "produced output, now idle" in heartbeat_lines[-1], heartbeat_lines[-1]
+
+
+def test_heartbeat_survives_a_closed_stderr():
+    """P1 (codex review, round 1): a closed/broken stderr must degrade the heartbeat
+    to a silent no-op, never abort the whole backend call. `print()` on a CLOSED
+    io.StringIO raises ValueError, not OSError -- `_emit_wait_heartbeat` must catch
+    both, or a closed stderr turns a harmless heartbeat into a failed review."""
+    code = "import time\ntime.sleep(2)\n"
+    argv = [sys.executable, "-c", code]
+
+    buf = io.StringIO()
+    buf.close()  # any write now raises ValueError: I/O operation on closed file
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="1"), contextlib.redirect_stderr(buf):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=1,
+            backend="fake-closed-stderr",
+            round_no=17,
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+
+
+def test_heartbeat_reports_producing_output_for_a_chatty_child():
+    """P2 (codex review, round 7): a child writing faster than the heartbeat interval
+    (every 0.1s here, heartbeat every 1s) must be reported as "producing output", not
+    misleadingly "produced output, now idle" -- `got_output` alone can't tell "still
+    actively streaming" apart from "wrote something once, ages ago"."""
+    argv = _slow_argv(lines=40, interval=0.1)  # ~4s of continuous chatter
+
+    buf = io.StringIO()
+    with _with_env(REVIEW_HEARTBEAT_SECONDS="1"), contextlib.redirect_stderr(buf):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=10,
+            backend="fake-chatty-heartbeat",
+            round_no=19,
+        )
+
+    err = buf.getvalue()
+    heartbeat_lines = [
+        line
+        for line in err.splitlines()
+        if "fake-chatty-heartbeat round 19: still waiting" in line
+    ]
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert heartbeat_lines, f"expected at least one heartbeat, got: {err!r}"
+    assert all("producing output" in line for line in heartbeat_lines), heartbeat_lines
+    assert not any("now idle" in line for line in heartbeat_lines), heartbeat_lines
+
+
+def test_heartbeat_never_blocks_the_timeout_loop_on_a_full_pipe():
+    """P1 (codex review, round 6): a write to a FULL-but-open pipe (nobody draining the
+    read end) BLOCKS in real `print(flush=True)` -- it does not raise. If a heartbeat
+    fired inline on `_run_streamed`'s own timeout-enforcing poll thread, a blocked
+    write there would starve the very loop responsible for killing a hung child,
+    defeating the timeout entirely. This proves the fix (`_dispatch_heartbeat` runs
+    the print on its own daemon thread): reaping still happens on schedule even though
+    the heartbeat write itself is permanently stuck.
+
+    The heartbeat-thread semaphore this exercises is PROCESS-WIDE, cached for the life
+    of the process (see the module comment above `process._HEARTBEAT_SEM_LOCK`), so
+    this test rebuilds it before and after via `_reset_heartbeat_sem_for_tests`:
+    before, in case an EARLIER test in this file left every slot occupied by its own
+    stuck threads (which would silently suppress every heartbeat this test expects to
+    see fire); after, so stuck threads THIS test creates can't suppress heartbeats in
+    a LATER test. The underlying OS threads stay blocked forever regardless (Python
+    can't force-kill a thread) -- rebuilding the semaphore only stops FUTURE dispatch
+    calls from consulting the old, already-exhausted one."""
+    process._reset_heartbeat_sem_for_tests()
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    try:
+        while True:
+            os.write(write_fd, b"x" * 65536)
+    except BlockingIOError:
+        pass
+    os.set_blocking(write_fd, True)  # back to blocking, like a real inherited stderr fd
+    writer = os.fdopen(write_fd, "w", buffering=1)
+
+    code = "import time\ntime.sleep(4)\n"
+    argv = [sys.executable, "-c", code]
+    result_holder: dict[str, object] = {}
+
+    def _run_it():
+        with (
+            _with_env(REVIEW_HEARTBEAT_SECONDS="1"),
+            contextlib.redirect_stderr(writer),
+        ):
+            result_holder["result"] = review._run_streamed(
+                argv,
+                cwd=REPO_ROOT,
+                timeout=1,
+                backend="fake-full-pipe",
+                round_no=18,
+            )
+
+    t = threading.Thread(target=_run_it, daemon=True)
+    started = time.monotonic()
+    t.start()
+    t.join(timeout=8)
+    elapsed = time.monotonic() - started
+
+    try:
+        assert not t.is_alive(), (
+            f"reap was blocked by a heartbeat write to a full pipe "
+            f"(still running after {elapsed:.2f}s)"
+        )
+        result = result_holder.get("result")
+        assert result is not None, "run thread finished without producing a result"
+        assert result.returncode == 124, result.stdout + result.stderr
+        assert elapsed < 5, (
+            f"reap was delayed by a blocked heartbeat write ({elapsed:.2f}s)"
+        )
+    finally:
+        os.close(read_fd)
+        try:
+            writer.close()
+        except OSError:
+            pass
+        process._reset_heartbeat_sem_for_tests()
+
+
+def test_heartbeat_write_does_not_block_on_a_full_still_open_pipe():
+    """P1 (codex review, PR 409; grok follow-up): `print(..., flush=True)` to a
+    full, undrained pipe blocks while holding the Python stream lock. The sibling
+    full-pipe test misses this because it closes the read end (EPIPE unblocks the
+    writer) before asserting the writer finished. `_emit_wait_heartbeat` itself
+    must return even while the read end stays open.
+
+    A 0-timeout `select` then blocking `os.write` is not enough: `select` only
+    means "at least one byte free", while a POSIX pipe `write` of n <= PIPE_BUF
+    on a blocking fd waits until n bytes are free. Free a few bytes (less than a
+    heartbeat line) so `select` would say writable and a blocking write would
+    still hang — the almost-full pager case (`review diff 2>&1 | less`).
+    """
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    try:
+        while True:
+            os.write(write_fd, b"x" * 65536)
+    except BlockingIOError:
+        pass
+    os.set_blocking(write_fd, True)
+    os.read(read_fd, 16)  # some space, but less than the heartbeat line
+    writer = os.fdopen(write_fd, "w", buffering=1)
+    finished = threading.Event()
+
+    def emit():
+        with contextlib.redirect_stderr(writer):
+            process._emit_wait_heartbeat(
+                "fake-nonblock",
+                1,
+                5.0,
+                got_output=False,
+                elapsed_since_output=None,
+            )
+        finished.set()
+
+    t = threading.Thread(target=emit, daemon=True)
+    try:
+        t.start()
+        assert finished.wait(timeout=2), (
+            "heartbeat write blocked on an almost-full, still-open pipe"
+        )
+        assert not t.is_alive()
+    finally:
+        os.close(read_fd)
+        try:
+            writer.close()
+        except OSError:
+            pass
+        t.join(timeout=2)
+
+
+def test_heartbeat_thread_leak_is_bounded_not_unbounded():
+    """P1 (codex review, round 8 then round 9): with the stderr write PERMANENTLY
+    blocked (full pipe, never drained -- see the sibling test above), a naive "spawn a
+    new thread every due tick, forever, across every call" dispatcher would leak one
+    MORE stuck thread per tick/call, unboundedly, for as long as the process runs. The
+    fix caps concurrently in-flight heartbeat threads with a semaphore sized to
+    `max_concurrency()` -- the SAME cap already bounding concurrently-running backend
+    subprocesses (see the module comment above `process._HEARTBEAT_SEM_LOCK`).
+
+    This proves the bound holds across BOTH axes at once -- many due ticks within a
+    SINGLE long call, and multiple SEPARATE sequential calls -- against a cap forced to
+    a small known value (`REVIEW_MAX_CONCURRENCY=2`): however many ticks/calls this
+    generates (well more than 2), never more than 2 stuck `review-cli-heartbeat`
+    threads accumulate."""
+    process._reset_heartbeat_sem_for_tests()
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    try:
+        while True:
+            os.write(write_fd, b"x" * 65536)
+    except BlockingIOError:
+        pass
+    os.set_blocking(write_fd, True)
+    writer = os.fdopen(write_fd, "w", buffering=1)
+
+    # 0.5s is the clamp floor (see test_heartbeat_interval_is_clamped_to_a_minimum_
+    # floor). Each call below runs long enough for several due ticks; two SEPARATE
+    # calls run one after another, so together this exercises far more than 2
+    # tick/call opportunities to leak a thread -- well past the forced cap of 2.
+    cap = "2"
+    code = "import time\ntime.sleep(10)\n"  # well past the 2s timeout -- no race margin
+    argv = [sys.executable, "-c", code]
+    result_holder: dict[str, object] = {}
+
+    def _run_two_calls():
+        with (
+            _with_env(REVIEW_HEARTBEAT_SECONDS="0.1", REVIEW_MAX_CONCURRENCY=cap),
+            contextlib.redirect_stderr(writer),
+        ):
+            process._reset_heartbeat_sem_for_tests()  # rebuild against the forced cap
+            for i, backend in enumerate(("fake-leak-a", "fake-leak-b")):
+                result_holder[backend] = review._run_streamed(
+                    argv,
+                    cwd=REPO_ROOT,
+                    timeout=2,
+                    backend=backend,
+                    round_no=21 + i,
+                    timeout_mode="wall",
+                )
+
+    t = threading.Thread(target=_run_two_calls, daemon=True)
+    t.start()
+    t.join(timeout=15)
+
+    try:
+        assert not t.is_alive(), "run thread did not finish within the join timeout"
+        for backend in ("fake-leak-a", "fake-leak-b"):
+            result = result_holder.get(backend)
+            assert result is not None, f"{backend}: finished without a result"
+            assert result.returncode == 124, result.stdout + result.stderr
+        leaked = [
+            th
+            for th in threading.enumerate()
+            if th.name == "review-cli-heartbeat" and th.is_alive()
+        ]
+        assert len(leaked) <= 2, (
+            f"expected at most 2 (the forced REVIEW_MAX_CONCURRENCY) leaked heartbeat "
+            f"threads, found {len(leaked)}"
+        )
+    finally:
+        os.close(read_fd)
+        try:
+            writer.close()
+        except OSError:
+            pass
+        process._reset_heartbeat_sem_for_tests()
+
+
+def test_heartbeat_does_not_starve_a_concurrent_healthy_seat():
+    """P1 (codex review, round 10): a single shared dispatch SLOT (the round-9 design)
+    let a slow-but-eventually-draining writer for one seat hold the only slot while a
+    perfectly healthy, concurrently-running seat's own due heartbeat was silently
+    DROPPED, not delayed -- contradicting the documented "every streamed call" contract.
+    Proves the fix: while slot A is busy (held for slightly longer than the heartbeat
+    interval by a real, if slow, writer -- not permanently stuck), a concurrently
+    dispatched heartbeat for a DIFFERENT backend still gets its own semaphore slot and
+    fires."""
+    process._reset_heartbeat_sem_for_tests()
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowStream:
+        """A minimal stderr-like object whose ONE write blocks until `release` is set,
+        simulating a writer that is busy right now but not permanently stuck."""
+
+        def write(self, text: str) -> int:
+            started.set()
+            release.wait(timeout=5)
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+    buf_b = io.StringIO()
+    try:
+        with _with_env(REVIEW_MAX_CONCURRENCY="4"):
+            process._reset_heartbeat_sem_for_tests()
+            # Seat A occupies one slot with a slow (not stuck) write.
+            t_a = threading.Thread(
+                target=process._dispatch_heartbeat,
+                args=("seat-a", 0, 1.0),
+                kwargs={"got_output": False, "elapsed_since_output": None},
+                daemon=True,
+            )
+            with contextlib.redirect_stderr(_SlowStream()):
+                t_a.start()
+                assert started.wait(timeout=5), "seat A's write never started"
+
+                # Seat B dispatches concurrently, against a DIFFERENT (healthy, fast)
+                # stream -- it must still get a slot and fire, not be starved by A.
+                buf_b_ctx = contextlib.redirect_stderr(buf_b)
+                buf_b_ctx.__enter__()
+                try:
+                    process._dispatch_heartbeat(
+                        "seat-b",
+                        0,
+                        1.0,
+                        got_output=False,
+                        elapsed_since_output=None,
+                    )
+                    deadline = time.monotonic() + 5
+                    while (
+                        "seat-b" not in buf_b.getvalue() and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.05)
+                finally:
+                    buf_b_ctx.__exit__(None, None, None)
+            release.set()
+            t_a.join(timeout=5)
+    finally:
+        release.set()
+        process._reset_heartbeat_sem_for_tests()
+
+    assert "seat-b" in buf_b.getvalue(), (
+        f"seat B's heartbeat was starved by seat A holding a different slot: "
+        f"{buf_b.getvalue()!r}"
+    )
 
 
 def test_liveness_timeout_kills_a_totally_silent_process_fast():

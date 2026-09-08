@@ -4196,6 +4196,17 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
       window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
       applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
       timeout caps.
+    REVIEW_HEARTBEAT_SECONDS=N          — interval between "still waiting" heartbeat
+                                          lines printed to stderr once a backend call
+                                          has SPAWNED (not while still queued on
+                                          REVIEW_MAX_CONCURRENCY), for every STREAMED
+                                          backend call (_run_streamed — review/panel
+                                          seat dispatch) regardless of mode (default
+                                          60s; a non-finite value, e.g. nan/inf, falls
+                                          back to the default; ANY value <= 0, not just
+                                          a literal 0, disables heartbeats entirely; a
+                                          positive value below the 0.5s poll
+                                          granularity clamps up to it).
     REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
                                           <= 0 disables it. See `review stat`'s section
                                           in README.md.
