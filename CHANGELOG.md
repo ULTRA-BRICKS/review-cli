@@ -3,6 +3,10 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.1 — 2026-09-08
+
+- **On seat fail or unavailability, walk the role's fallback list before a different-role reserve (review-cli#454).**
+
 ## 0.37.0 — 2026-09-08
 
 - **Feat: refuse seat spawn when a family's live harness 5-hour or 7-day

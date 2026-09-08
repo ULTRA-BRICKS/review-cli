@@ -4,17 +4,26 @@ What: each REVIEW_ROLES key publishes an ordered tuple of bare model ids —
 the identity a role falls back through — and those ids (plus a config
 `model:` value) resolve onto a harness-prefixed seat.
 
-Accessed via: `review --show-board` (footer from format_role_fallback_section)
-and config._expand_alias (seat_for_model after the MODEL_ALIASES lookup).
+Accessed via: `review --show-board` (footer from format_role_fallback_section);
+config._expand_alias (seat_for_model after the MODEL_ALIASES lookup);
+panel.run_board_with_failover and config.select_pool / split_pool_reserve
+(next_role_fallback on seat fail/unavailable, before a different-role reserve).
 
 Assumptions: roles name bare model ids; the harness prefix is derived once
 via BOARD_MODEL_SEATS. Unknown ids are returned unchanged — never guessed.
+next_role_fallback only walks the list when the failed model is ON it;
+a custom seat of that role still falls through to reserve.
 
 Past bugs: leftover of review-cli#364 + 175-ask 168/170 — roles still named
 harness seats, and a bare id fell through to the opencode catch-all.
+Listing-only after review-cli#449: the lists printed but dispatch still
+popped the next-priority reserve (Grok/security -> DeepSeek/tests).
 """
 
 from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import replace
 
 ROLE_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
     "architect": ("claude-fable-5", "claude-opus-4-8"),
@@ -77,6 +86,39 @@ def bare_model_id(token: str) -> str:
     if prefix in ("oc", "opencode") and "/" in rest:
         return rest.split("/", 1)[1]
     return rest
+
+
+def _identity_keys(token: str) -> frozenset[str]:
+    """Seat, bare id, and original token — so used_models can name any form."""
+    seat = seat_for_model(token)
+    return frozenset({token, seat, bare_model_id(token), bare_model_id(seat)})
+
+
+def next_role_fallback(failed, used_models: Iterable[str] = ()):
+    """Next same-role seat after `failed`, or None if the role list is exhausted.
+
+    Walks ROLE_FALLBACK_MODELS[failed.role] in order, resolves each id via
+    seat_for_model, and skips `failed.model` plus anything in `used_models`.
+    Returns replace(failed, model=next_seat) so role and effort stay put.
+
+    If the failed model is not on that role's list (a custom m-pool seat),
+    returns None immediately so the caller can pop the next-priority reserve.
+    """
+    models = ROLE_FALLBACK_MODELS.get(getattr(failed, "role", ""), ())
+    if not models:
+        return None
+    failed_keys = _identity_keys(failed.model)
+    if not any(_identity_keys(mid) & failed_keys for mid in models):
+        return None
+    used_keys = set(failed_keys)
+    for token in used_models:
+        used_keys |= _identity_keys(token)
+    for mid in models:
+        seat = seat_for_model(mid)
+        if _identity_keys(seat) & used_keys:
+            continue
+        return replace(failed, model=seat)
+    return None
 
 
 def format_role_fallback_section() -> str:

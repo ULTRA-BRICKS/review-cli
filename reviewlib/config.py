@@ -752,6 +752,51 @@ def _effective_pool_size(seat_count: int, pool: int) -> int:
     return pool
 
 
+def _seats_with_role_fallback(
+    board: list[BoardReviewer],
+    available: Callable[[BoardReviewer], bool],
+) -> list[BoardReviewer]:
+    """Walk `board` in priority order, substituting a same-role fallback when a
+    seat is unreachable instead of skipping straight to a different-role next
+    seat. Dedup by model id so a substitute (Astra for Sol) is not also picked
+    as its own later board row."""
+    from .role_models import bare_model_id, next_role_fallback
+
+    picked: list[BoardReviewer] = []
+    seen: set[str] = set()
+
+    def _mark(model: str) -> None:
+        seen.add(model)
+        seen.add(bare_model_id(model))
+
+    def _seen(model: str) -> bool:
+        return model in seen or bare_model_id(model) in seen
+
+    for seat in board:
+        if _seen(seat.model):
+            continue
+        if available(seat):
+            picked.append(seat)
+            _mark(seat.model)
+            continue
+        used = set(seen)
+        used.add(seat.model)
+        used.add(bare_model_id(seat.model))
+        while True:
+            cand = next_role_fallback(seat, used_models=used)
+            if cand is None:
+                break
+            used.add(cand.model)
+            used.add(bare_model_id(cand.model))
+            if _seen(cand.model):
+                continue
+            if available(cand):
+                picked.append(cand)
+                _mark(cand.model)
+                break
+    return picked
+
+
 def select_pool(
     board: list[BoardReviewer],
     pool: int,
@@ -761,15 +806,16 @@ def select_pool(
 
     The board is EXPECTED to be priority-ordered (strongest first) — that order IS the
     priority. Startup failover: a higher-priority seat whose backend is NOT reachable
-    (per `available`) is SKIPPED and the next-priority seat pulled up, so the run still
-    starts with `pool` WORKING seats when enough reachable seats exist. The default
-    `available` treats every seat as reachable, so callers that check availability
-    downstream get "the first `pool` seats in priority order".
+    (per `available`) is replaced by the next unused model on that role's fallback
+    list when that substitute is reachable, so the run keeps the role rather than
+    pulling a different-role next seat. Only if the role list is exhausted is the
+    seat skipped. The default `available` treats every seat as reachable, so callers
+    that check availability downstream get "the first `pool` seats in priority order".
 
     The selection is deterministic. `pool <= 0` means "all (available) seats", and a
     `pool` larger than the available count is clamped — a caller can never ask for more
     seats than exist. An empty board stays empty. Returns a NEW list, never a view."""
-    seats = [r for r in board if available(r)]
+    seats = _seats_with_role_fallback(board, available)
     return list(seats[: _effective_pool_size(len(seats), pool)])
 
 
@@ -780,12 +826,13 @@ def split_pool_reserve(
 ) -> tuple[list[BoardReviewer], list[BoardReviewer]]:
     """Split the AVAILABLE board into (pool, reserve) by priority, for failover.
 
-    `pool` = the top-N available seats (startup failover — same slice select_pool makes).
+    `pool` = the top-N available seats (startup failover — same slice select_pool makes,
+    including same-role fallback substitutes for unreachable board seats).
     `reserve` = the remaining available seats, in priority order, which back-fill a pool
     seat that fails mid-run. Unavailable seats are in NEITHER list (they can't run). The
     two lists are disjoint and together hold every available seat, in priority order. The
     `board` is EXPECTED to be priority-ordered (its order is the priority)."""
-    seats = [r for r in board if available(r)]
+    seats = _seats_with_role_fallback(board, available)
     n = _effective_pool_size(len(seats), pool)
     return list(seats[:n]), list(seats[n:])
 

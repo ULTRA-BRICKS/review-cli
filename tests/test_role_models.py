@@ -23,6 +23,7 @@ from reviewlib.config import (  # noqa: E402
     SOL_SEAT,
     SONNET_SEAT,
     TERRA_SEAT,
+    BoardReviewer,
     _expand_alias,
     load_board,
 )
@@ -30,6 +31,7 @@ from reviewlib.role_models import (  # noqa: E402
     ROLE_FALLBACK_MODELS,
     bare_model_id,
     format_role_fallback_section,
+    next_role_fallback,
     seat_for_model,
 )
 
@@ -147,6 +149,45 @@ def test_bare_model_id_strips_harness_prefix():
     )
     assert bare_model_id("codex:gpt-5.6-sol") == "gpt-5.6-sol"
     assert bare_model_id("gemini") == "gemini"
+
+
+def test_next_role_fallback_grok_security_returns_qwen_same_role():
+    failed = BoardReviewer(GROK_SEAT, "security", "Grok", effort="high")
+    nxt = next_role_fallback(failed, used_models=())
+    assert nxt is not None
+    assert nxt.model == "oc:commandcode/Qwen/Qwen3.7-Max"
+    assert nxt.role == "security"
+    assert nxt.effort == "high"
+    assert nxt.display == "Grok"
+
+
+def test_next_role_fallback_skips_used_qwen_to_glm():
+    failed = BoardReviewer(GROK_SEAT, "security", "Grok")
+    nxt = next_role_fallback(
+        failed, used_models=("oc:commandcode/Qwen/Qwen3.7-Max",)
+    )
+    assert nxt is not None
+    assert nxt.model == "zai:glm-5.2"
+    assert nxt.role == "security"
+
+
+def test_next_role_fallback_exhausted_returns_none():
+    failed = BoardReviewer(GROK_SEAT, "security", "Grok")
+    nxt = next_role_fallback(
+        failed,
+        used_models=(
+            "oc:commandcode/Qwen/Qwen3.7-Max",
+            GROK_SEAT,
+            "zai:glm-5.2",
+        ),
+    )
+    assert nxt is None
+
+
+def test_next_role_fallback_unknown_model_not_on_list_returns_none():
+    failed = BoardReviewer("m-pool", "correctness", "Custom")
+    nxt = next_role_fallback(failed, used_models=())
+    assert nxt is None
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from .backends import (
 )
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 from .process import set_board_deadline, write_retry_log
+from .role_models import next_role_fallback
 
 # Overall wall-clock BUDGET (seconds, from the start of a board run) that
 # run_board_with_failover clamps its reserve-promotion idle timeouts against via
@@ -545,8 +546,9 @@ def run_board_with_failover(
 
     The pool runs in parallel (run_panel). Any seat whose result is NOT usable
     (result_is_usable: non-zero exit, empty output, or an "unavailable" sentinel body)
-    is a failed seat; for each, the next-priority RESERVE reviewer is promoted and run,
-    repeating until `len(pool)` usable verdicts are collected or the reserve is exhausted
+    is a failed seat; for each, the same-role fallback list is walked first
+    (next_role_fallback) and only then is the next-priority RESERVE reviewer promoted,
+    repeating until `len(pool)` usable verdicts are collected or both are exhausted
     (then it degrades gracefully — `FailoverOutcome.degraded` is True). The target count
     is the number of pool seats handed in (already sized to --pool and to availability by
     the caller's startup failover).
@@ -604,9 +606,32 @@ def run_board_with_failover(
                     _tally_ok(True)
                 else:
                     # This seat failed — count it as a fail and try to backfill it from
-                    # the next-priority reserve. The replacement runs in the NEXT round.
+                    # the same-role fallback list before the next-priority reserve.
                     _tally_ok(False)
-                    if reserve_queue:
+                    used = set(usable_models)
+                    used.update(r.model for r in current)
+                    used.update(r.model for r in next_round)
+                    used.update(
+                        r.model for r in reserve if r not in reserve_queue
+                    )
+                    cand = next_role_fallback(reviewer, used_models=used)
+                    if cand is not None:
+                        print(
+                            f"[review-cli] board: {result.model} failed — role-fallback "
+                            f"{cand.model} [{reviewer.role}]",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        write_retry_log(
+                            f"{result.model}->{cand.model}",
+                            kind="promote",
+                            attempt=0,
+                            max_attempts=1,
+                            delay=0.0,
+                            result=result,
+                        )
+                        next_round.append(cand)
+                    elif reserve_queue:
                         promoted = reserve_queue.pop(0)
                         print(
                             f"[review-cli] board: {result.model} failed — promoting "
