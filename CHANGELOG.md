@@ -21,6 +21,34 @@ semantic versioning.
   `input_text is None` path — never a bare/inherited `None` — while the codex/claude path
   (`input_text` provided) keeps `stdin=subprocess.PIPE` unchanged.
 
+## 0.36.5 — 2026-09-08
+
+- **Fix: `review task CODE --check`'s `#389` near-miss key diagnostic now
+  prints in plain-text mode too, not just `--json`.** `quorum_check`'s
+  `searched_key`/`near_miss_keys` fields (added alongside the `105`/`#105`
+  read-time aliasing) previously reached only the `--json` payload — a human
+  running a bare `review task CODE --check` never saw the note, even though
+  the mismatch is supposed to be diagnosable from the refusal alone. Both
+  modes now print `[review task] note: searched key '#105' — found '105' in
+  the store (same digits, different '#')…` on a failed/empty check whenever
+  the other spelling exists in the store.
+- **Fix (review-cli#389 follow-up, quorum-review finding): the near-miss note above
+  no longer claims a twin's iteration "already counts above" when it never actually
+  did.** The note's wording used to branch on `excluded_mismatched_iterations` (a
+  count of diff-identity mismatches) alone — a twin whose only record has
+  `passed=False` never reaches that count at all, so the "already count above" claim
+  printed regardless and was simply false for that shape (Grok review flipped a prior
+  CLEAN verdict to NOT CLEAN with a concrete `#105`/`105` repro). `quorum_check` now
+  exposes the real signal — `near_miss_counted`/`near_miss_ever_passed`, checked
+  against the actual gated population — and the CLI picks accurate wording for each of
+  the three cases (counted, passed-but-mismatched, never passed). Also: the
+  passed-but-mismatched case used to point a plain-text reader at `mismatch_details`,
+  a `--json`-only field they have no way to see; it now says to re-run with `--json`
+  instead. Also documents `searched_key`/`near_miss_keys`/`near_miss_counted`/
+  `near_miss_ever_passed` in the `--check --json` schema (README) — undocumented
+  since `near_miss_keys` first shipped — and adds `--check --json` regression tests
+  covering all three near-miss shapes (never passed, gated-pass, passed-but-mismatched).
+
 ## 0.36.3 — 2026-09-08
 
 - **Fix: `review task --check` treats `105` and `#105` as the same GitHub-issue

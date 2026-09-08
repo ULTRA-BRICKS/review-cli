@@ -4387,6 +4387,78 @@ def test_quorum_check_near_miss_keys_on_failed_check_review_cli_389():
         assert "near_miss_keys" not in same
 
 
+def test_quorum_check_near_miss_counted_false_when_twin_never_passed_review_cli_431():
+    """review-cli#431 quorum-round finding (Grok flipping a prior CLEAN verdict
+    to NOT CLEAN with a concrete repro): a twin whose ONLY record has
+    `passed=False` sits in the dual-key-read `iterations` unconditionally (the
+    membership check `near_miss_keys` itself is based on), but never reaches
+    `passed_iterations` at all -- so `near_miss_counted` must be False and
+    `near_miss_ever_passed` must be False, even though
+    `excluded_mismatched_iterations` is absent/0 (there was no diff-identity
+    mismatch to exclude; the record simply never passed). Before this fix the
+    CLI's note claimed this twin's iteration "already counts above" whenever
+    `excluded` was falsy, which was false for exactly this shape."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        result = _stats.quorum_check("#105", min_iter=3, min_models=1)
+        assert result["passed"] is False
+        assert result["searched_key"] == "#105"
+        assert result["near_miss_keys"] == ["105"]
+        assert result.get("excluded_mismatched_iterations", 0) == 0
+        assert result["near_miss_counted"] is False
+        assert result["near_miss_ever_passed"] is False
+
+
+def test_quorum_check_near_miss_counted_true_when_twin_actually_gated_review_cli_431():
+    """Sibling of the above, PRESENCE case: a twin whose record actually passed
+    and landed in the gated set must report `near_miss_counted=True` -- the
+    "already counts above" wording stays accurate for the case it was written
+    for."""
+    with _TmpStore():
+        _record_passed_iteration("105", "codex")
+        result = _stats.quorum_check("#105", min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["near_miss_keys"] == ["105"]
+        assert result["near_miss_counted"] is True
+        assert result["near_miss_ever_passed"] is True
+
+
+def test_quorum_check_near_miss_ever_passed_true_but_not_counted_when_mismatched_review_cli_431():
+    """Third shape (the excluded-branch case): a twin's record DID pass, but
+    diff-identity verification excluded it as a repo/diff mismatch -- it must
+    report `near_miss_ever_passed=True` alongside `near_miss_counted=False`,
+    the combination the CLI's middle branch ("excluded as mismatch") keys
+    off of."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",
+            diff_files=["b.py"],
+        )
+        result = _stats.quorum_check(
+            "#105", min_iter=3, min_models=1, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is False
+        assert result["near_miss_keys"] == ["105"]
+        assert result["excluded_mismatched_iterations"] == 1
+        assert result["near_miss_counted"] is False
+        assert result["near_miss_ever_passed"] is True
+
+
 def test_quorum_check_rejects_zero_or_negative_thresholds_directly():
     """The floor validation lives in quorum_check() itself, not only the CLI
     wrapper -- a direct library caller (bypassing the CLI's own --min-iter/
@@ -5920,6 +5992,261 @@ def test_cli_check_min_models_advisory_absent_when_only_min_roles_given_review_c
             )
         assert rc == 0, out.getvalue()
         assert "note:" not in out.getvalue()
+
+
+def test_cli_check_near_miss_key_note_text_mode_review_cli_389():
+    """review-cli#389: a failed check whose search key has a same-digits,
+    different-'#' twin already in the store must print a diagnostic note in
+    PLAIN TEXT mode too, not just --json -- a human running a bare
+    `review task CODE --check` never opens --json, and the acceptance bar is
+    "diagnosable from the refusal alone"."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    "#105",
+                    "--check",
+                    "--min-iter",
+                    "3",
+                    "--min-models",
+                    "1",
+                    "--no-verify-identity",
+                ]
+            )
+        assert rc != 0, out.getvalue()
+        assert "searched key '#105'" in err.getvalue(), err.getvalue()
+        assert "'105'" in err.getvalue(), err.getvalue()
+
+
+def test_cli_check_near_miss_key_absent_when_no_twin_review_cli_389():
+    """No note at all when the searched key has no twin in the store (the
+    common case: nothing to diagnose)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check", "--min-iter", "3"])
+        assert rc != 0, out.getvalue()
+        assert "searched key" not in err.getvalue(), err.getvalue()
+
+
+def test_cli_check_near_miss_note_not_falsely_already_counted_review_cli_431():
+    """review-cli#431: the text-mode near-miss note must not claim a twin's
+    iteration "already counts above" when that twin's only record never
+    passed -- it must state the accurate fact (it did not count) instead."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    "#105",
+                    "--check",
+                    "--min-iter",
+                    "3",
+                    "--min-models",
+                    "1",
+                    "--no-verify-identity",
+                ]
+            )
+        assert rc != 0, out.getvalue()
+        note = err.getvalue()
+        assert "searched key '#105'" in note, note
+        assert "'105'" in note, note
+        assert "already count above" not in note, note
+        assert "do not count above" in note, note
+
+
+def test_cli_check_near_miss_note_points_to_json_not_bare_field_review_cli_431():
+    """review-cli#431: when the near-miss twin's iteration(s) passed but were
+    excluded above as a repo/diff mismatch, the text-mode note must not tell a
+    plain-text reader to "check mismatch_details" -- that field only exists in
+    --json output (a human in text mode has no way to act on that pointer).
+    It must point at something actually usable from text mode."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",
+            diff_files=["b.py"],
+        )
+        old_resolve = _cli._resolve_quorum_check_context
+        _cli._resolve_quorum_check_context = lambda cwd_raw, verify_identity: (
+            "repo-a",
+            ["a.py"],
+            "ran",
+        )
+        try:
+            out = io.StringIO()
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(out):
+                rc = _cli.main(
+                    [
+                        "task",
+                        "#105",
+                        "--check",
+                        "--min-iter",
+                        "3",
+                        "--min-models",
+                        "1",
+                    ]
+                )
+        finally:
+            _cli._resolve_quorum_check_context = old_resolve
+        assert rc != 0, out.getvalue()
+        note = err.getvalue()
+        assert "searched key '#105'" in note, note
+        assert "already count above" not in note, note
+        assert "check mismatch_details" not in note, note
+        assert "--json" in note, note
+
+
+def test_cli_check_json_near_miss_fields_never_passed_review_cli_431():
+    """review-cli#431 (Codex review finding): `--check --json` must actually
+    carry `near_miss_counted`/`near_miss_ever_passed` alongside `near_miss_keys`
+    -- not just the text-mode note -- for a twin whose only record never
+    passed."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    "#105",
+                    "--check",
+                    "--json",
+                    "--min-iter",
+                    "3",
+                    "--min-models",
+                    "1",
+                ]
+            )
+        assert rc != 0, out.getvalue()
+        payload = json.loads(out.getvalue())
+        assert payload["searched_key"] == "#105"
+        assert payload["near_miss_keys"] == ["105"]
+        assert payload["near_miss_counted"] is False
+        assert payload["near_miss_ever_passed"] is False
+
+
+def test_cli_check_json_near_miss_fields_counted_review_cli_431():
+    """Sibling PRESENCE case: a twin whose record actually passed and landed
+    in the gated set must carry `near_miss_counted: true` in --json."""
+    with _TmpStore():
+        _record_passed_iteration("105", "codex")
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    "#105",
+                    "--check",
+                    "--json",
+                    "--min-iter",
+                    "3",
+                    "--min-models",
+                    "3",
+                    "--no-verify-identity",
+                ]
+            )
+        assert rc != 0, out.getvalue()
+        payload = json.loads(out.getvalue())
+        assert payload["near_miss_keys"] == ["105"]
+        assert payload["near_miss_counted"] is True
+        assert payload["near_miss_ever_passed"] is True
+
+
+def test_cli_check_json_near_miss_fields_mismatched_review_cli_431():
+    """Third shape: a twin's record passed but was excluded above as a
+    repo/diff mismatch -- --json must show `near_miss_counted: false` WITH
+    `near_miss_ever_passed: true`, the exact combination the text-mode note's
+    middle branch keys off of."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code="105",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",
+            diff_files=["b.py"],
+        )
+        old_resolve = _cli._resolve_quorum_check_context
+        _cli._resolve_quorum_check_context = lambda cwd_raw, verify_identity: (
+            "repo-a",
+            ["a.py"],
+            "ran",
+        )
+        try:
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(
+                    [
+                        "task",
+                        "#105",
+                        "--check",
+                        "--json",
+                        "--min-iter",
+                        "3",
+                        "--min-models",
+                        "1",
+                    ]
+                )
+        finally:
+            _cli._resolve_quorum_check_context = old_resolve
+        assert rc != 0, out.getvalue()
+        payload = json.loads(out.getvalue())
+        assert payload["near_miss_keys"] == ["105"]
+        assert payload["excluded_mismatched_iterations"] == 1
+        assert payload["near_miss_counted"] is False
+        assert payload["near_miss_ever_passed"] is True
 
 
 # ---------------------------------------------------------------------------

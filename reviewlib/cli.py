@@ -1899,6 +1899,48 @@ def _quorum_check_subcommand(
             file=sys.stderr,
         )
 
+    # review-cli#389: a failed/empty check whose search key has a same-digits
+    # different-'#' twin already IN the store must say so on the refusal itself —
+    # both modes (--json's payload already carries searched_key/near_miss_keys for
+    # a machine reader, but a human running a plain `review task CODE --check`
+    # never opens --json) so the mismatch is diagnosable from the refusal alone,
+    # matching the excluded-mismatch warning's same both-modes convention above.
+    #
+    # Quorum-review round 2 (Grok, flipping a prior CLEAN to NOT CLEAN with a
+    # concrete repro): the original cut branched on `excluded` (this task's
+    # TOTAL mismatched-iteration count) to pick the wording, but a twin whose
+    # ONLY record has `passed=False` never reaches `passed_iterations` at all
+    # -- `excluded` stays 0 for it and the "already count above" branch fired
+    # anyway, which is false. `near_miss_counted`/`near_miss_ever_passed`
+    # (quorum_check, computed against the actual gated/passed populations) are
+    # the real signal, so branch on those instead of `excluded`.
+    if near_miss := result.get("near_miss_keys"):
+        near_miss_list = ", ".join(repr(key) for key in near_miss)
+        prefix = "review-cli#389 aliases these spellings when reading iterations, "
+        if result.get("near_miss_counted"):
+            detail = f"{prefix}so they already count above"
+        elif result.get("near_miss_ever_passed"):
+            # Passed at least once, but diff-identity verification excluded
+            # every one of those as a repo/diff mismatch. `mismatch_details`
+            # is --json-only (round-2 review finding: the original text
+            # pointed a plain-text reader at a field they have no way to see)
+            # -- point at the flag that actually gets them there instead.
+            detail = (
+                f"{prefix}but diff-identity verification excluded the twin's "
+                "passed iteration(s) as a repo/diff mismatch above -- re-run "
+                "with --json to see mismatch_details for confirmation"
+            )
+        else:
+            detail = (
+                f"{prefix}but none of the twin's recorded iteration(s) actually "
+                "passed, so they do not count above"
+            )
+        print(
+            f"[review task] note: searched key {result['searched_key']!r} — found "
+            f"{near_miss_list} in the store (same digits, different '#'); {detail}",
+            file=sys.stderr,
+        )
+
     if as_json:
         import json as _json
 

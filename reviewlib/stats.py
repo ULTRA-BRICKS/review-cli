@@ -1821,6 +1821,36 @@ def quorum_check(
         ):
             result["searched_key"] = clean
             result["near_miss_keys"] = [twin]
+            # Quorum-review finding (Grok, round 2, flipping a prior CLEAN to
+            # NOT CLEAN with a concrete repro): `iterations` above is the
+            # UNFILTERED dual-key read -- a twin record sits in it even when
+            # that record never passed at all, so membership in `iterations`
+            # alone cannot support "the twin already counts above". Expose the
+            # real signal instead: does the twin have a record that actually
+            # landed in `gate_iterations` (the same passed+verified/
+            # unverifiable population the quorum math above used)? And,
+            # separately, did it ever pass at all (a passed-but-mismatched
+            # twin gets different wording than a twin that never passed) --
+            # see `_quorum_check_subcommand`'s near_miss_keys branch for how
+            # these two booleans pick the printed wording. Both are booleans,
+            # not counts -- neither branch below needs "how many", only
+            # "did it happen at all".
+            # `gate_iterations = verified + unverifiable` (this function's own
+            # earlier assignment) and `_sort_passed_iterations_into_buckets`
+            # partitions EVERY item of `passed_iterations` into exactly one of
+            # verified/mismatched/unverifiable -- so `passed_iterations` minus
+            # `gate_iterations` is exactly `mismatched`, by construction, with
+            # no other exclusion path. That is what makes cli.py's "excluded
+            # above as a repo/diff mismatch" wording (the near_miss_counted=
+            # False, near_miss_ever_passed=True branch) a provable claim, not
+            # an assumption -- round-2 review (Opus, Sonnet) independently
+            # flagged this as unverifiable from the diff alone; it holds.
+            result["near_miss_counted"] = any(
+                item.get("task_code") == twin for item in gate_iterations
+            )
+            result["near_miss_ever_passed"] = any(
+                item.get("task_code") == twin for item in passed_iterations
+            )
     return result
 
 
