@@ -390,11 +390,13 @@ def test_board_flags_and_listing():
         "claude:claude-opus-4-8",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
-        # Grok — verifies the 11-seat count below is actually seats 1-11 with Grok present,
-        # not merely a matching total (review of #166).
+        # Grok — verifies the 12-seat count below is actually seats with Grok present,
+        # not merely a matching total (review of #166). MIMO_SEAT (review-cli#450) is the
+        # 12th light-preset seat.
         "oc:xai/grok-4.6",
+        "omp:opencode-go/mimo-v2.5",
         "contracts",
-        "11 seats",
+        "12 seats",
         "#1",
         # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
@@ -405,13 +407,15 @@ def test_board_flags_and_listing():
     # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
     # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
     # (Fable was the only seat carrying it). review-cli#382 added TERRA_SEAT/SONNET_SEAT,
-    # so heavy is now 12 seats (with GROK_SEAT, review-cli#165), not 9/10.
+    # so heavy is now 13 seats (with GROK_SEAT, review-cli#165, and MIMO_SEAT,
+    # review-cli#450), not 9/10.
     for needle in (
         "source: preset:heavy",
         "codex:gpt-5.6-sol",
         # Grok — same rationale as the default-board needle above.
         "oc:xai/grok-4.6",
-        "12 seats",
+        "omp:opencode-go/mimo-v2.5",
+        "13 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_not_in("claude:claude-fable-5", heavy)

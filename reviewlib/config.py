@@ -96,6 +96,15 @@ GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.2"
 # `grok`, which would also match grok-3).
 GROK_SEAT = "oc:xai/grok-4.6"
 
+# Canonical MiMo 2.5 seat — OpenCode Go subscription via omp's opencode-go provider
+# (review-cli#450). Live `omp models find mimo-v2.5` selector is opencode-go/mimo-v2.5;
+# agentic through review_omp. The opencode CLI catalog spelling
+# `oc:opencode/mimo-v2.5-free` is NOT DEFAULT-safe (`default_routes_live` False:
+# provider `opencode` under `oc:` is not a named backend token and is not in
+# `_AGENTIC_ONLY_PROVIDERS`). Explicit `-m oc:opencode/mimo-v2.5-free` still works
+# at runtime. Not on VISUAL_MODELS.
+MIMO_SEAT = "omp:opencode-go/mimo-v2.5"
+
 
 def _agentic(seat: str) -> str:
     """Turn a diff-only keyed-HTTP seat (`provider:model`) into its AGENTIC opencode
@@ -134,7 +143,7 @@ def _agentic(seat: str) -> str:
 # Code default keeps a self-sufficient panel (incl. opencode). Personal model
 # preferences live in ~/.config/review-cli/config.yaml (keys: models,
 # brainstorm_models) and override this — see load_config().
-DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT, GROK_SEAT)
+DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT, GROK_SEAT, MIMO_SEAT)
 # Visual review uses a separate priority list from the text reviewer board. The visual
 # pipeline selects the first reachable vision-capable backend, so a dead/paywalled Opus is
 # skipped automatically and the next vision seat is promoted.
@@ -174,6 +183,9 @@ MODEL_ALIASES = {
     "grok-4.6": GROK_SEAT,
     # `grok45` is the Grok 4.5 spelling; it does not track GROK_SEAT.
     "grok45": "oc:xai/grok-4.5",
+    "mimo": MIMO_SEAT,
+    "mimo25": MIMO_SEAT,
+    "mimo-2.5": MIMO_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -309,7 +321,7 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the raw 13-seat board used as the source of truth for built-in presets
+# DEFAULT_BOARD: the raw 14-seat board used as the source of truth for built-in presets
 # and for custom/config fallback paths. A plain `review diff` runs the default preset,
 # not this tuple directly. The board is ordered by *priority* — strongest WORKING model
 # first, weakest (or least-reliable, review-cli#fable-seat-reliability) last — NOT by
@@ -335,9 +347,10 @@ class BoardReviewer:
 # seats — full incident writeup in CHANGELOG.md), and the z.ai-GLM seat was re-lensed
 # `quality` -> `security`. Astra's pre-existing `consistency` role (a duplicate of Sol's)
 # was DELIBERATELY LEFT UNCHANGED — an earlier draft flipped it to `security`, but that
-# left `consistency` with zero live fallback board-wide; see its own entry below. `tests`/
-# `contracts`/`architect` stay thin (no third distinct already-paid model existed to give
-# them one too). Stopgap within the existing hardcoded seat-string mechanism, not the
+# left `consistency` with zero live fallback board-wide; see its own entry below. `tests`
+# now has MIMO_SEAT as a live paid fallback (review-cli#450); `contracts`/`architect`
+# stay thin (no third distinct already-paid model existed to give them one too). Stopgap
+# within the existing hardcoded seat-string mechanism, not the
 # "roles declare models, harness auto-resolves" redesign tracked as review-cli#364/
 # rig-cli#337.
 #
@@ -431,7 +444,12 @@ DEFAULT_BOARD = (
     # by Qwen (commandcode — unpaid/disabled machine-wide) and the slow, quota-fragile GLM
     # seat below, so this fast, live, oauth-backed reserve is the lens that was missing.
     BoardReviewer(GROK_SEAT, "security", "Grok"),
-    # priority 12 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
+    # priority 12 — MiMo 2.5 via omp OpenCode Go (review-cli#450). Live paid `tests`
+    # fallback: DeepSeek (priority 9) is the only other tests seat and is commandcode
+    # (often unpaid). Same rationale as GROK filling `security`. The
+    # `oc:opencode/mimo-v2.5-free` catalog spelling is NOT DEFAULT-safe.
+    BoardReviewer(MIMO_SEAT, "tests", "MiMo"),
+    # priority 13 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
     # opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of the reserve
     # (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load, so
     # promoting it onto the failover critical path stalls the pool's path to a verdict.
@@ -443,7 +461,7 @@ DEFAULT_BOARD = (
     # live-but-fragile seat to backfill `security` (whose only other seat, Qwen, is
     # disabled) instead of duplicating Sonnet.
     BoardReviewer(_agentic("zai:glm-5.2"), "security", "GLM"),
-    # priority 13 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
+    # priority 14 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
     # priority 1 to LAST (review-cli#fable-seat-reliability, 2026-08): `review stat`
     # telemetry showed a 97.9-100% dispatch failure rate (chronic session/usage-limit
     # exhaustion on the account it runs through — being priority 1 made it the FIRST
@@ -489,8 +507,8 @@ DEFAULT_PRESET_BOARD = tuple(
 # moving Fable anywhere else would have silently shifted every later seat's tier by one slot
 # with no test catching it (the tuple-order pin would read as a membership change, not a
 # tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
-# first ordering and the resulting seat-count invariant self-documenting (12 seats as of
-# review-cli#165's GROK_SEAT addition on top of review-cli#382's TERRA_SEAT/SONNET_SEAT —
+# first ordering and the resulting seat-count invariant self-documenting (13 seats as of
+# review-cli#450's MIMO_SEAT on top of review-cli#165's GROK_SEAT and review-cli#382's TERRA_SEAT/SONNET_SEAT —
 # first 4 get `xhigh` effort: Sol, Opus,
 # GLM-cc, Kimi (unchanged from before #382 — TERRA_SEAT/SONNET_SEAT were inserted at raw
 # priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the

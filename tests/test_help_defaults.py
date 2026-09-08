@@ -142,6 +142,15 @@ def test_config_help_documents_grok46_aliases():
     assert "oc:xai/grok-4.5" in text, text
 
 
+def test_config_help_documents_mimo_aliases():
+    """`review help config` names mimo/mimo25/mimo-2.5 -> MIMO_SEAT."""
+    text = cli._help_topic_config()
+    assert "mimo" in text, text
+    assert "mimo25" in text, text
+    assert "mimo-2.5" in text, text
+    assert "omp:opencode-go/mimo-v2.5" in text, text
+
+
 def test_numeric_defaults_are_concrete():
     # --pool / --timeout are global (top-level); --vision-timeout is a visual flag scoped to
     # the subcommands. Assert each shows its concrete numeric default on the right surface.

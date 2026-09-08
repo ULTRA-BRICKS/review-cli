@@ -3,6 +3,22 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.1 — 2026-09-08
+
+- **New default board seat: MiMo 2.5 via omp OpenCode Go (`MIMO_SEAT`,
+  review-cli#450).** Canonical id `omp:opencode-go/mimo-v2.5` (live
+  `omp models find mimo-v2.5` selector). Aliases `mimo` / `mimo25` /
+  `mimo-2.5`. Role `tests` (DeepSeek is the only other tests seat and is
+  commandcode, often unpaid — same rationale as GROK filling `security`).
+  Inserted after Grok (priority 12), before z.ai GLM; Fable stays last
+  (raw board 13 → 14; light/default 11 → 12; heavy 12 → 13). Added to
+  `DEFAULT_MODELS`. The opencode CLI catalog spelling
+  `oc:opencode/mimo-v2.5-free` is documented as not DEFAULT-safe
+  (`default_routes_live` False: provider `opencode` under `oc:` is not a
+  named backend token and is not in `_AGENTIC_ONLY_PROVIDERS`); explicit
+  `-m oc:opencode/mimo-v2.5-free` still works at runtime. Not added to
+  `VISUAL_MODELS` or `_AGENTIC_ONLY_PROVIDERS`.
+
 ## 0.37.0 — 2026-09-08
 
 - **Feat: refuse seat spawn when a family's live harness 5-hour or 7-day

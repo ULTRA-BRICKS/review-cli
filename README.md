@@ -1186,6 +1186,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
 | `oc:xai/grok-4.6` / `grok` / `grok46` / `grok-4.6` | cli | Grok 4.6 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-11 seat. `grok45` pins `oc:xai/grok-4.5`. |
+| `omp:opencode-go/mimo-v2.5` / `mimo` / `mimo25` / `mimo-2.5` | cli | MiMo 2.5 via omp OpenCode Go (`MIMO_SEAT`, the default board's priority-12 `tests` reserve). The `oc:opencode/mimo-v2.5-free` catalog spelling is not DEFAULT-safe (`default_routes_live` False: provider `opencode` under `oc:` is unnamed and not in `_AGENTIC_ONLY_PROVIDERS`). Explicit `-m oc:opencode/mimo-v2.5-free` still works at runtime. |
 | `omp:<provider>/<model>` / `omp` | cli | `omp -p --no-session --tools read,grep,glob --add-dir <repo> @<payloadfile>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
@@ -1423,7 +1424,7 @@ the panel still covers a broad set of facets.
 
 `--pool N` overrides the preset default (the top-N available, with the same failover);
 `--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 12 heavy-preset built-in seats (the raw 13-seat board,
+`--preset heavy --pool 0` for all 13 heavy-preset built-in seats (the raw 14-seat board,
 including last-resort Fable, needs an explicit `board:`/`models:` config). The board is **never
 disabled** — `--pool` only sizes the pool.
 
@@ -1443,8 +1444,9 @@ on a fully-keyed environment):
 | 9 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 10 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
 | 11 | reserve | Grok | `oc:xai/grok-4.6` | `security` | injection, authz, secrets, unsafe deserialization, SSRF, path traversal (opencode's native xai provider, oauth-authenticated; agentic, no diff-only REST fallback exists; placed directly before the slow GLM seat so failover reaches it first, review-cli#165/#415) |
-| 12 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
-| 13 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
+| 12 | reserve | MiMo | `omp:opencode-go/mimo-v2.5` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage (OpenCode Go via omp; live paid `tests` fallback because DeepSeek is commandcode and often unpaid; `oc:opencode/mimo-v2.5-free` is not DEFAULT-safe, review-cli#450) |
+| 13 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
+| 14 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
 
 **review-cli#382 (2026-09-05):** `unpaid_providers: [commandcode, gemini]` disables every
 commandcode-routed seat (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That
@@ -1634,11 +1636,11 @@ When `models:` is present,
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
 `models:` or `board:` configured, the CLI uses the default preset (light as of
-2026-08-28); `--preset default` uses the same 11 seats at high effort, and `--preset
-heavy` uses the 12-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
-excluded, see "Reviewer board" above) — the raw 13-seat board (including last-resort
+2026-08-28); `--preset default` uses the same 12 seats at high effort, and `--preset
+heavy` uses the 13-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
+excluded, see "Reviewer board" above) — the raw 14-seat board (including last-resort
 Fable) is only reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the
-seats you want; an absent or empty `board:`/`models:` falls back to the same 11-seat
+seats you want; an absent or empty `board:`/`models:` falls back to the same 12-seat
 `LIGHT_PRESET_BOARD` (no Fable, no Sol; same model order as `DEFAULT_PRESET_BOARD`, at
 medium instead of high effort) that the default preset now resolves to. A
 `board:` that is **present but has no usable entry at all** is a hard error (non-zero
@@ -1737,6 +1739,18 @@ not protected by that guard and isn't what `GROK_SEAT` uses. Same startup-probe/
 graceful-degradation and idle-timeout behavior as the other agentic seats.
 `--moderator grok` expands to GROK_SEAT. The seat is also on the flat `DEFAULT_MODELS`
 panel (just-ask / quorum / brainstorm) and on `VISUAL_MODELS`.
+
+**MiMo board reviewer (agentic, via omp OpenCode Go):** `omp:opencode-go/mimo-v2.5`
+(`MIMO_SEAT`; aliases `mimo` / `mimo25` / `mimo-2.5`) authenticates through omp's
+opencode-go provider — the live OpenCode Go subscription (`omp models find mimo-v2.5`).
+Role `tests`: DeepSeek is the only other tests seat and is commandcode (often unpaid);
+MIMO is the live paid tests fallback, same rationale as GROK filling `security`. The
+opencode CLI catalog spelling `oc:opencode/mimo-v2.5-free` resolves to `review_opencode`
+and is LIVE in `opencode models`, but `default_routes_live` is False (provider
+`opencode` under `oc:` is not a named backend token and is not in
+`_AGENTIC_ONLY_PROVIDERS`). Do not ship that spelling as a DEFAULT; explicit
+`-m oc:opencode/mimo-v2.5-free` still works at runtime. MIMO_SEAT is on the flat
+`DEFAULT_MODELS` panel (just-ask / quorum / brainstorm). It is not on `VISUAL_MODELS`.
 
 **Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
 subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock

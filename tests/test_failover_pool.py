@@ -58,6 +58,7 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_POOL_SIZE,
     GLM_COMMANDCODE_SEAT,
     GROK_SEAT,
+    MIMO_SEAT,
     HEAVY_PRESET_BOARD,
     KIMI_SEAT,
     LIGHT_PRESET_BOARD,
@@ -314,7 +315,7 @@ def test_heavy_preset_double_failure_still_beats_pre_382_board():
     # failure left only Sol/Opus/Astra available (3, one seat short of the pool, with
     # `consistency` ALREADY duplicated) and NO reserve whatsoever.
     pre_382_board = [
-        r for r in board if r.model not in {TERRA_SEAT, SONNET_SEAT, GROK_SEAT}
+        r for r in board if r.model not in {TERRA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT}
     ]
     pre_382_available = {
         r.model for r in pre_382_board if r.model in available_double_failure
@@ -353,13 +354,13 @@ def test_light_preset_double_failure_pool_unchanged_but_reserve_deepens():
     # GROK_SEAT (review-cli#165) is a third live reserve behind Terra/Sonnet: agentic via
     # opencode's native xai provider, so neither the commandcode/gemini disable nor the
     # z.ai GLM outage touches it.
-    assert reserve_models == [TERRA_SEAT, SONNET_SEAT, GROK_SEAT]
+    assert reserve_models == [TERRA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT]
 
-    # Pre-#382 comparison: same board minus TERRA_SEAT/SONNET_SEAT (and GROK_SEAT, added
-    # later still) -- the dispatched pool is byte-identical, but the reserve was empty
-    # (nothing left to backfill Opus/Astra).
+    # Pre-#382 comparison: same board minus TERRA_SEAT/SONNET_SEAT (and GROK_SEAT/
+    # MIMO_SEAT, added later still) -- the dispatched pool is byte-identical, but the
+    # reserve was empty (nothing left to backfill Opus/Astra).
     pre_382_board = [
-        r for r in board if r.model not in {TERRA_SEAT, SONNET_SEAT, GROK_SEAT}
+        r for r in board if r.model not in {TERRA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT}
     ]
     pre_382_available = {
         r.model for r in pre_382_board if r.model in available_double_failure

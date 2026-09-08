@@ -143,8 +143,8 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available
-seats in the selected preset/board (`--preset heavy --pool 0` covers all 12
-heavy-preset-built-ins; the raw 13-seat board, incl. last-resort Fable, needs an
+seats in the selected preset/board (`--preset heavy --pool 0` covers all 13
+heavy-preset-built-ins; the raw 14-seat board, incl. last-resort Fable, needs an
 explicit `board:`/`models:`).
 The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
 always limits the run to exactly those models; with no configured `models:`/`board:` it is
@@ -160,8 +160,10 @@ tier and availability.
 
 The default repo-capable gateway seats are agentic `oc:` routes, not diff-only REST:
 `oc:commandcode/moonshotai/Kimi-K2.7-Code`, `oc:commandcode/Qwen/Qwen3.7-Max`,
-`oc:commandcode/deepseek/deepseek-v4-pro`, `oc:zai/glm-5.2`, and `oc:xai/grok-4.6` (Grok,
-via opencode's native xai provider — no diff-only REST fallback exists for it). The
+`oc:commandcode/deepseek/deepseek-v4-pro`, `oc:zai/glm-5.2`, `oc:xai/grok-4.6` (Grok,
+via opencode's native xai provider — no diff-only REST fallback exists for it), and
+`omp:opencode-go/mimo-v2.5` (MiMo 2.5 via omp OpenCode Go; agentic `omp:` route).
+The `oc:opencode/mimo-v2.5-free` catalog spelling is not DEFAULT-safe. The
 keyed-HTTP `commandcode:` / `zai:` routes remain for explicit `-m cc` / `-m glm` and
 custom config.
 

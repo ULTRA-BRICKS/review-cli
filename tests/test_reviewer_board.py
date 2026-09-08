@@ -40,6 +40,7 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_PRESET_BOARD,
     GLM_COMMANDCODE_SEAT,
     GROK_SEAT,
+    MIMO_SEAT,
     HEAVY_PRESET_BOARD,
     KIMI_SEAT,
     LIGHT_PRESET_BOARD,
@@ -123,6 +124,11 @@ def test_default_board_matches_directive_table():
         # (NOT `performance`, which already has a live paid fallback in Terra) — see the
         # seat's own comment in `reviewlib/config.py`.
         ("oc:xai/grok-4.6", "security", "Grok"),
+        # Seat 12 — MiMo 2.5 via omp OpenCode Go (review-cli#450). Live paid `tests`
+        # fallback: DeepSeek is the only other tests seat and is commandcode (often
+        # unpaid). Same rationale as GROK filling `security`. Sits AFTER Grok, BEFORE
+        # the slow z.ai GLM last-resort, Fable stays LAST.
+        ("omp:opencode-go/mimo-v2.5", "tests", "MiMo"),
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
@@ -163,6 +169,7 @@ def test_default_board_is_priority_ordered():
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
         "oc:xai/grok-4.6",
+        "omp:opencode-go/mimo-v2.5",
         "oc:zai/glm-5.2",
         "claude:claude-fable-5",
     ]
@@ -228,6 +235,46 @@ def test_grok_aliases_resolve_to_the_canonical_seat():
     assert MODEL_ALIASES["grok-4.6"] == GROK_SEAT
     assert MODEL_ALIASES["grok45"] == "oc:xai/grok-4.5"
     assert MODEL_ALIASES["grok45"] != GROK_SEAT
+
+
+def test_mimo_seat_is_the_canonical_constant_and_resolves_to_omp():
+    """MIMO_SEAT is byte-exact "omp:opencode-go/mimo-v2.5" (pinned so the seat can't
+    silently drift to a different spelling), sits on the board as "MiMo" with role
+    `tests`, and resolves through review_omp (OpenCode Go via omp). DeepSeek is the
+    only other tests seat and is commandcode (often unpaid); MIMO is the live paid
+    tests fallback — same rationale as GROK filling security."""
+    assert MIMO_SEAT == "omp:opencode-go/mimo-v2.5"
+    seat = next(r for r in DEFAULT_BOARD if r.model == MIMO_SEAT)
+    assert seat.display == "MiMo"
+    assert seat.role == "tests"
+    assert backends.resolve_backend(MIMO_SEAT) is backends.review_omp
+    assert backends.default_routes_live(MIMO_SEAT) is True
+    assert backends.effective_provider(MIMO_SEAT) == "omp"
+
+
+def test_mimo_aliases_resolve_to_the_canonical_seat():
+    """`mimo` / `mimo25` / `mimo-2.5` expand to MIMO_SEAT."""
+    from reviewlib.config import MODEL_ALIASES
+
+    assert MODEL_ALIASES["mimo"] == MIMO_SEAT
+    assert MODEL_ALIASES["mimo25"] == MIMO_SEAT
+    assert MODEL_ALIASES["mimo-2.5"] == MIMO_SEAT
+
+
+def test_oc_mimo_catalog_id_is_not_default_safe():
+    """`oc:opencode/mimo-v2.5-free` is LIVE in `opencode models` and resolve_backend
+    routes it to review_opencode, but default_routes_live is False: the provider
+    `opencode` under `oc:` is not a named backend token and is not in
+    `_AGENTIC_ONLY_PROVIDERS` (currently {xai}). Do not ship it as a DEFAULT;
+    explicit `-m oc:opencode/mimo-v2.5-free` still works at runtime. MIMO_SEAT uses
+    the omp OpenCode Go spelling instead."""
+    oc_id = "oc:opencode/mimo-v2.5-free"
+    assert backends.resolve_backend(oc_id) is backends.review_opencode
+    assert backends.default_routes_live(oc_id) is False
+
+
+def test_mimo_seat_is_on_default_models():
+    assert MIMO_SEAT in DEFAULT_MODELS
 
 
 def test_bare_and_colon_xai_forms_are_not_named_routes():
@@ -462,10 +509,10 @@ def test_default_pool_roles_are_distinct_no_lens_lost():
     assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
 
 
-def test_default_board_has_thirteen_seats():
+def test_default_board_has_fourteen_seats():
     # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12);
-    # GROK_SEAT (review-cli#165) makes it 13.
-    assert len(DEFAULT_BOARD) == 13, len(DEFAULT_BOARD)
+    # GROK_SEAT (review-cli#165) makes it 13; MIMO_SEAT (review-cli#450) makes it 14.
+    assert len(DEFAULT_BOARD) == 14, len(DEFAULT_BOARD)
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
@@ -508,6 +555,9 @@ def test_preset_boards_pin_model_order_pool_and_effort():
     assert GROK_SEAT in [r.model for r in DEFAULT_PRESET_BOARD]
     assert GROK_SEAT in [r.model for r in LIGHT_PRESET_BOARD]
     assert GROK_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
+    assert MIMO_SEAT in [r.model for r in DEFAULT_PRESET_BOARD]
+    assert MIMO_SEAT in [r.model for r in LIGHT_PRESET_BOARD]
+    assert MIMO_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
     # review-cli#382 (round 4 review finding): explicitly pin Terra's/Sonnet's effort at
     # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
     # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
@@ -1187,12 +1237,15 @@ def test_default_models_routes_kimi_through_commandcode():
     applies before dispatch. The flat panel stays diff-only on purpose: it has no
     reserve/failover, so it keeps the key-only route that needs no opencode install (#24)."""
     assert KIMI_SEAT.startswith("commandcode:"), KIMI_SEAT
-    assert DEFAULT_MODELS == ("codex", "gemini", KIMI_SEAT, GROK_SEAT), DEFAULT_MODELS
+    assert DEFAULT_MODELS == ("codex", "gemini", KIMI_SEAT, GROK_SEAT, MIMO_SEAT), (
+        DEFAULT_MODELS
+    )
     assert _split_models(list(DEFAULT_MODELS)) == [
         "codex",
         "gemini",
         KIMI_SEAT,
         GROK_SEAT,
+        MIMO_SEAT,
     ]
 
 
@@ -1403,7 +1456,7 @@ def test_default_pool_size_is_four():
 
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
-    13-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
+    14-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
     GLM-5.2-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
     moved from priority 1 to the very last reserve seat — see
     `test_default_board_matches_directive_table`'s comment for the full rationale)."""
@@ -1419,8 +1472,9 @@ def test_select_pool_default_picks_first_four_seats():
     # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
     # (review-cli#382 live fallbacks), the remaining opencode routes (review-cli#24), the
     # diff-only Gemini, Grok (agentic via opencode's native xai provider, directly BEFORE
-    # the slow GLM seat so failover reaches it first), the slow z.ai GLM seat (LAST-RESORT, review-cli#65
-    # deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
+    # MiMo/the slow GLM seat so failover reaches it first), MiMo (review-cli#450, live
+    # paid `tests` fallback via omp OpenCode Go), the slow z.ai GLM seat (LAST-RESORT,
+    # review-cli#65 deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
         "codex:gpt-6-astra",
@@ -1430,6 +1484,7 @@ def test_select_pool_default_picks_first_four_seats():
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
         "oc:xai/grok-4.6",
+        "omp:opencode-go/mimo-v2.5",
         "oc:zai/glm-5.2",
         "claude:claude-fable-5",
     ]
@@ -1499,9 +1554,9 @@ def test_glm_seat_routes_agentically_via_opencode_zai_provider():
 
 def test_all_repo_capable_default_seats_are_agentic():
     """review-cli#24 acceptance, as amended by the GLM-5.2-via-commandcode seat: every
-    DEFAULT_BOARD seat that HAS an agentic transport uses it (the codex CLI, opencode, or the
-    claude CLI) — not a stateless diff-only REST/keyed-HTTP call. Exactly TWO seats stay
-    diff-only, each because NO agentic transport reaches them:
+    DEFAULT_BOARD seat that HAS an agentic transport uses it (the codex CLI, opencode, the
+    claude CLI, or omp) — not a stateless diff-only REST/keyed-HTTP call. Exactly TWO seats
+    stay diff-only, each because NO agentic transport reaches them:
       * Gemini — a workspace-less REST API, no agentic CLI/opencode provider; and
       * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 3) — opencode's `commandcode`
         provider does NOT register this GLM id, so `oc:commandcode/zai-org/GLM-5.2` errors;
@@ -1509,11 +1564,18 @@ def test_all_repo_capable_default_seats_are_agentic():
 
     This still pins the agentic-by-default contract for the seats that CAN be agentic:
     Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Sol/Astra through the codex CLI,
-    the two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
-    the diff-only REST route fails here. (claude is agentic via its CLI path; resolve_backend
-    returns review_claude for both, and the board's claude seats run the CLI on a normal
-    host.)"""
-    agentic = {backends.review_codex, backends.review_opencode, backends.review_claude}
+    the two Anthropic seats through claude, MiMo through omp (review-cli#450 — omp's
+    read-only three-layer cage mounts the repo, so it is agentic, not diff-only, same as
+    the codex/opencode/claude CLI transports). A future edit that silently reverts one of
+    THOSE to the diff-only REST route fails here. (claude is agentic via its CLI path;
+    resolve_backend returns review_claude for both, and the board's claude seats run the
+    CLI on a normal host.)"""
+    agentic = {
+        backends.review_codex,
+        backends.review_opencode,
+        backends.review_claude,
+        backends.review_omp,
+    }
     # The seats that are legitimately diff-only (no agentic transport exists), keyed by the
     # backend they MUST route to. Any OTHER seat falling to a diff-only backend is the
     # silent regression #24 guards against.
@@ -1557,12 +1619,13 @@ def test_install_skill_text_documents_agentic_default_board():
     assert "selected preset/board" in low
     assert "--preset heavy --pool 0" in SKILL_MD
     # review-cli#fable-seat-reliability: the heavy preset excludes Fable (~100%
-    # dispatch failure rate). review-cli#382 added TERRA_SEAT/SONNET_SEAT, so --pool 0
-    # now covers 11 built-ins, not 10/9. Normalized whitespace (GLM review finding):
-    # matching the raw string coupled this assertion to exactly where install.py's
-    # paragraph happens to line-wrap — a future reflow of that markdown with no content
-    # change would break it for no real reason.
-    assert "covers all 12 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
+    # dispatch failure rate). review-cli#382 added TERRA_SEAT/SONNET_SEAT (11 built-ins),
+    # review-cli#165 added GROK_SEAT (12), and review-cli#450 added MIMO_SEAT, so --pool 0
+    # now covers 13 built-ins. Normalized whitespace (GLM review finding): matching the
+    # raw string coupled this assertion to exactly where install.py's paragraph happens
+    # to line-wrap — a future reflow of that markdown with no content change would break
+    # it for no real reason.
+    assert "covers all 13 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
     So their availability gates on the `opencode` BINARY plus opencode's OWN provider

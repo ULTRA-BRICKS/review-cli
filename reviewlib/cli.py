@@ -4193,7 +4193,7 @@ CONFIG FILE
                        wall-clock QA cost cap.
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
   `glm` -> zai:glm-5.2, `cc` -> commandcode, `grok`/`grok46`/`grok-4.6` -> oc:xai/grok-4.6,
-  `grok45` -> oc:xai/grok-4.5).
+  `grok45` -> oc:xai/grok-4.5, `mimo`/`mimo25`/`mimo-2.5` -> omp:opencode-go/mimo-v2.5).
 
 SELECTION CASCADE, by mode:
   review diff           : explicit -m requested models  >  explicit --preset  >
