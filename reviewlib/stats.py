@@ -1025,9 +1025,12 @@ def quorum_check(
         ``passed``. ``distinct_models_passed``/``models`` are still computed/reported
         for visibility (no ``min_models`` key itself, since no floor was requested).
       * BOTH explicitly given: an explicitly requested floor is now ALWAYS enforced —
-        ``passed`` requires ``min_iter`` AND the model floor AND the role floor to all
-        be met (Alex's policy: "if a model limit is explicitly set, it must work").
-        This closes the round-3 finding below.
+        ``passed`` requires the model floor AND the role floor (Alex's policy: "if a
+        model limit is explicitly set, it must work"). When ``min_roles`` is set
+        (explicitly or by the bare-check default below), role coverage waives
+        ``min_iter``: one padded iteration covering N roles is enough. ``min_iter``
+        still gates model-only mode (``min_roles is None``). This closes the
+        round-3 finding below.
       * NEITHER given (the true default — no flags at all): the default switches to a
         ROLE-based check at ``_DEFAULT_QUORUM_FLOOR`` (the SAME numeric value
         ``--min-models`` used to default to), not a model-count check — Alex's
@@ -1603,7 +1606,12 @@ def quorum_check(
     iter_ok = len(gate_iterations) >= min_iter
     models_ok = min_models is None or len(models) >= min_models
     roles_ok = min_roles is None or (roles is not None and len(roles) >= min_roles)
-    gate_met = iter_ok and models_ok and roles_ok
+    # Role coverage is the predicate when min_roles is set (bare --check default
+    # or explicit --min-roles). A 1-model pad is one iteration covering 3 roles;
+    # ANDing min_iter=3 made passed=false and fired ship-review-quorum hatch.
+    # Model-only mode (min_roles is None) still requires min_iter. Explicit
+    # min_models still ANDs. Zero iterations still fail (empty roles).
+    gate_met = models_ok and roles_ok and (iter_ok or min_roles is not None)
 
     result = {
         "task_code": clean,

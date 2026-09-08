@@ -3938,11 +3938,13 @@ def test_quorum_check_bare_default_aggregates_roles_from_one_multi_seat_record_r
             fail_count=0,
             passed=True,
         )
-        # Only 1 passed ITERATION (one multi-seat record), so min_iter=3 (the
-        # bare default) is NOT met even though all 3 default roles are covered
-        # by that single record -- iterations and roles are counted separately.
+        # One multi-seat record covering 3 roles: role coverage is the
+        # predicate when min_roles is set (bare --check default). min_iter=3
+        # is waived -- requiring 3 iterations here is what fired hatch on a
+        # 1-iteration pad (C12). Roles still aggregated from the single
+        # record's `roles` list (not silently zero/one).
         short_on_iter = _stats.quorum_check(TASK, min_iter=3)
-        assert short_on_iter["passed"] is False, short_on_iter
+        assert short_on_iter["passed"] is True, short_on_iter
         assert short_on_iter["distinct_roles_passed"] == 3
         assert short_on_iter["passed_iterations"] == 1
 
@@ -4699,6 +4701,35 @@ def test_quorum_check_min_roles_counts_distinct_roles_not_models_review_cli_221(
         # distinct_models_passed is still reported for visibility even without
         # an explicit --min-models -- it just never gates.
         assert by_roles["distinct_models_passed"] == 2
+
+
+def test_quorum_check_one_model_three_role_pad_waives_min_iter():
+    """One padded iteration covering 3 board roles must pass --check even when
+    min_iter=3. Default AND of min_iter made passed=false on a 1-model pad, which
+    drove ship-review-quorum hatch (C12). Role coverage is the predicate when
+    min_roles is set; min_iter is not a second iteration floor. Empty roles
+    still fail. Explicit min_models still ANDs."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["grok", "grok", "grok"],
+            roles=["architect", "correctness", "security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=3, min_roles=3)
+        assert result["passed"] is True, result
+        assert result["passed_iterations"] == 1
+        assert result["distinct_roles_passed"] == 3
+        assert result["distinct_models_passed"] == 1
+
+        still_anded = _stats.quorum_check(
+            TASK, min_iter=3, min_models=3, min_roles=3
+        )
+        assert still_anded["passed"] is False, still_anded
 
 
 def test_quorum_check_min_models_regression_unchanged_review_cli_221():

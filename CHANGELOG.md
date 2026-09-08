@@ -3,6 +3,17 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.36.8 — 2026-09-08
+
+- **Fix: `review task CODE --check` passes when one padded iteration covers the
+  role floor (C12 / review-cli#433 follow-up).** A 1-model pad records one
+  iteration with 3 board roles. `quorum_check` still ANDed default `min_iter=3`,
+  so `passed` was false and agents fired `ship-review-quorum` hatch even though
+  role coverage (the ship predicate, agent-tools#644) was met. When `min_roles`
+  is set (bare `--check` default or explicit), role coverage waives `min_iter`.
+  Model-only mode still requires `min_iter`. Explicit `--min-models` still ANDs.
+  A zero-iteration record still fails.
+
 ## 0.36.7 — 2026-09-08
 
 - **Fix: recorded `review diff --task CODE --pool 0` still pads a same-role config
