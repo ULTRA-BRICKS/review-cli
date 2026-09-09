@@ -77,6 +77,7 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "HOME": home,
         "XDG_CONFIG_HOME": str(Path(home) / ".config"),
         "REVIEW_TASK_CODE": "SMOKE-1",
+        "REVIEW_LOG_SQLITE": "0",
     }
     full_env.update(env or {})
     return full_env
@@ -676,7 +677,7 @@ def test_sessions_listing():
 _FRESH_TMP = object()
 _UNIT_FILES = [
     ("test_dashboard_service.py", {}),
-    ("test_dashboard.py", {}),
+    ("test_dashboard.py", {"REVIEW_LOG_SQLITE": "0"}),
     ("test_streaming.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # review-cli#221: run_board_with_failover arms/clears the wall-clock board deadline
     # at the right moments (the clamp math itself is covered in test_streaming.py). One
@@ -926,6 +927,8 @@ _UNIT_FILES = [
     # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
     # Deterministic — synthetic tmpdirs, no real log dir, no network.
     ("test_call_log_cache.py", {}),
+    # SQLite log archive storage + migration proofs (reviewlib.log_archive).
+    ("test_log_archive.py", {}),
     # `_run_streamed`'s Popen stdin kwarg (review-cli#428): the argv-only backend
     # path (opencode/omp: input_text=None) must get stdin=DEVNULL, never a bare
     # None/inherited fd that could block forever reading review-cli's own stdin;

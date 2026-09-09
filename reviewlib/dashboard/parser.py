@@ -559,16 +559,16 @@ def _classify_from_full_text(
     )
 
 
-def parse_call_log(path: Path) -> CallLog | None:
-    """Parse one ``*-r{n}.log`` file. Returns None if the name doesn't match, INCLUDING
-    a name that matches the shape but carries a date `_parse_stamp` can't parse (a
-    corrupted/restored/typo'd filename) — review-cli#323 review finding: this used to
-    raise ValueError straight out of `_parse_stamp`, which is fatal to every caller that
-    doesn't specifically guard for it (both `load_sessions`'s directory scan AND the SSE
-    `_emit_activity` path reach this function with no such guard). Matching the
-    documented "Returns None if the name doesn't match" contract for an invalid date too
-    means every caller gets the fix for free, instead of needing its own guard."""
-    m = _CALL_RE.match(path.name)
+def parse_call_log_text(
+    filename: str,
+    raw: str,
+    *,
+    size: int | None = None,
+    mtime: datetime | None = None,
+    path: str | None = None,
+) -> CallLog | None:
+    """Parse one call log from ``filename`` + raw body (archive or in-memory)."""
+    m = _CALL_RE.match(filename)
     if not m:
         return None
     try:
@@ -577,10 +577,6 @@ def parse_call_log(path: Path) -> CallLog | None:
         return None
     backend = m.group(3)
     round_no = int(m.group(4))
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        raw = ""
     lines = raw.splitlines()
     argv0 = ""
     body_lines: list[str] = []
@@ -675,13 +671,8 @@ def parse_call_log(path: Path) -> CallLog | None:
         if line.startswith(_STDERR_PREFIX):
             stderr_lines.append(line[len(_STDERR_PREFIX) :])
         body_lines.append(line)
-    try:
-        st = path.stat()
-        size = st.st_size
-        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
-    except OSError:
+    if size is None:
         size = len(raw.encode("utf-8"))
-        mtime = None
     full_body = "\n".join(body_lines).strip()
     (
         completed,
@@ -700,9 +691,10 @@ def parse_call_log(path: Path) -> CallLog | None:
         true_silenced,
         true_silence_secs,
     )
+    resolved_path = path if path is not None else filename
     return CallLog(
-        path=str(path),
-        filename=path.name,
+        path=resolved_path,
+        filename=filename,
         started=started,
         backend=backend,
         round=round_no,
@@ -734,6 +726,28 @@ def parse_call_log(path: Path) -> CallLog | None:
     )
 
 
+def parse_call_log(path: Path) -> CallLog | None:
+    """Parse one ``*-r{n}.log`` file from disk."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    try:
+        st = path.stat()
+        size = st.st_size
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    except OSError:
+        size = len(raw.encode("utf-8"))
+        mtime = None
+    return parse_call_log_text(
+        path.name,
+        raw,
+        size=size,
+        mtime=mtime,
+        path=str(path),
+    )
+
+
 _BS_HEADER_RE = re.compile(r"panel=(?P<panel>[^ ]*) moderator=(?P<mod>[^ ]*)")
 _BS_TASK_RE = re.compile(r"\btask=(?P<task>\S+)")
 _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
@@ -747,22 +761,21 @@ _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
 _BS_SECTION_RE = re.compile(r"^(?:## Moderator \(round \d+\)|# Final synthesis)\s*$")
 
 
-def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
-    """Returns None if the name doesn't match, INCLUDING a name that matches the shape
-    but carries a date `_parse_stamp` can't parse — same fix and rationale as
-    `parse_call_log` (review-cli#323 review finding: a `.log`-only guard left this
-    `.md` sibling still fatal to `load_sessions`'s directory scan)."""
-    m = _BRAINSTORM_RE.match(path.name)
+def parse_brainstorm_log_text(
+    filename: str,
+    raw: str,
+    *,
+    mtime: datetime | None = None,
+    path: str | None = None,
+) -> BrainstormLog | None:
+    """Parse one brainstorm log from ``filename`` + raw body."""
+    m = _BRAINSTORM_RE.match(filename)
     if not m:
         return None
     try:
         started = _parse_stamp(m.group(1), m.group(2))
     except ValueError:
         return None
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        raw = ""
     topic = ""
     panel: list[str] = []
     moderator: str | None = None
@@ -829,13 +842,10 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
     for rnd in rounds:
         for p in rnd["personas"]:
             p["text"] = p["text"].strip()
-    try:
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    except OSError:
-        mtime = None
+    resolved_path = path if path is not None else filename
     return BrainstormLog(
-        path=str(path),
-        filename=path.name,
+        path=resolved_path,
+        filename=filename,
         started=started,
         topic=topic,
         panel=panel,
@@ -844,6 +854,24 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
         rounds=rounds,
         body=raw,
         mtime=mtime,
+    )
+
+
+def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
+    """Parse one ``*-brainstorm.md`` file from disk."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        mtime = None
+    return parse_brainstorm_log_text(
+        path.name,
+        raw,
+        mtime=mtime,
+        path=str(path),
     )
 
 
@@ -1133,34 +1161,38 @@ def load_sessions(
     log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS
 ) -> list[Session]:
     """Read every artifact in ``log_dir_path`` and return clustered sessions, newest first."""
+    from ..log_archive import load_brainstorms_from_archive, load_calls_from_archive, use_sqlite_logs
+
     calls: list[CallLog] = []
     brainstorms: list[BrainstormLog] = []
-    if not log_dir_path.exists():
-        return []
-    for entry in sorted(log_dir_path.iterdir()):
-        if not entry.is_file():
-            continue
-        if entry.suffix == ".log":
-            # Call-log files are write-once, so a repeat scan of the same directory can
-            # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
-            # and re-parsing potentially tens of thousands of files on every request —
-            # the documented cause of the dashboard's default view rendering blank
-            # before a cold parse of a long-lived install's log dir finishes.
-            #
-            # A malformed filename (a bad date component `_parse_stamp` can't parse) is
-            # handled INSIDE `parse_call_log` now (returns None, same as any other
-            # non-matching name) — see its docstring for why (review-cli#323 review
-            # finding). One bad file must not crash the entire scan, and fixing it at
-            # that source covers every caller (this scan AND the SSE `_emit_activity`
-            # path) instead of needing a guard at each call site.
-            c = call_log_cache.get_or_parse(log_dir_path, entry, parse_call_log)
-            if c:
-                calls.append(c)
-        elif entry.suffix == ".md":
-            b = parse_brainstorm_log(entry)
-            if b:
-                brainstorms.append(b)
-    call_log_cache.save(log_dir_path)
+    if use_sqlite_logs():
+        calls.extend(load_calls_from_archive())
+        brainstorms.extend(load_brainstorms_from_archive())
+    if log_dir_path.exists():
+        for entry in sorted(log_dir_path.iterdir()):
+            if not entry.is_file():
+                continue
+            if entry.suffix == ".log":
+                # Call-log files are write-once, so a repeat scan of the same directory can
+                # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
+                # and re-parsing potentially tens of thousands of files on every request —
+                # the documented cause of the dashboard's default view rendering blank
+                # before a cold parse of a long-lived install's log dir finishes.
+                #
+                # A malformed filename (a bad date component `_parse_stamp` can't parse) is
+                # handled INSIDE `parse_call_log` now (returns None, same as any other
+                # non-matching name) — see its docstring for why (review-cli#323 review
+                # finding). One bad file must not crash the entire scan, and fixing it at
+                # that source covers every caller (this scan AND the SSE `_emit_activity`
+                # path) instead of needing a guard at each call site.
+                c = call_log_cache.get_or_parse(log_dir_path, entry, parse_call_log)
+                if c:
+                    calls.append(c)
+            elif entry.suffix == ".md":
+                b = parse_brainstorm_log(entry)
+                if b:
+                    brainstorms.append(b)
+        call_log_cache.save(log_dir_path)
     return cluster_sessions(calls, brainstorms, gap_seconds)
 
 
@@ -1534,8 +1566,16 @@ def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
     session (which is always within the window) -- never a crash or systemic drift. Not
     covered by a test (the scenario requires simulating an external process, not just this
     module's own write path); flagged here rather than silently assumed away."""
+    from ..log_archive import archive_signature, use_sqlite_logs
+
+    count = 0
+    max_mtime = 0.0
+    if use_sqlite_logs():
+        arch_chunks, arch_max, arch_empty = archive_signature()
+        count += arch_chunks + arch_empty
+        max_mtime = max(max_mtime, arch_max)
     scan = _scan_log_dir_entries(log_dir_path)
-    return (scan.total_count, scan.max_mtime)
+    return (count + scan.total_count, max(max_mtime, scan.max_mtime))
 
 
 def load_sessions_cached(

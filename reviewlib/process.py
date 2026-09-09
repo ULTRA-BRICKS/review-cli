@@ -23,6 +23,8 @@ from pathlib import Path
 
 from .stats import normalize_task_code
 
+from .log_archive import archive_db_path, store_call_raw, use_sqlite_logs
+
 _LOG_HEADER_CONTROL_TRANSLATION = {
     **{codepoint: "?" for codepoint in range(0x20)},
     **{codepoint: "?" for codepoint in range(0x80, 0xA0)},
@@ -846,8 +848,36 @@ def _task_header_suffix() -> str:
 
 
 def _open_log(backend: str, round_no: int) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    return _virtual_log_path(backend, round_no, datetime.now(timezone.utc))
+
+
+def _virtual_log_path(backend: str, round_no: int, started: datetime) -> Path:
+    stamp = started.strftime("%Y%m%dT%H%M%S_%fZ")
     return log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
+
+
+def _persist_call_log(
+    *,
+    backend: str,
+    round_no: int,
+    started: datetime,
+    content: str,
+) -> Path:
+    """Write a finished call log to SQLite (default) or return the legacy file path."""
+    if use_sqlite_logs():
+        filename = store_call_raw(
+            backend=backend,
+            round_no=round_no,
+            started=started,
+            content=content,
+            mtime=started,
+        )
+        return log_dir() / filename
+    path = log_dir() / f"{started.strftime('%Y%m%dT%H%M%S_%fZ')}-{_safe_backend(backend)}-r{round_no}.log"
+    fd, path = _open_log_with_fallback(path)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    return path
 
 
 # The `timeout_marker_kind` value stamped (via the `timeout_kind` result attribute,
@@ -1148,23 +1178,56 @@ def write_sidecar_log(
     subprocess runner uses, so the dashboard counts a REST timeout as a TIMEOUT (not a
     generic error) — keeping the timeout metric consistent across backends (codex P2).
     """
-    stamp = (started or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%fZ")
+    started_at = started or datetime.now(timezone.utc)
+    parts = [
+        f"[review-cli] {_safe_log_header(backend)}: {_safe_log_header(argv0)} "
+        f"(args redacted){_task_header_suffix()}\n"
+    ]
+    if stdout:
+        parts.append(stdout if stdout.endswith("\n") else stdout + "\n")
+    for line in stderr.splitlines():
+        parts.append("[stderr] " + line + "\n")
+    if timed_out:
+        secs = timeout_secs if timeout_secs is not None else 0
+        parts.append(f"[review-cli] TIMEOUT after {secs}s — partial output above]\n")
+    parts.append(_exit_line(returncode))
+    content = "".join(parts)
+    if use_sqlite_logs():
+        return _persist_call_log(
+            backend=backend,
+            round_no=round_no,
+            started=started_at,
+            content=content,
+        )
+    stamp = started_at.strftime("%Y%m%dT%H%M%S_%fZ")
     path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
     fd, path = _open_log_with_fallback(path)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(
-            f"[review-cli] {_safe_log_header(backend)}: {_safe_log_header(argv0)} "
-            f"(args redacted){_task_header_suffix()}\n"
-        )
-        if stdout:
-            fh.write(stdout if stdout.endswith("\n") else stdout + "\n")
-        for line in stderr.splitlines():
-            fh.write("[stderr] " + line + "\n")
-        if timed_out:
-            secs = timeout_secs if timeout_secs is not None else 0
-            fh.write(f"[review-cli] TIMEOUT after {secs}s — partial output above]\n")
-        fh.write(_exit_line(returncode))
+        fh.write(content)
     return path
+
+
+class _SqliteLogBuffer:
+    """In-memory stand-in for the per-call log file when writing to SQLite."""
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._nl = True
+
+    def write(self, text: str) -> None:
+        if text:
+            self._parts.append(text)
+            self._nl = text.endswith("\n")
+
+    def flush(self) -> None:
+        return None
+
+    @property
+    def tail_newline(self) -> bool:
+        return self._nl
+
+    def content(self) -> str:
+        return "".join(self._parts)
 
 
 # How much of the failing error channel a retry/promotion log records. Enough to see the
@@ -1335,14 +1398,20 @@ def _run_streamed(
     Returns a CompletedProcess-compatible object (.returncode/.stdout/.stderr) so
     callers like review_codex need no structural change.
     """
-    path = _open_log(backend, round_no)
-    # Open (with the review-cli#162 fallback) BEFORE the announce line below, so a
-    # fallen-back path is what gets announced/logged everywhere else in this call —
-    # never the pre-fallback path the caller can't actually `tail -f`.
-    fd, path = _open_log_with_fallback(path)
+    call_started = datetime.now(timezone.utc)
+    path = _virtual_log_path(backend, round_no, call_started)
+    sqlite_mode = use_sqlite_logs()
+    if sqlite_mode:
+        announce_path = archive_db_path()
+    else:
+        # Open (with the review-cli#162 fallback) BEFORE the announce line below, so a
+        # fallen-back path is what gets announced/logged everywhere else in this call —
+        # never the pre-fallback path the caller can't actually `tail -f`.
+        fd, path = _open_log_with_fallback(path)
+        announce_path = path
     if announce:
         print(
-            f"[review-cli] {backend} live log: {path} (tail -f to follow)",
+            f"[review-cli] {backend} live log: {announce_path} (tail -f to follow)",
             file=sys.stderr,
             flush=True,
         )
@@ -1381,10 +1450,14 @@ def _run_streamed(
     # (codex P2: an unanchored footer is unparsable). The header ends with "\n".
     log_tail = {"nl": True}
 
-    # `fd` (and possibly-fallen-back `path`) were already opened above, before the
-    # announce line — private file perms: logs persist prompts/diffs that may contain
-    # secrets.
-    log_fh = os.fdopen(fd, "w", encoding="utf-8", buffering=1)  # line-buffered
+    log_buf: _SqliteLogBuffer | None = _SqliteLogBuffer() if sqlite_mode else None
+    if sqlite_mode:
+        log_fh = log_buf  # type: ignore[assignment]
+    else:
+        # `fd` (and possibly-fallen-back `path`) were already opened above, before the
+        # announce line — private file perms: logs persist prompts/diffs that may contain
+        # secrets.
+        log_fh = os.fdopen(fd, "w", encoding="utf-8", buffering=1)  # line-buffered
     try:
         # Header records the backend + argv[0] only — NOT the full argv, which carries
         # the prompt/diff for claude/opencode and could leak secrets into the log. A
@@ -1925,4 +1998,15 @@ def _run_streamed(
             sem_acquired = False
             concurrency_sem.release()
         with log_lock:
-            log_fh.close()
+            if sqlite_mode and log_buf is not None:
+                try:
+                    _persist_call_log(
+                        backend=backend,
+                        round_no=round_no,
+                        started=call_started,
+                        content=log_buf.content(),
+                    )
+                except Exception:
+                    pass
+            else:
+                log_fh.close()
