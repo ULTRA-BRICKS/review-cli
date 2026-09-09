@@ -296,7 +296,9 @@ def review_with_images(
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         if not allow_spawn_for_model(model):
-            reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            reason = (
+                spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            )
             return _usage_limit_skip_result(model, round_no, reason, backend="claude")
         result = review_claude_cli_with_images(
             model, prompt, diff, cwd, timeout, round_no, images, effort=effort
@@ -1413,7 +1415,9 @@ def review_gemini(
             stderr = ""
         else:
             stdout = ""
-            stderr = f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            stderr = (
+                f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            )
         _emit_rest_log(
             "gemini",
             command,
@@ -2374,7 +2378,8 @@ def review_claude_api(
         # content to `result_is_usable()`; keep the failed result's stdout empty
         # like the other REST paths (tokens still ride on the result fields).
         stdout = (
-            text.strip() + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            text.strip()
+            + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
             if rc == 0
             else ""
         )
@@ -2600,7 +2605,27 @@ _UNAVAILABLE_MARKERS = (
 # OTHER chronic shape the token-burn investigation found dominates Fable's real failures
 # (1,836 of 4,322 recorded failures) — it is NOT rc=0/short-body shaped like the sentinel
 # above (the CLI exits non-zero), so it needs its own marker check.
-_CHRONIC_QUOTA_MARKERS = ("session limit", "usage-credits", "usage credits")
+# Live-reproduced bug (2026-09-09, GLM/z.ai): dispatching `oc:zai/glm-5.2` after its
+# recorded cooldown had already expired correctly re-attempted a REAL opencode call —
+# `active_cooldown`'s fail-open `until<=now` expiry check worked exactly as designed —
+# but the real z.ai account was INDEPENDENTLY still exhausted. The actual `opencode`
+# failure was `returncode=1` with a body containing the literal text "Error:
+# Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10 21:15:09". That
+# exact wording matched neither this tuple nor `_UNAVAILABLE_MARKERS`, so
+# `_chronic_unavailable_reason` returned None and no fresh cooldown was ever recorded —
+# the STALE, already-expired cooldown entry was left untouched, and review-cli kept
+# re-attempting this same pathologically-slow doomed dispatch (GLM is the board's
+# deliberately-deprioritized last-resort reserve seat, see config.py's own comment on
+# it) on every subsequent invocation instead of being cached-skipped until z.ai's real
+# reset time. "limit exhausted" is added below for the same reason the existing three
+# markers are safe: it is specific quota-exhaustion phrasing, not plausible in an
+# unrelated transient/fatal STDERR channel by accident.
+_CHRONIC_QUOTA_MARKERS = (
+    "session limit",
+    "usage-credits",
+    "usage credits",
+    "limit exhausted",
+)
 # The administrative sentinel is only trustworthy when the WHOLE body is short (a
 # one-liner notice) — a real, long review that happens to mention availability must
 # never be cached as a chronic failure. Shared by panel.result_is_usable and

@@ -157,7 +157,9 @@ def test_pre_187_flat_store_shape_reads_as_no_cooldown_and_is_replaced_on_write(
         assert "until" not in data[model], data  # flat shape discarded, not merged
         assert set(data[model]) == {"opencode"}, data
         fresh = sc.active_cooldown(model, access_method="opencode")
-        assert fresh is not None and fresh["fail_count"] == 1, fresh  # no legacy history
+        assert fresh is not None and fresh["fail_count"] == 1, (
+            fresh
+        )  # no legacy history
         assert sc.active_cooldown(model, access_method="cli") is None
         sc.clear_cooldown(model, access_method="opencode")
         assert sc.active_cooldown(model, access_method="opencode") is None
@@ -1743,6 +1745,59 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording_non
         _with_store(_run)
 
 
+def test_review_claude_records_cooldown_for_weekly_monthly_limit_exhausted_wording():
+    """Pins the live-reproduced GLM/z.ai bug (2026-09-09): dispatching
+    `oc:zai/glm-5.2` after its recorded cooldown had already expired correctly
+    re-attempted a REAL opencode call (`active_cooldown`'s fail-open `until<=now`
+    expiry check worked exactly as designed) — but the real z.ai account was
+    independently still exhausted. The actual `opencode` failure was
+    `returncode=1` with a body containing the literal text "Error: Weekly/Monthly
+    Limit Exhausted. Your limit will reset at 2026-09-10 21:15:09". That exact
+    wording matched neither `_CHRONIC_QUOTA_MARKERS` nor `_UNAVAILABLE_MARKERS`
+    before this fix, so `_chronic_unavailable_reason` returned None and no fresh
+    cooldown was ever recorded — the stale, already-expired entry was left
+    untouched and review-cli kept re-attempting this same pathologically-slow
+    doomed dispatch on every subsequent invocation instead of being
+    cached-skipped until z.ai's real reset time.
+
+    Also patches `backends.allow_spawn_for_model` -> True: `review_claude`'s
+    harness 5h/7d spawn gate (#438) reads the REAL local harness usage window
+    when unmocked, which would non-deterministically short-circuit this test
+    before it ever reaches the mocked `review_claude_cli` on a host whose own
+    Claude Code session is near its real usage window -- unrelated to the
+    quota-marker fix this test pins."""
+
+    def _run():
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
+        saved_spawn = _patched(backends, "allow_spawn_for_model", lambda *a, **k: True)
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Error: Weekly/Monthly Limit Exhausted. Your limit will "
+                    "reset at 2026-09-10 21:15:09"
+                ),
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.allow_spawn_for_model = saved_spawn
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
+
+    _with_store(_run)
+
+
 def test_review_claude_does_not_cache_a_transient_5xx_status_even_with_unavailable_wording():
     """GLM review finding: `review_claude_api` sets `returncode = exc.code` on an
     `HTTPError`, so a REAL 503/529 gateway blip reaches `_chronic_unavailable_reason`
@@ -3061,7 +3116,10 @@ def test_wiring_review_claude_rc0_transient_stderr_sentinel_does_not_clear_coold
     def _run():
         sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="cli")
         sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="cli")
-        assert sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"] == 2
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"]
+            == 2
+        )
 
         saved = backends.review_claude_cli
         saved_unpaid = _patched(
