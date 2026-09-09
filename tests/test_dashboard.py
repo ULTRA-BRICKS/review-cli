@@ -3264,6 +3264,111 @@ def test_compute_stats_against_fixtures():
         assert stats["by_mode"]["brainstorm"] == 1
 
 
+def test_compute_stats_by_dimension_covers_non_brainstorm_calls():
+    """`by_role` is brainstorm-persona-only (Session.roles() is empty otherwise); the new
+    `by_dimension` must cover every mode via the static board model->lens map, so a plain
+    `review diff`/quorum call — the vast majority of real traffic — shows a real
+    per-dimension (correctness/performance/consistency/...) pass/fail breakdown instead of
+    nothing. codex:gpt-5.6-sol (SOL_SEAT) is DEFAULT_BOARD's priority-1 seat, role
+    "consistency"."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # A single, non-brainstorm codex call — no persona data at all for it.
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "looks good\n",
+            argv0="codex -m gpt-5.6-sol",
+            exit_code=0,
+        )
+        sessions = p.load_sessions(ld)
+        stats = p.compute_stats(sessions)
+        assert stats["by_role"] == {}  # confirms the pre-existing gap this covers
+        assert "consistency" in stats["by_dimension"]
+        dim = stats["by_dimension"]["consistency"]
+        assert dim["calls"] == 1
+        assert dim["ok"] == 1
+        assert dim["error"] == 0
+        assert dim["ok_rate"] == 1.0
+
+
+def test_compute_stats_by_dimension_tracks_errors_separately(monkeypatch):
+    from reviewlib.dashboard import parser as p
+
+    monkeypatch.setattr(
+        p,
+        "_board_models_cached",
+        lambda: (
+            {
+                "model": "codex",
+                "role": "consistency",
+                "display": "Codex",
+                "priority": 1,
+            },
+        ),
+        raising=True,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        # `has_error` is EXIT-code-authoritative once an exit code is present (body text is
+        # only consulted when there's no exit code at all) — a non-zero exit is what makes
+        # this an error, not the "error:" text in the body.
+        _write_call_log(
+            ld,
+            "20260601T103000_000000",
+            "codex",
+            0,
+            "there's an issue with the selected model.\n",
+            exit_code=1,
+        )
+        sessions = p.load_sessions(ld)
+        stats = p.compute_stats(sessions)
+        dim = stats["by_dimension"]["consistency"]
+        assert dim["calls"] == 2
+        assert dim["ok"] == 1
+        assert dim["error"] == 1
+        assert dim["ok_rate"] == 0.5
+
+
+def test_compute_stats_by_dimension_counts_exit_0_paywall_as_a_failure(monkeypatch):
+    """codex review finding (review-cli#351): `has_error` is EXIT-code-authoritative, but
+    Fable's paywall body arrives with EXIT 0 -- the body, not the code, is the failure
+    signal (see `_fable_paywall_log`). An earlier version of `by_dimension` counted this
+    as `ok` (mirroring the has_error split), silently hiding a paywalled seat's failure
+    from the per-dimension breakdown; it must use the same `classify_call` verdict the
+    rest of the dashboard's health views already rely on."""
+    from reviewlib.dashboard import parser as p
+
+    monkeypatch.setattr(
+        p,
+        "_board_models_cached",
+        lambda: (
+            {
+                "model": p._CLAUDE_FABLE_MODEL,
+                "role": "architect",
+                "display": "Fable",
+                "priority": 1,
+            },
+        ),
+        raising=True,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _fable_paywall_log(ld, "20260601T100000_000000")
+        sessions = p.load_sessions(ld)
+        stats = p.compute_stats(sessions)
+        dim = stats["by_dimension"]["architect"]
+        assert dim["calls"] == 1
+        assert dim["ok"] == 0
+        assert dim["error"] == 1
+        assert dim["ok_rate"] == 0.0
+
+
 # --- per-model health classifier (Models & roles tab) -----------------------
 #
 # These cover the dashboard's per-model health view + the problematic-count badge. Each

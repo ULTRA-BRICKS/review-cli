@@ -26,6 +26,10 @@ const state = {
   // and every subsequent tab switch showed an honest-looking "Loading…" that was actually a
   // dead end.
   loadError: null,
+  filterDay: null, // when set (an ISO day, or a period-bucket key for week/month), session
+  // lists show only runs whose `started` date falls in that bucket — set by clicking a bar
+  // in the Stats timeline.
+  statsPeriod: 'day', // 'day' | 'week' | 'month' — the Stats timeline's active bucket size
 };
 
 // ---- model identity --------------------------------------------------------
@@ -426,6 +430,13 @@ function filteredRuns(runs) {
   }
   if (state.filterRole) out = out.filter((r) => r.mode === 'brainstorm' || r.topic);
   if (state.filterTask) out = out.filter((r) => String(r.task_code || '') === state.filterTask);
+  if (state.filterDay) {
+    const range = periodRange(state.filterDay, state.statsPeriod);
+    out = out.filter((r) => {
+      const d = String(r.started || '').slice(0, 10);
+      return d >= range[0] && d <= range[1];
+    });
+  }
   return out;
 }
 // The active-filter banner shown atop a filtered list. Clear buttons reset the filter.
@@ -445,6 +456,9 @@ function filterBar() {
   }
   if (state.filterTask) {
     bits.push(`<span class="filter-pill">${esc(state.filterTask)} <button class="filter-x" data-clear="task" aria-label="clear task filter">×</button></span>`);
+  }
+  if (state.filterDay) {
+    bits.push(`<span class="filter-pill">${esc(periodLabel(state.filterDay, state.statsPeriod))} <button class="filter-x" data-clear="day" aria-label="clear date filter">×</button></span>`);
   }
   if (!bits.length) return '';
   return `<div class="filterbar"><span class="muted">filtered by</span> ${bits.join(' ')} <button class="btn small" data-clear="all">clear all</button></div>`;
@@ -554,16 +568,42 @@ PANELS.chat = () => {
 PANELS.stats = () => {
   const s = state.stats;
   if (!s || !s.session_count) return `<div class="panel-head"><h2>Stats</h2></div>` + emptyState('stats', 'No sessions to aggregate.');
-  let html = `<div class="panel-head"><h2>Stats</h2><p class="sub">Runs over time and counts by mode/model/role. Click a model bar to filter the board.</p></div>`;
-  html += `<div class="section"><h3>Sessions per day</h3>${barChart(s.by_day)}</div>`;
+  let html = `<div class="panel-head"><h2>Stats</h2><p class="sub">Runs over time and counts by mode/model/role. Click a timeline bar or a model bar to drill in.</p></div>`;
+  const period = state.statsPeriod || 'day';
+  html += `<div class="section"><div class="section-head"><h3>Sessions over time</h3>
+      <div class="period-toggle" role="group" aria-label="timeline period">
+        ${['day', 'week', 'month'].map((p) => `<button class="btn small${p === period ? ' is-active' : ''}" data-period="${p}">${p}</button>`).join('')}
+      </div></div>
+      ${timelineChart(s.by_day, period)}</div>`;
   html += `<div class="section"><h3>By mode</h3>${barChart(s.by_mode)}</div>`;
   if (s.by_task && Object.keys(s.by_task).length)
     html += `<div class="section"><h3>By task</h3>${barChart(s.by_task, { task: true })}</div>`;
   html += `<div class="section"><h3>By model</h3>${barChart(s.by_model, { model: true })}</div>`;
+  if (s.by_dimension && Object.keys(s.by_dimension).length)
+    html += `<div class="section"><h3>By review dimension</h3><p class="sub">Every <code>review diff</code>/quorum call, attributed to its board lens (correctness, performance, security, ...) — not just brainstorm. Lens comes from the built-in default board, not a per-repo custom <code>board:</code> config, and reflects that board's PRESENT shape even for old calls — see review-cli#347.</p>${dimensionChart(s.by_dimension)}</div>`;
   if (s.by_role && Object.keys(s.by_role).length)
-    html += `<div class="section"><h3>By role / persona</h3>${barChart(s.by_role, { role: true })}</div>`;
+    html += `<div class="section"><h3>Brainstorm personas</h3><p class="sub">Rotating expert personas — only recorded for <code>review brainstorm</code> runs.</p>${barChart(s.by_role, { role: true })}</div>`;
   return html;
 };
+
+// Per-dimension pass/fail bar — like `barChart` but shows an ok/error split instead of a
+// single count, since "how often" alone hides whether a lens is actually healthy.
+function dimensionChart(byDimension) {
+  const entries = Object.entries(byDimension || {}).sort((a, b) => b[1].calls - a[1].calls);
+  if (!entries.length) return `<div class="muted">no data</div>`;
+  const max = Math.max(...entries.map(([, v]) => v.calls)) || 1;
+  return entries
+    .map(([dim, v]) => {
+      const okPct = v.calls ? (v.ok / v.calls) * 100 : 0;
+      const rate = v.ok_rate == null ? '—' : Math.round(v.ok_rate * 100) + '%';
+      return `<div class="bar-row" title="${esc(dim)}: ${v.ok}/${v.calls} ok (${rate})">
+        <div class="k"><span class="badge lens-badge">${esc(dim)}</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width:${((v.calls / max) * 100).toFixed(1)}%"></div></div>
+        <div class="v">${esc(v.calls)} <span class="muted">(${rate} ok)</span></div>
+      </div>`;
+    })
+    .join('');
+}
 
 // Human label + status-pill class for a model's health class. The pill reuses the
 // existing .badge palette (ok green, err red, degraded/nodata amber-ish).
@@ -904,6 +944,92 @@ function barChart(obj, opts) {
       <div class="v">${esc(v)}</div></div>`;
     })
     .join('');
+}
+
+// ---- Stats timeline: horizontal time axis with a day/week/month toggle -----
+// Replaces the old per-day `barChart` (one row per calendar day, SORTED BY COUNT) with a
+// genuine chronological timeline — bars flow left-to-right by date, at whichever bucket
+// size (day/week/month) the toggle is set to, and every bar is clickable: it sets
+// `state.filterDay`/`state.statsPeriod` and jumps to the (now date-filtered) overview
+// panel, so a spike is one click away from "what actually happened then". With ~2.5 months
+// of real history, the old list grew to ~80 rows; this keeps it to one screen-width row.
+
+// Monday-anchored ISO week key (the bucket id for 'week' period) for a 'YYYY-MM-DD' string.
+function weekKeyFor(dayStr) {
+  const d = new Date(dayStr + 'T00:00:00Z');
+  const dow = d.getUTCDay(); // 0=Sun..6=Sat
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  d.setUTCDate(d.getUTCDate() + mondayOffset);
+  return d.toISOString().slice(0, 10);
+}
+
+// Groups a `{ 'YYYY-MM-DD': count }` map into day/week/month buckets, chronologically
+// ordered. Returns `[bucketKey, count][]` — `bucketKey` doubles as the filter value
+// (`state.filterDay`) and, together with `period`, is enough to recompute the bucket's
+// real day-range later (see `periodRange`) without storing it separately.
+function bucketByPeriod(byDay, period) {
+  const days = Object.entries(byDay || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  if (period === 'day') return days;
+  const buckets = new Map();
+  for (const [d, c] of days) {
+    const key = period === 'week' ? weekKeyFor(d) : d.slice(0, 7); // 'YYYY-MM'
+    buckets.set(key, (buckets.get(key) || 0) + c);
+  }
+  return [...buckets.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+}
+
+// The real ['YYYY-MM-DD', 'YYYY-MM-DD'] inclusive day-range a bucket key covers, for
+// filtering `runs` by their `.started` date — the inverse of the grouping in `bucketByPeriod`.
+function periodRange(key, period) {
+  if (period === 'day') return [key, key];
+  if (period === 'month') {
+    const [y, m] = key.split('-').map(Number);
+    const last = new Date(Date.UTC(y, m, 0)).getUTCDate(); // day 0 of next month = last of this
+    return [key + '-01', `${key}-${String(last).padStart(2, '0')}`];
+  }
+  // week: key is the Monday; the range runs Monday..Sunday.
+  const monday = new Date(key + 'T00:00:00Z');
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  return [key, sunday.toISOString().slice(0, 10)];
+}
+
+function periodLabel(key, period) {
+  if (period === 'month') {
+    const [y, m] = key.split('-');
+    const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${names[Number(m) - 1]} ${y}`;
+  }
+  if (period === 'week') {
+    const [, end] = periodRange(key, 'week');
+    return `week of ${key} → ${end}`;
+  }
+  return key;
+}
+
+function timelineChart(byDay, period) {
+  const buckets = bucketByPeriod(byDay, period);
+  if (!buckets.length) return `<div class="muted">no data</div>`;
+  const max = Math.max(...buckets.map((b) => b[1])) || 1;
+  const bars = buckets
+    .map(([key, count]) => {
+      const pct = Math.max(2, Math.round((count / max) * 100)); // floor so a 1-count bar is visible
+      return `<div class="tl-bar" data-day="${esc(key)}" tabindex="0" role="button"
+          title="${esc(periodLabel(key, period))}: ${count} session${count === 1 ? '' : 's'} — click to view">
+        <div class="tl-bar-track"><div class="tl-bar-fill" style="height:${pct}%"></div></div>
+        <div class="tl-bar-v">${esc(count)}</div>
+        <div class="tl-bar-label">${esc(shortPeriodLabel(key, period))}</div>
+      </div>`;
+    })
+    .join('');
+  return `<div class="tl-chart">${bars}</div>`;
+}
+
+// A compact axis tick — the full label lives in the bar's `title` tooltip.
+function shortPeriodLabel(key, period) {
+  if (period === 'day') return key.slice(5); // MM-DD
+  if (period === 'month') return key.slice(2); // YY-MM
+  return key.slice(5); // week: MM-DD of the Monday
 }
 
 // ---- session detail (chat transcript) -------------------------------------
@@ -1274,6 +1400,37 @@ function wireChips() {
       if (what === 'model' || what === 'all') state.filterModel = null;
       if (what === 'role' || what === 'all') state.filterRole = null;
       if (what === 'task' || what === 'all') state.filterTask = null;
+      if (what === 'day' || what === 'all') state.filterDay = null;
+      render();
+    };
+  });
+  // Timeline bar click: jump to the (now date-filtered) session list for that bucket.
+  // The bar markup advertises `role="button" tabindex="0"` (timelineChart), so it needs the
+  // same Enter/Space-activates-click wiring as the other keyboard-operable chips above —
+  // without this, a focused bar was keyboard-inert despite the button semantics.
+  document.querySelectorAll('[data-day]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const day = el.dataset.day;
+      state.filterDay = state.filterDay === day ? null : day;
+      state.detail = null;
+      navigate('overview');
+    };
+    el.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        el.click();
+      }
+    };
+  });
+  // Day/week/month toggle: re-bucket the SAME timeline in place, no navigation.
+  document.querySelectorAll('[data-period]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const p = el.dataset.period;
+      if (p === state.statsPeriod) return;
+      state.statsPeriod = p;
+      state.filterDay = null; // a bucket key from the old period isn't valid under the new one
       render();
     };
   });
