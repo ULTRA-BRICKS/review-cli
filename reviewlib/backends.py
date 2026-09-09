@@ -837,16 +837,21 @@ def _run_opencode_with_stall_retry(
     return proc
 
 
-def _record_true_silence_if_needed(model: str, proc) -> None:
-    """After an opencode `_run_streamed` call (codex review finding, round 13: only
-    opencode calls this today — omp is tracked for the same wiring in #235, not done
-    yet): if it was reaped for producing ZERO output (`proc.true_silenced` — see
+def _record_true_silence_if_needed(model: str, proc, *, access_method: str) -> None:
+    """After a `_run_streamed` call (codex review finding, round 13: originally only
+    opencode called this — review-cli#235 now also wires `review_omp` through the
+    same path; the remaining backends #235 still tracks are not done yet): if it was
+    reaped for producing ZERO output (`proc.true_silenced` — see
     process._run_streamed's
     true_silence_timeout), record a cooldown so the NEXT invocation skips this seat
     for a while instead of paying for another multi-minute stuck dispatch (Alex's
     request 2026-08-19/20). A no-op for every other outcome (ordinary success,
     ordinary idle-timeout, or a real error) — those are unrelated to true-silence and
-    already handled by their own existing paths.
+    already handled by their own existing paths. `access_method` (required, no
+    default — every caller must name its own cooldown namespace explicitly) keys the
+    cooldown-store entry, mirroring `_cooldown_skip_result`'s own no-default
+    reasoning: opencode and omp are independent failure domains and must never share
+    one cooldown bucket.
 
     Branches on the explicit `.true_silenced` attribute, NOT `proc.returncode == 125`
     (round-2 review finding, codex + Fable): 125 is a real exit code some CLIs/
@@ -901,15 +906,13 @@ def _record_true_silence_if_needed(model: str, proc) -> None:
     above ("closes the false-clear ... rc=0 body") describes the round-12 FIX's
     motivating scenario, not the full scope of what this call now covers."""
     if getattr(proc, "true_silenced", False):
-        record_cooldown(
-            model, "true-silence timeout", access_method=_OPENCODE_ACCESS_METHOD
-        )
+        record_cooldown(model, "true-silence timeout", access_method=access_method)
         return
     reason = _chronic_unavailable_reason(proc)
     if reason is not None:
-        record_cooldown(model, reason, access_method=_OPENCODE_ACCESS_METHOD)
+        record_cooldown(model, reason, access_method=access_method)
     elif proc.returncode == 0 and proc.stdout.strip():
-        clear_cooldown(model, access_method=_OPENCODE_ACCESS_METHOD)
+        clear_cooldown(model, access_method=access_method)
 
 
 def review_opencode(
@@ -1034,7 +1037,9 @@ def review_opencode(
             model=canonical_model,
             true_silence_timeout=true_silence_timeout_seconds(canonical_model),
         )
-        _record_true_silence_if_needed(canonical_model, proc)
+        _record_true_silence_if_needed(
+            canonical_model, proc, access_method=_OPENCODE_ACCESS_METHOD
+        )
         return ReviewResult(
             model=model,
             command=command,
@@ -1087,7 +1092,9 @@ def review_opencode(
             model=canonical_model,
             true_silence_timeout=true_silence_timeout_seconds(canonical_model),
         )
-    _record_true_silence_if_needed(canonical_model, proc)
+    _record_true_silence_if_needed(
+        canonical_model, proc, access_method=_OPENCODE_ACCESS_METHOD
+    )
     return ReviewResult(
         model=model,
         command=command,
@@ -1152,6 +1159,11 @@ _OMP_CAGE_OVERLAY = (
 
 OMP_SUPPORTED_MODES = ("cli",)  # CLI-only — no omp REST transport exists.
 
+# Cooldown-store access-method key for the omp backend (mirrors _OPENCODE_ACCESS_METHOD
+# above): omp's read-only agentic seat is a distinct failure domain from the claude CLI
+# transport ("cli"), so it gets its own cooldown namespace rather than reusing that one.
+_OMP_ACCESS_METHOD = "omp"
+
 
 def review_omp(
     model: str,
@@ -1173,6 +1185,14 @@ def review_omp(
     )
     if unpaid is not None:
         return unpaid
+    # review-cli#235: mirrors review_opencode's own cooldown-consult pattern (checked
+    # BEFORE resolve_backend_mode/_which/preflight) so a cooling-down omp seat skips ALL
+    # real work, not just the final dispatch. omp model ids (e.g. "omp:kimi-code/k3")
+    # are already the canonical cooldown-store key -- no alias-normalization step is
+    # needed here the way review_opencode's oc:/opencode: spelling pair requires.
+    cooldown = active_cooldown(model, access_method=_OMP_ACCESS_METHOD)
+    if cooldown is not None:
+        return _cooldown_skip_result(model, round_no, cooldown, backend="omp")
     # CLI-only: a forced REVIEW_OMP_MODE=api is a config error — surface it as a
     # dead-backend result (mirrors review_zai's forced-mode path), never silently run.
     try:
@@ -1255,7 +1275,9 @@ def review_omp(
             round_no=round_no,
             announce=_ANNOUNCE_LOGS,
             header_argv0=f"omp -m {_safe_log_header(omp_model)}" if omp_model else None,
+            true_silence_timeout=true_silence_timeout_seconds(model),
         )
+    _record_true_silence_if_needed(model, proc, access_method=_OMP_ACCESS_METHOD)
     return ReviewResult(
         model=model,
         command=command,

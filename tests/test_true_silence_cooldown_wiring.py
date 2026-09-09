@@ -468,7 +468,9 @@ def test_repeated_true_silence_escalates_the_cooldown_instead_of_resetting_it():
         # persisted prior entry's fail_count to escalate, regardless of whether that
         # prior cooldown has expired yet, so this needs no wall-clock manipulation.
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(125, stdout="partial output", true_silenced=True)
+            MODEL,
+            _FakeProc(125, stdout="partial output", true_silenced=True),
+            access_method="opencode",
         )
         data2 = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
         second_window = data2[MODEL]["opencode"]["until"] - data2[MODEL]["opencode"]["recorded_at"]
@@ -491,12 +493,16 @@ def test_true_silence_then_empty_rc0_body_does_not_clear_the_cooldown():
 
     def _run():
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(125, stdout="", true_silenced=True)
+            MODEL,
+            _FakeProc(125, stdout="", true_silenced=True),
+            access_method="opencode",
         )
         assert sc.active_cooldown(MODEL, access_method="opencode") is not None
 
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(0, stdout="   \n  ", true_silenced=False)
+            MODEL,
+            _FakeProc(0, stdout="   \n  ", true_silenced=False),
+            access_method="opencode",
         )
         assert sc.active_cooldown(MODEL, access_method="opencode") is not None, (
             "an empty/whitespace-only rc=0 body wrongly cleared the cooldown"
@@ -517,7 +523,9 @@ def test_true_silence_then_success_then_true_silence_resets_fail_count():
     def _run():
         # First true-silence trip: fail_count=1.
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(125, stdout="", true_silenced=True)
+            MODEL,
+            _FakeProc(125, stdout="", true_silenced=True),
+            access_method="opencode",
         )
         data = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
         assert data[MODEL]["opencode"]["fail_count"] == 1
@@ -525,7 +533,9 @@ def test_true_silence_then_success_then_true_silence_resets_fail_count():
         # A genuine success in between: must clear the cooldown entirely, not just
         # let it passively expire.
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(0, stdout="a real review verdict", true_silenced=False)
+            MODEL,
+            _FakeProc(0, stdout="a real review verdict", true_silenced=False),
+            access_method="opencode",
         )
         assert sc.active_cooldown(MODEL, access_method="opencode") is None, (
             "a genuine success after a true-silence trip did not clear the cooldown"
@@ -534,7 +544,9 @@ def test_true_silence_then_success_then_true_silence_resets_fail_count():
         # A THIRD true-silence trip, after the recovery: fail_count must restart at 1,
         # not continue escalating from the pre-recovery history.
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(125, stdout="", true_silenced=True)
+            MODEL,
+            _FakeProc(125, stdout="", true_silenced=True),
+            access_method="opencode",
         )
         data2 = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
         assert data2[MODEL]["opencode"]["fail_count"] == 1, (
@@ -558,7 +570,9 @@ def test_true_silence_then_rc0_quota_body_then_true_silence_preserves_escalation
     def _run():
         # First true-silence trip: fail_count=1.
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(125, stdout="", true_silenced=True)
+            MODEL,
+            _FakeProc(125, stdout="", true_silenced=True),
+            access_method="opencode",
         )
         data = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
         assert data[MODEL]["opencode"]["fail_count"] == 1
@@ -570,6 +584,7 @@ def test_true_silence_then_rc0_quota_body_then_true_silence_preserves_escalation
             _FakeProc(
                 0, stdout="GLM-5.2 is currently unavailable", true_silenced=False
             ),
+            access_method="opencode",
         )
         assert sc.active_cooldown(MODEL, access_method="opencode") is not None, (
             "a chronic-unavailable-shaped rc=0 body wrongly cleared the cooldown"
@@ -582,7 +597,9 @@ def test_true_silence_then_rc0_quota_body_then_true_silence_preserves_escalation
         # A THIRD true-silence trip: must escalate from 2, not reset to 1 -- the
         # sentinel body in between was never a genuine recovery.
         review_backends._record_true_silence_if_needed(
-            MODEL, _FakeProc(125, stdout="", true_silenced=True)
+            MODEL,
+            _FakeProc(125, stdout="", true_silenced=True),
+            access_method="opencode",
         )
         data2 = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
         assert data2[MODEL]["opencode"]["fail_count"] == 3, (
@@ -609,6 +626,7 @@ def test_nonzero_exit_with_quota_marker_in_stderr_records_a_cooldown():
             _FakeProc(
                 1, stdout="", stderr="session limit reached", true_silenced=False
             ),
+            access_method="opencode",
         )
         assert sc.active_cooldown(MODEL, access_method="opencode") is not None, (
             "a non-zero exit with a quota-marker stderr did not record a cooldown"

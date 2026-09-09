@@ -80,9 +80,12 @@ _DEFAULT_BEHAVIOR = ModelBehavior(
 # empty of specific overrides beyond the mechanism itself — this repo's own code
 # currently has no VERIFIED per-model silent-thinking data (the "5min" figure that
 # review-cli#153/#159/#179's zai/glm watchdog folklore referenced was never actually
-# implemented at this layer). This mechanism is currently wired into review_opencode
-# only (review-cli#235 tracks extending it to the other 5 backend call sites). Add an
-# entry here backed by real observed evidence (a linked issue/incident), not a guess.
+# implemented at this layer). This mechanism is now wired into review_opencode AND
+# review_omp (review-cli#235: 2 of the backend call sites are wired; review_codex,
+# review_claude/review_claude_api/review_claude_cli(+with_images), review_gemini,
+# review_zai, review_commandcode, and review_openrouter remain tracked, not done yet).
+# Add an entry here backed by real observed evidence (a linked issue/incident), not a
+# guess.
 _REGISTRY: dict[str, ModelBehavior] = {}
 
 

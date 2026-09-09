@@ -46,13 +46,26 @@ class _Captured:
         self.payload_path: Path | None = None
         self.cage_text: str | None = None
         self.env: dict | None = None
+        self.true_silence_timeout: int | None = None
 
-    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, header_argv0=None, env=None):
+    def __call__(
+        self,
+        argv,
+        cwd,
+        timeout,
+        backend,
+        round_no=0,
+        announce=False,
+        header_argv0=None,
+        env=None,
+        true_silence_timeout=None,
+    ):
         self.argv = list(argv)
         self.cwd = Path(cwd)
         self.timeout = timeout
         self.header_argv0 = header_argv0
         self.env = env
+        self.true_silence_timeout = true_silence_timeout
         at_args = [a for a in self.argv if a.startswith("@")]
         if at_args:
             self.payload_path = Path(at_args[-1][1:])
