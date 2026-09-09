@@ -67,6 +67,14 @@ TERRA_SEAT = "codex:gpt-5.6-terra"
 # dispatched cleanly 7/7 times historically, zero recorded failures — unlike FABLE_SEAT's
 # ~100% dispatch failure rate (see its own entry below).
 SONNET_SEAT = "claude:claude-sonnet-5"
+# OMP-hosted Claude ("Sonnet via omp") -- review-cli#168: the SAME claude-sonnet-5 model,
+# dispatched through the omp harness (reviewlib.backends.review_omp) instead of the direct
+# `claude` CLI -- a genuinely DIFFERENT auth path (omp's own ANTHROPIC_API_KEY/
+# ANTHROPIC_OAUTH_TOKEN/profile-scoped agent dir, independent of Claude Code CLI's
+# CLAUDE_CONFIG_DIR/keychain), so it survives an outage that takes out every claude:*
+# seat's shared account state. Live `quality` fallback for both Kimi (commandcode) AND
+# Sonnet (claude: direct) -- see ROLE_FALLBACK_MODELS / DEFAULT_BOARD.
+OMP_CLAUDE_SEAT = "omp:anthropic/claude-sonnet-5"
 # review-cli#fable-seat-reliability (GLM review finding): the single source of truth
 # for the Fable seat's model id — every sibling seat (KIMI_SEAT/SOL_SEAT/
 # GLM_COMMANDCODE_SEAT above) already has one; the Fable id was the one left as a
@@ -422,6 +430,10 @@ DEFAULT_BOARD = (
     # priority 7 — Sonnet (review-cli#382): live `quality` fallback for Kimi — the exact
     # role the 2026-09-05 z.ai-quota incident exposed (see CHANGELOG.md).
     BoardReviewer(SONNET_SEAT, "quality", "Sonnet"),
+    # priority 7.5 (review-cli#168) -- Sonnet via omp, a DIFFERENT auth path than the
+    # seat right above; live `quality` fallback that survives a Claude-account-wide
+    # outage (every claude:* seat sharing one exhausted/paywalled account).
+    BoardReviewer(OMP_CLAUDE_SEAT, "quality", "Sonnet-omp"),
     # priority 8 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
     # priority 9 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
@@ -507,9 +519,9 @@ DEFAULT_PRESET_BOARD = tuple(
 # moving Fable anywhere else would have silently shifted every later seat's tier by one slot
 # with no test catching it (the tuple-order pin would read as a membership change, not a
 # tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
-# first ordering and the resulting seat-count invariant self-documenting (13 seats as of
-# review-cli#450's MIMO_SEAT on top of review-cli#165's GROK_SEAT and review-cli#382's TERRA_SEAT/SONNET_SEAT —
-# first 4 get `xhigh` effort: Sol, Opus,
+# first ordering and the resulting seat-count invariant self-documenting (14 seats as of
+# review-cli#168's OMP_CLAUDE_SEAT on top of review-cli#450's MIMO_SEAT, review-cli#165's
+# GROK_SEAT and review-cli#382's TERRA_SEAT/SONNET_SEAT — first 4 get `xhigh` effort: Sol, Opus,
 # GLM-cc, Kimi (unchanged from before #382 — TERRA_SEAT/SONNET_SEAT were inserted at raw
 # priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the
 # rest get `max`).
@@ -904,15 +916,11 @@ def select_pool_with_reuse(
         candidates = under_limit
     else:
         not_exhausted = [
-            r
-            for r in reachable
-            if (usage_percent(r.model) or 0.0) < 100.0
+            r for r in reachable if (usage_percent(r.model) or 0.0) < 100.0
         ]
         if not not_exhausted:
             return []
-        idx = _least_depleted_index(
-            [r.model for r in not_exhausted], usage_percent
-        )
+        idx = _least_depleted_index([r.model for r in not_exhausted], usage_percent)
         candidates = [not_exhausted[idx]]
 
     primary = candidates[: min(n, len(candidates))]
@@ -1053,9 +1061,7 @@ def expand_flat_models_with_reuse(
     if under_limit:
         pool_models = under_limit
     else:
-        not_exhausted = [
-            m for m in models if (usage_percent(m) or 0.0) < 100.0
-        ]
+        not_exhausted = [m for m in models if (usage_percent(m) or 0.0) < 100.0]
         if not not_exhausted:
             return []
         idx = _least_depleted_index(not_exhausted, usage_percent)

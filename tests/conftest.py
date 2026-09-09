@@ -72,3 +72,19 @@ def _isolate_log_and_stats_paths(tmp_path, monkeypatch):
     """
     for key in _ISOLATED_ENV_KEYS:
         monkeypatch.setenv(key, str(tmp_path / key.lower()))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_accounts_root(tmp_path, monkeypatch):
+    """Default EVERY test to a throwaway `$CLAUDE_ROTATE_ROOT` (review-cli#168).
+
+    `reviewlib.claude_accounts.accounts_root()` falls back to this DEVELOPER MACHINE's
+    real `~/.claude-accounts/account-0/1/2` registry when the env var is unset. Without
+    this fixture, any suite that drives the real account-rotation loop (`review_claude`'s
+    `_claude_account_candidates`) would pick up whatever accounts happen to be registered
+    on the machine running the tests -- non-deterministic, and a real credential-bearing
+    dir the test suite has no business touching. Point every test at an empty, unique
+    `tmp_path` subdir instead; a test that wants a populated registry builds one under
+    this same dir explicitly.
+    """
+    monkeypatch.setenv("CLAUDE_ROTATE_ROOT", str(tmp_path / "claude-accounts"))

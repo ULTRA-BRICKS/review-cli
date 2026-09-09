@@ -21,7 +21,12 @@ ROLE_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
     "correctness": ("claude-opus-4-8", "gpt-6-astra"),
     "consistency": ("gpt-5.6-sol", "gpt-6-astra"),
     "performance": ("zai-org/GLM-5.2", "gpt-5.6-terra"),
-    "quality": ("moonshotai/Kimi-K2.7-Code", "claude-sonnet-5"),
+    # review-cli#168: "claude-sonnet-5-omp" is a THIRD quality fallback, the SAME
+    # claude-sonnet-5 model dispatched through the omp harness instead of the direct
+    # claude CLI -- a genuinely different auth path, so it survives a Claude-account-
+    # wide outage that would otherwise take out both Kimi's commandcode reserve AND
+    # the direct Sonnet seat.
+    "quality": ("moonshotai/Kimi-K2.7-Code", "claude-sonnet-5", "claude-sonnet-5-omp"),
     "security": ("Qwen/Qwen3.7-Max", "grok-4.6", "glm-5.2"),
     "tests": ("deepseek/deepseek-v4-pro", "gpt-5.6-terra"),
     "contracts": ("gemini", "gpt-6-astra"),
@@ -43,6 +48,11 @@ def _board_model_seats() -> dict[str, str]:
         "gpt-5.6-terra": c.TERRA_SEAT,
         "moonshotai/Kimi-K2.7-Code": c.KIMI_SEAT,
         "claude-sonnet-5": c.SONNET_SEAT,
+        # review-cli#168: "claude-sonnet-5-omp" is a review-cli-INVENTED display id
+        # (not a stripped-prefix derivation of OMP_CLAUDE_SEAT -- see bare_model_id's
+        # special case below), distinguishing the omp-hosted seat from the direct
+        # claude-sonnet-5 CLI seat above it in this same map.
+        "claude-sonnet-5-omp": c.OMP_CLAUDE_SEAT,
         "Qwen/Qwen3.7-Max": "oc:commandcode/Qwen/Qwen3.7-Max",
         "grok-4.6": c.GROK_SEAT,
         "glm-5.2": "zai:glm-5.2",
@@ -70,7 +80,19 @@ def bare_model_id(token: str) -> str:
     `moonshotai/Kimi-K2.7-Code`; `oc:xai/grok-4.6` -> `grok-4.6`).
     Other `harness:id` forms drop only the harness (`codex:gpt-5.6-sol` ->
     `gpt-5.6-sol`). A token with no colon is already bare.
+
+    review-cli#168: `OMP_CLAUDE_SEAT` ("omp:anthropic/claude-sonnet-5") is a
+    SPECIAL CASE, checked before the generic split -- the generic omp branch would
+    otherwise strip it to "anthropic/claude-sonnet-5" (dropping the transport but
+    keeping the provider segment, since "omp" is not in the oc/opencode branch
+    above). "claude-sonnet-5-omp" is review-cli's own INVENTED display id (see
+    `_board_model_seats`), not a stripped-prefix derivation, so it needs an
+    explicit mapping rather than falling out of the split.
     """
+    from . import config as c
+
+    if token == c.OMP_CLAUDE_SEAT:
+        return "claude-sonnet-5-omp"
     if ":" not in token:
         return token
     prefix, rest = token.split(":", 1)

@@ -21,6 +21,18 @@ tg-ctl file, an unmapped model, or any parse error all resolve to None /
 allow spawn, so a review can never be blocked by this module being wrong,
 absent, or out of date.
 
+A SECOND, ORTHOGONAL scoping axis: `account` (review-cli#168, Alex's
+hatch-request incident 2026-09-09). Every function below now accepts an
+optional keyword-only `account` (an email, normalized case/whitespace-
+insensitively). When given, only harness cards carrying that SAME account
+gate the result -- a card for a DIFFERENT registered Claude account (see
+`reviewlib.claude_accounts`) never gates a dispatch for THIS one. This is
+the exact fix for the bug where ANY ONE of this machine's N registered
+Claude Code accounts reporting 100% blocked EVERY `claude:*` seat regardless
+of which account was actually in use. `account=None` (every existing caller)
+is 100% backward compatible: the old aggregate-across-every-account MAX
+behaviour, unchanged.
+
 Accessed via: board/panel composition (`usage_percent_for_model`) and the
 claude pre-dispatch spawn gate (`allow_spawn_for_model` in backends.py).
 Tests inject cards via `cards=` / `runner=` / `$REVIEW_HARNESS_LIMITS_JSON`
@@ -214,12 +226,26 @@ def _family_from_provider(provider: object) -> str | None:
     return _HARNESS_PROVIDER_FAMILY.get(provider.strip().lower())
 
 
-def _percent_from_harness_cards(cards: list[dict], family: str) -> float | None:
+def _card_account(card: dict) -> str | None:
+    """Normalized (casefolded, stripped) `card["account"]`, or None when the
+    harness didn't report one. Callers normalize their own `account=` kwarg
+    the same way before comparing, so "Alex@X.com" and "alex@x.com " match."""
+    value = card.get("account")
+    return value.strip().lower() if isinstance(value, str) and value.strip() else None
+
+
+def _percent_from_harness_cards(
+    cards: list[dict], family: str, account: str | None = None
+) -> float | None:
     """Max used_percent across this family's 5-hour and 7-day windows.
 
     Cards with status != "ok" are skipped. Windows with used_percent None
     (or non-finite) are skipped. Identification is by window_seconds, never
-    the English name."""
+    the English name.
+
+    `account`, when given, further restricts matching to cards reporting
+    that SAME account -- a card for a DIFFERENT account never contributes
+    (no fallback to the old unscoped aggregate; review-cli#168)."""
     best: float | None = None
     for card in cards:
         if not isinstance(card, dict):
@@ -227,6 +253,8 @@ def _percent_from_harness_cards(cards: list[dict], family: str) -> float | None:
         if card.get("status") != "ok":
             continue
         if _family_from_provider(card.get("provider")) != family:
+            continue
+        if account is not None and _card_account(card) != account:
             continue
         windows = card.get("windows")
         if not isinstance(windows, list):
@@ -244,13 +272,18 @@ def _percent_from_harness_cards(cards: list[dict], family: str) -> float | None:
     return best
 
 
-def _exhausted_window_names(cards: list[dict], family: str) -> list[str]:
-    """5-hour / weekly names whose used_percent is >= 100 for `family`."""
+def _exhausted_window_names(
+    cards: list[dict], family: str, account: str | None = None
+) -> list[str]:
+    """5-hour / weekly names whose used_percent is >= 100 for `family`
+    (optionally scoped to `account`; see `_percent_from_harness_cards`)."""
     seen: dict[str, float] = {}
     for card in cards:
         if not isinstance(card, dict) or card.get("status") != "ok":
             continue
         if _family_from_provider(card.get("provider")) != family:
+            continue
+        if account is not None and _card_account(card) != account:
             continue
         windows = card.get("windows")
         if not isinstance(windows, list):
@@ -314,6 +347,7 @@ def usage_percent_for_model(
     cards: list[dict] | None = None,
     now: float | None = None,
     runner=None,
+    account: str | None = None,
 ) -> float | None:
     """The highest current rate-limit-window usage percent (0-100) for
     `model`'s underlying account, or None when unknown (unmapped provider, no
@@ -326,6 +360,11 @@ def usage_percent_for_model(
     used INSTEAD of reading either live source -- the existing unit tests drive
     this so the tg-ctl algorithm has zero filesystem/env dependency. `cards`
     and `runner` inject harness JSON the same way for the live-limits path.
+
+    `account`, when given, scopes the harness-card path to that ONE account
+    (review-cli#168; see `_percent_from_harness_cards`). The tg-ctl samples
+    fallback has no per-account field in its schema -- KNOWN PARTIAL
+    COVERAGE: that path stays unscoped regardless of `account`.
     """
     family = _agent_family(model)
     if family is None:
@@ -335,7 +374,7 @@ def usage_percent_for_model(
     # (neither samples nor cards) prefers harness, then tg-ctl fallback.
     if cards is not None or samples is None:
         live_cards = cards if cards is not None else load_harness_cards(runner=runner)
-        harness_pct = _percent_from_harness_cards(live_cards, family)
+        harness_pct = _percent_from_harness_cards(live_cards, family, account)
         if harness_pct is not None:
             return harness_pct
         if cards is not None and samples is None:
@@ -352,11 +391,13 @@ def allow_spawn_for_model(
     cards: list[dict] | None = None,
     now: float | None = None,
     runner=None,
+    account: str | None = None,
 ) -> bool:
     """True unless this family's more-restrictive 5-hour or 7-day window is
-    at or above 100%. Missing data fails open (True)."""
+    at or above 100%. Missing data fails open (True). `account` scopes the
+    check to one registered account (review-cli#168)."""
     pct = usage_percent_for_model(
-        model, samples=samples, cards=cards, now=now, runner=runner
+        model, samples=samples, cards=cards, now=now, runner=runner, account=account
     )
     return pct is None or pct < 100.0
 
@@ -368,18 +409,20 @@ def spawn_refuse_reason(
     cards: list[dict] | None = None,
     now: float | None = None,
     runner=None,
+    account: str | None = None,
 ) -> str | None:
     """Human-readable reason naming the exhausted 5-hour/7-day window, or
-    None when spawn is allowed."""
+    None when spawn is allowed. `account` scopes to one registered account
+    (review-cli#168)."""
     if allow_spawn_for_model(
-        model, samples=samples, cards=cards, now=now, runner=runner
+        model, samples=samples, cards=cards, now=now, runner=runner, account=account
     ):
         return None
     family = _agent_family(model)
     if family is None:
         return None
     live_cards = cards if cards is not None else load_harness_cards(runner=runner)
-    names = _exhausted_window_names(live_cards, family)
+    names = _exhausted_window_names(live_cards, family, account)
     if not names and samples is not None:
         # tg-ctl samples use limitName already.
         for sample in samples:

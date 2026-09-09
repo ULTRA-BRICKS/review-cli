@@ -883,6 +883,16 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
         _backends.backend_available = lambda _m: True
         _panel.backend_available = lambda _m: True
         _review_mode.backend_available = lambda _m: True
+        # Neutralize the LIVE usage-limit signal (tg-ctl samples + harness cards on
+        # THIS machine) for pool composition: cli._dispatch builds its `_usage_percent`
+        # from the cli-module-global `usage_percent_for_model`, and a real exhausted or
+        # near-limit Claude Code / Codex window silently re-seats the pool these tests
+        # pin (review-cli#168's Sonnet-omp seat made a duplicate-`quality` trio
+        # reachable exactly that way when both families are over threshold). Unknown
+        # usage (None) keeps every seat under-limit -> deterministic raw-priority
+        # selection, same as the availability stubs above make liveness deterministic.
+        saved_up = _cli.usage_percent_for_model
+        _cli.usage_percent_for_model = lambda *_a, **_k: None
         saved_cfg = _cli.load_config
         saved_lb = _cli.load_board
         _cli.load_config = lambda: {}
@@ -918,6 +928,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
             r["_stderr"] = err.getvalue()
             return r
         finally:
+            _cli.usage_percent_for_model = saved_up
             restore()
             _backends.backend_available = saved_avail_b
             _panel.backend_available = saved_avail_p
@@ -1103,6 +1114,12 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
         _backends.backend_available = lambda _m: True
         _panel.backend_available = lambda _m: True
         _review_mode.backend_available = lambda _m: True
+        # Neutralize the LIVE usage-limit signal for pool composition, exactly as in
+        # _run_board_review_and_get_record (a real near-limit window on THIS machine
+        # otherwise changes which reserve backfills -- review-cli#168's Sonnet-omp made
+        # that reachable in one more machine state).
+        saved_up = _cli.usage_percent_for_model
+        _cli.usage_percent_for_model = lambda *_a, **_k: None
         saved_cfg = _cli.load_config
         saved_lb = _cli.load_board
         _cli.load_config = lambda: {}
@@ -1135,6 +1152,7 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
             r["_rc"] = rc
             return r
         finally:
+            _cli.usage_percent_for_model = saved_up
             restore()
             _backends.backend_available = saved_avail_b
             _panel.backend_available = saved_avail_p
@@ -4726,9 +4744,7 @@ def test_quorum_check_one_model_three_role_pad_waives_min_iter():
         assert result["distinct_roles_passed"] == 3
         assert result["distinct_models_passed"] == 1
 
-        still_anded = _stats.quorum_check(
-            TASK, min_iter=3, min_models=3, min_roles=3
-        )
+        still_anded = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
         assert still_anded["passed"] is False, still_anded
 
 

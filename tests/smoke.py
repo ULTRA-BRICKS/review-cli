@@ -390,13 +390,13 @@ def test_board_flags_and_listing():
         "claude:claude-opus-4-8",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
-        # Grok — verifies the 12-seat count below is actually seats with Grok present,
+        # Grok — verifies the 13-seat count below is actually seats with Grok present,
         # not merely a matching total (review of #166). MIMO_SEAT (review-cli#450) is the
-        # 12th light-preset seat.
+        # 12th light-preset seat; OMP_CLAUDE_SEAT (review-cli#168) makes it 13.
         "oc:xai/grok-4.6",
         "omp:opencode-go/mimo-v2.5",
         "contracts",
-        "12 seats",
+        "13 seats",
         "#1",
         # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
@@ -408,14 +408,14 @@ def test_board_flags_and_listing():
     # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
     # (Fable was the only seat carrying it). review-cli#382 added TERRA_SEAT/SONNET_SEAT,
     # so heavy is now 13 seats (with GROK_SEAT, review-cli#165, and MIMO_SEAT,
-    # review-cli#450), not 9/10.
+    # review-cli#450); OMP_CLAUDE_SEAT (review-cli#168) makes it 14.
     for needle in (
         "source: preset:heavy",
         "codex:gpt-5.6-sol",
         # Grok — same rationale as the default-board needle above.
         "oc:xai/grok-4.6",
         "omp:opencode-go/mimo-v2.5",
-        "13 seats",
+        "14 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_not_in("claude:claude-fable-5", heavy)
@@ -765,6 +765,17 @@ _UNIT_FILES = [
     # (every core assertion passes `samples=`); the few real-file tests manage their own
     # $REVIEW_USAGE_LIMITS_FILE/_DIR save-restore internally, no shared env needed.
     ("test_usage_limits.py", {}),
+    # The claude-rotate multi-account registry discovery module (review-cli#168):
+    # listing, `current` state, oauth email extraction, rotation wrap order,
+    # $CLAUDE_ROTATE_ROOT override. Hermetic — every test builds its own throwaway
+    # registry under a temp dir; no real ~/.claude-accounts, no network.
+    ("test_claude_accounts.py", {}),
+    # The account-rotation fallback loops that module feeds (review-cli#168/#170):
+    # an exhausted/chronic account is skipped and the next one in rotation order
+    # answers, for BOTH the direct claude:* CLI seats and the omp-hosted Claude
+    # seat. Patches backends attributes directly (no Popen), isolates its own
+    # registry/log/cooldown env — no shared env needed here.
+    ("test_account_rotation.py", {}),
     # The operator-facing "panel/board padded" warnings + quorum's <model>#N
     # duplicate-seat labelling (review-cli#205 round 2). Pure functions +
     # mocked run_panel/run_moderator, no real dispatch.

@@ -3,6 +3,7 @@
 
 Standalone runner (`python3 tests/test_role_models.py`) and pytest-collectable.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -55,6 +56,7 @@ def test_fallback_lists_are_the_published_identity():
     assert ROLE_FALLBACK_MODELS["quality"] == (
         "moonshotai/Kimi-K2.7-Code",
         "claude-sonnet-5",
+        "claude-sonnet-5-omp",
     )
     assert ROLE_FALLBACK_MODELS["security"] == (
         "Qwen/Qwen3.7-Max",

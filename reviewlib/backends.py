@@ -296,7 +296,9 @@ def review_with_images(
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         if not allow_spawn_for_model(model):
-            reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            reason = (
+                spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            )
             return _usage_limit_skip_result(model, round_no, reason, backend="claude")
         result = review_claude_cli_with_images(
             model, prompt, diff, cwd, timeout, round_no, images, effort=effort
@@ -348,6 +350,26 @@ def _ensure_codex_recursion_guard() -> None:
         _codex_recursion_guard_ensured = True
 
 
+def _cwd_is_git_repo(cwd: Path) -> bool:
+    """True when `cwd` is inside a git work tree. codex's `-s read-only -C <cwd>`
+    refuses to run ("Not inside a trusted directory and --skip-git-repo-check was
+    not specified") for a non-repo cwd (review-cli#168's reported `codex:gpt-5.6-terra`
+    failure) -- e.g. review-cli's own omp-cage sandbox dirs, or a plain scratch dir a
+    caller points `review visual`/`--diff` at. Any subprocess failure (git missing,
+    timeout) is treated as "not a repo", the conservative default that still lets
+    codex make its own trust decision rather than review-cli asserting a repo exists."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
 def review_codex(
     model: str,
     prompt: str,
@@ -370,6 +392,9 @@ def review_codex(
     # their home directory or print a guard-installed notice for a backend that never runs.
     _ensure_codex_recursion_guard()
     argv = [codex_path, "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
+    if not _cwd_is_git_repo(cwd):
+        # review-cli#168: codex refuses a non-repo `-C` dir outright otherwise.
+        argv.append("--skip-git-repo-check")
     if codex_model:
         argv += ["-m", codex_model]
     codex_effort = _codex_reasoning_effort(effort)
@@ -1165,6 +1190,48 @@ OMP_SUPPORTED_MODES = ("cli",)  # CLI-only — no omp REST transport exists.
 _OMP_ACCESS_METHOD = "omp"
 
 
+def _omp_model_hosts_claude(omp_model: str | None) -> bool:
+    """True when the `omp:<selector>` model string names an Anthropic/Claude model
+    (review-cli#168's omp-engine account axis) -- e.g. `anthropic/claude-sonnet-5` or
+    any selector containing "claude"."""
+    if not omp_model:
+        return False
+    lowered = omp_model.lower()
+    return "claude" in lowered or lowered.startswith("anthropic/")
+
+
+def _review_omp_claude_profiles() -> list[str | None]:
+    """Ordered omp `--profile` names to try when the hosted model is Claude/Anthropic
+    (review-cli#168's omp-engine account axis). `$REVIEW_OMP_CLAUDE_PROFILES` is a
+    comma-separated list of already-logged-in omp profile names (each populated by a
+    one-time interactive `omp --profile <name>` OAuth login -- review-cli cannot perform
+    that itself). Unset/empty -> `[None]`, today's single-default-profile behaviour,
+    unchanged."""
+    raw = os.environ.get("REVIEW_OMP_CLAUDE_PROFILES", "").strip()
+    if not raw:
+        return [None]
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    return names or [None]
+
+
+def _review_omp_with_account_fallback(
+    model, omp_model, prompt, diff, cwd, timeout, round_no, effort
+) -> ReviewResult:
+    """Try each configured omp Claude profile in order until one produces a
+    non-chronic result, or return the last (worst) result when every profile is
+    exhausted -- the omp-hosted mirror of `_review_claude_cli_with_account_fallback`."""
+    candidates = _review_omp_claude_profiles()
+    last_result = None
+    for profile in candidates:
+        result = _review_omp_once(
+            model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile
+        )
+        if _chronic_unavailable_reason(result) is None:
+            return result
+        last_result = result
+    return last_result
+
+
 def review_omp(
     model: str,
     prompt: str,
@@ -1204,6 +1271,38 @@ def review_omp(
         return ReviewResult(
             model=model, command=command, returncode=1, stdout="", stderr=str(exc)
         )
+    # review-cli#168: an omp-hosted Claude/Anthropic model has its own account-fallback
+    # axis (configured omp profiles, each a separate logged-in identity), independent of
+    # the direct claude:* CLI's account rotation. Every other omp-hosted model (Kimi,
+    # MiMo, ...) has exactly one identity today, so it dispatches once as before.
+    if _omp_model_hosts_claude(omp_model):
+        return _review_omp_with_account_fallback(
+            model, omp_model, prompt, diff, cwd, timeout, round_no, effort
+        )
+    return _review_omp_once(
+        model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile=None
+    )
+
+
+def _review_omp_once(
+    model: str,
+    omp_model: str | None,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int,
+    effort: str | None,
+    profile: str | None,
+) -> ReviewResult:
+    """The actual omp dispatch (sandbox/cage/argv/env), extracted verbatim from
+    `review_omp` (review-cli#168) so the outer function can pick which omp `--profile`
+    to use before calling in — see `_omp_agent_dir`'s `profile` parameter."""
+    command = (
+        f"omp -p --no-session --tools {_OMP_READONLY_TOOLS}"
+        + (f" --model {omp_model}" if omp_model else "")
+        + " @<payloadfile>"
+    )
     # AGENTIC, read-only: omp can READ any project file (mounted via `--add-dir`) — not
     # just the diff embedded in the prompt — while the three-layer cage (see the module
     # comment above) makes mutation, exec, and egress impossible.
@@ -1265,7 +1364,7 @@ def review_omp(
         # instead of HOME must not escape the cage either (review of #174).
         env["HOME"] = str(home)
         env["XDG_CONFIG_HOME"] = str(home / ".config")
-        env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir())
+        env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir(profile=profile))
         proc = _run_streamed(
             argv,
             cwd=box,
@@ -1435,7 +1534,9 @@ def review_gemini(
             stderr = ""
         else:
             stdout = ""
-            stderr = f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            stderr = (
+                f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            )
         _emit_rest_log(
             "gemini",
             command,
@@ -2396,7 +2497,8 @@ def review_claude_api(
         # content to `result_is_usable()`; keep the failed result's stdout empty
         # like the other REST paths (tokens still ride on the result fields).
         stdout = (
-            text.strip() + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            text.strip()
+            + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
             if rc == 0
             else ""
         )
@@ -2523,6 +2625,60 @@ def _claude_runtime_gateway_provider() -> str | None:
     return _claude_gateway_provider_from_env()
 
 
+def _claude_account_candidates() -> list[tuple[str | None, str | None]]:
+    """Ordered (CLAUDE_CONFIG_DIR, email) pairs review_claude's CLI transport tries,
+    current account first (reviewlib.claude_accounts.rotation_order). A single
+    `(None, None)` when no `~/.claude-accounts` registry exists -- the single implicit
+    account, IDENTICAL to review-cli's pre-#168 behaviour."""
+    from . import claude_accounts as _accts
+
+    order = _accts.rotation_order()
+    if not order:
+        return [(None, None)]
+    return [(str(d), _accts.account_email(d)) for d in order]
+
+
+def _review_claude_cli_with_account_fallback(
+    model, prompt, diff, cwd, timeout, round_no, *, effort
+) -> ReviewResult:
+    """Try each registered Claude account (CLAUDE_CONFIG_DIR) in rotation order, current
+    first, until one produces a non-chronic result or every account is exhausted
+    (review-cli#168/#170: the OLD gate blocked every claude:* seat when ANY ONE
+    configured account reported 100% usage, even when the account actually in use was
+    fine). A host with no `~/.claude-accounts` registry gets exactly one (None, None)
+    candidate and behaves byte-identically to before this function existed."""
+    candidates = _claude_account_candidates()
+    last_result = None
+    skipped = []
+    for config_dir, email in candidates:
+        if not allow_spawn_for_model(model, account=email):
+            skipped.append(email or config_dir or "default")
+            continue
+        result = review_claude_cli(
+            model,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            round_no,
+            effort=effort,
+            config_dir=config_dir,
+        )
+        if _chronic_unavailable_reason(result) is None:
+            return result
+        last_result = result
+        skipped.append(email or config_dir or "default")
+    if last_result is not None:
+        return last_result
+    reason = (
+        spawn_refuse_reason(model, account=candidates[0][1])
+        or "harness 5-hour window exhausted (100%)"
+    )
+    if len(candidates) > 1:
+        reason = f"{reason} on all {len(candidates)} configured accounts ({', '.join(skipped)})"
+    return _usage_limit_skip_result(model, round_no, reason, backend="claude")
+
+
 def review_claude(
     model: str,
     prompt: str,
@@ -2575,17 +2731,13 @@ def review_claude(
     # Claude Code 5h/7d cards measure the CLI subscription, not the paid API
     # account. Gating the API transport on that card would suppress a valid
     # Anthropic-compatible call when local Claude Code is exhausted.
-    if not use_api and not allow_spawn_for_model(model):
-        reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
-        return _usage_limit_skip_result(model, round_no, reason, backend="claude")
-    if use_api:
-        result = review_claude_api(
+    result = (
+        review_claude_api(model, prompt, diff, cwd, timeout, round_no, effort=effort)
+        if use_api
+        else _review_claude_cli_with_account_fallback(
             model, prompt, diff, cwd, timeout, round_no, effort=effort
         )
-    else:
-        result = review_claude_cli(
-            model, prompt, diff, cwd, timeout, round_no, effort=effort
-        )
+    )
     reason = _chronic_unavailable_reason(result)
     if reason is not None:
         record_cooldown(model, reason, access_method=access_method)
@@ -3511,6 +3663,7 @@ def review_claude_cli(
     timeout: int,
     round_no: int = 0,
     effort: str | None = None,
+    config_dir: str | None = None,
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
     claude_model = model.split(":", 1)[1] if ":" in model else None
@@ -3521,11 +3674,20 @@ def review_claude_cli(
     # interactive "Do you trust this folder?" gate (see _ensure_workspace_trusted).
     _ensure_workspace_trusted(cwd)
     argv = _claude_cli_argv(binary, direct, claude_model, cwd, timeout, effort=effort)
+    # A fresh per-call dict (`_claude_cli_env()` already returns `dict(os.environ)`, a
+    # new object every call) -- account rotation (review-cli#168) selects a registered
+    # `~/.claude-accounts/account-N` dir via CLAUDE_CONFIG_DIR here. NEVER mutate global
+    # `os.environ`: seats dispatch concurrently across threads (reviewlib/process.py's
+    # ThreadPoolExecutor), so a global mutation here would be a real, hard-to-reproduce
+    # cross-seat race.
+    env = _claude_cli_env()
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
     proc = _run_streamed(
         argv,
         cwd=cwd,
         input_text=_payload(prompt, diff),
-        env=_claude_cli_env(),
+        env=env,
         timeout=timeout,
         backend="claude",
         round_no=round_no,
@@ -4421,21 +4583,30 @@ def _oc_provider_auth_available(provider: str) -> bool:
 _OMP_AUTH_DB_ENV = "OMP_AUTH_DB"
 
 
-def _omp_agent_dir() -> Path:
+def _omp_agent_dir(profile: str | None = None) -> Path:
     """omp's agent storage dir for THIS process (verified against omp v17):
     `PI_CODING_AGENT_DIR` replaces it outright; else `OMP_PROFILE` (= `--profile`)
     isolates state under ~/.omp/profiles/<name>/agent; else the default ~/.omp/agent.
     Shared by the auth probe and the seat launch — the seat runs with a SANITIZED HOME
-    and pins this explicitly so auth still resolves there."""
+    and pins this explicitly so auth still resolves there.
+
+    `profile`, when given explicitly, takes priority over BOTH env vars -- the caller
+    is requesting a NAMED omp profile's agent dir directly (review-cli#168's
+    omp-Claude-account rotation: `_review_omp_claude_profiles`/
+    `$REVIEW_OMP_CLAUDE_PROFILES`), skipping the env-var precedence entirely. Every
+    existing call site passes nothing, so `profile is None` stays byte-identical to
+    before this parameter existed."""
+    if profile is not None:
+        return Path.home() / ".omp" / "profiles" / profile / "agent"
     agent_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
     if agent_dir:
         # Absolutize (after expanding any `~`): a RELATIVE override would resolve
         # against a different cwd in the seat's sandbox than in the probe's process
         # (review of #174).
         return Path(os.path.abspath(os.path.expanduser(agent_dir)))
-    profile = os.environ.get("OMP_PROFILE", "").strip()
-    if profile:
-        return Path.home() / ".omp" / "profiles" / profile / "agent"
+    env_profile = os.environ.get("OMP_PROFILE", "").strip()
+    if env_profile:
+        return Path.home() / ".omp" / "profiles" / env_profile / "agent"
     return Path.home() / ".omp" / "agent"
 
 

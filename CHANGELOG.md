@@ -3,6 +3,52 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.2 — 2026-09-09
+
+- **Feat: omp-hosted Claude board seat + account-level fallback across
+  registered Claude accounts (review-cli#168).** New `OMP_CLAUDE_SEAT`
+  (`omp:anthropic/claude-sonnet-5`, display "Sonnet-omp") joins
+  `DEFAULT_BOARD` at priority 7.5 with the `quality` role, directly after
+  the direct-CLI Sonnet seat — the SAME claude-sonnet-5 model dispatched
+  through the omp harness, a genuinely different auth path (omp's own
+  credentials/profile-scoped agent dir, independent of the Claude Code
+  CLI's `CLAUDE_CONFIG_DIR`/keychain), so it survives an outage that takes
+  out every `claude:*` seat sharing one account. Raw board 14 → 15 seats
+  (default/light 12 → 13, heavy 13 → 14); `ROLE_FALLBACK_MODELS["quality"]`
+  gains `claude-sonnet-5-omp` as its third fallback.
+- **Account rotation (review-cli#168/#170).** The trigger: a
+  Claude-account-wide outage or paywall — or a 100% harness 5-hour/7-day
+  window — hitting every `claude:*` seat that shares one account. The new
+  `reviewlib/claude_accounts` module discovers the registry `claude-rotate`
+  and harness-cli already use (`~/.claude-accounts/account-*/`, the same
+  `$CLAUDE_ROTATE_ROOT` override name claude-rotate honors, the `current`
+  state file) and yields the wrap-around rotation order starting at the
+  current account. `review_claude`'s CLI transport rotates
+  `CLAUDE_CONFIG_DIR` per dispatch (a fresh per-call env dict, never a
+  global `os.environ` mutation — seats dispatch concurrently); the
+  omp-hosted Claude seat rotates `--profile` across the comma-separated
+  `$REVIEW_OMP_CLAUDE_PROFILES`. An account whose own harness window is
+  exhausted is skipped pre-dispatch; a chronically unavailable result falls
+  through to the next account; only when EVERY configured account is
+  exhausted does the run return the synthetic usage-limit skip, now naming
+  every account it tried. A host with no registry gets exactly one implicit
+  candidate — byte-identical to the pre-#168 behaviour.
+- **Usage-limit `account=` scoping axis (review-cli#170).**
+  `usage_limits`' `usage_percent_for_model` / `allow_spawn_for_model` /
+  `spawn_refuse_reason` accept a keyword-only `account` (an email,
+  normalized case/whitespace-insensitively): only harness cards for THAT
+  account gate the result — the exact fix for one registered account's 100%
+  card blocking seats actually running as another. `account=None` keeps the
+  old aggregate-across-every-account behaviour for every existing caller.
+- **Fix: codex seats run from a non-repo `-C` dir (review-cli#168).**
+  `codex exec -s read-only -C <dir>` refuses outright ("Not inside a
+  trusted directory and --skip-git-repo-check was not specified") when the
+  target isn't a git work tree (omp-cage sandbox dirs, plain scratch dirs).
+  `review_codex` now probes `git rev-parse --is-inside-work-tree` and
+  appends `--skip-git-repo-check` only for a non-repo cwd, leaving codex's
+  own trust decision untouched inside real repos.
+
+
 ## 0.37.1 — 2026-09-08
 
 - **New default board seat: MiMo 2.5 via omp OpenCode Go (`MIMO_SEAT`,

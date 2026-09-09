@@ -111,6 +111,11 @@ def test_default_board_matches_directive_table():
         # duplicate role in the common (nothing disabled) case.
         ("codex:gpt-5.6-terra", "performance", "Terra"),
         ("claude:claude-sonnet-5", "quality", "Sonnet"),
+        # Seat 7.5 (review-cli#168): OMP_CLAUDE_SEAT, the SAME claude-sonnet-5 model
+        # dispatched through the omp harness instead of the direct claude CLI -- a
+        # DIFFERENT auth path, so it survives an outage that takes out every claude:*
+        # seat's shared account state.
+        ("omp:anthropic/claude-sonnet-5", "quality", "Sonnet-omp"),
         # Seats 4, 8-9 and 11 route through opencode (`oc:`) so they run AGENTICALLY (read the
         # repo read-only), not the diff-only commandcode/z.ai REST call (review-cli#24). Seats
         # 6-7 (Terra/Sonnet, review-cli#382) run via the codex/claude CLIs, not opencode.
@@ -149,14 +154,15 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_is_priority_ordered():
     """The CTO's priority sketch (strongest-WORKING-model first): Sol, Opus,
-    GLM-5.2-via-commandcode, Kimi, Astra, Terra, Sonnet, Qwen, DeepSeek, Gemini,
-    GLM-5.2-via-z.ai, Fable. Re-ranking = reordering
-    DEFAULT_BOARD; this pins the order. Seats 4, 8-9, and 11 are the AGENTIC opencode
+    GLM-5.2-via-commandcode, Kimi, Astra, Terra, Sonnet, Sonnet-omp, Qwen, DeepSeek,
+    Gemini, GLM-5.2-via-z.ai, Fable. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 4, 9-10, and 12 are the AGENTIC opencode
     (`oc:`) routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. Terra/Sonnet
     (review-cli#382) are live fallbacks for performance/quality, inserted right after Astra.
-    The z.ai GLM seat is DEPRIORITIZED to next-to-last (review-cli#65) — pathologically slow
-    under load. Fable is LAST (review-cli#fable-seat-reliability) — a confirmed ~100%
-    dispatch failure rate, worse than merely slow."""
+    Sonnet-omp (review-cli#168) is the SAME Sonnet model via a different auth path,
+    right after Sonnet. The z.ai GLM seat is DEPRIORITIZED to next-to-last (review-cli#65)
+    — pathologically slow under load. Fable is LAST (review-cli#fable-seat-reliability) —
+    a confirmed ~100% dispatch failure rate, worse than merely slow."""
     assert [r.model for r in DEFAULT_BOARD] == [
         "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
@@ -165,6 +171,7 @@ def test_default_board_is_priority_ordered():
         "codex:gpt-6-astra",
         "codex:gpt-5.6-terra",
         "claude:claude-sonnet-5",
+        "omp:anthropic/claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
@@ -509,10 +516,11 @@ def test_default_pool_roles_are_distinct_no_lens_lost():
     assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
 
 
-def test_default_board_has_fourteen_seats():
+def test_default_board_has_fifteen_seats():
     # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12);
-    # GROK_SEAT (review-cli#165) makes it 13; MIMO_SEAT (review-cli#450) makes it 14.
-    assert len(DEFAULT_BOARD) == 14, len(DEFAULT_BOARD)
+    # GROK_SEAT (review-cli#165) makes it 13; MIMO_SEAT (review-cli#450) makes it 14;
+    # OMP_CLAUDE_SEAT (review-cli#168) makes it 15.
+    assert len(DEFAULT_BOARD) == 15, len(DEFAULT_BOARD)
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
@@ -1470,16 +1478,18 @@ def test_select_pool_default_picks_first_four_seats():
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
     # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
-    # (review-cli#382 live fallbacks), the remaining opencode routes (review-cli#24), the
-    # diff-only Gemini, Grok (agentic via opencode's native xai provider, directly BEFORE
-    # MiMo/the slow GLM seat so failover reaches it first), MiMo (review-cli#450, live
-    # paid `tests` fallback via omp OpenCode Go), the slow z.ai GLM seat (LAST-RESORT,
-    # review-cli#65 deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
+    # (review-cli#382 live fallbacks), Sonnet-omp (review-cli#168, same model different
+    # auth path), the remaining opencode routes (review-cli#24), the diff-only Gemini,
+    # Grok (agentic via opencode's native xai provider, directly BEFORE MiMo/the slow
+    # GLM seat so failover reaches it first), MiMo (review-cli#450, live paid `tests`
+    # fallback via omp OpenCode Go), the slow z.ai GLM seat (LAST-RESORT, review-cli#65
+    # deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
         "codex:gpt-6-astra",
         "codex:gpt-5.6-terra",
         "claude:claude-sonnet-5",
+        "omp:anthropic/claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
