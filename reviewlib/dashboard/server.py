@@ -9,9 +9,9 @@ serves:
   GET  /assets/<file>            -> static JS/CSS (from assets/, allowlisted)
   GET  /events                  -> Server-Sent Events: live review activity stream
   GET  /api/health              -> {ok, log_dir, store_path, allowed_origins, ...}
-  GET  /api/runs[?gap=N]        -> [session summaries], newest first
+  GET  /api/runs[?gap=N&days=N] -> [session summaries], newest first (days default 7; <=0 = all history)
   GET  /api/runs/<id>           -> full session detail (calls/brainstorm/roles + annotation)
-  GET  /api/stats[?gap=N]       -> aggregate stats (modes/models/roles/days/durations,
+  GET  /api/stats[?gap=N&days=N] -> aggregate stats (modes/models/roles/days/durations,
                                    plus per-model `model_health` + `problematic_count`)
   GET  /api/annotations         -> {session_id: annotation} (overseer store dump)
   POST /api/runs/<id>/feedback  -> {feedback: "..."}          (overseer feedback)
@@ -222,8 +222,8 @@ class _SessionCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # Lineage = (gap, log-dir path). The min-recompute window only ever debounces churn
-        # WITHIN one lineage; a different gap or a different log dir must never be served from
+        # Lineage = (gap, days, log-dir path). The min-recompute window only ever debounces churn
+        # WITHIN one lineage; a different gap, days window, or log dir must never be served from
         # another lineage's cache (matters for tests, which point each case at its own temp
         # dir — in production the log dir is fixed for the process's life).
         #
@@ -233,7 +233,7 @@ class _SessionCache:
         # served. Tracked as review-cli#327 (a real per-lineage in-flight-parse redesign,
         # not a patch here — an earlier attempt at a narrower same-lineage-only fix was
         # reverted after review found it introduced a worse, narrower race of its own).
-        self._lineage: tuple[float, str] | None = None
+        self._lineage: tuple[float, float, str] | None = None
         self._fingerprint: tuple[int, float, int] | None = None
         self._sessions: list[dparser.Session] | None = None
         self._computed_at = 0.0
@@ -247,8 +247,14 @@ class _SessionCache:
             False  # a parse (sync or background) is in flight (don't start a second)
         )
 
-    def get(self, gap: float, *, force: bool = False) -> list[dparser.Session]:
-        """The cached parsed `Session` list for ``gap``.
+    def get(
+        self,
+        gap: float,
+        *,
+        force: bool = False,
+        days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS,
+    ) -> list[dparser.Session]:
+        """The cached parsed `Session` list for ``gap`` and ``days``.
 
         Computes synchronously only for ``force`` (the startup prewarm) or a different
         gap/log dir than whatever is cached — a genuinely cold cache does NOT block: it
@@ -261,12 +267,16 @@ class _SessionCache:
         The returned list and its `Session` objects are the SHARED cached objects — callers must
         treat them as read-only and derive fresh dicts from them (`to_summary()`/`to_detail()`
         build new dicts; `_merge_annotation` copies before mutating)."""
-        return self._fresh_sessions_for(gap, force=force)[0]
+        return self._fresh_sessions_for(gap, force=force, days=days)[0]
 
     _LINEAGE_RETRY_LIMIT = 5
 
     def _fresh_sessions_for(
-        self, gap: float, *, force: bool
+        self,
+        gap: float,
+        *,
+        force: bool,
+        days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS,
     ) -> tuple[list[dparser.Session], int]:
         """The cached session list for ``gap``, PAIRED with the generation it was read
         under — captured in ONE lock hold, atomically. `_ensure_fresh` decides-then-releases
@@ -292,9 +302,9 @@ class _SessionCache:
         land in between, tagging a derivation computed from the OLD list under the NEW
         generation (review-cli#323 review finding)."""
         ld = log_dir()
-        lineage = (gap, str(ld))
+        lineage = (gap, days, str(ld))
         for _ in range(self._LINEAGE_RETRY_LIMIT):
-            self._ensure_fresh(gap, force=force)
+            self._ensure_fresh(gap, force=force, days=days)
             with self._lock:
                 if self._lineage == lineage:
                     return self._sessions, self._generation  # type: ignore[return-value]
@@ -305,7 +315,7 @@ class _SessionCache:
             f"uncached parse to avoid serving another gap's data",
             flush=True,
         )
-        sessions = dparser.load_sessions(ld, gap_seconds=gap)
+        sessions = dparser.load_sessions(ld, gap_seconds=gap, days=days)
         # Return -1, NEVER `self._generation` — that's the generation of whatever
         # FOREIGN lineage is currently cached (the whole reason the loop above gave up
         # is that it never matched ours), not a tag for this uninstalled, uncached
@@ -324,6 +334,8 @@ class _SessionCache:
         gap: float,
         key: object,
         factory: Callable[[list[dparser.Session]], object],
+        *,
+        days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS,
     ) -> object:
         """A value derived from the cached session list, memoized until the list is reparsed.
 
@@ -341,7 +353,7 @@ class _SessionCache:
         different-gap parse could install in between and this method would derive stats
         over the WRONG gap's session list. Also takes its PAIRED `(sessions, generation)`
         from the same atomic read for the reason in that docstring's last paragraph."""
-        sessions, gen = self._fresh_sessions_for(gap, force=False)
+        sessions, gen = self._fresh_sessions_for(gap, force=False, days=days)
         with self._lock:
             cached = self._derived.get(key)
             if cached is not None and cached[0] == gen:
@@ -352,7 +364,13 @@ class _SessionCache:
                 self._derived[key] = (gen, value)
         return value
 
-    def _ensure_fresh(self, gap: float, *, force: bool) -> None:
+    def _ensure_fresh(
+        self,
+        gap: float,
+        *,
+        force: bool,
+        days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS,
+    ) -> None:
         """Serve-stale-while-revalidate, extended to the COLD case — and critically, the
         actual expensive parse NEVER runs while `self._lock` is held, for ANY caller
         (including the explicit `force=True` startup prewarm).
@@ -377,7 +395,7 @@ class _SessionCache:
         lineage does NOT block: it installs an empty placeholder and kicks the same
         background-refresh machinery used for a stale-but-warm cache."""
         ld = log_dir()
-        lineage = (gap, str(ld))
+        lineage = (gap, days, str(ld))
         with self._lock:
             fingerprint = _log_dir_fingerprint(ld)
             need_sync_parse = self._must_block(lineage, force=force)
@@ -406,9 +424,9 @@ class _SessionCache:
                     # prewarm's parse + this cold placeholder's background parse ran at the
                     # same time, doubling disk/CPU contention instead of halving it).
                     if not self._refreshing:
-                        self._start_background_refresh(gap, lineage)
+                        self._start_background_refresh(gap, days, lineage)
                 elif self._should_refresh(lineage, fingerprint):
-                    self._start_background_refresh(gap, lineage)
+                    self._start_background_refresh(gap, days, lineage)
                 return
             # About to run the expensive parse unlocked (below) — mark it in-flight so a
             # concurrent cold caller's placeholder path (above) doesn't ALSO start one.
@@ -419,7 +437,7 @@ class _SessionCache:
         # need_sync_parse: lock released — run the expensive parse unlocked so no other
         # caller can ever be stuck waiting on it.
         try:
-            sessions = dparser.load_sessions(ld, gap_seconds=gap)
+            sessions = dparser.load_sessions(ld, gap_seconds=gap, days=days)
         except Exception:
             # Nothing to install — just release the in-flight flag so a later caller can
             # retry, in its own lock hold (there's no ordering hazard here: no fresh data
@@ -448,7 +466,7 @@ class _SessionCache:
             self._derived.clear()  # derivations from the previous parse are now stale
             self._refreshing = False
 
-    def _must_block(self, lineage: tuple[float, str], *, force: bool) -> bool:
+    def _must_block(self, lineage: tuple[float, float, str], *, force: bool) -> bool:
         """True iff a synchronous reparse is unavoidable: the explicit prewarm (`force=True`,
         runs on its own thread, wants real data to warm the derived-stats cache too), or a
         DIFFERENT lineage than whatever is cached (nothing of any age exists for THIS gap/dir
@@ -462,7 +480,7 @@ class _SessionCache:
         return self._lineage != lineage
 
     def _should_refresh(
-        self, lineage: tuple[float, str], fingerprint: tuple[int, float, int]
+        self, lineage: tuple[float, float, str], fingerprint: tuple[int, float, int]
     ) -> bool:
         """True iff the cached (same-lineage) list is stale enough to refresh in the background."""
         if self._refreshing:
@@ -474,7 +492,7 @@ class _SessionCache:
         # log-writing session from kicking a reparse on every single request.
         return (time.monotonic() - self._computed_at) >= _SUMMARY_MIN_RECOMPUTE_SECONDS
 
-    def _start_background_refresh(self, gap: float, lineage: tuple[float, str]) -> None:
+    def _start_background_refresh(self, gap: float, days: float, lineage: tuple[float, float, str]) -> None:
         """Kick a single background reparse (caller holds the lock). Serves stale until it lands."""
         self._refreshing = True
 
@@ -483,9 +501,9 @@ class _SessionCache:
                 ld = log_dir()
                 # Re-read the lineage/fingerprint at run time: the dir may have grown more since
                 # the refresh was scheduled, and we want the freshest snapshot.
-                fresh_lineage = (gap, str(ld))
+                fresh_lineage = (gap, days, str(ld))
                 fresh_fp = _log_dir_fingerprint(ld)
-                sessions = dparser.load_sessions(ld, gap_seconds=gap)
+                sessions = dparser.load_sessions(ld, gap_seconds=gap, days=days)
                 with self._lock:
                     # Only install if still the relevant lineage (a gap/dir change since
                     # scheduling would already have been handled by a blocking reparse on
@@ -526,13 +544,17 @@ class _SessionCache:
 _session_cache = _SessionCache()
 
 
-def _cached_sessions(gap: float) -> list[dparser.Session]:
-    """The shared, warm, parsed `Session` list for ``gap`` — the single source every read
+def _cached_sessions(
+    gap: float, days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS
+) -> list[dparser.Session]:
+    """The shared, warm, parsed `Session` list for ``gap``/``days`` — the single source every read
     endpoint (`/api/runs`, `/api/stats`, detail, write existence-check) derives from."""
-    return _session_cache.get(gap)
+    return _session_cache.get(gap, days=days)
 
 
-def _cached_stats(gap: float) -> dict:
+def _cached_stats(
+    gap: float, days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS
+) -> dict:
     """The `/api/stats` aggregate, memoized until the session list is reparsed.
 
     `compute_stats` is ~8s over ~600 sessions and does NOT memoize on its own, so an uncached
@@ -540,17 +562,23 @@ def _cached_stats(gap: float) -> dict:
     cache generation makes it cheap and auto-invalidate on the next reparse. Store rollups
     (conscious/feedback counts) are layered on per-request since annotations change independently
     of the parse."""
-    return _session_cache.get_derived(gap, "stats", dparser.compute_stats)  # type: ignore[return-value]
+    return _session_cache.get_derived(gap, "stats", dparser.compute_stats, days=days)  # type: ignore[return-value]
 
 
-def _summaries_for_gap(gap: float) -> list[dict]:
-    """Annotation-merged run summaries for ``gap`` — the `/api/runs` payload, cached + warm."""
+def _summaries_for_gap(
+    gap: float, days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS
+) -> list[dict]:
+    """Annotation-merged run summaries for ``gap``/``days`` — the `/api/runs` payload, cached + warm."""
     return [
-        _merge_annotation(s.to_summary(), s.session_id) for s in _cached_sessions(gap)
+        _merge_annotation(s.to_summary(), s.session_id)
+        for s in _cached_sessions(gap, days=days)
     ]
 
 
-def prewarm_summary_cache(gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS) -> None:
+def prewarm_summary_cache(
+    gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS,
+    days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS,
+) -> None:
     """Parse + warm the session list once at startup so the FIRST page load is already warm.
 
     Without this the first browser hit — which fires `/api/runs` AND `/api/stats` together, plus
@@ -563,10 +591,10 @@ def prewarm_summary_cache(gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS) -> N
     it IS logged (a silently-cold cache would present as the very 'dashboard still empty' symptom
     this fixes)."""
     try:
-        for s in _session_cache.get(gap, force=True):
+        for s in _session_cache.get(gap, force=True, days=days):
             s.to_summary()  # warm the per-session cached_property (errors/recovery scan) too
         _cached_stats(
-            gap
+            gap, days
         )  # warm the /api/stats aggregate (the other half of the first paint)
     except Exception as exc:  # noqa: BLE001 — prewarm is best-effort; never crash startup
         print(
@@ -576,8 +604,10 @@ def prewarm_summary_cache(gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS) -> N
         )
 
 
-def _session_index(gap: float) -> dict[str, dparser.Session]:
-    return {s.session_id: s for s in _cached_sessions(gap)}
+def _session_index(
+    gap: float, days: float = dparser.DEFAULT_LOAD_SESSIONS_DAYS
+) -> dict[str, dparser.Session]:
+    return {s.session_id: s for s in _cached_sessions(gap, days=days)}
 
 
 def _merge_annotation(summary: dict, session_id: str) -> dict:
@@ -656,6 +686,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return float(qs.get("gap", [dparser.DEFAULT_SESSION_GAP_SECONDS])[0])
         except (ValueError, TypeError):
             return dparser.DEFAULT_SESSION_GAP_SECONDS
+
+    def _days(self, qs: dict) -> float:
+        try:
+            return float(qs.get("days", [dparser.DEFAULT_LOAD_SESSIONS_DAYS])[0])
+        except (ValueError, TypeError):
+            return dparser.DEFAULT_LOAD_SESSIONS_DAYS
 
     def _host_hostname(self) -> str | None:
         """The bare hostname from this request's Host header (port + IPv6 brackets stripped)."""
@@ -772,10 +808,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # request, so the first (and every concurrent) page load is fast instead of
                 # stampeding and rendering empty. Annotations are merged here per-request so a
                 # feedback/conscious write stays instantly visible.
-                return self._send_json(_summaries_for_gap(self._gap(qs)))
+                return self._send_json(_summaries_for_gap(self._gap(qs), self._days(qs)))
             if path.startswith("/api/runs/"):
                 sid = path[len("/api/runs/") :]
-                idx = _session_index(self._gap(qs))
+                idx = _session_index(self._gap(qs), self._days(qs))
                 sess = idx.get(sid)
                 if sess is None:
                     return self._error(404, f"unknown session {sid}")
@@ -788,7 +824,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # (a Promise.all), so an uncached/un-memoized stats call here would keep the first
                 # render slow even with /api/runs cached. Copy before layering store rollups so
                 # the per-request annotation counts never mutate the memoized stats dict.
-                stats = dict(_cached_stats(self._gap(qs)))
+                stats = dict(_cached_stats(self._gap(qs), self._days(qs)))
                 # Tasks/overseer rollups come from the store, layered on top of stats.
                 anns = dstore.all_annotations()
                 stats["conscious_count"] = sum(
@@ -853,8 +889,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         Writes are only allowed against a session that actually exists (HYP-742
         finding 1): annotating an arbitrary attacker-chosen id would let a CSRF write
         seed junk records into the store. The default gap is used (POSTs carry no
-        ?gap=), matching how the UI clusters."""
-        return sid in _session_index(dparser.DEFAULT_SESSION_GAP_SECONDS)
+        ?gap=), matching how the UI clusters. ``days=0`` (all history) so an old
+        transcript the Runs list no longer shows can still be annotated."""
+        return sid in _session_index(dparser.DEFAULT_SESSION_GAP_SECONDS, days=0)
 
     def do_POST(self) -> None:  # noqa: N802
         if self._reject_foreign_host():
@@ -1083,7 +1120,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # the front-end can refresh a row (or the whole list) in place. Cached: this is only
         # reached after the snapshot diff already saw a change, so the dir signature has moved
         # and the loader re-parses — then refreshes the cache so the next /api/runs reuses it.
-        sessions = dparser.load_sessions_cached(ld, gap_seconds=gap)
+        sessions = dparser.load_sessions_cached(
+            ld, gap_seconds=gap, days=dparser.DEFAULT_LOAD_SESSIONS_DAYS
+        )
         # Only the sessions whose window overlaps a changed file are "live"; cheap heuristic
         # = re-emit the newest few summaries (the changed files are almost always the newest).
         for s in sessions[:_SSE_RECENT_RUNS]:
@@ -1139,8 +1178,12 @@ def _prewarm_cache(gap: float) -> None:
     prewarm can never crash or block the server."""
     try:
         ld = log_dir()
-        sessions = dparser.load_sessions_cached(ld, gap_seconds=gap)
-        dparser.compute_stats_cached(sessions, ld, gap_seconds=gap)
+        sessions = dparser.load_sessions_cached(
+            ld, gap_seconds=gap, days=dparser.DEFAULT_LOAD_SESSIONS_DAYS
+        )
+        dparser.compute_stats_cached(
+            sessions, ld, gap_seconds=gap, days=dparser.DEFAULT_LOAD_SESSIONS_DAYS
+        )
     except Exception:  # noqa: BLE001 — prewarm is best-effort; never propagate
         return
 

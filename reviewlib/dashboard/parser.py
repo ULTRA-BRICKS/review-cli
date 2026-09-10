@@ -66,6 +66,9 @@ _STDERR_PREFIX = "[stderr] "
 # intra-session gaps of a few-to-~30s and inter-session gaps of 60s+, so 90s is a safe
 # default; override via ?gap= on the API for re-clustering.
 DEFAULT_SESSION_GAP_SECONDS = 90.0
+# Dashboard GET `/api/runs`/`/api/stats` window, matching `review stat --days`.
+# `load_sessions()` itself defaults to 0 (all history). `days <= 0` = all history.
+DEFAULT_LOAD_SESSIONS_DAYS = 7.0
 
 # Largest plausible wall-time of a single call (review's default per-call timeout). Used
 # to cap mtime-as-end-marker so an out-of-band touch can't balloon a session window.
@@ -1130,16 +1133,29 @@ def cluster_sessions(
 
 
 def load_sessions(
-    log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS
+    log_dir_path: Path,
+    gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS,
+    days: float = 0,
 ) -> list[Session]:
-    """Read every artifact in ``log_dir_path`` and return clustered sessions, newest first."""
+    """Read artifacts in ``log_dir_path`` and return clustered sessions, newest first.
+
+    Default ``days=0`` is all history — `review task` (`cli._task_sessions`) and the
+    dashboard write-side existence check must still see old transcripts. Dashboard GET
+    `/api/runs` and `/api/stats` pass ``days=DEFAULT_LOAD_SESSIONS_DAYS`` (7, matching
+    `review stat --days`). ``days <= 0`` scans all history. The cutoff is directory-
+    relative — ``min(newest valid filename stamp, now)`` via `_scan_log_dir_entries` —
+    so fixture dirs whose stamps sit in the past (e.g. 2026-06) stay inside a finite
+    window instead of being dropped by a raw ``now - 7d`` floor. Files whose stamp is
+    older than the window are not walked, stated, or parsed.
+    """
     calls: list[CallLog] = []
     brainstorms: list[BrainstormLog] = []
     if not log_dir_path.exists():
         return []
-    for entry in sorted(log_dir_path.iterdir()):
-        if not entry.is_file():
-            continue
+    window_seconds = 0.0 if days <= 0 else float(days) * 86400.0
+    scan = _scan_log_dir_entries(log_dir_path, window_seconds=window_seconds)
+    for item in scan.entries:
+        entry = log_dir_path / item.name
         if entry.suffix == ".log":
             # Call-log files are write-once, so a repeat scan of the same directory can
             # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
@@ -1176,7 +1192,7 @@ def load_sessions(
 # cache. `load_sessions` itself stays DETERMINISTIC given the same on-disk `.log`/`.md`
 # content (tests still get repeatable parses) — it does now persist its own per-file perf
 # memo (`call_log_cache`) as a side effect, but that memo never changes what it RETURNS.
-_CacheKey = tuple[str, float]  # (resolved dir str, gap)
+_CacheKey = tuple[str, float, float]  # (resolved dir str, gap, days)
 _Signature = tuple[int, float]  # (entry-count, max-mtime), from `_dir_signature`
 
 
@@ -1303,6 +1319,14 @@ _SIGNATURE_WINDOW_SECONDS = 6 * 3600.0
 _STAMP_PREFIX_LEN = 15  # len("YYYYMMDDTHHMMSS")
 _STAMP_PREFIX_RE = re.compile(r"^\d{8}T\d{6}$")
 
+# Dir-mtime-gated NAME LIST for `_scan_log_dir_entries`. Keyed by abspath + the
+# directory's own mtime. Create/delete bumps parent dir mtime on APFS; append to an
+# existing file does NOT — so a cache hit still `.stat()`s the windowed subset (the
+# live-streaming invariant). Listing cache ≠ TTL debounce: there is no time-based
+# reuse; an unchanged mtime is the only hit condition.
+_NAME_LIST_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_NAME_LIST_CACHE_LOCK = threading.Lock()
+
 
 class LogEntry(NamedTuple):
     name: str
@@ -1371,9 +1395,8 @@ def _scan_log_dir_entries(
 ) -> LogDirScan:
     """A `LogDirScan` of `log_dir_path`'s `.log`/`.md` artifacts, `.stat()`-ing only the ones
     that could plausibly still be changing. `window_seconds <= 0` disables the bound (stats
-    every matching entry, the historical unbounded behavior) -- not used by any caller today,
-    kept as an explicit escape hatch matching `review stat --days 0`'s "0 = all history"
-    convention elsewhere in this codebase.
+    every matching entry, the historical unbounded behavior) -- `load_sessions(days<=0)`
+    uses that hatch, matching `review stat --days 0`'s "0 = all history" convention.
 
     WHY a bounded window is SAFE here (not just fast): every `.log`/`.md` artifact is
     write-once by its ORIGINATING writer process -- nothing in this module (or
@@ -1389,21 +1412,21 @@ def _scan_log_dir_entries(
     covers create/delete of a file OUTSIDE the window, which the write-once argument doesn't
     by itself protect against.
 
-    This is a DIFFERENT (and safe) idea from cheapening the check via the log dir's OWN
-    top-level `os.stat()` mtime (a single O(1) call) -- that was considered and REJECTED after
-    direct measurement on this machine's real filesystem (APFS): appending to an EXISTING
-    file's content does NOT bump its PARENT directory's mtime, only creating/removing an entry
-    does. A dashboard whose invalidation check trusted the parent dir's mtime would therefore
-    never notice a live review's `.log` growing -- silently regressing the exact "a
-    live-streaming session's freshly appended content must become visible promptly" invariant
-    this whole caching system exists to protect. Per-file filename-window filtering has no
-    such gap: every entry inside the window is still individually `.stat()`-ed.
+    The NAME LIST is reused when `os.stat(log_dir_path).st_mtime` is unchanged (O(1) on the
+    directory inode). Create/delete bumps that mtime on APFS; append to an existing file
+    does NOT — which is why a cache hit still `.stat()`s every windowed entry. Using dir
+    mtime to SKIP those per-file stats was considered and rejected: a live review's `.log`
+    growing would become invisible. Listing cache ≠ TTL debounce: an unchanged mtime is the
+    only hit condition, with no time-based reuse. Tests that mock `os.scandir` still work
+    — the cache is keyed by path+mtime, and a mock path whose `os.stat` fails (or whose
+    mtime changes) still scandirs on every call.
 
     Deliberately NOT time-debounced/TTL-cached across calls: every existing caller (and the
     test suite hardening it, e.g. `test_writing_the_call_log_cache_does_not_itself_invalidate_
     the_session_memo`) relies on a fresh call reflecting a just-written file IMMEDIATELY, with
     no "wait a second and try again" — the same live-streaming invariant above. The windowing
-    is what makes paying that cost on every call affordable.
+    plus the name-list cache is what makes paying the remaining per-window `.stat()` cost
+    on every call affordable.
 
     The cutoff is anchored on `min(newest valid filename stamp in the directory, now)` — the
     directory's own newest activity, CLAMPED to never run later than the real wall clock
@@ -1432,11 +1455,40 @@ def _scan_log_dir_entries(
         anchor can never be later than `now`, so the cutoff can never be later than
         `now - window_seconds`, so nothing genuinely within the real window is ever excluded
         by a future-dated name."""
+    key = os.path.abspath(os.fspath(log_dir_path))
     try:
-        with os.scandir(log_dir_path) as it:
-            candidates = [e for e in it if Path(e.name).suffix in (".log", ".md")]
-    except (FileNotFoundError, NotADirectoryError):
-        return LogDirScan(entries=[], total_count=0)
+        dir_mtime: float | None = os.stat(log_dir_path).st_mtime
+    except OSError:
+        dir_mtime = None
+
+    cached_names: tuple[str, ...] | None = None
+    if dir_mtime is not None:
+        with _NAME_LIST_CACHE_LOCK:
+            cached = _NAME_LIST_CACHE.get(key)
+        if cached is not None and cached[0] == dir_mtime:
+            cached_names = cached[1]
+
+    dir_entries = None  # os.DirEntry list on a real scandir; None on a name-list hit
+    if cached_names is None:
+        try:
+            with os.scandir(log_dir_path) as it:
+                dir_entries = [e for e in it if Path(e.name).suffix in (".log", ".md")]
+        except (FileNotFoundError, NotADirectoryError):
+            return LogDirScan(entries=[], total_count=0)
+        names = tuple(e.name for e in dir_entries)
+        if dir_mtime is not None:
+            try:
+                post_mtime = os.stat(log_dir_path).st_mtime
+            except OSError:
+                post_mtime = None
+            # Only publish when pre-scan and post-scan mtimes match. A create racing
+            # the listing bumps mtime and the captured names are incomplete relative
+            # to that new mtime — caching them under it would hide the new file.
+            if post_mtime is not None and post_mtime == dir_mtime:
+                with _NAME_LIST_CACHE_LOCK:
+                    _NAME_LIST_CACHE[key] = (post_mtime, names)
+    else:
+        names = cached_names
 
     cutoff: str | None = None
     if window_seconds > 0:
@@ -1452,9 +1504,9 @@ def _scan_log_dir_entries(
         # names clustered at the top.
         shape_matching = sorted(
             (
-                e.name[:_STAMP_PREFIX_LEN]
-                for e in candidates
-                if _STAMP_PREFIX_RE.match(e.name[:_STAMP_PREFIX_LEN])
+                name[:_STAMP_PREFIX_LEN]
+                for name in names
+                if _STAMP_PREFIX_RE.match(name[:_STAMP_PREFIX_LEN])
             ),
             reverse=True,
         )
@@ -1477,31 +1529,48 @@ def _scan_log_dir_entries(
         # to the always-stat "can't confidently judge its age" branch below, same as today's
         # unbounded behavior for such a directory (rare: only foreign/malformed names).
 
+    def _windowed(name: str) -> bool:
+        if cutoff is None:
+            return True
+        # Filtering only needs the CHEAP shape check + a plain string compare against an
+        # already-validated `cutoff` -- no per-candidate `strptime` here. An entry whose
+        # shape matches but whose OWN date is semantically invalid (e.g. month 13) still
+        # gets a real (if not chronologically meaningful) string comparison against
+        # `cutoff`; that's fine, not a correctness gap -- CONFIRMED (review-cli#151 review
+        # round 4 finding, verified): `_CALL_RE` itself is shape-only (no calendar
+        # validation baked into the regex), but `parse_call_log` wraps its downstream
+        # `_parse_stamp(...)` call in `try/except ValueError: return None` specifically so
+        # a shape-matching-but-invalid date can't crash real parsing either -- such a name
+        # NEVER contributes a session regardless of what this scan's filter does with it,
+        # so excluding vs including it here has no effect on what `/api/runs` returns.
+        prefix = name[:_STAMP_PREFIX_LEN]
+        return not (_STAMP_PREFIX_RE.match(prefix) and prefix < cutoff)
+
     entries: list[LogEntry] = []
-    for e in candidates:
-        if cutoff is not None:
-            # Filtering only needs the CHEAP shape check + a plain string compare against an
-            # already-validated `cutoff` -- no per-candidate `strptime` here. An entry whose
-            # shape matches but whose OWN date is semantically invalid (e.g. month 13) still
-            # gets a real (if not chronologically meaningful) string comparison against
-            # `cutoff`; that's fine, not a correctness gap -- CONFIRMED (review-cli#151 review
-            # round 4 finding, verified): `_CALL_RE` itself is shape-only (no calendar
-            # validation baked into the regex), but `parse_call_log` wraps its downstream
-            # `_parse_stamp(...)` call in `try/except ValueError: return None` specifically so
-            # a shape-matching-but-invalid date can't crash real parsing either -- such a name
-            # NEVER contributes a session regardless of what this scan's filter does with it,
-            # so excluding vs including it here has no effect on what `/api/runs` returns.
-            prefix = e.name[:_STAMP_PREFIX_LEN]
-            if _STAMP_PREFIX_RE.match(prefix) and prefix < cutoff:
+    if dir_entries is not None:
+        # Fresh scandir: keep DirEntry.stat() so tests that mock os.scandir (fake path,
+        # no real inodes) still drive `.stat()` on the proxy objects they supplied.
+        for e in dir_entries:
+            if not _windowed(e.name):
                 continue  # provably finished relative to the dir's own newest activity
-        try:
-            st = e.stat()
-        except OSError:
-            # A racing unlink between scandir and stat: skip it; the next scan's changed
-            # count/mtime will re-sync. Don't let one vanished file crash the scan.
-            continue
-        entries.append(LogEntry(e.name, st.st_mtime, st.st_size))
-    return LogDirScan(entries=entries, total_count=len(candidates))
+            try:
+                st = e.stat()
+            except OSError:
+                # A racing unlink between scandir and stat: skip it; the next scan's changed
+                # count/mtime will re-sync. Don't let one vanished file crash the scan.
+                continue
+            entries.append(LogEntry(e.name, st.st_mtime, st.st_size))
+    else:
+        # Name-list cache hit: still `.stat()` the windowed subset (live-streaming).
+        for name in names:
+            if not _windowed(name):
+                continue
+            try:
+                st = os.stat(os.path.join(log_dir_path, name))
+            except OSError:
+                continue
+            entries.append(LogEntry(name, st.st_mtime, st.st_size))
+    return LogDirScan(entries=entries, total_count=len(names))
 
 
 def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
@@ -1539,9 +1608,11 @@ def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
 
 
 def load_sessions_cached(
-    log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS
+    log_dir_path: Path,
+    gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS,
+    days: float = 0,
 ) -> list[Session]:
-    """Cached wrapper over `load_sessions`, keyed on (resolved dir, gap) + a stat-only dir
+    """Cached wrapper over `load_sessions`, keyed on (resolved dir, gap, days) + a stat-only dir
     signature. Returns the memoised parse when the dir is unchanged since the last call; re-parses
     (and refreshes the cache) when the signature moves. Thread-safe AND single-flight: the
     dashboard's ThreadingHTTPServer serves many threads, and concurrent cold misses for the same
@@ -1549,10 +1620,12 @@ def load_sessions_cached(
     saturated CPU and timed every request out. The multi-second `load_sessions` runs OUTSIDE the
     lock. Use this from request handlers; use the pure `load_sessions` where deterministic
     re-parsing is required (tests)."""
-    key = (str(log_dir_path.resolve()), gap_seconds)
+    key = (str(log_dir_path.resolve()), gap_seconds, float(days))
     signature = _dir_signature(log_dir_path)
     return _SESSIONS_CACHE.get_or_compute(
-        key, signature, lambda: load_sessions(log_dir_path, gap_seconds=gap_seconds)
+        key,
+        signature,
+        lambda: load_sessions(log_dir_path, gap_seconds=gap_seconds, days=days),
     )
 
 
@@ -1560,9 +1633,10 @@ def compute_stats_cached(
     sessions: list[Session],
     log_dir_path: Path,
     gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS,
+    days: float = 0,
 ) -> dict:
     """Cached wrapper over `compute_stats`, keyed identically to `load_sessions_cached`:
-    (resolved dir, gap) + the cheap stat-only dir signature. Returns the memoised aggregate when
+    (resolved dir, gap, days) + the cheap stat-only dir signature. Returns the memoised aggregate when
     the dir is unchanged, re-aggregating only when the signature moves — so stats invalidate
     exactly when the sessions they summarise do. Thread-safe AND single-flight: concurrent cold
     misses for the same key collapse to ONE aggregation (see `_SingleFlightCache`), not N parallel
@@ -1576,7 +1650,7 @@ def compute_stats_cached(
     only, microseconds, nowhere near the multi-second aggregation — so adding/overwriting a
     top-level key can never accumulate into the shared cache. Nested values are shared (the
     handler only adds new scalar keys, never mutates nested ones)."""
-    key = (str(log_dir_path.resolve()), gap_seconds)
+    key = (str(log_dir_path.resolve()), gap_seconds, float(days))
     signature = _dir_signature(log_dir_path)
     stats = _STATS_CACHE.get_or_compute(key, signature, lambda: compute_stats(sessions))
     return dict(stats)

@@ -1817,6 +1817,254 @@ def test_log_dir_fingerprint_total_size_reflects_only_the_windowed_subset():
         )
 
 
+# --- follow-up to review-cli#151 / review-cli#447: listing cache + 7-day parse window
+# PR https://github.com/alex-mextner/review-cli/pull/426 skipped `.stat()` for old files but
+# every fingerprint/SSE still scandirs all names, and `load_sessions` still parses every
+# artifact. These tests pin the remaining O(corpus) costs: a dir-mtime-gated name-list
+# cache (listing cache ≠ TTL debounce) and a `review stat --days`-matching parse window.
+def test_scan_log_dir_entries_reuses_name_list_when_dir_mtime_unchanged():
+    """Second `_scan_log_dir_entries` on an unchanged dir where ONLY an in-window file grew
+    must not call `os.scandir` again (APFS: append does not bump parent dir mtime; create
+    /delete does). It MUST still `.stat()` the windowed subset so the live-streaming
+    size/mtime change is visible on the very next scan. Count scandir calls, do not time."""
+    from reviewlib.dashboard import parser as p
+
+    scandir_calls = {"n": 0}
+    real_scandir = p.os.scandir
+
+    def _counting_scandir(path):
+        scandir_calls["n"] += 1
+        return real_scandir(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        stamp = "20260601T100000_000000"
+        path = _write_call_log(ld, stamp, "codex", 0, "partial output so far\n")
+        p.os.scandir = _counting_scandir
+        try:
+            first = p._scan_log_dir_entries(ld)
+            assert scandir_calls["n"] == 1, scandir_calls
+            assert len(first.entries) == 1
+            first_entry = first.entries[0]
+            dir_mtime_before = os.stat(ld).st_mtime
+
+            import time as _time
+
+            _time.sleep(0.05)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("more streamed output\n[review-cli] EXIT 0\n")
+
+            assert os.stat(ld).st_mtime == dir_mtime_before, (
+                "this test assumes append does not bump parent dir mtime (APFS); "
+                "if the filesystem does, the name-list cache cannot reuse the listing"
+            )
+
+            second = p._scan_log_dir_entries(ld)
+            assert scandir_calls["n"] == 1, (
+                f"unchanged dir mtime must reuse the cached name list, not scandir again "
+                f"(got {scandir_calls['n']} scandir calls)"
+            )
+            assert len(second.entries) == 1
+            second_entry = second.entries[0]
+            assert second_entry.size > first_entry.size, (
+                "growth wasn't observed: size unchanged after appending to the live file"
+            )
+            assert second_entry.mtime >= first_entry.mtime, (
+                "growth wasn't observed: mtime didn't move forward after appending"
+            )
+        finally:
+            p.os.scandir = real_scandir
+
+
+def test_scan_log_dir_entries_rescans_when_a_new_file_is_created():
+    """Creating a new matching `.log`/`.md` file DOES bump parent dir mtime (APFS), so the
+    next `_scan_log_dir_entries` must scandir again and `total_count` must move. The
+    name-list cache is keyed by path+mtime, not a TTL — a create is a real listing change."""
+    from reviewlib.dashboard import parser as p
+
+    scandir_calls = {"n": 0}
+    real_scandir = p.os.scandir
+
+    def _counting_scandir(path):
+        scandir_calls["n"] += 1
+        return real_scandir(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        p.os.scandir = _counting_scandir
+        try:
+            first = p._scan_log_dir_entries(ld)
+            assert scandir_calls["n"] == 1, scandir_calls
+            assert first.total_count == 1
+
+            _write_call_log(
+                ld, "20260601T100010_000000", "gemini", 0, "more\n", exit_code=0
+            )
+
+            second = p._scan_log_dir_entries(ld)
+            assert scandir_calls["n"] == 2, (
+                f"creating a new matching file must rescan (got {scandir_calls['n']} "
+                "scandir calls, expected 2)"
+            )
+            assert second.total_count == 2, second.total_count
+            assert len(second.entries) == 2
+        finally:
+            p.os.scandir = real_scandir
+
+
+def test_load_sessions_days_window_skips_old_stamped_files():
+    """`load_sessions(..., days=7)` (the dashboard read-path window, matching
+    `review stat --days`) must not walk/stat/parse files whose filename stamp is older
+    than the window. The cutoff is directory-relative (`min(newest_valid_stamp, now)`),
+    same as `_scan_log_dir_entries`, so 2026-06 fixtures stay inside the window.
+    `days<=0` is all history. Counts get_or_parse calls, not wall time."""
+    from datetime import timedelta
+
+    from reviewlib.dashboard import parser as p
+
+    gop_calls = {"n": 0}
+    real_gop = p.call_log_cache.get_or_parse
+
+    def _counting_gop(*args, **kwargs):
+        gop_calls["n"] += 1
+        return real_gop(*args, **kwargs)
+
+    newest = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    n_old = 2000
+    n_recent = 5
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
+        body = "[review-cli] codex: /usr/bin/fake (args redacted)\nok\n[review-cli] EXIT 0\n"
+        for i in range(n_old):
+            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(body, encoding="utf-8")
+        for i in range(n_recent):
+            recent_dt = newest - timedelta(minutes=i)
+            stamp = recent_dt.strftime("%Y%m%dT%H%M%S") + "_000000"
+            _write_call_log(ld, stamp, "codex", i, "recent\n", exit_code=0)
+
+        p.call_log_cache.get_or_parse = _counting_gop
+        try:
+            sessions = p.load_sessions(ld, gap_seconds=90, days=7)
+            n_calls = sum(len(s.calls) for s in sessions)
+            assert gop_calls["n"] == n_recent, (
+                f"load_sessions(..., days=7) must parse only the recent-window files "
+                f"({n_recent}), not the {n_old} old ones — got {gop_calls['n']} get_or_parse calls"
+            )
+            assert n_calls == n_recent, (
+                f"days=7 window must return only recent-window sessions "
+                f"(got {n_calls} calls, expected {n_recent})"
+            )
+
+            gop_calls["n"] = 0
+            all_sessions = p.load_sessions(ld, gap_seconds=90, days=0)
+            n_all = sum(len(s.calls) for s in all_sessions)
+            assert gop_calls["n"] == n_old + n_recent, (
+                f"days=0 must parse all history ({n_old + n_recent}), got {gop_calls['n']}"
+            )
+            assert n_all == n_old + n_recent, (
+                f"days=0 must return all sessions (got {n_all} calls, expected {n_old + n_recent})"
+            )
+        finally:
+            p.call_log_cache.get_or_parse = real_gop
+
+
+def test_load_sessions_without_days_keeps_all_history():
+    """P1: `load_sessions()` with no `days=` must stay all-history so `review task`
+    (`cli._task_sessions`) and write-side `_session_exists` do not drop old transcripts.
+    The 7-day bound is a dashboard read-path argument, not the library default."""
+    from datetime import timedelta
+
+    from reviewlib.dashboard import parser as p
+
+    gop_calls = {"n": 0}
+    real_gop = p.call_log_cache.get_or_parse
+
+    def _counting_gop(*args, **kwargs):
+        gop_calls["n"] += 1
+        return real_gop(*args, **kwargs)
+
+    newest = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    n_old = 50
+    n_recent = 3
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
+        body = "[review-cli] codex: /usr/bin/fake (args redacted)\nok\n[review-cli] EXIT 0\n"
+        for i in range(n_old):
+            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(body, encoding="utf-8")
+        for i in range(n_recent):
+            recent_dt = newest - timedelta(minutes=i)
+            stamp = recent_dt.strftime("%Y%m%dT%H%M%S") + "_000000"
+            _write_call_log(ld, stamp, "codex", i, "recent\n", exit_code=0)
+
+        p.call_log_cache.get_or_parse = _counting_gop
+        try:
+            sessions = p.load_sessions(ld, gap_seconds=90)
+            n_calls = sum(len(s.calls) for s in sessions)
+            assert gop_calls["n"] == n_old + n_recent, (
+                f"load_sessions() default must parse all history "
+                f"({n_old + n_recent}), got {gop_calls['n']}"
+            )
+            assert n_calls == n_old + n_recent, (
+                f"load_sessions() default must return all sessions "
+                f"(got {n_calls} calls, expected {n_old + n_recent})"
+            )
+        finally:
+            p.call_log_cache.get_or_parse = real_gop
+
+
+def test_scan_log_dir_entries_does_not_cache_name_list_when_mtime_changes_during_scan():
+    """P1: only publish the name-list cache when pre-scan and post-scan dir mtimes
+    match. If they differ, a create raced the listing and the captured names are
+    incomplete relative to the new mtime — caching them under that mtime would hide
+    the new file on the next call."""
+    from types import SimpleNamespace
+
+    from reviewlib.dashboard import parser as p
+
+    scandir_calls = {"n": 0}
+    dir_stat_n = {"n": 0}
+    real_scandir = p.os.scandir
+    real_stat = p.os.stat
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        ld_key = os.path.abspath(os.fspath(ld))
+
+        def _counting_scandir(path):
+            scandir_calls["n"] += 1
+            return real_scandir(path)
+
+        def _split_stat(path, *args, **kwargs):
+            if os.path.abspath(os.fspath(path)) == ld_key:
+                dir_stat_n["n"] += 1
+                st = real_stat(path, *args, **kwargs)
+                # n==1: pre-scan real mtime. n>=2: pretend a create bumped mtime,
+                # including the next call's pre-scan so a buggy cache keyed on the
+                # post-scan mtime would HIT.
+                if dir_stat_n["n"] >= 2:
+                    return SimpleNamespace(st_mtime=st.st_mtime + 10.0)
+                return st
+            return real_stat(path, *args, **kwargs)
+
+        p.os.scandir = _counting_scandir
+        p.os.stat = _split_stat
+        try:
+            p._scan_log_dir_entries(ld)
+            assert scandir_calls["n"] == 1, scandir_calls
+            p._scan_log_dir_entries(ld)
+            assert scandir_calls["n"] == 2, (
+                f"pre/post dir mtime mismatch must not publish the name list "
+                f"(got {scandir_calls['n']} scandir calls, expected 2)"
+            )
+        finally:
+            p.os.scandir = real_scandir
+            p.os.stat = real_stat
+
+
 def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
     """`/api/stats` was STILL ~8.5s on a warm session cache: the sessions came back fast, but the
     handler then re-ran the PURE ``compute_stats`` (re-aggregating ~590 sessions / ~30k calls,
@@ -2125,15 +2373,22 @@ def test_prewarm_cache_warms_sessions_and_stats_so_first_load_is_not_cold():
             assert after_prewarm_compute == 1, "prewarm did not aggregate stats"
 
             # The first real default-gap page load must be a WARM hit on both caches.
+            # Dashboard read paths pass days=DEFAULT_LOAD_SESSIONS_DAYS (7); prewarm
+            # uses the same key so this hit matches `/api/runs`+`/api/stats`.
             sessions = p.load_sessions_cached(
-                ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS
+                ld,
+                gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS,
+                days=p.DEFAULT_LOAD_SESSIONS_DAYS,
             )
             assert parse_calls["n"] == after_prewarm_parse, (
                 f"cold first load: re-parsed despite prewarm "
                 f"({parse_calls['n']} > {after_prewarm_parse})"
             )
             p.compute_stats_cached(
-                sessions, ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS
+                sessions,
+                ld,
+                gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS,
+                days=p.DEFAULT_LOAD_SESSIONS_DAYS,
             )
             assert compute_calls["n"] == after_prewarm_compute, (
                 f"cold first load: re-aggregated despite prewarm "
@@ -2993,11 +3248,11 @@ def test_fresh_sessions_for_never_returns_another_lineages_data_after_retry_boun
         cache = server._SessionCache()
         orig_ensure_fresh = cache._ensure_fresh
 
-        def _always_install_wrong_lineage(gap, *, force):
+        def _always_install_wrong_lineage(gap, *, force, days=7.0):
             # Simulate another concurrent caller winning the race every single time.
             with cache._lock:
                 cache._sessions = ["wrong-lineage-placeholder"]
-                cache._lineage = (gap + 999.0, str(ld))
+                cache._lineage = (gap + 999.0, days, str(ld))
                 cache._generation += 1
 
         cache._ensure_fresh = _always_install_wrong_lineage
@@ -3041,11 +3296,11 @@ def test_get_derived_never_caches_a_retry_fallback_result_under_a_foreign_genera
         cache = server._SessionCache()
         # Seed a real cached lineage/generation, as if gap=90 already won the race.
         cache._sessions = ["gap90-sessions"]
-        cache._lineage = (90.0, str(ld))
+        cache._lineage = (90.0, 7.0, str(ld))
         cache._fingerprint = (1, 1.0, 1)
         cache._generation = 3
         orig_ensure_fresh = cache._ensure_fresh
-        cache._ensure_fresh = lambda gap, *, force: None  # never installs gap=30
+        cache._ensure_fresh = lambda gap, *, force, days=7.0: None  # never installs gap=30
         try:
             value = cache.get_derived(
                 30.0, "stats", lambda sessions: f"stats-for-{len(sessions)}-sessions"
@@ -3367,6 +3622,8 @@ def test_compute_stats_by_dimension_counts_exit_0_paywall_as_a_failure(monkeypat
         assert dim["ok"] == 0
         assert dim["error"] == 1
         assert dim["ok_rate"] == 0.0
+
+
 
 
 # --- per-model health classifier (Models & roles tab) -----------------------

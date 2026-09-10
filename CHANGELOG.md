@@ -3,6 +3,24 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.10 — 2026-09-10
+
+- **Perf: dashboard hot path no longer scales with the full log corpus (review-cli#447).**
+  PR #426 skipped `.stat()` for old files but every fingerprint/SSE still `os.scandir`'d
+  all ~154k names, and `load_sessions` still parsed every artifact — `GET /api/runs?gap=90`
+  hung. `_scan_log_dir_entries` now reuses the candidate name list when the directory
+  mtime is unchanged (still `.stat()`s the windowed subset so a live-streaming `.log`
+  stays visible; listing cache ≠ TTL debounce; cache is published only when pre-scan
+  and post-scan dir mtimes match). `load_sessions()` stays all-history by default so
+  `review task` and write-side existence checks keep old transcripts; dashboard GET
+  `/api/runs` and `/api/stats` pass `days=7` (matching `review stat --days`; `?days=`
+  override, `days<=0` = all history). Measured 2026-09-08 against `~/Library/Logs/review-cli`
+  (154810 entries, 148100 `.log`, 6706 `.md`):
+  - `_scan_log_dir_entries` (6h window): 0.55–0.75s every call → 0.44s first / **0.12s**
+    cached (name list reused; 5085 windowed / 154806 total).
+  - `load_sessions` default 7-day window: **4.3s** (2870 sessions / 10939 calls) instead
+    of hanging over the full corpus.
+
 ## 0.37.9 — 2026-09-10
 
 - **Feat(specweb):** version history + compare view (review-cli#484 item 2).
