@@ -1,0 +1,13 @@
+name: Apply reviewed current closeout
+on:
+  push:
+    branches: [docs/full-grooming-2026-09-10]
+    paths: [.github/workflows/closeout-apply.yml]
+permissions:
+  contents: write
+  issues: write
+jobs:
+  apply:
+    uses: ultrabricks/rig-cli/.github/workflows/closeout-apply-reusable.yml@f707ee2b2f643a4621121187df442554aa968244
+    with:
+      source_ref: f707ee2b2f643a4621121187df442554aa968244
