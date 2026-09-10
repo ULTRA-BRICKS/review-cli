@@ -1,0 +1,11 @@
+name: Reconcile closeout relationships
+on:
+  push:
+    branches: [docs/full-grooming-2026-09-10]
+    paths: [.github/workflows/closeout-relationships.yml]
+permissions:
+  contents: write
+  issues: write
+jobs:
+  graph:
+    uses: ultrabricks/rig-cli/.github/workflows/closeout-graph-reusable.yml@03481ded53ce898f7425cf4d9a1e8e24c7d5bfe2
