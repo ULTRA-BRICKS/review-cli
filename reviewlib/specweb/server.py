@@ -16,6 +16,9 @@ GET  /api/health               -> {ok, spec_path, store_path, allowed_origins, .
 GET  /api/spec                 -> {html, headings, title}
 GET  /api/comments             -> [comment, ...]
 GET  /api/drafts               -> {slot: draft, ...} (restore in-progress composer text)
+GET  /api/spec/versions        -> [{id, created, mtime, size}, ...] (newest-first, review-cli#484)
+GET  /api/spec/versions/<id>   -> one snapshot's rendered HTML (id "live" = current on-disk text)
+GET  /api/spec/versions/compare?a=<id>&b=<id> -> {a, b, ops} line-diff between two versions
 POST /api/comments             -> create a comment (enters the pending batch)
 POST /api/comments/<id>/reply  -> thread an inline answer
 POST /api/comments/<id>/edit   -> edit a comment's body (and optionally its kind)
@@ -40,6 +43,7 @@ Extra allowed hosts can be added via ``$REVIEW_SPECWEB_ALLOWED_HOSTS`` (comma-se
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import queue
@@ -48,7 +52,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import registry
 from . import render as srender
@@ -186,6 +190,28 @@ def _spec_mtime(spec_path: Path) -> float | None:
         return spec_path.stat().st_mtime
     except OSError:
         return None
+
+
+def _diff_lines(a_text: str, b_text: str) -> list[dict]:
+    """Line-level diff (stdlib difflib) between two full spec texts, for the version-compare
+    view (review-cli#484 item 2). Whole-document word-level diff would be O(n*m) — too slow
+    for a multi-thousand-word spec — so compare is at LINE granularity server-side; the
+    client just renders the returned ops."""
+    a_lines = a_text.splitlines()
+    b_lines = b_text.splitlines()
+    ops: list[dict] = []
+    sm = difflib.SequenceMatcher(a=a_lines, b=b_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            ops.extend({"t": "same", "line": ln} for ln in a_lines[i1:i2])
+        elif tag == "delete":
+            ops.extend({"t": "del", "line": ln} for ln in a_lines[i1:i2])
+        elif tag == "insert":
+            ops.extend({"t": "add", "line": ln} for ln in b_lines[j1:j2])
+        elif tag == "replace":
+            ops.extend({"t": "del", "line": ln} for ln in a_lines[i1:i2])
+            ops.extend({"t": "add", "line": ln} for ln in b_lines[j1:j2])
+    return ops
 
 
 class SpecWebHandler(BaseHTTPRequestHandler):
@@ -469,6 +495,12 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 self._store.all_drafts(),
                 extra_headers={"X-Draft-Token-Seed": str(self._store.max_draft_token())},
             )
+        if path == "/api/spec/versions":
+            return self._send_json(self._store.list_versions(), cache_control="no-cache")
+        if path == "/api/spec/versions/compare":
+            return self._serve_spec_versions_compare()
+        if path.startswith("/api/spec/versions/"):
+            return self._serve_spec_version_detail(path[len("/api/spec/versions/"):])
         return self._error(404, f"not found: {path}")
 
     # ---- routing: POST ---------------------------------------------------- #
@@ -730,6 +762,7 @@ class SpecWebHandler(BaseHTTPRequestHandler):
     def _serve_spec_json(self) -> None:
         ctx = self._ctx
         result = srender.render_spec(ctx.spec_path, asset_base=ctx.asset_base)  # type: ignore[union-attr]
+        self._maybe_snapshot_spec()
         # Cache the asset map per spec-name so /asset/<name> can validate against it (one
         # cache serves both modes; the single-spec name is "").
         self._asset_cache()[ctx.name] = result.assets  # type: ignore[union-attr]
@@ -740,6 +773,96 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 "mtime": _spec_mtime(ctx.spec_path),  # type: ignore[union-attr]
                 "headings": [{"level": lv, "text": t, "id": hid} for (lv, t, hid) in result.headings],
             },
+            cache_control="no-cache",
+        )
+
+    def _maybe_snapshot_spec(self) -> None:
+        """Best-effort: capture a version snapshot of the spec's current on-disk text when
+        it differs from the last recorded snapshot (review-cli#484 item 2). Called from
+        _serve_spec_json, which runs on initial page load AND every SSE-triggered
+        live-reload re-fetch — so a snapshot is captured the next time anyone views the
+        spec after it changed on disk.
+
+        stat-read-stat: the mtime is read BEFORE and AFTER the file read, and the snapshot
+        is dropped (not stored) if they disagree — a concurrent edit mid-read would
+        otherwise pair the OLD mtime (or a torn read) with a mismatched, inconsistent
+        version record. A dropped attempt is not lost: the next call (the next page view
+        or SSE re-fetch) retries once the file has settled. Never raises: a snapshot
+        failure of any kind must not break spec rendering."""
+        ctx = self._ctx
+        spec_path = ctx.spec_path  # type: ignore[union-attr]
+        try:
+            mtime_before = _spec_mtime(spec_path)
+            if mtime_before is None:
+                return
+            text = spec_path.read_text(encoding="utf-8", errors="replace")
+            mtime_after = _spec_mtime(spec_path)
+            if mtime_after is None or mtime_after != mtime_before:
+                return
+            self._store.maybe_snapshot(text, mtime_after)
+        except Exception:  # noqa: BLE001 - a snapshot failure must never break rendering
+            pass
+
+    def _resolve_version_text(self, version_id: str) -> tuple[str, dict] | None:
+        """(markdown_text, meta) for a version id. ``"live"`` is a reserved id meaning the
+        spec's CURRENT on-disk text (which may not be snapshotted yet — e.g. mid-edit), so
+        a reviewer can always compare a past snapshot against what's on disk right now."""
+        ctx = self._ctx
+        if version_id == "live":
+            try:
+                text = ctx.spec_path.read_text(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+            except OSError:
+                return None
+            return text, {
+                "id": "live",
+                "created": None,
+                "mtime": _spec_mtime(ctx.spec_path),  # type: ignore[union-attr]
+            }
+        rec = self._store.get_version(version_id)
+        if rec is None:
+            return None
+        return rec["text"], {"id": rec["id"], "created": rec["created"], "mtime": rec["mtime"]}
+
+    def _serve_spec_version_detail(self, version_id: str) -> None:
+        """GET /api/spec/versions/<id>: one snapshot's rendered HTML. Part of the explicit
+        read-only API surface asked for in review-cli#484's acceptance criteria; the
+        shipped compare-focused History UI doesn't link to it directly (it renders the
+        line diff inline instead of a full single-version preview), but it is a real,
+        tested route another client (or a future single-version preview) can rely on."""
+        version_id = unquote(version_id)
+        resolved = self._resolve_version_text(version_id)
+        if resolved is None:
+            return self._error(404, f"version not found: {version_id}")
+        text, meta = resolved
+        ctx = self._ctx
+        result = srender.render_markdown(
+            text,
+            assets_dir=ctx.spec_path.parent / "assets",  # type: ignore[union-attr]
+            asset_base=ctx.asset_base,  # type: ignore[union-attr]
+        )
+        self._send_json(
+            {
+                **meta,
+                "html": result.html,
+                "headings": [{"level": lv, "text": t, "id": hid} for (lv, t, hid) in result.headings],
+            },
+            cache_control="no-cache",
+        )
+
+    def _serve_spec_versions_compare(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        a_id = (query.get("a") or [""])[0]
+        b_id = (query.get("b") or [""])[0]
+        if not a_id or not b_id:
+            return self._error(400, "expected ?a=<id>&b=<id>")
+        a_resolved = self._resolve_version_text(a_id)
+        b_resolved = self._resolve_version_text(b_id)
+        if a_resolved is None or b_resolved is None:
+            return self._error(404, "version not found")
+        a_text, a_meta = a_resolved
+        b_text, b_meta = b_resolved
+        self._send_json(
+            {"a": a_meta, "b": b_meta, "ops": _diff_lines(a_text, b_text)},
             cache_control="no-cache",
         )
 

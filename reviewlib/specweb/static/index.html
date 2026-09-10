@@ -13,6 +13,7 @@
 <header class="topbar">
   <div class="topbar-title">Spec review · <span id="specTitle">{{SPEC_TITLE}}</span></div>
   <div class="connection-status" id="connectionStatus" hidden role="status">Offline · cached copy</div>
+  <button class="history-btn" id="historyOpen" title="View version history" aria-label="View version history">History</button>
   <button class="back-btn" id="navBack" hidden title="Back to previous position" aria-label="Back to previous position">← Back</button>
 </header>
 
@@ -78,6 +79,31 @@
       <button id="composerCancel">Cancel</button>
       <button id="composerSubmit" class="primary">Add to review</button>
     </div>
+  </div>
+</div>
+
+<!-- Version history: git-log-style list of on-disk snapshots + a compare/diff view between
+     any two (or a snapshot vs. the live current state). review-cli#484 item 2. -->
+<div class="history-backdrop" id="historyBackdrop" hidden>
+  <div class="history-modal" id="historyModal" role="dialog" aria-modal="true" aria-labelledby="historyHead">
+    <div class="history-head">
+      <span id="historyHead">Version history</span>
+      <button class="history-close" id="historyClose" aria-label="Close">✕</button>
+    </div>
+    <div class="history-compare-row">
+      <label class="history-select-label">
+        <span class="sr-only">Compare from</span>
+        <select id="historyFromSelect"></select>
+      </label>
+      <span class="history-arrow" aria-hidden="true">→</span>
+      <label class="history-select-label">
+        <span class="sr-only">Compare to</span>
+        <select id="historyToSelect"></select>
+      </label>
+      <button id="historyCompareBtn" class="primary">Compare</button>
+    </div>
+    <div class="history-diff" id="historyDiff" hidden></div>
+    <div class="history-list" id="historyList"></div>
   </div>
 </div>
 
