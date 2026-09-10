@@ -1215,6 +1215,91 @@ def _review_omp_claude_profiles() -> list[str | None]:
     return names or [None]
 
 
+def _omp_model_hosts_openai_codex(omp_model: str | None) -> bool:
+    """True when the `omp:<selector>` model string names an openai-codex model
+    (review-cli#168 omp-engine account axis) -- e.g. `openai-codex/gpt-5.6-terra`."""
+    if not omp_model:
+        return False
+    return omp_model.lower().startswith("openai-codex/")
+
+
+def _review_omp_openai_codex_credentials() -> list[int | None]:
+    """Ordered openai-codex credential ids from omp's auth db for this process.
+
+    Reads `auth_credentials` rows for provider `openai-codex` with no
+    `disabled_cause`, ordered by `id` (same ordering `omp token --list` uses).
+    Probe failure or zero rows -> `[None]` (single implicit dispatch, unchanged).
+    """
+    db = _omp_auth_db()
+    try:
+        import sqlite3  # noqa: PLC0415
+        from urllib.parse import quote  # noqa: PLC0415
+
+        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=ro", uri=True, timeout=0.5)
+        try:
+            rows = conn.execute(
+                "SELECT id FROM auth_credentials "
+                "WHERE provider = 'openai-codex' AND disabled_cause IS NULL "
+                "ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — unreadable db => implicit single identity
+        return [None]
+    ids = [
+        row[0]
+        for row in rows
+        if isinstance(row[0], int) and not isinstance(row[0], bool)
+    ]
+    return ids if ids else [None]
+
+
+def _review_omp_with_codex_credential_fallback(
+    model, omp_model, prompt, diff, cwd, timeout, round_no, effort
+) -> ReviewResult:
+    """Try each openai-codex credential in order until one produces a non-chronic
+    result, or return the last (worst) result when every credential is exhausted.
+
+    Pins each attempt via `OMP_CREDENTIAL_ID` in the seat env when omp supports
+    it (forward-compatible); a single stored credential keeps today's behaviour
+    (no pin env, one dispatch)."""
+    candidates = _review_omp_openai_codex_credentials()
+    if len(candidates) <= 1:
+        # Single (or zero) stored credential: identical to pre-fallback dispatch —
+        # do not pin via OMP_CREDENTIAL_ID so omp's native selector stays unchanged.
+        return _review_omp_once(
+            model,
+            omp_model,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            round_no,
+            effort,
+            profile=None,
+        )
+    last_result = None
+    for credential_id in candidates:
+        if not isinstance(credential_id, int):
+            continue
+        result = _review_omp_once(
+            model,
+            omp_model,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            round_no,
+            effort,
+            profile=None,
+            credential_id=credential_id,
+        )
+        if _chronic_unavailable_reason(result) is None:
+            return result
+        last_result = result
+    return last_result
+
+
 def _review_omp_with_account_fallback(
     model, omp_model, prompt, diff, cwd, timeout, round_no, effort
 ) -> ReviewResult:
@@ -1280,6 +1365,10 @@ def review_omp(
         return _review_omp_with_account_fallback(
             model, omp_model, prompt, diff, cwd, timeout, round_no, effort
         )
+    if _omp_model_hosts_openai_codex(omp_model):
+        return _review_omp_with_codex_credential_fallback(
+            model, omp_model, prompt, diff, cwd, timeout, round_no, effort
+        )
     return _review_omp_once(
         model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile=None
     )
@@ -1295,10 +1384,12 @@ def _review_omp_once(
     round_no: int,
     effort: str | None,
     profile: str | None,
+    credential_id: int | None = None,
 ) -> ReviewResult:
     """The actual omp dispatch (sandbox/cage/argv/env), extracted verbatim from
     `review_omp` (review-cli#168) so the outer function can pick which omp `--profile`
-    to use before calling in — see `_omp_agent_dir`'s `profile` parameter."""
+    or openai-codex credential to use before calling in — see `_omp_agent_dir`'s
+    `profile` parameter and `_OMP_CREDENTIAL_ID_ENV`."""
     command = (
         f"omp -p --no-session --tools {_OMP_READONLY_TOOLS}"
         + (f" --model {omp_model}" if omp_model else "")
@@ -1359,13 +1450,21 @@ def _review_omp_once(
             k: v
             for k, v in os.environ.items()
             if k
-            not in ("HOME", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE")
+            not in (
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "PI_CODING_AGENT_DIR",
+                "OMP_PROFILE",
+                _OMP_CREDENTIAL_ID_ENV,
+            )
         }
         # Sanitized XDG_CONFIG_HOME too — user-scope discovery that keys off XDG
         # instead of HOME must not escape the cage either (review of #174).
         env["HOME"] = str(home)
         env["XDG_CONFIG_HOME"] = str(home / ".config")
         env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir(profile=profile))
+        if credential_id is not None:
+            env[_OMP_CREDENTIAL_ID_ENV] = str(credential_id)
         proc = _run_streamed(
             argv,
             cwd=box,
@@ -4584,6 +4683,10 @@ def _oc_provider_auth_available(provider: str) -> bool:
 # Env var that overrides the omp auth db path in tests (mirrors OC_AUTH_FILE for the
 # opencode probe), so the availability tests never touch the real ~/.omp/agent/agent.db.
 _OMP_AUTH_DB_ENV = "OMP_AUTH_DB"
+# Forward-compatible omp seat pin: when set, omp should resolve only this
+# `auth_credentials.id` for openai-codex (not yet read by omp v18.1.16, but
+# review-cli passes it so future omp builds can honor per-credential fallback).
+_OMP_CREDENTIAL_ID_ENV = "OMP_CREDENTIAL_ID"
 
 
 def _omp_agent_dir(profile: str | None = None) -> Path:

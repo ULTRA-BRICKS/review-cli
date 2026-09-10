@@ -3,6 +3,14 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.7 — 2026-09-10
+
+- **Feat(backends): omp openai-codex multi-credential fallback (review-cli#491).**
+  Mirror the omp-hosted Claude profile rotation loop for openai-codex seats: read
+  active credential ids from omp agent.db, try each in order on chronic exhaustion,
+  and pin attempts via `OMP_CREDENTIAL_ID` when multiple credentials exist.
+  Single-credential hosts keep the pre-change dispatch path.
+
 ## 0.37.6 — 2026-09-10
 
 - **Feat(dashboard): interactive Stats timeline + per-review-dimension breakdown

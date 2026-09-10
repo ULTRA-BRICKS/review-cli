@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -507,6 +508,161 @@ def test_review_omp_claude_profiles_env_parsing():
         assert backends._review_omp_claude_profiles() == [None]
         os.environ[key] = "main, alt ,,  third "
         assert backends._review_omp_claude_profiles() == ["main", "alt", "third"]
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+
+# --- the omp-hosted openai-codex credential-rotation loop --------------------
+
+_OMP_CODEX_MODEL = "omp:openai-codex/gpt-5.6-terra"
+
+
+def test_omp_codex_fallback_rotates_credentials_past_chronic_result():
+    tried = []
+
+    def fake_once(
+        model,
+        omp_model,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        round_no,
+        effort,
+        profile,
+        credential_id=None,
+    ):
+        tried.append(credential_id)
+        return _chronic(model) if credential_id == 12 else _usable(model)
+
+    with _patched_backends(
+        _review_omp_openai_codex_credentials=lambda: [12, 15],
+        _review_omp_once=fake_once,
+    ):
+        result = backends._review_omp_with_codex_credential_fallback(
+            _OMP_CODEX_MODEL,
+            "openai-codex/gpt-5.6-terra",
+            "prompt",
+            "diff",
+            Path("."),
+            60,
+            1,
+            None,
+        )
+    assert tried == [12, 15], tried
+    assert result.stdout == "a real review verdict"
+
+
+def test_omp_codex_fallback_every_credential_chronic_returns_the_last_result():
+    tried = []
+
+    def fake_once(
+        model,
+        omp_model,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        round_no,
+        effort,
+        profile,
+        credential_id=None,
+    ):
+        tried.append(credential_id)
+        return _chronic(model, tag=f"{credential_id}: ")
+
+    with _patched_backends(
+        _review_omp_openai_codex_credentials=lambda: [12, 15],
+        _review_omp_once=fake_once,
+    ):
+        result = backends._review_omp_with_codex_credential_fallback(
+            _OMP_CODEX_MODEL,
+            "openai-codex/gpt-5.6-terra",
+            "prompt",
+            "diff",
+            Path("."),
+            60,
+            1,
+            None,
+        )
+    assert tried == [12, 15], tried
+    assert result.stdout.startswith("15: "), result.stdout
+
+
+def test_omp_codex_fallback_single_credential_dispatches_once_without_pin():
+    tried = []
+
+    def fake_once(
+        model,
+        omp_model,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        round_no,
+        effort,
+        profile,
+        credential_id=None,
+    ):
+        tried.append(credential_id)
+        return _usable(model)
+
+    with _patched_backends(
+        _review_omp_openai_codex_credentials=lambda: [12],
+        _review_omp_once=fake_once,
+    ):
+        result = backends._review_omp_with_codex_credential_fallback(
+            _OMP_CODEX_MODEL,
+            "openai-codex/gpt-5.6-terra",
+            "prompt",
+            "diff",
+            Path("."),
+            60,
+            1,
+            None,
+        )
+    assert tried == [None], tried
+    assert result.stdout == "a real review verdict"
+
+
+def test_omp_model_hosts_openai_codex_detection():
+    assert backends._omp_model_hosts_openai_codex("openai-codex/gpt-5.6-terra") is True
+    assert backends._omp_model_hosts_openai_codex("OpenAI-Codex/gpt-5.6-terra") is True
+    assert backends._omp_model_hosts_openai_codex(None) is False
+    assert backends._omp_model_hosts_openai_codex("") is False
+    assert backends._omp_model_hosts_openai_codex("anthropic/claude-sonnet-5") is False
+    assert backends._omp_model_hosts_openai_codex("kimi-code/k3-256k") is False
+
+
+def test_review_omp_openai_codex_credentials_reads_auth_db():
+    db = Path(tempfile.mkdtemp()) / "agent.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, "
+        "credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO auth_credentials (id, provider, credential_type, data, disabled_cause) "
+        "VALUES (3, 'openai-codex', 'oauth', '{}', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO auth_credentials (id, provider, credential_type, data, disabled_cause) "
+        "VALUES (7, 'openai-codex', 'oauth', '{}', 'revoked')"
+    )
+    conn.execute(
+        "INSERT INTO auth_credentials (id, provider, credential_type, data, disabled_cause) "
+        "VALUES (9, 'openai-codex', 'oauth', '{}', NULL)"
+    )
+    conn.commit()
+    conn.close()
+    key = backends._OMP_AUTH_DB_ENV
+    saved = os.environ.get(key)
+    try:
+        os.environ[key] = str(db)
+        assert backends._review_omp_openai_codex_credentials() == [3, 9]
     finally:
         if saved is None:
             os.environ.pop(key, None)
