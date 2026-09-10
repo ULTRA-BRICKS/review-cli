@@ -5,7 +5,7 @@ semantic versioning.
 
 ## 0.37.8 — 2026-09-10
 
-- **Feat(specweb):** version history panel and related UI (#484).
+- **Feat(specweb):** version history panel and compare view (#484).
 
 ## 0.37.6 — 2026-09-10
 
@@ -293,5 +293,14 @@ semantic versioning.
   exposes the real signal — `near_miss_counted`/`near_miss_ever_passed`, checked
   against the actual gated population — and the CLI picks accurate wording for each of
   the three cases (counted, passed-but-mismatched, never passed). Also: the
+  passed-but-mismatched case used to point a plain-text reader at `mismatch_details`,
+  a `--json`-only field they have no way to see; it now says to re-run with `--json`
+  instead. Also documents `searched_key`/`near_miss_keys`/`near_miss_counted`/
+  `near_miss_ever_passed` in the `--check --json` schema (README) — undocumented
+  since `near_miss_keys` first shipped — and adds `--check --json` regression tests
+  covering all three near-miss shapes (never passed, gated-pass, passed-but-mismatched).
 
-[Showing lines 1-300 of 328. Use :301 to continue]
+## 0.36.3 — 2026-09-08
+
+
+[Showing lines 1-300 of 1752. Use :301 to continue]
