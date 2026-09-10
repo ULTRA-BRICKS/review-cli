@@ -1,0 +1,16 @@
+name: Apply source-preserving full grooming
+on:
+  push:
+    branches: [docs/full-grooming-2026-09-10]
+    paths: [.github/workflows/full-grooming-apply.yml]
+permissions:
+  contents: write
+  issues: write
+concurrency:
+  group: full-grooming-apply
+  cancel-in-progress: false
+jobs:
+  apply:
+    uses: alex-mextner/rig-cli/.github/workflows/grooming-apply-reusable.yml@0e4b097c8bd97da93f22e0039a351b57b128648d
+    with:
+      plan_ref: 94a1825f2f9e611031dd6b74eb1de2d8b3130c56
