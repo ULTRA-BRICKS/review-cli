@@ -1,0 +1,15 @@
+name: Reconcile complete backlog with v4 source
+on:
+  push:
+    branches: [docs/full-grooming-2026-09-10]
+    paths: [.github/workflows/v4-apply.yml]
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+concurrency:
+  group: full-grooming-apply
+  cancel-in-progress: false
+jobs:
+  reconcile:
+    uses: alex-mextner/rig-cli/.github/workflows/v4-apply-reusable.yml@docs/full-grooming-2026-09-10
