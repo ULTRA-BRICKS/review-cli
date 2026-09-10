@@ -931,6 +931,9 @@ _UNIT_FILES = [
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Backend-aware --task validation (review-cli#427). Skips lib-dependent
+    # checks when agent-tools is not checked out beside review-cli (CI).
+    ("test_taskref.py", {}),
     # Diff-identity binding (review-cli#213): repo/diff mismatch detection for
     # `review task CODE --check`'s self-merge-authority gate.
     ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
