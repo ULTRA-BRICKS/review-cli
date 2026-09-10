@@ -109,6 +109,12 @@
   function kindOf(c) {
     return c && c.kind === 'question' ? 'question' : 'remark';
   }
+  // An AGENT has already responded on this thread (an answer to a question, or an inline
+  // explanation left on a remark) — both ride the same `review spec-web reply` mechanism,
+  // so one check covers both kinds.
+  function hasAgentReply(c) {
+    return !!(c.replies && c.replies.some(function (r) { return r.author === AGENT_AUTHOR; }));
+  }
   // Cap the internal-link nav history so a long chain of cross-references can't grow it
   // unboundedly (oldest entries are dropped first).
   var MAX_NAV_HISTORY = 50;
@@ -1043,17 +1049,45 @@
     els.commentsCount.hidden = n === 0;
   }
   function renderComment(c) {
+    var changedAnchor = c._unanchored && !!c._anchorNew;
     var div = document.createElement('div');
-    div.className = 'comment kind-border-' + kindOf(c) + (c._unanchored ? ' unanchored' : '');
+    div.className =
+      'comment kind-border-' + kindOf(c) + (c._unanchored ? ' unanchored' : '') + (changedAnchor ? ' anchor-changed' : '');
     div.dataset.id = c.id;
     var meta =
       '<div class="comment-meta">' +
       kindChip(c) +
       statusPill(c.status) +
       (c.section_title ? '<span class="comment-section">· ' + esc(c.section_title) + '</span>' : '') +
-      (c._unanchored ? '<span class="unanchored-flag">· unanchored</span>' : '') +
+      (changedAnchor
+        ? '<span class="anchor-changed-flag">· anchor text changed</span>'
+        : c._unanchored
+        ? '<span class="unanchored-flag">· unanchored</span>'
+        : '') +
       '</div>';
-    var quote = c.quote ? '<blockquote class="comment-quote">' + esc(c.quote) + '</blockquote>' : '';
+    var quote;
+    if (changedAnchor) {
+      var diffOps = diffWords(c.quote, c._anchorNew);
+      quote =
+        '<div class="comment-quote comment-quote-diff">' +
+        '<div class="anchor-diff-label">Original anchor text moved or changed — comparing old vs. current:</div>' +
+        '<div class="anchor-diff">' + renderAnchorDiff(diffOps) + '</div>' +
+        '</div>';
+    } else {
+      quote = c.quote ? '<blockquote class="comment-quote">' + esc(c.quote) + '</blockquote>' : '';
+    }
+    var agentHint = '';
+    if (!hasAgentReply(c) && c.status !== 'resolved') {
+      if (kindOf(c) === 'question') {
+        agentHint =
+          '<div class="agent-hint agent-hint-question">🤖 <strong>Agent:</strong> this question is open — answer it via ' +
+          '<code>review spec-web reply ' + esc(c.id) + ' "..."</code> (or the reply box below).</div>';
+      } else {
+        agentHint =
+          '<div class="agent-hint agent-hint-remark">🤖 Agent: you may explain this change inline via ' +
+          '<code>review spec-web reply ' + esc(c.id) + ' "..."</code>.</div>';
+      }
+    }
     var bodyHtml = '<div class="comment-body">' + esc(c.body) + '</div>';
     var replies = '';
     if (c.replies && c.replies.length) {
@@ -1094,7 +1128,7 @@
       '<div class="reply-box">' +
       '<textarea rows="2" placeholder="Write an answer…"></textarea>' +
       '<button class="primary reply-send">' + replyLabel + '</button></div>';
-    div.innerHTML = meta + quote + bodyHtml + replies + actions + replyBox;
+    div.innerHTML = meta + quote + bodyHtml + agentHint + replies + actions + replyBox;
 
     div.addEventListener('click', function (e) {
       var act = e.target.getAttribute('data-act');
@@ -1225,14 +1259,132 @@
     });
     state.comments.forEach(function (c) {
       c._unanchored = false;
+      c._anchorNew = null;
       if (!c.quote) {
         c._unanchored = true;
         return;
       }
       var anchored = highlightQuote(c);
-      if (!anchored) c._unanchored = true;
+      if (!anchored) {
+        c._unanchored = true;
+        // The quote moved/changed rather than simply vanishing: look for the current
+        // passage most similar to the OLD quote in the same section, so the card can show
+        // a text-change diff instead of a bare "unanchored" flag (null when nothing in the
+        // section is plausibly the same passage anymore).
+        c._anchorNew = findAnchorSuccessor(c);
+      }
     });
     renderComments();
+  }
+
+  // ---- anchor-change detection (successor text + word diff) ---------------
+  // A quote that can no longer be found VERBATIM (highlightQuote failed) may still have
+  // been merely EDITED, not deleted outright. Score every block in the comment's old
+  // section by how much of the old quote's wording it still shares (a Dice coefficient
+  // over words) and take the best-scoring one, if it clears a similarity floor — below the
+  // floor there is nothing left that is plausibly "the same passage", and the comment stays
+  // a bare "unanchored" (the pre-existing fallback).
+  var ANCHOR_MATCH_FLOOR = 0.34;
+  function anchorWords(s) {
+    return (s || '').toLowerCase().match(/[a-z0-9']+/g) || [];
+  }
+  function anchorWordScore(a, b) {
+    var wa = anchorWords(a);
+    var wb = anchorWords(b);
+    if (!wa.length || !wb.length) return 0;
+    var counts = {};
+    wa.forEach(function (w) {
+      counts[w] = (counts[w] || 0) + 1;
+    });
+    var shared = 0;
+    wb.forEach(function (w) {
+      if (counts[w] > 0) {
+        shared++;
+        counts[w]--;
+      }
+    });
+    return (2 * shared) / (wa.length + wb.length);
+  }
+  function findAnchorSuccessor(c) {
+    var scope = c.section_id && specEl(c.section_id) ? sectionRange(c.section_id) : null;
+    var roots = scope || [els.specBody];
+    var candidates = [];
+    for (var i = 0; i < roots.length; i++) {
+      var root = roots[i];
+      if (root.nodeType !== 1) continue;
+      candidates.push(root);
+      var descendants = root.querySelectorAll('p,li,td,th,blockquote,pre,figcaption,h1,h2,h3,h4,h5,h6');
+      for (var j = 0; j < descendants.length; j++) candidates.push(descendants[j]);
+    }
+    var best = null;
+    var bestScore = 0;
+    for (var k = 0; k < candidates.length; k++) {
+      var text = (candidates[k].textContent || '').trim();
+      if (!text) continue;
+      var score = anchorWordScore(c.quote, text);
+      if (score > bestScore) {
+        bestScore = score;
+        best = text;
+      }
+    }
+    return bestScore >= ANCHOR_MATCH_FLOOR ? best : null;
+  }
+
+  // Word-level diff (plain LCS DP — quotes/paragraphs are short, so O(n*m) is cheap) between
+  // the OLD anchor text and the successor passage found above. Guarded against pathological
+  // input: above the cap it skips the diff and just shows both texts as a straight del/add.
+  var ANCHOR_DIFF_WORD_CAP = 400;
+  function diffTokens(s) {
+    return (s || '').split(/(\s+)/).filter(function (t) {
+      return t.length > 0;
+    });
+  }
+  function diffWords(oldText, newText) {
+    var a = diffTokens(oldText);
+    var b = diffTokens(newText);
+    if (a.length > ANCHOR_DIFF_WORD_CAP || b.length > ANCHOR_DIFF_WORD_CAP) {
+      return [
+        { t: 'del', w: oldText },
+        { t: 'add', w: newText },
+      ];
+    }
+    var n = a.length;
+    var m = b.length;
+    var dp = [];
+    for (var i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+    for (i = n - 1; i >= 0; i--) {
+      for (var j = m - 1; j >= 0; j--) {
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    var ops = [];
+    i = 0;
+    var p = 0;
+    while (i < n && p < m) {
+      if (a[i] === b[p]) {
+        ops.push({ t: 'same', w: a[i] });
+        i++;
+        p++;
+      } else if (dp[i + 1][p] >= dp[i][p + 1]) {
+        ops.push({ t: 'del', w: a[i] });
+        i++;
+      } else {
+        ops.push({ t: 'add', w: b[p] });
+        p++;
+      }
+    }
+    while (i < n) ops.push({ t: 'del', w: a[i++] });
+    while (p < m) ops.push({ t: 'add', w: b[p++] });
+    return ops;
+  }
+  function renderAnchorDiff(ops) {
+    return ops
+      .map(function (op) {
+        if (op.t === 'same') return esc(op.w);
+        if (op.t === 'del') return '<del class="sw-diff-del">' + esc(op.w) + '</del>';
+        return '<ins class="sw-diff-add">' + esc(op.w) + '</ins>';
+      })
+      .join('');
   }
 
   function highlightQuote(c) {

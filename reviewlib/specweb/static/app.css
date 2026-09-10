@@ -43,7 +43,12 @@ body{
 .spec-pane{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;background:#0c0e13;padding:24px 36px 50vh;scroll-behavior:smooth;min-width:0}
 .divider{flex:0 0 6px;cursor:col-resize;background:var(--line);transition:background .15s}
 .divider:hover{background:var(--accent)}
-.comments-pane{flex:0 0 380px;overflow-y:auto;background:var(--panel);border-left:1px solid var(--line);
+/* align-self:flex-start opts the pane OUT of the row's default stretch-to-full-height,
+   so a short comment list shrink-wraps to its own content instead of filling the whole
+   viewport with trailing empty space; max-height:100% + overflow-y:auto still caps a long
+   list at the available height and scrolls it internally exactly as before. */
+.comments-pane{flex:0 0 380px;align-self:flex-start;max-height:100%;overflow-y:auto;
+  background:var(--panel);border-left:1px solid var(--line);
   display:flex;flex-direction:column;min-width:0}
 
 /* Collapsed state (desktop): the pane shrinks to just its header bar — NOT display:none.
@@ -107,6 +112,16 @@ body{
 .status-answered{color:var(--answered);border-color:var(--answered)}
 .status-resolved{color:var(--resolved);border-color:var(--resolved)}
 .unanchored-flag{color:var(--danger);font-weight:600}
+/* Anchor TEXT CHANGE (vs a plain "unanchored"): the quote couldn't be re-found verbatim,
+   but app.js located a plausible successor passage in the same section — style it as an
+   edit event (amber), distinct from a genuine "nothing found" (danger/red). */
+.comment.anchor-changed{border-left-color:var(--pending)}
+.anchor-changed-flag{color:var(--pending);font-weight:600}
+.comment-quote-diff{border-left-color:var(--pending)}
+.anchor-diff-label{font-size:11px;color:var(--muted);margin-bottom:4px;font-style:normal}
+.anchor-diff{white-space:pre-wrap}
+.sw-diff-del{color:var(--danger);text-decoration:line-through;opacity:.75}
+.sw-diff-add{color:var(--answered);text-decoration:none;font-weight:600}
 .comment-quote{margin:0 0 7px;padding:5px 9px;border-left:2px solid var(--quote);
   background:#1c1a12;color:#ffe6ad;font-style:italic;border-radius:4px;font-size:12.5px;
   white-space:pre-wrap;max-height:5.4em;overflow:hidden}
@@ -129,6 +144,20 @@ body{
 .comment-actions button{background:#161b26;border:1px solid var(--line);color:var(--muted);
   border-radius:6px;padding:3px 9px;font-size:11.5px;cursor:pointer}
 .comment-actions button:hover{border-color:var(--accent);color:var(--ink)}
+/* Resolve/Delete glyphs live in ::before (not a child span) so they can never become the
+   click target themselves (the card's click handler reads data-act off e.target) — and an
+   explicit color here keeps both the SAME gray regardless of the button's own hover-
+   lightened text color. */
+.comment-actions button[data-act="resolve"]::before{content:"\2713 ";color:var(--muted)}
+.comment-actions button[data-act="delete"]::before{content:"\2715 ";color:var(--muted)}
+/* Agent-facing nudge: a visible hint aimed at the AGENT reading this page (not the human
+   reviewer) to actually answer an open question, or optionally explain a change inline on
+   a remark — both via the existing `review spec-web reply <id> "..."` CLI, which already
+   threads into either kind. */
+.agent-hint{margin-top:8px;padding:6px 9px;border-radius:6px;font-size:11.5px;line-height:1.5}
+.agent-hint code{background:#0d1420;border:1px solid #223047;border-radius:4px;padding:1px 5px;font-size:11px}
+.agent-hint-question{background:rgba(201,139,255,.08);border:1px dashed var(--question);color:#d9c2f7}
+.agent-hint-remark{background:rgba(126,224,192,.06);border:1px dashed var(--remark);color:#bfe8da}
 .reply-box{margin-top:8px;display:none;flex-direction:column;gap:6px}
 .reply-box.open{display:flex}
 .reply-box textarea{width:100%;background:#11141c;border:1px solid var(--line);color:var(--ink);

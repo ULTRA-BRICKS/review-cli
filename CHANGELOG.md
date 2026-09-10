@@ -3,6 +3,10 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.8 — 2026-09-10
+
+- **Feat(specweb):** anchor-change tracking, auto-height panel, agent hints, resolve/delete icons (#484).
+
 ## 0.37.7 — 2026-09-10
 
 - **Feat(backends): omp openai-codex multi-credential fallback (review-cli#491).**
