@@ -76,6 +76,13 @@ AGENT_AUTHOR = "agent"
 # the store agree on the key.
 NEW_DRAFT_SLOT = "new"
 
+# Cap on persisted snapshots per spec (review-cli#484 item 2): a version is captured
+# whenever the server detects the on-disk spec file changed (see SpecStore.maybe_snapshot),
+# which for a spec edited in a long-lived review session could otherwise grow the per-spec
+# JSON store unboundedly. Oldest snapshots are dropped first once the cap is hit — recent
+# history matters far more than the very first draft for a "what changed lately" compare.
+MAX_SPEC_VERSIONS = 50
+
 
 def edit_draft_slot(comment_id: str) -> str:
     """Draft slot id for an in-progress EDIT of an existing comment."""
@@ -219,6 +226,9 @@ class SpecStore:
             # after the trailing clear cannot resurrect the draft. Token-less writes (legacy
             # clients) skip the check and never touch this map.
             "draft_tokens": {},
+            # Snapshots of the spec's full text + mtime, captured on detected on-disk
+            # changes and capped at MAX_SPEC_VERSIONS — see SpecStore.maybe_snapshot.
+            "versions": [],
         }
 
     def load(self) -> dict:
@@ -241,6 +251,11 @@ class SpecStore:
         # treats every slot as fresh, which is correct (no recorded high-water-mark yet).
         if not isinstance(data.get("draft_tokens"), dict):
             data["draft_tokens"] = {}
+        # `versions` is a list of snapshot records (review-cli#484 item 2). A legacy file
+        # has none; a tampered non-list reads as empty — never crashes the comment reads
+        # that share this load().
+        if not isinstance(data.get("versions"), list):
+            data["versions"] = []
         return data
 
     def _write(self, data: dict) -> None:
@@ -533,6 +548,66 @@ class SpecStore:
             data["drafts"].pop(slot, None)
             self._write(data)
             return True
+
+    # ---- versions (review-cli#484 item 2: version history & compare) ------ #
+    def maybe_snapshot(self, text: str, mtime: float) -> dict | None:
+        """Capture a new version snapshot IF the spec's on-disk state actually moved on
+        since the last recorded one.
+
+        Called from the server whenever it observes the spec file's mtime (the same signal
+        that drives the SSE live-reload watcher) — a "version" is one detected on-disk
+        change, not an arbitrary poll. Always captures the FIRST-seen state (no versions
+        yet). Otherwise dedupes on TEXT ALONE: a byte-identical re-save (mtime bumped, body
+        unchanged) is a no-op. Deliberately does NOT also gate on mtime — mtime-preserving
+        tooling (``git checkout``/``stash pop`` restoring a tracked spec, ``cp -p``,
+        ``rsync --times``) or coarse filesystem mtime resolution (NFS/SMB/FAT, or two edits
+        landing in the same second) can leave a genuinely changed body under an UNCHANGED
+        mtime; gating on mtime there would silently drop a real revision from history.
+
+        Trims to the last MAX_SPEC_VERSIONS entries (oldest dropped first) so a long-lived
+        review session can't grow the per-spec JSON store unboundedly. Returns the new
+        version record, or None if no snapshot was needed (so callers can tell "captured"
+        from "no-op" without a second read)."""
+        with self._guard():
+            data = self.load()
+            versions = data["versions"]
+            last = versions[-1] if versions else None
+            if last is not None and last.get("text") == text:
+                return None
+            rec = {
+                "id": _new_id(),
+                "created": _now(),
+                "mtime": mtime,
+                "text": text,
+                "size": len(text),
+            }
+            versions.append(rec)
+            data["versions"] = versions[-MAX_SPEC_VERSIONS:]
+            self._write(data)
+            return rec
+
+    def list_versions(self) -> list[dict]:
+        """Version SUMMARIES (id/created/mtime/size — no ``text``, to keep the list payload
+        small), newest-first."""
+        with _LOCK:
+            versions = self.load()["versions"]
+        return [
+            {
+                "id": v.get("id"),
+                "created": v.get("created"),
+                "mtime": v.get("mtime"),
+                "size": v.get("size"),
+            }
+            for v in reversed(versions)
+        ]
+
+    def get_version(self, version_id: str) -> dict | None:
+        """The FULL stored record (including ``text``) for one version id, or None."""
+        with _LOCK:
+            for v in self.load()["versions"]:
+                if v.get("id") == version_id:
+                    return dict(v)
+        return None
 
     # ---- review batch (GitHub "Submit review") ---------------------------- #
     def submit_pending(self) -> dict:

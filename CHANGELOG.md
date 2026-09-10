@@ -3,6 +3,10 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.9 — 2026-09-10
+
+- **Feat(specweb):** version history + compare view (review-cli#484 item 2).
+
 ## 0.37.8 — 2026-09-10
 
 - **Feat(specweb):** anchor-change tracking, auto-height panel, agent hints, resolve/delete icons (#484).

@@ -51,6 +51,15 @@
     composerSubmit: document.getElementById('composerSubmit'),
     commentsCollapse: document.getElementById('commentsCollapse'),
     divider: document.getElementById('divider'),
+    historyOpen: document.getElementById('historyOpen'),
+    historyBackdrop: document.getElementById('historyBackdrop'),
+    historyModal: document.getElementById('historyModal'),
+    historyClose: document.getElementById('historyClose'),
+    historyFromSelect: document.getElementById('historyFromSelect'),
+    historyToSelect: document.getElementById('historyToSelect'),
+    historyCompareBtn: document.getElementById('historyCompareBtn'),
+    historyDiff: document.getElementById('historyDiff'),
+    historyList: document.getElementById('historyList'),
   };
 
   var state = {
@@ -66,6 +75,7 @@
     // Internal-link navigation history: each entry is the spec pane's scrollTop at the
     // moment an in-doc link was followed, so "← Back" returns to the exact prior position.
     navHistory: [],
+    historyVersions: [], // raw version-summary list from GET /api/spec/versions, newest-first
   };
 
   // The author stamped on a reply left by the AGENT (`review spec-web reply`), mirrored
@@ -194,6 +204,9 @@
     var draftNote = clone.querySelector('#composerDraftNote');
     var body = clone.querySelector('#composerBody');
     var navBack = clone.querySelector('#navBack');
+    var historyBackdrop = clone.querySelector('#historyBackdrop');
+    var historyDiff = clone.querySelector('#historyDiff');
+    var historyList = clone.querySelector('#historyList');
     if (list) list.innerHTML = '';
     if (empty) {
       empty.hidden = false;
@@ -211,6 +224,15 @@
       body.removeAttribute('value');
     }
     if (navBack) navBack.hidden = true;
+    // A History modal left open when the SSE-triggered loadSpec() re-caches the shell
+    // must not persist into the cached offline shell — else a later offline navigation
+    // would restore a stale, populated modal (review-cli#484 review).
+    if (historyBackdrop) historyBackdrop.hidden = true;
+    if (historyDiff) {
+      historyDiff.hidden = true;
+      historyDiff.innerHTML = '';
+    }
+    if (historyList) historyList.innerHTML = '';
     return window.caches.open(CONTENT_CACHE)
       .then(function (cache) {
         return cache.put(currentPageUrl(), new Response('<!DOCTYPE html>\n' + clone.outerHTML, {
@@ -290,6 +312,90 @@
       })
       .catch(function (e) {
         els.specBody.innerHTML = '<div class="loading">Failed to load spec: ' + esc(e.message) + '</div>';
+      });
+  }
+
+  // ---- version history + compare (review-cli#484 item 2) ------------------
+  function formatVersionDate(v) {
+    var d = v.created ? new Date(v.created) : null;
+    return d && !isNaN(d.getTime()) ? d.toLocaleString() : (v.created || v.id);
+  }
+  function loadHistoryVersions() {
+    return api('GET', '/api/spec/versions').then(function (versions) {
+      state.historyVersions = versions || [];
+      renderHistoryList();
+      populateHistorySelects();
+    });
+  }
+  function renderHistoryList() {
+    var versions = state.historyVersions;
+    if (!versions.length) {
+      els.historyList.innerHTML =
+        '<div class="history-empty">No snapshots yet — a version is captured the next time the spec file changes on disk.</div>';
+      return;
+    }
+    els.historyList.innerHTML = versions
+      .map(function (v) {
+        return (
+          '<div class="history-row">' +
+          '<span class="history-row-date">' + esc(formatVersionDate(v)) + '</span>' +
+          '<span class="history-row-size">' + (v.size != null ? v.size + ' chars' : '') + '</span>' +
+          '</div>'
+        );
+      })
+      .join('');
+  }
+  function populateHistorySelects() {
+    var opts = state.historyVersions.map(function (v) {
+      return { id: v.id, label: formatVersionDate(v) };
+    });
+    opts.push({ id: 'live', label: 'Live (current)' });
+    var html = opts
+      .map(function (o) { return '<option value="' + esc(o.id) + '">' + esc(o.label) + '</option>'; })
+      .join('');
+    els.historyFromSelect.innerHTML = html;
+    els.historyToSelect.innerHTML = html;
+    if (opts.length > 1) {
+      // opts is newest-first (state.historyVersions order) with 'live' appended last, so
+      // opts[0] is the most recent SNAPSHOT — defaulting "from" there gives "what changed
+      // since my last save" (previous snapshot vs live), not the oldest-ever revision.
+      els.historyFromSelect.value = opts[0].id;
+    }
+    els.historyToSelect.value = 'live';
+  }
+  function openHistory() {
+    els.historyBackdrop.hidden = false;
+    els.historyDiff.hidden = true;
+    els.historyDiff.innerHTML = '';
+    els.historyList.innerHTML = '<div class="history-loading">Loading…</div>';
+    loadHistoryVersions().catch(function () {
+      els.historyList.innerHTML = '<div class="history-empty">Failed to load version history.</div>';
+    });
+  }
+  function closeHistory() {
+    els.historyBackdrop.hidden = true;
+  }
+  function renderVersionDiff(ops) {
+    return ops
+      .map(function (op) {
+        var cls = op.t === 'same' ? 'diff-same' : op.t === 'del' ? 'diff-del' : 'diff-add';
+        var prefix = op.t === 'same' ? '  ' : op.t === 'del' ? '- ' : '+ ';
+        return '<span class="history-diff-line ' + cls + '">' + esc(prefix + op.line) + '</span>';
+      })
+      .join('');
+  }
+  function runHistoryCompare() {
+    var a = els.historyFromSelect.value;
+    var b = els.historyToSelect.value;
+    if (!a || !b) return;
+    els.historyDiff.hidden = false;
+    els.historyDiff.innerHTML = '<div class="history-loading">Comparing…</div>';
+    api('GET', '/api/spec/versions/compare?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b))
+      .then(function (result) {
+        els.historyDiff.innerHTML = renderVersionDiff(result.ops);
+      })
+      .catch(function (e) {
+        els.historyDiff.innerHTML = '<div class="history-empty">' + esc(e.message || 'Compare failed') + '</div>';
       });
   }
 
@@ -1694,6 +1800,12 @@
     els.composerBackdrop.addEventListener('click', function (e) {
       if (e.target === els.composerBackdrop) closeComposer();
     });
+    els.historyOpen.addEventListener('click', openHistory);
+    els.historyClose.addEventListener('click', closeHistory);
+    els.historyBackdrop.addEventListener('click', function (e) {
+      if (e.target === els.historyBackdrop) closeHistory();
+    });
+    els.historyCompareBtn.addEventListener('click', runHistoryCompare);
     els.composerBody.addEventListener('keydown', function (e) {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submitComposer();
       if (e.key === 'Escape') closeComposer();
