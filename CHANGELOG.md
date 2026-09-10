@@ -5,7 +5,7 @@ semantic versioning.
 
 ## 0.37.8 — 2026-09-10
 
-- **feat(specweb): version history panel (#484)**
+- **Feat(specweb):** version history panel and related UI (#484).
 
 ## 0.37.6 — 2026-09-10
 
@@ -293,31 +293,5 @@ semantic versioning.
   exposes the real signal — `near_miss_counted`/`near_miss_ever_passed`, checked
   against the actual gated population — and the CLI picks accurate wording for each of
   the three cases (counted, passed-but-mismatched, never passed). Also: the
-⚠ 1 unresolved conflict detected
-- ours = HEAD
-- theirs = bade2cc (chore: bump version to 0.37.7)
-- base = parent of bade2cc (chore: bump version to 0.37.7)
-NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
-`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
-Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
-Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
 
-──── #2  L6-40 ────
-<<< ours
-## 0.37.6 — 2026-09-10
-
-- **Feat(dashboard): interactive Stats timeline + per-review-dimension breakdown
-  (review-cli#343).** Replaces the old count-sorted per-day list with a horizontal
-  time-axis chart (day/week/month toggle, click-through drill-in) and surfaces
-  `compute_stats()`'s `by_dimension` breakdown (ok/error/ok_rate per board lens).
-… (20 more lines)
-=== base
-(empty)
->>> theirs
-## 0.37.7 — 2026-09-10
-
-- **feat(specweb): version history panel (#484)**
-
-
-
-[Showing lines 1-300 of 1761. Use :301 to continue]
+[Showing lines 1-300 of 328. Use :301 to continue]
