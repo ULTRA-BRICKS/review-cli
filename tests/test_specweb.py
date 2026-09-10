@@ -32,6 +32,7 @@ from reviewlib.specweb import render as srender  # noqa: E402
 from reviewlib.specweb import server as sserver  # noqa: E402
 from reviewlib.specweb.store import (  # noqa: E402
     AGENT_AUTHOR,
+    MAX_SPEC_VERSIONS,
     NEW_DRAFT_SLOT,
     SpecStore,
     edit_draft_slot,
@@ -1950,6 +1951,202 @@ def test_js_python_draft_constants_in_sync():
     assert ("var NEW_DRAFT_SLOT = '%s'" % PY_NEW) in js, "app.js NEW_DRAFT_SLOT out of sync with store.py"
     assert "return 'edit:' + id;" in js, "app.js edit-slot format out of sync with store.edit_draft_slot"
     assert "edit:" in edit_draft_slot("x"), "store edit_draft_slot must use the 'edit:' prefix"
+
+
+# --------------------------------------------------------------------------- #
+# Feature: spec version history + compare (review-cli#484 item 2)
+# --------------------------------------------------------------------------- #
+def test_store_maybe_snapshot_first_call_and_duplicate_noop():
+    # The first call always captures (no versions yet); a repeat with the SAME mtime+text
+    # is a no-op (an editor re-save shouldn't duplicate the entry).
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        rec1 = store.maybe_snapshot("hello world", 100.0)
+        assert rec1 is not None
+        assert rec1["text"] == "hello world"
+        assert rec1["mtime"] == 100.0
+        assert rec1["size"] == len("hello world")
+        assert store.maybe_snapshot("hello world", 100.0) is None
+        assert len(SpecStore(FIXTURE).list_versions()) == 1
+
+
+def test_store_maybe_snapshot_dedupes_on_text_alone_not_mtime():
+    # Text unchanged (byte-identical re-save, mtime bumped) must NOT append — the classic
+    # no-op-resave case. But mtime unchanged with DIFFERENT text MUST still append: mtime-
+    # preserving tooling (git checkout/cp -p) or coarse filesystem mtime resolution can
+    # leave a real content change under an unchanged mtime, and that revision must not be
+    # silently dropped from history (review-cli#484 review finding).
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.maybe_snapshot("v1 text", 100.0)
+        assert store.maybe_snapshot("v1 text", 200.0) is None, "text unchanged must not append, even with a new mtime"
+        assert len(store.list_versions()) == 1
+        rec = store.maybe_snapshot("v1 text CHANGED", 100.0)
+        assert rec is not None, "text changed must append even with an UNCHANGED mtime"
+        assert len(store.list_versions()) == 2
+        rec2 = store.maybe_snapshot("v2 text", 200.0)
+        assert rec2 is not None
+        assert len(store.list_versions()) == 3
+
+
+def test_store_list_versions_summaries_newest_first_and_get_version_full():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        r1 = store.maybe_snapshot("text A", 1.0)
+        r2 = store.maybe_snapshot("text B", 2.0)
+        versions = store.list_versions()
+        assert [v["id"] for v in versions] == [r2["id"], r1["id"]], "must be newest-first"
+        assert "text" not in versions[0], "list_versions must be a summary, no full text"
+        assert set(versions[0]) == {"id", "created", "mtime", "size"}
+        full = store.get_version(r1["id"])
+        assert full["text"] == "text A"
+        assert full["mtime"] == 1.0
+        assert store.get_version("does-not-exist") is None
+
+
+def test_store_maybe_snapshot_caps_at_max_versions_dropping_oldest():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        n = MAX_SPEC_VERSIONS + 5
+        ids = []
+        for i in range(n):
+            rec = store.maybe_snapshot(f"text {i}", float(i))
+            ids.append(rec["id"])
+        versions = store.list_versions()
+        assert len(versions) == MAX_SPEC_VERSIONS, "must be capped, not grow unboundedly"
+        expected_newest_first = list(reversed(ids[-MAX_SPEC_VERSIONS:]))
+        assert [v["id"] for v in versions] == expected_newest_first, "oldest entries must be dropped first"
+
+
+def test_render_markdown_matches_render_spec_for_same_content():
+    # The refactor must round-trip: rendering the same text via the extracted text-taking
+    # entry point produces byte-identical HTML to the original file-reading entry point.
+    md = FIXTURE.read_text(encoding="utf-8")
+    assets_dir = FIXTURE.parent / "assets"
+    assert srender.render_markdown(md, assets_dir=assets_dir).html == srender.render_spec(FIXTURE).html
+
+
+def test_server_versions_list_route():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.maybe_snapshot("v1 content", 1.0)
+        store.maybe_snapshot("v2 content", 2.0)
+        s = _Server()
+        try:
+            st, body, _ = s.get("/api/spec/versions")
+            assert st == 200, body
+            data = json.loads(body)
+            assert len(data) == 2
+            assert "text" not in data[0], "the list route must not leak full text"
+            assert data[0]["size"] == len("v2 content"), "newest-first"
+        finally:
+            s.stop()
+
+
+def test_server_version_detail_route():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        rec = store.maybe_snapshot("# Old Heading\n\nold marker text\n", 1.0)
+        s = _Server()
+        try:
+            st, body, _ = s.get("/api/spec/versions/" + rec["id"])
+            assert st == 200, body
+            data = json.loads(body)
+            assert data["id"] == rec["id"]
+            assert "old marker text" in data["html"]
+            assert data["headings"] and data["headings"][0]["text"] == "Old Heading"
+            st404, _, _ = s.get("/api/spec/versions/does-not-exist")
+            assert st404 == 404
+        finally:
+            s.stop()
+
+
+def test_server_version_live_route_with_zero_snapshots():
+    # "live" is served from the CURRENT on-disk file, not the store — it must work even
+    # when nothing has been snapshotted yet.
+    with _TempStoreEnv():
+        assert SpecStore(FIXTURE).list_versions() == []
+        s = _Server()
+        try:
+            st, body, _ = s.get("/api/spec/versions/live")
+            assert st == 200, body
+            data = json.loads(body)
+            assert data["id"] == "live"
+            assert data["html"] == srender.render_spec(FIXTURE).html
+        finally:
+            s.stop()
+
+
+def test_server_versions_compare_route_reflects_line_changes():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        a = store.maybe_snapshot("line one\nline two\nline three\n", 1.0)
+        b = store.maybe_snapshot("line one\nline TWO CHANGED\nline three\nline four\n", 2.0)
+        s = _Server()
+        try:
+            st, body, _ = s.get(f"/api/spec/versions/compare?a={a['id']}&b={b['id']}")
+            assert st == 200, body
+            data = json.loads(body)
+            ops = data["ops"]
+            same_lines = [o["line"] for o in ops if o["t"] == "same"]
+            del_lines = [o["line"] for o in ops if o["t"] == "del"]
+            add_lines = [o["line"] for o in ops if o["t"] == "add"]
+            assert "line one" in same_lines and "line three" in same_lines
+            assert "line two" in del_lines, del_lines
+            assert "line TWO CHANGED" in add_lines and "line four" in add_lines, add_lines
+            st400, _, _ = s.get("/api/spec/versions/compare?a=" + a["id"])
+            assert st400 == 400
+            st404, _, _ = s.get(f"/api/spec/versions/compare?a=nope&b={b['id']}")
+            assert st404 == 404
+        finally:
+            s.stop()
+
+
+def test_server_spec_json_captures_snapshot_end_to_end():
+    # GET /api/spec (the route hit on initial load AND every SSE-triggered re-fetch) must
+    # capture a version snapshot when the on-disk file actually changed, and NOT double up
+    # on a repeat fetch of the same content.
+    with _TempStoreEnv(), tempfile.TemporaryDirectory() as d:
+        spec = Path(d) / "demo.md"
+        spec.write_text("# Title\n\nversion one body\n", encoding="utf-8")
+        httpd = sserver.make_server(spec, host="127.0.0.1", port=0)
+        port = httpd.server_address[1]
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("GET", "/api/spec")
+            r = c.getresponse()
+            assert r.status == 200
+            r.read()
+            c.close()
+            assert len(SpecStore(spec).list_versions()) == 1
+
+            # a repeat fetch with NO on-disk change must not duplicate the snapshot
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("GET", "/api/spec")
+            r = c.getresponse()
+            r.read()
+            c.close()
+            assert len(SpecStore(spec).list_versions()) == 1
+
+            # modify content + bump mtime distinctly (deterministic, no sleep needed)
+            spec.write_text("# Title\n\nversion TWO body, changed\n", encoding="utf-8")
+            bumped = spec.stat().st_mtime + 5
+            os.utime(spec, (bumped, bumped))
+
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("GET", "/api/spec")
+            r = c.getresponse()
+            assert r.status == 200
+            r.read()
+            c.close()
+
+            versions = SpecStore(spec).list_versions()
+            assert len(versions) == 2, versions
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == "__main__":

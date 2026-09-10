@@ -493,6 +493,17 @@ class _Renderer:
         return RenderResult(html="\n".join(out), headings=headings, assets=dict(self.assets))
 
 
+def render_markdown(md: str, *, assets_dir: Path, asset_base: str = "/asset/") -> RenderResult:
+    """Render markdown TEXT (already read) to HTML.
+
+    The text-taking core of ``render_spec`` — split out so a historical spec version (whose
+    stored text no longer necessarily matches what's on disk, see
+    ``SpecStore.get_version``/review-cli#484 item 2) can be rendered without a file read.
+    ``assets_dir``/``asset_base`` mean the same as on ``render_spec``.
+    """
+    return _Renderer(Path(assets_dir), asset_base).render(md)
+
+
 def render_spec(
     spec_path: Path, *, assets_dir: Path | None = None, asset_base: str = "/asset/"
 ) -> RenderResult:
@@ -508,4 +519,4 @@ def render_spec(
     if assets_dir is None:
         assets_dir = spec_path.parent / "assets"
     md = spec_path.read_text(encoding="utf-8", errors="replace")
-    return _Renderer(Path(assets_dir), asset_base).render(md)
+    return render_markdown(md, assets_dir=assets_dir, asset_base=asset_base)

@@ -240,6 +240,39 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 .composer-actions button{background:#161b26;border:1px solid var(--line);color:var(--ink);
   border-radius:7px;padding:6px 13px;font-size:13px;cursor:pointer}
 
+/* Version history + compare (review-cli#484 item 2): a centered fixed overlay like
+   .composer-backdrop, so it needs no separate mobile branch. */
+.history-btn{background:#1c2230;border:1px solid var(--line);color:var(--ink);
+  border-radius:8px;padding:5px 11px;font-size:13px;cursor:pointer;line-height:1;
+  white-space:nowrap;flex:0 0 auto}
+.history-btn:hover{border-color:var(--accent)}
+.history-backdrop{position:fixed;inset:0;z-index:60;background:rgba(6,8,12,.55);
+  display:flex;align-items:center;justify-content:center;padding:18px}
+.history-modal{width:min(720px,100%);max-height:85vh;background:var(--panel2);
+  border:1px solid #33405e;border-radius:14px;padding:16px;display:flex;flex-direction:column;
+  gap:10px;box-shadow:0 18px 60px rgba(0,0,0,.6);overflow:hidden}
+.history-head{display:flex;align-items:center;justify-content:space-between;font-weight:600}
+.history-close{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;
+  line-height:1;padding:2px 6px}
+.history-close:hover{color:var(--ink)}
+.history-compare-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.history-compare-row select{background:#11141c;border:1px solid var(--line);color:var(--ink);
+  border-radius:7px;padding:6px 9px;font-size:13px;max-width:220px}
+.history-arrow{color:var(--muted)}
+.history-compare-row button{border-radius:7px;padding:6px 13px;font-size:13px;cursor:pointer}
+.history-diff{font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
+  background:#0d0f14;border:1px solid var(--line);border-radius:8px;padding:10px;
+  max-height:40vh;overflow:auto}
+.history-diff-line{display:block;padding:0 4px}
+.history-diff-line.diff-add{background:rgba(66,169,96,.18);color:var(--answered)}
+.history-diff-line.diff-del{background:rgba(219,90,90,.18);color:var(--danger);text-decoration:line-through}
+.history-diff-line.diff-same{color:var(--ink)}
+.history-list{overflow:auto;border-top:1px solid var(--line);padding-top:8px;display:flex;
+  flex-direction:column;gap:4px}
+.history-row{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;
+  color:var(--muted);padding:4px 2px}
+.history-empty,.history-loading{font-size:12.5px;color:var(--muted);padding:8px 2px}
+
 /* ---- mobile: comments as a bottom sheet that collapses to its header bar -- */
 /* The collapse-to-header-bar behaviour itself lives in the shared rule above (so desktop
    and mobile behave identically); this block only adds the mobile bottom-sheet framing and
