@@ -1257,14 +1257,14 @@ def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failur
             d.cleanup()
 
 
-def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_221():
-    """The invariant `_ran_roles`'s `explicit_models` branch relies on (round-2
-    review finding, Opus/Fable, independently, both marked 'blocking' pending this
-    exact confirmation): an exact board with ANY failed seat can never record
-    `passed=True` (there is no reserve to backfill it — `run_board_with_failover`
-    degrades), so "return every planned seat's role regardless of pass/fail" (the
-    same pre-existing shortcut `_ran_models` already took) can never leak a FAILED
-    seat's role into a record that actually counts toward --min-roles."""
+def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_137():
+    """FIXED (review-cli#137): an exact board with a failed seat can never record
+    `passed=True` for the WHOLE run (there is no reserve to backfill it --
+    `run_board_with_failover` degrades) -- that stays exactly as before. What
+    changed: the seat that DID genuinely succeed (codex/correctness) now still
+    earns role credit toward `--min-roles`, via the new seat-granular
+    `usable_roles` field, even though the sibling gemini/contracts seat's hard
+    failure makes `passed` False for the record as a whole."""
     with _TmpStore() as store:
         d = _git_init_with_diff()
         restore = _with_backend_stub(_stub_resolve_backend({"codex": 0, "gemini": 1}))
@@ -1286,23 +1286,29 @@ def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_22
             assert rc == 1, rc  # gemini failed -> the whole exact-board run degrades
             rec = store.records()[0]
             assert rec.get("passed") is False
-            # `_ran_roles` DOES still record both roles onto the iteration (mirrors
-            # `_ran_models`'s identical, already-tested choice above) --
+            # `_ran_roles` still records both roles onto the legacy `roles` field
+            # (mirrors `_ran_models`'s identical, already-tested choice) -- UNCHANGED
+            # by this fix.
             assert rec["roles"] == ["correctness", "contracts"]
-            # Round-10 review finding (Opus): pairwise, not just two independently-
-            # correct lists -- `_ran_models`/`_ran_roles` build both from the SAME
-            # `board` list in the SAME comprehension order, so each model lands
-            # with the role IT was actually configured under, not a neighbor's.
             assert list(zip(rec["models"], rec["roles"])) == [
                 ("codex", "correctness"),
                 ("gemini", "contracts"),
             ]
-            # -- but because `passed` is False, `quorum_check`'s `passed is True`
-            # filter excludes this iteration entirely: NEITHER role counts, including
-            # "correctness" from the seat that actually succeeded.
-            result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=1)
-            assert result["passed"] is False
-            assert result["roles"] == []
+            # NEW (review-cli#137): the seat-granular field only credits the seat
+            # that actually produced a usable verdict.
+            assert rec["usable_roles"] == ["correctness"]
+            # A role-only floor (no `min_models`) now credits "correctness" despite
+            # `passed` being False for the whole record.
+            result = _stats.quorum_check(TASK, min_iter=1, min_roles=1)
+            assert result["passed"] is True, result
+            assert result["roles"] == ["correctness"]
+            # `min_models` stays run-level/passed-gated -- UNCHANGED by this fix: a
+            # combined check still fails because the record's own `passed` is False,
+            # so no iteration satisfies `min_iter`/`min_models` at all.
+            combined = _stats.quorum_check(
+                TASK, min_iter=1, min_models=1, min_roles=1
+            )
+            assert combined["passed"] is False, combined
         finally:
             restore()
             _cli.load_config = saved_cfg
@@ -1310,17 +1316,18 @@ def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_22
             d.cleanup()
 
 
-def test_cli_exact_board_unavailable_sentinel_seat_never_satisfies_min_roles_review_cli_221():
-    """Round-4 review finding (Opus, marked 'blocking pending one trace'): the
-    failed-seat invariant above must ALSO hold for a seat that returns exit 0
-    with an UNAVAILABLE-SENTINEL body (`result_is_usable`'s third failure shape —
-    the paywalled-but-keyed case a raw exit-code check can't see), not only a
-    plain non-zero exit. Traced: `run_board_with_failover` gates `usable` (hence
+def test_cli_exact_board_unavailable_sentinel_seat_never_satisfies_min_roles_review_cli_137():
+    """FIXED (review-cli#137), sentinel-body variant of the test above: the
+    failed-seat scenario must ALSO hold for a seat that returns exit 0 with an
+    UNAVAILABLE-SENTINEL body (`result_is_usable`'s third failure shape — the
+    paywalled-but-keyed case a raw exit-code check can't see), not only a plain
+    non-zero exit. `run_board_with_failover` gates `usable` (hence
     `outcome.degraded`, hence `ok = not degraded`, hence the CLI's exit code) on
     `result_is_usable`, which classifies an rc=0 short body containing an
     unavailable marker as UNUSABLE -- so an exact board (empty reserve) with a
-    sentinel-body seat degrades exactly like a plain failure, and `passed` is
-    False the same way."""
+    sentinel-body seat degrades exactly like a plain failure, `passed` stays
+    False the same way, but the seat that DID produce a real verdict still earns
+    seat-granular role credit via `usable_roles`."""
     with _TmpStore() as store:
         d = _git_init_with_diff()
 
@@ -1367,9 +1374,11 @@ def test_cli_exact_board_unavailable_sentinel_seat_never_satisfies_min_roles_rev
             assert rc == 1, rc
             rec = store.records()[0]
             assert rec.get("passed") is False
-            result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=1)
-            assert result["passed"] is False
-            assert result["roles"] == []
+            assert rec["roles"] == ["correctness", "contracts"]
+            assert rec["usable_roles"] == ["correctness"]
+            result = _stats.quorum_check(TASK, min_iter=1, min_roles=1)
+            assert result["passed"] is True, result
+            assert result["roles"] == ["correctness"]
         finally:
             restore()
             _cli.load_config = saved_cfg
@@ -4638,6 +4647,38 @@ def test_record_run_roles_persisted_when_given():
         assert rec["roles"] == ["architect", "security"]
 
 
+def test_record_run_usable_roles_persisted_when_given_review_cli_137():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["opus", "codex"],
+            roles=["correctness", "security"],
+            usable_roles=["correctness"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=1,
+            passed=False,
+        )
+        rec = store.records()[0]
+        assert rec["usable_roles"] == ["correctness"]
+        assert rec["roles"] == ["correctness", "security"]  # legacy field unchanged
+
+
+def test_record_run_usable_roles_omitted_when_not_given_review_cli_137():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["opus", "codex"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+        )
+        rec = store.records()[0]
+        assert "usable_roles" not in rec
+
+
 def test_record_run_roles_omitted_on_length_mismatch_review_cli_221():
     """Round-7 review finding (Fable): `_distinct_roles` (the ENFORCING counter
     behind --min-roles) has no reference to `models` -- unlike the advisory
@@ -4968,6 +5009,32 @@ def test_quorum_check_unknown_role_strings_never_satisfy_min_roles_review_cli_22
         assert result["passed"] is False
         assert result["roles"] == []
         assert result["distinct_roles_passed"] == 0
+
+
+def test_quorum_check_seat_level_role_credit_survives_run_level_failure_review_cli_137():
+    """The core review-cli#137 regression, at the record_run/quorum_check level
+    directly: a single run recorded with 3 seats (1 usable, role=correctness; 2
+    quota-exhausted, rc!=0) must still let 'correctness' satisfy quorum_check's
+    role floor, even though the run's own `passed` is False."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["opus", "codex", "grok"],
+            roles=["correctness", "security", "consistency"],
+            usable_roles=["correctness"],  # only opus individually succeeded
+            duration_seconds=12.0,
+            ok_count=1,
+            fail_count=2,
+            passed=False,  # codex/grok quota-exhausted -> the WHOLE run fails
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_roles=1)
+        assert result["passed"] is True, result
+        assert result["roles"] == ["correctness"]
+        assert result["distinct_roles_passed"] == 1
+        short = _stats.quorum_check(TASK, min_iter=1, min_roles=2)
+        assert short["passed"] is False, short
+        assert short["roles"] == ["correctness"]
 
 
 def test_quorum_check_min_roles_ignores_roles_on_failed_iterations_review_cli_221():

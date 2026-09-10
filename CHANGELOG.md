@@ -67,6 +67,26 @@ semantic versioning.
   appends `--skip-git-repo-check` only for a non-repo cwd, leaving codex's
   own trust decision untouched inside real repos.
 
+## 0.37.5 — 2026-09-10
+
+- **Fix: role credit for `review` mode is now seat-granular per run
+  (review-cli#137).** A new `usable_roles` field on `record_run` (read from
+  `panel.FailoverOutcome.usable_roles` via a new `usable_roles_after` callable
+  threaded through `cli._run_mode_with_stats`) records the board role of every
+  seat that INDIVIDUALLY produced a usable verdict this run, independent of
+  the run's own `passed`. `quorum_check`'s `--min-roles` gate now credits from
+  a new `_seat_credited_roles` helper reading `usable_roles` (falling back to
+  the legacy passed-only `roles` reading for pre-fix records), so a hard-failed
+  sibling seat (e.g. a quota-exhausted provider returning nonzero) no longer
+  zeroes out role credit for a genuinely-successful seat in the same run —
+  concretely, an exact `-m modelA,modelB,...` board with Opus succeeding while
+  Codex/GLM/Grok/Sonnet were all exhausted can now credit Opus's role toward
+  `--min-roles` even though the run as a whole still fails. `--min-iter` /
+  `--min-models` / `passed` are unchanged — still the run's own all-or-nothing
+  verdict. This does NOT resolve review-cli#137's own two open acceptance
+  criteria (whether non-review modes like brainstorm/quorum/just-ask should
+  count toward the gate at all, and review mode's free-text content-verdict
+  parsing gap) — both remain open.
 
 ## 0.37.1 — 2026-09-08
 

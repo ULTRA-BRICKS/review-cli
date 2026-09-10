@@ -2784,6 +2784,7 @@ def _run_mode_with_stats(
     dispatch,
     models_after=None,
     roles_after=None,
+    usable_roles_after=None,
     *,
     task_code: str | None = None,
     repo_id: str | None = None,
@@ -2821,7 +2822,22 @@ def _run_mode_with_stats(
     every one of those seats genuinely produced a verdict (any single failure degrades
     the whole run to a nonzero exit first); a record whose seats didn't ALL succeed is
     always `passed=False` and therefore never counts toward `--min-roles` regardless
-    of what this callable returned.
+    of what this callable returned. `roles` itself is UNCHANGED by review-cli#137 below
+    (still index-aligned with `models`, still consumed by the
+    `_models_behind_role_coverage` monoculture-suggestion diagnostic) but is NO LONGER
+    the sole source `quorum_check`'s `--min-roles` gate credits from — that's now
+    `usable_roles_after`.
+
+    `usable_roles_after` (optional, review-cli#137) is the SEAT-granular sibling of
+    `roles_after`: a zero-arg callable read AFTER the run for `record_run`'s
+    `usable_roles` param (see its docstring), recording seat-level role credit that
+    survives a sibling seat's hard failure in the same run. Unlike `_ran_models`/
+    `_ran_roles`'s exact-board special case above, this needs NO such case:
+    `panel.FailoverOutcome.usable_roles` already means "seats that individually
+    succeeded" whether or not a reserve exists (an exact board with no reserve simply
+    degrades instead of backfilling), so the same `outcome_sink[0].usable_roles if
+    outcome_sink else []` expression covers both the exact and reserve-failover board
+    shapes — see `_ran_usable_roles` in `_dispatch`.
 
     A run that dispatched ZERO backend calls (a clean-tree review with no diff, an
     early usage error) is NOT recorded: it has no real wall-clock to contribute and a
@@ -2898,6 +2914,19 @@ def _run_mode_with_stats(
                 actual_roles = None
             if actual_roles:
                 recorded_roles = actual_roles
+        recorded_usable_roles = None
+        # review-cli#137: unlike `recorded_roles` above, this has NO dependency on
+        # `models_after` succeeding/not-falling-back -- `usable_roles` is not
+        # index-paired with `models` at all (see record_run's `usable_roles`
+        # docstring), it is simply "the roles this run individually satisfied", so
+        # there is no pairing invariant to protect here.
+        if usable_roles_after is not None:
+            try:
+                actual_usable_roles = usable_roles_after()
+            except Exception:  # noqa: BLE001 — stats must never break the run
+                actual_usable_roles = None
+            if actual_usable_roles:
+                recorded_usable_roles = actual_usable_roles
         # Only record a run that actually dispatched at least one backend call. No
         # dispatch -> nothing real to time -> skip, so no-op invocations never poison
         # the ETA average.
@@ -2945,6 +2974,26 @@ def _run_mode_with_stats(
             # fix, which only had to stop mis-recording a KNOWN-not-passed run as
             # passed.
             #
+            # PARTIALLY ADDRESSED (review-cli#137, 2026-09-10): the paragraphs above describe a
+            # CONTENT-verdict gap (ran cleanly vs. approved-with-no-findings) and a non-review-
+            # mode-counting policy question — both remain fully open; this fix touches NEITHER.
+            # A different, narrower gap in the same "what should count as a role credit" area is
+            # now fixed instead: `ok`/`rc` above is still the WHOLE run's own all-or-nothing
+            # verdict (unchanged, still what `passed` reflects), but `quorum_check`'s
+            # `--min-roles` gate no longer inherits that all-or-nothing shape for role CREDIT.
+            # Previously, an exact `-m modelA,modelB,modelC,...` board (no reserve to backfill a
+            # failed seat) recorded per-seat role data that only ever counted when `passed` was
+            # True for the WHOLE run — so a single quota-exhausted sibling seat (nonzero
+            # returncode) zeroed out role credit for a genuinely successful seat in the SAME run
+            # (e.g. Opus succeeding while Codex/GLM/Grok/Sonnet were all exhausted), even though
+            # that seat's own verdict was real. See `_ran_usable_roles`/`usable_roles_after`
+            # below and `record_run`'s `usable_roles` param / `stats._seat_credited_roles` — role
+            # credit is now SEAT-granular: a seat's own role counts toward `--min-roles` whenever
+            # THAT SEAT individually produced a usable verdict, regardless of a sibling's hard
+            # failure in the same run. `--min-iter`/`--min-models` (and `passed` itself) are
+            # UNCHANGED — still the run's own all-or-nothing signal, exactly as this whole
+            # comment block already describes.
+            #
             # `rc` is None only if `dispatch()` raised before returning; treat that
             # as not-passed (fail-closed) too — a run that never completed is not a
             # pass by any definition.
@@ -2967,6 +3016,7 @@ def _run_mode_with_stats(
                 diff_files=diff_files,
                 diff_sha256=diff_sha256,
                 roles=recorded_roles,
+                usable_roles=recorded_usable_roles,
                 prompt_tokens=prompt_tokens,
                 output_tokens=output_tokens,
             )
@@ -6189,12 +6239,26 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return [r.role for r in board]
             return outcome_sink[0].usable_roles if outcome_sink else []
 
+        def _ran_usable_roles() -> list[str]:
+            # review-cli#137: SEAT-granular role credit, independent of the whole
+            # run's own `passed`/exit code -- every board seat (exact `-m` OR
+            # reserve-failover) that individually produced a usable verdict this
+            # run, so a sibling seat's hard failure (quota exhaustion, a dead key,
+            # a timeout, ...) never zeroes out a genuinely-successful seat's role
+            # credit. Unlike `_ran_models`/`_ran_roles` above, this has NO exact-
+            # board special case: `FailoverOutcome.usable_roles` already means
+            # "seats that individually succeeded" for BOTH an exact board (no
+            # reserve -- see `panel.run_board_with_failover`'s docstring) and a
+            # reserve-failover board, so the same expression covers both shapes.
+            return outcome_sink[0].usable_roles if outcome_sink else []
+
         return _run_mode_with_stats(
             mode.stats_mode,
             eta_models,
             lambda: mode.handler(ctx),
             models_after=_ran_models,
             roles_after=_ran_roles,
+            usable_roles_after=_ran_usable_roles,
             task_code=task_code,
             repo_id=repo_id,
             diff_files=diff_files,

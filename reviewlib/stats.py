@@ -305,6 +305,7 @@ def record_run(
     diff_files: list[str] | None = None,
     diff_sha256: str | None = None,
     roles: list[str] | None = None,
+    usable_roles: list[str] | None = None,
     prompt_tokens: int = 0,
     output_tokens: int = 0,
 ) -> bool:
@@ -341,6 +342,23 @@ def record_run(
     ``passed``/``repo_id`` — so a ``--min-roles`` gate can tell "never recorded a
     role" apart from "recorded zero roles". Modes with no board (quorum/just-ask/
     brainstorm/qa) never pass this.
+
+    ``usable_roles`` (review-cli#137) is the SEAT-GRANULAR counterpart of ``roles``:
+    the board ROLE of every seat that INDIVIDUALLY produced a usable verdict this
+    run (``panel.FailoverOutcome.usable_roles`` — the SAME source ``roles`` reads
+    for the reserve-failover board path), recorded regardless of whether a
+    SIBLING seat in the same run hard-failed (quota exhaustion, a dead key, a
+    timeout, …) and made the run's own ``passed`` False. This is what closes
+    review-cli#137's adjacent seat-crediting gap: before it existed, an exact
+    ``-m modelA,modelB,...`` board (no reserve) recorded ``roles`` for every
+    PLANNED seat only when the run fully passed, and ``quorum_check`` only ever
+    read ``roles`` from ``passed is True`` records — so ONE hard-failed seat
+    zeroed role credit for the entire iteration, including a seat that genuinely
+    produced a verdict. ``usable_roles`` has NO ``models``-length-alignment
+    requirement (unlike ``roles``) — it is not paired seat-by-seat with a
+    parallel ``models`` list, it is simply "the roles this run actually
+    satisfied". ``None`` (the default) means "no seat-granular credit to report"
+    and the key is omitted entirely, same convention as ``roles``/``passed``.
 
     ``passed`` is the run's VERDICT — the caller's own success/failure criterion
     (e.g. the mode handler's exit code), NOT ``ok_count``/``fail_count`` (those are
@@ -409,6 +427,10 @@ def record_run(
         # actually describes.
         if len(roles) == len(models):
             record["roles"] = list(roles)
+    if usable_roles is not None:
+        # review-cli#137: no `models`-length alignment requirement (unlike `roles`
+        # above) -- see this function's `usable_roles` docstring paragraph for why.
+        record["usable_roles"] = list(usable_roles)
     try:
         p = stats_path()  # may raise RuntimeError on an unexpandable ~user / no HOME
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -631,6 +653,39 @@ def _distinct_roles(items: list[dict]) -> list[str]:
     roles: list[str] = []
     for item in items:
         for role in item.get("roles") or []:
+            if isinstance(role, str) and role in REVIEW_ROLES and role not in roles:
+                roles.append(role)
+    roles.sort()
+    return roles
+
+
+def _seat_credited_roles(items: list[dict]) -> list[str]:
+    """Sorted, deduped board-role list crediting each SEAT's OWN role independently
+    of the record's overall run ``passed`` (review-cli#137).
+
+    Reads the seat-granular ``usable_roles`` key (the roles of seats that
+    INDIVIDUALLY produced a usable verdict this run — see ``record_run``'s
+    ``usable_roles`` param) ahead of the legacy run-granular ``roles`` key. Falls
+    back to ``roles``, but ONLY when both (a) the record predates ``usable_roles``
+    (a pre-review-cli#137 record never wrote it) AND (b) the record's own
+    ``passed`` is True — a pre-#137 record never separated per-seat credit from
+    the run's own verdict, so a pre-#137 FAILED record's ``roles`` cannot be
+    trusted for partial credit: an exact `-m` board with no reserve used to record
+    every PLANNED seat's role there whenever the run passed, and record nothing
+    reliable per-seat when it didn't.
+
+    Mirrors ``_distinct_roles`` otherwise: only a real ``REVIEW_ROLES`` key
+    counts; an iteration with neither key contributes nothing (same fail-closed-
+    by-omission convention)."""
+    roles: list[str] = []
+    for item in items:
+        if "usable_roles" in item:
+            item_roles = item.get("usable_roles") or []
+        elif item.get("passed") is True:
+            item_roles = item.get("roles") or []
+        else:
+            item_roles = []
+        for role in item_roles:
             if isinstance(role, str) and role in REVIEW_ROLES and role not in roles:
                 roles.append(role)
     roles.sort()
@@ -975,6 +1030,19 @@ def quorum_check(
     can never satisfy this gate, only verdict-tagged passed runs can. This is
     fail-closed by design, not a bug — see record_run's ``passed`` param.
 
+    FIXED (review-cli#137; was the exact-board seat-crediting gap Alex hit concretely —
+    Opus review OK, Codex/GLM/Grok/Sonnet quota-exhausted, unable to record any passing
+    iteration): role credit for ``min_roles`` below is now SEAT-granular, not run-
+    granular. A single hard-failed sibling seat (nonzero returncode from a quota-
+    exhausted/dead-key/timed-out provider) no longer zeroes out role credit for a
+    genuinely-successful seat in the SAME run — the role floor is computed from
+    ``_seat_credited_roles`` (see its own docstring), which reads the seat-granular
+    ``usable_roles`` key across every non-diff-identity-mismatched iteration of ANY
+    verdict, falling back to the legacy passed-only ``roles`` reading only for records
+    written before this fix existed. ``min_iter``/``min_models``/``passed`` themselves
+    are UNCHANGED — still the run's own all-or-nothing verdict, exactly as described
+    above.
+
     ``repo_id``/``diff_files`` (both optional) are the CURRENT check context — "what
     repo/diff are we deciding whether to merge right now" — and enable diff-identity
     verification (v4, see the module docstring): a passed iteration whose OWN recorded
@@ -993,8 +1061,10 @@ def quorum_check(
     shape when passing," since it doesn't depend on diff-identity at all.)
 
     ``min_roles`` (optional, review-cli#221) switches the SECOND half of the gate from
-    counting distinct model-name strings to counting distinct board ROLES covered by
-    ``gate_iterations`` — a role filled by the board's shortage-resilience duplicate-
+    counting distinct model-name strings to counting distinct board ROLES credited
+    SEAT-granularly (review-cli#137 — see ``_seat_credited_roles``) across every non-
+    diff-identity-mismatched iteration, regardless of that iteration's own ``passed``
+    — a role filled by the board's shortage-resilience duplicate-
     model pad (a model reused onto an otherwise-empty role slot, see
     ``config.select_pool_with_reuse`` / PR #207) counts once per role there, exactly
     like any other role, instead of collapsing into the model string ``_distinct_models``
@@ -1598,7 +1668,20 @@ def quorum_check(
             )
 
     models = _distinct_models(gate_iterations)
-    roles = _distinct_roles(gate_iterations) if min_roles is not None else None
+    # review-cli#137: role credit is SEAT-granular, not run-granular -- computed
+    # across every non-diff-identity-mismatched iteration (ANY verdict), not just
+    # `gate_iterations` (PASSED-only, still used for `models`/`min_models`/`min_iter`
+    # above, unchanged). `_seat_credited_roles` reads the seat-level `usable_roles`
+    # key when present (falling back to the legacy passed-only `roles` reading for
+    # pre-#137 records) -- see its own docstring and record_run's `usable_roles` param.
+    role_credit_iterations = (
+        _iterations_excluding_mismatched(iterations, repo_id, diff_files)
+        if min_roles is not None
+        else []
+    )
+    roles = (
+        _seat_credited_roles(role_credit_iterations) if min_roles is not None else None
+    )
 
     # review-cli#246: each floor gates independently when given, vacuously satisfied
     # when not -- an explicitly requested floor can never be silently outvoted by the
