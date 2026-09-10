@@ -3,6 +3,25 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.5 — 2026-09-10
+
+- **New `review entities` bare subcommand — read-only harness/provider/model/
+  account/effort-lens overview (review-cli#487, Phase 0).** Prints a
+  structural snapshot of review-cli's own configured entities: which
+  harnesses (codex/claude/opencode/omp/commandcode/z.ai/gemini/openrouter)
+  the resolved board actually routes seats through (via the same
+  `backends.resolve_backend` router used at dispatch time, not a re-derived
+  guess), each seat's provider/role/effort/availability, the registered
+  Claude multi-account roster (`reviewlib.claude_accounts`), the
+  `ROLE_FALLBACK_MODELS` effort/role fallback chains, and a compact
+  per-harness call-health summary for the last 7 days reusing `review
+  stat`'s own report builder. `--json` emits the machine-readable form.
+  Entirely read-only and offline — no new external call, no key printed —
+  and reuses only data review-cli already resolves for a normal run. This
+  is the Phase 0 (static list view) slice of the fuller interactive
+  entity/relationship browser (drill-down, live refresh) tracked in
+  review-cli#487; later phases add the TUI itself.
+
 ## 0.37.2 — 2026-09-09
 
 - **Feat: omp-hosted Claude board seat + account-level fallback across

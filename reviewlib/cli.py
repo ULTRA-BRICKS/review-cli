@@ -1652,6 +1652,175 @@ def _render_stat_oversized_section(top: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# review entities — read-only entity/relationship/stats overview (review-cli#487)
+# ---------------------------------------------------------------------------
+
+# Maps a resolved backend dispatch function's __name__ (see `backends.resolve_backend`)
+# to the harness display name `review stat --harness`/the README already use. The single
+# source of truth for "which harness does this model route through" is
+# `backends._match_named_backend`; this table only LABELS its outputs for humans instead
+# of re-deriving the prefix rules a second time (review-cli#487).
+_ENTITY_HARNESS_LABELS = {
+    "review_codex": "codex",
+    "review_claude": "claude",
+    "review_opencode": "opencode",
+    "review_omp": "omp",
+    "review_commandcode": "commandcode",
+    "review_zai": "z.ai",
+    "review_gemini": "gemini",
+    "review_openrouter": "openrouter",
+}
+
+
+def _entity_harness_for_model(model: str) -> str:
+    """The harness display name a board seat's `model` string actually dispatches
+    through, via the real `backends.resolve_backend` router -- never a second guess at
+    the prefix rules (see `_ENTITY_HARNESS_LABELS`)."""
+    fn = backends.resolve_backend(model)
+    return _ENTITY_HARNESS_LABELS.get(getattr(fn, "__name__", ""), "unknown")
+
+
+def _entities_subcommand(rest: list[str]) -> int:
+    """`review entities [--json]` -- read-only structural overview of review-cli's own
+    configured entities (harnesses, providers/vendors, models, accounts, effort/role
+    lenses) and how they relate, plus a compact per-harness call-health line from the
+    real call logs (last 7 days).
+
+    This is the Phase-0 list-view slice of the fuller interactive entity/relationship
+    browser tracked in review-cli#487 -- it prints a structured report once and exits;
+    it does not yet support drill-down or live refresh (later phases). Every field comes
+    from data review-cli already owns (the resolved board, `role_models`,
+    `claude_accounts`, and the real call-log stats `review stat` also reads) -- no new
+    external calls. Read-only -- no model is called, no key is printed."""
+    parser = argparse.ArgumentParser(
+        prog="review entities",
+        description="Read-only overview of review-cli's harnesses/providers/models/accounts/efforts.",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+
+    config = load_config()
+    backends.configure_unpaid_providers(config.get("unpaid_providers"))
+    config_models = _split_models(config.get("models") or [])
+    try:
+        board = (
+            board_from_models(config_models, config)
+            if config_models
+            else load_board(config)
+        )
+    except BoardConfigError as exc:
+        print(f"[review entities] {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    from .role_models import ROLE_FALLBACK_MODELS
+    from .claude_accounts import account_email, current_account_name, list_accounts
+    from .dashboard.tokenstats import compute_stat_report
+
+    harnesses: dict[str, dict] = {}
+    models: list[dict] = []
+    for r in board:
+        harness = _entity_harness_for_model(r.model)
+        provider = backends.effective_provider(r.model)
+        available = backends.backend_available(r.model)
+        entry = harnesses.setdefault(harness, {"providers": set(), "seats": 0})
+        entry["providers"].add(provider)
+        entry["seats"] += 1
+        models.append(
+            {
+                "seat": r.model,
+                "display": r.display,
+                "harness": harness,
+                "provider": provider,
+                "role": r.role,
+                "effort": r.effort,
+                "available": available,
+            }
+        )
+
+    account_dirs = list_accounts()
+    current = current_account_name()
+    accounts = [
+        {"name": d.name, "email": account_email(d), "current": d.name == current}
+        for d in account_dirs
+    ]
+
+    since = datetime.now(timezone.utc) - timedelta(days=7)
+    stat_report = compute_stat_report(since=since, top=1)
+
+    payload = {
+        "harnesses": {
+            name: {"seats": v["seats"], "providers": sorted(v["providers"])}
+            for name, v in sorted(harnesses.items())
+        },
+        "models": models,
+        "accounts": accounts,
+        "roles": {role: list(ids) for role, ids in ROLE_FALLBACK_MODELS.items()},
+        "stats_since": stat_report["since"],
+        "stats_harnesses": stat_report["harnesses"],
+    }
+
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    print(_render_entities_report(payload))
+    return 0
+
+
+def _render_entities_report(payload: dict) -> str:
+    """Human-readable `review entities` report -- see `_entities_subcommand`."""
+    lines = ["review entities -- harnesses, providers, models, accounts, efforts\n"]
+
+    lines.append("HARNESSES")
+    for name, info in payload["harnesses"].items():
+        providers = ", ".join(info["providers"]) or "-"
+        lines.append(
+            f"  {name:<12} {info['seats']:>2} seat(s)   providers: {providers}"
+        )
+
+    lines.append("\nMODELS (board order)")
+    name_w = max((len(m["display"]) for m in payload["models"]), default=0)
+    for m in payload["models"]:
+        status = "available" if m["available"] else "unavailable"
+        role = m["role"] or "general"
+        effort = m["effort"] or "-"
+        lines.append(
+            f"  {m['display'].ljust(name_w)}  {m['harness']:<11} {m['provider']:<12} "
+            f"role={role:<12} effort={effort:<6} [{status}]"
+        )
+
+    lines.append("\nACCOUNTS (Claude multi-account registry)")
+    if not payload["accounts"]:
+        lines.append("  none registered -- single implicit account")
+    else:
+        for a in payload["accounts"]:
+            marker = "*" if a["current"] else " "
+            lines.append(
+                f"  {marker} {a['name']:<14} {a['email'] or '(no email on disk)'}"
+            )
+
+    lines.append("\nEFFORT / ROLE LENSES (fallback chain per role)")
+    for role, ids in payload["roles"].items():
+        lines.append(f"  {role:<12} {' -> '.join(ids)}")
+
+    since = payload["stats_since"] or "all recorded history"
+    lines.append(f"\nCALL STATS (since {since})")
+    if not payload["stats_harnesses"]:
+        lines.append("  no calls recorded in this window")
+    else:
+        lines.append(_render_stat_harness_table(payload["stats_harnesses"]))
+
+    lines.append(
+        "\nThis is a read-only Phase-0 snapshot (`review entities --json` for the "
+        "machine-readable form) -- the full interactive browser (drill-down, live "
+        "refresh) is tracked in review-cli#487."
+    )
+    return "\n".join(lines)
+
+
 def _resolve_quorum_check_context(
     cwd_raw: str, verify_identity: bool
 ) -> tuple[str | None, list[str] | None, str]:
@@ -4100,6 +4269,7 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "sessions",
         "task",
         "stat",
+        "entities",
         "trust-module",
         "register-module",
         "spec-web",
@@ -4836,6 +5006,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # sessions), NOT a fan-out mode.
     if argv and argv[0] == "stat":
         return _stat_subcommand(argv[1:])
+    # `review entities` — read-only overview of review-cli's own configured
+    # harnesses/providers/models/accounts/effort-role lenses. A bare MANAGEMENT
+    # subcommand (like stat/task/dashboard/sessions), NOT a fan-out mode (review-cli#487).
+    if argv and argv[0] == "entities":
+        return _entities_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the

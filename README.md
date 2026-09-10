@@ -735,6 +735,27 @@ JSON top-level shape:
 
 ---
 
+## `review entities` — harnesses/providers/models/accounts/effort-lenses overview
+
+Read-only structural report of review-cli's own configured entities: which harnesses
+(codex/claude/opencode/omp/commandcode/z.ai/gemini/openrouter) the active board actually
+routes seats through, each seat's provider/role/effort/availability, the registered
+Claude multi-account roster (`reviewlib.claude_accounts`), the effort/role fallback
+lenses (`reviewlib.role_models.ROLE_FALLBACK_MODELS`), and a compact per-harness
+call-health summary for the last 7 days (the same data `review stat` reads). It makes no
+new external/network calls and prints no keys — every field is reused from data
+review-cli already resolves for a normal run.
+
+```bash
+review entities                    # text report
+review entities --json             # machine-readable
+```
+
+This is the Phase 0 (read-only list view) slice of the fuller interactive
+entity/relationship browser with drill-down and live refresh tracked in issue 487.
+
+---
+
 ## `--detach` / `review jobs` / `review status` / `review wait` — background jobs
 
 `review` advertises no EXTERNAL timeout — a healthy run finishes in minutes, so agents

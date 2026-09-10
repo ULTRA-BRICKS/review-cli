@@ -669,6 +669,31 @@ def test_sessions_listing():
     assert_fails("sessions", "-s", "NOPE", env=env)
 
 
+# --- entities overview (review-cli#487 Phase 0) ----------------------------------------------
+def test_entities_subcommand():
+    help_out = review_out("entities", "--help")
+    assert_in("--json", help_out)
+
+    text = review_out("entities")
+    for section in (
+        "HARNESSES",
+        "MODELS (board order)",
+        "ACCOUNTS",
+        "EFFORT / ROLE LENSES",
+        "CALL STATS",
+    ):
+        assert_in(section, text)
+    assert_in("none registered", text)  # throwaway smoke HOME has no claude-accounts registry
+
+    import json
+
+    payload = json.loads(review_out("entities", "--json"))
+    for key in ("harnesses", "models", "accounts", "roles"):
+        assert key in payload, f"missing {key!r} in --json payload"
+    assert payload["accounts"] == []
+    assert len(payload["models"]) > 0
+
+
 # --- the standalone unit files (each was `python3 tests/test_*.py` in smoke.sh) -------------
 # The dashboard wiring + data/parser/store/server tests, plus the rest of the reviewlib suite.
 # Each runs as its own subprocess (self-contained, redirects its own temp dirs). A dedicated
