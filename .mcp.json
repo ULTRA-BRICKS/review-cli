@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "haft": {
+      "command": "haft",
+      "args": [
+        "serve"
+      ],
+      "env": {
+        "HAFT_PROJECT_ROOT": "${PWD:-.}"
+      }
+    }
+  }
+}
