@@ -102,6 +102,7 @@ from .stats import (
     record_run,
     task_summaries,
 )
+from .taskref import resolve_task_code
 
 if TYPE_CHECKING:
     from agenttools_service import ServiceManager
@@ -1146,7 +1147,8 @@ def _task_subcommand(rest: list[str]) -> int:
         return 0
 
     try:
-        code = normalize_task_code(ns.code)
+        repo_root = _effective_cwd(ns.cwd, warn=False)
+        code = resolve_task_code(ns.code, repo_root)
     except ValueError as exc:
         print(f"[review task] invalid task code: {exc}", file=sys.stderr)
         return 2
@@ -2205,6 +2207,12 @@ def _quorum_check_subcommand(
     passed iteration counts, no repo/diff cross-check) — an escape hatch for a cwd
     that can't resolve a repo, not a way around a genuine mismatch finding.
     """
+    try:
+        repo_root = _effective_cwd(cwd_raw, warn=False)
+        code = resolve_task_code(code, repo_root)
+    except ValueError as exc:
+        print(f"[review task] invalid task code: {exc}", file=sys.stderr)
+        return 2
     repo_id, diff_files, verification_status = _resolve_quorum_check_context(
         cwd_raw, identity_mode
     )
@@ -6001,8 +6009,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     )
     if requires_task_code:
         raw_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
+        task_repo = _effective_cwd(args.cwd, warn=False)
         try:
-            task_code = normalize_task_code(raw_task)
+            task_code = resolve_task_code(raw_task, task_repo)
         except ValueError as exc:
             print(
                 f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True

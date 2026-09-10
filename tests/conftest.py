@@ -88,3 +88,15 @@ def _isolate_claude_accounts_root(tmp_path, monkeypatch):
     this same dir explicitly.
     """
     monkeypatch.setenv("REVIEW_CLAUDE_ACCOUNTS_ROOT", str(tmp_path / "claude-accounts"))
+
+
+@pytest.fixture(autouse=True)
+def _disable_taskref_backend_validation(monkeypatch):
+    """Default every test to permissive task-code shape checks (review-cli#427).
+
+    Backend validation via ``agenttools_taskref`` is opt-in under pytest so the
+    existing synthetic placeholders (``TEST-1``, ``CODE``, …) keep working without
+    mocking ``gh``. Tests that exercise validation set ``REVIEW_TASKREF_VALIDATE=1``
+    explicitly.
+    """
+    monkeypatch.setenv("REVIEW_TASKREF_VALIDATE", "0")
