@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "source_version": 4,
+  "context": {
+    "repository": "ultrabricks/review-cli",
+    "repository_id": 1261272159,
+    "source_ref": "f707ee2b2f643a4621121187df442554aa968244",
+    "snapshot_run": "34541300125",
+    "mutations": "body only",
+    "manual_exclusions": []
+  },
+  "mode": "apply",
+  "started_at": "2026-09-10T23:37:28.363216+00:00",
+  "events": [
+    {
+      "key": "review-cli#511",
+      "number": 511,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "99d382a0093230cd0fcf0cf9aab2c27dd023862e1df1e9cfd51d1d4243e2b7eb"
+    },
+    {
+      "key": "review-cli#508",
+      "number": 508,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "6a8bdaf3f3128fa5ff40cce793770663ec34384fd35626083697c993aafedf10"
+    },
+    {
+      "key": "review-cli#507",
+      "number": 507,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "a826f92722ebe589c9822680df39deff7d64095eac47f79d191854b15a3f43c1"
+    },
+    {
+      "key": "review-cli#505",
+      "number": 505,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "9e6f5f91b5511d27b5ab5b82061e4913a666519ecc7a23960fa61e6bd3e0ef76"
+    },
+    {
+      "key": "review-cli#501",
+      "number": 501,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "4673a46c57fec227d736cc1a628d8f1378fd85bf4eba1651c8ebc18cf6e668c0"
+    },
+    {
+      "key": "review-cli#500",
+      "number": 500,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "2255942487dd61c465dfec3d988ece79c4ed0be39bcafc10da56e1ce72ac21a6"
+    },
+    {
+      "key": "review-cli#499",
+      "number": 499,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "7f26b16c712b17451cac3f7f9c8e599120bf73e995793267b86a815cb935e51e"
+    },
+    {
+      "key": "review-cli#496",
+      "number": 496,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "ddd494e4679a4f218956b740ff0c46873e1cabbf3398f1929851cb5bcc0c28da"
+    },
+    {
+      "key": "review-cli#492",
+      "number": 492,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "296efc5a903180e0a4e778bce0a9ebc8e12e558fb89c1189ed1289bd1ff309bd"
+    },
+    {
+      "key": "review-cli#487",
+      "number": 487,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "358410a2f637efbfaebcbad6894fad42a186f3e970b2a5d56bc47a42446e5beb"
+    },
+    {
+      "key": "review-cli#479",
+      "number": 479,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "c333b361fef38359372d3f5ffb3cb8af387ac4f9b6173976f06ba932bb6f4cc5"
+    },
+    {
+      "key": "review-cli#472",
+      "number": 472,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "8948548d6876a6836c496257b095a24e2a173f1654d889d6aeb2fcb131f21ef7"
+    },
+    {
+      "key": "review-cli#469",
+      "number": 469,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "17dacfbc3689764c40a10936acbad117fe712afc5fe44b79a37099715b2d1e1d"
+    },
+    {
+      "key": "review-cli#465",
+      "number": 465,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "345ed58d60ddc40887416562940a7deda4092b1084e9f99b722dfc6f1d9a4710"
+    },
+    {
+      "key": "review-cli#460",
+      "number": 460,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "e635c906c6b71289ff1565e71ac9808d2a2f59b758f9faa3fd06c89ade3a6e24"
+    },
+    {
+      "key": "review-cli#457",
+      "number": 457,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "7d2ec94e9292016801f8a66efaf1f19ca8ae86fbc404174ed061f20c54c6ced6"
+    },
+    {
+      "key": "review-cli#455",
+      "number": 455,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "3290fac2d92cefbb188db5f6a67125124851fdbc974b6c2b5a1f01be3abcb199"
+    },
+    {
+      "key": "review-cli#454",
+      "number": 454,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "a73330bed4f2f156cfc5c50784a42771a9797029a087cebacee8f4726e843938"
+    },
+    {
+      "key": "review-cli#450",
+      "number": 450,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "4829ce4019f27686ab9afb3f3bde584ca90150083297fe051c8ed1ee52c74679"
+    },
+    {
+      "key": "review-cli#444",
+      "number": 444,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "30dd5037a330b57aca1e2df71a9fe4802decc6307000630cabaf219aeb7b75c8"
+    },
+    {
+      "key": "review-cli#442",
+      "number": 442,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "df51d0091f5e3aa86a768e57702199f4abb06af780e9a7d8b415c6ca48df222a"
+    },
+    {
+      "key": "review-cli#441",
+      "number": 441,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "3df1cfcf931bda9a0962c90ad0911f48afd0660d76566ba424484f347c64ca2b"
+    },
+    {
+      "key": "review-cli#440",
+      "number": 440,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "091cd96a52729fe24c50af391a4897123f549ee6ef86c37c25e283ff146d49b2"
+    },
+    {
+      "key": "review-cli#439",
+      "number": 439,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "c94042ac0e602492f2deaa4454764fcef6e37942f1b2a674c9e26c31339be7dd"
+    },
+    {
+      "key": "review-cli#435",
+      "number": 435,
+      "result": "delivery-uncertain",
+      "observed_before_sha256": "6c9e76f522fe11b3146c6dce00bc751efacb10df9a13f93013bc9b78215b32c7"
+    }
+  ],
+  "writes": 24,
+  "complete": false,
+  "fatal": "delivery-uncertain",
+  "product_acceptance": false,
+  "counts": {
+    "patch-received-awaiting-readback": 24,
+    "delivery-uncertain": 1
+  },
+  "pending_write": {
+    "key": "review-cli#435",
+    "intended_sha256": "709564ad08e2f44882803611542c0b43410108dacca8b791d37ad2efc35fcfa0"
+  },
+  "readback_error": "HTTPError",
+  "planned": 347,
+  "remaining_or_conflicted": 347,
+  "finished_at": "2026-09-10T23:40:57.322206+00:00"
+}
