@@ -2207,12 +2207,6 @@ def _quorum_check_subcommand(
     passed iteration counts, no repo/diff cross-check) — an escape hatch for a cwd
     that can't resolve a repo, not a way around a genuine mismatch finding.
     """
-    try:
-        repo_root = _effective_cwd(cwd_raw, warn=False)
-        code = resolve_task_code(code, repo_root)
-    except ValueError as exc:
-        print(f"[review task] invalid task code: {exc}", file=sys.stderr)
-        return 2
     repo_id, diff_files, verification_status = _resolve_quorum_check_context(
         cwd_raw, identity_mode
     )
