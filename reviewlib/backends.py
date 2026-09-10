@@ -410,6 +410,7 @@ def review_codex(
         backend="codex",
         round_no=round_no,
         announce=_ANNOUNCE_LOGS,
+        true_silence_timeout=true_silence_timeout_seconds(model),
         header_argv0=f"codex -m {_safe_log_header(codex_model)}"
         if codex_model
         else None,
@@ -3692,6 +3693,7 @@ def review_claude_cli(
         backend="claude",
         round_no=round_no,
         announce=_ANNOUNCE_LOGS,
+        true_silence_timeout=true_silence_timeout_seconds(model),
     )
     # Belt-and-suspenders: strip any terminal control noise the CLI still leaked into the
     # pipe (a stray spinner frame from claude-p, an escape sequence) so it can never
@@ -3759,6 +3761,7 @@ def review_claude_cli_with_images(
             backend="claude",
             round_no=round_no,
             announce=_ANNOUNCE_LOGS,
+            true_silence_timeout=true_silence_timeout_seconds(model),
         )
     # The TemporaryDirectory context deleted tmp; remove the trust entry that
     # _ensure_workspace_trusted seeded so dead /tmp/review-cli-claude-images-* paths

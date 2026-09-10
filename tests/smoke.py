@@ -704,6 +704,13 @@ _UNIT_FILES = [
     # no-cooldown-on-a-genuine-child-exit-125 safeguard (codex/Fable review findings).
     # Isolates its own $REVIEW_SEAT_COOLDOWN_FILE per test — no shared env needed here.
     ("test_true_silence_cooldown_wiring.py", {}),
+    # 4 backend wiring checks (review-cli#474): codex/omp/claude_cli/claude_cli_with_images
+    # each forward true_silence_timeout=true_silence_timeout_seconds(model) to _run_streamed.
+    ("test_true_silence_backend_wiring.py", {}),
+    # Backend-agnostic regression test (review-cli#474): _run_streamed itself reaps a
+    # real, zero-output subprocess via true_silence_timeout — independent of any
+    # single backend's wiring (that's covered separately by the wiring test above).
+    ("test_true_silence_hang_regression.py", {}),
     # The omp (Oh My Pi) agentic read-only backend (review-cli#174): routing, the
     # `@payloadfile` launch contract, the offline sqlite auth probe, unpaid gating,
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed

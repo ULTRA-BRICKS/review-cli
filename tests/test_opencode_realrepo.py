@@ -388,14 +388,17 @@ def test_stall_watchdog_owns_zero_output_for_watched_model():
             review_backends.review_opencode(
                 "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
             )
-            assert cap.liveness_timeout == review_backends._OPENCODE_DEFAULT_STALL_SECONDS
+            assert (
+                cap.liveness_timeout == review_backends._OPENCODE_DEFAULT_STALL_SECONDS
+            )
             assert cap.true_silence_timeout is None, cap.true_silence_timeout
             unwatched = "oc:moonshotai/kimi-k2.5"
             assert not review_backends._opencode_model_needs_stall_watchdog(unwatched)
             review_backends.review_opencode(unwatched, "Review.", "DIFF", repo, 1200)
             assert cap.liveness_timeout is None
-            assert cap.true_silence_timeout == model_behavior.true_silence_timeout_seconds(
-                unwatched
+            assert (
+                cap.true_silence_timeout
+                == model_behavior.true_silence_timeout_seconds(unwatched)
             )
             assert cap.true_silence_timeout is not None
 
@@ -636,6 +639,7 @@ class _CapturedCodex:
         announce=False,
         input_text="",
         header_argv0=None,
+        true_silence_timeout=None,
     ):
         self.argv = list(argv)
         self.cwd = Path(cwd)

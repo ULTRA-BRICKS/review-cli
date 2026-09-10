@@ -16,6 +16,7 @@ the developer's real ~/.omp/agent/agent.db is never touched.
 
 Mock harness style mirrors tests/test_opencode_realrepo.py.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -145,11 +146,20 @@ def _omp_auth_db(provider_rows: list[tuple[str, str | None]]):
 
 def test_omp_routes_to_review_omp():
     assert review_backends.resolve_backend("omp") is review_backends.review_omp
-    assert review_backends.resolve_backend("omp:kimi-code/k3") is review_backends.review_omp
+    assert (
+        review_backends.resolve_backend("omp:kimi-code/k3")
+        is review_backends.review_omp
+    )
     # The matcher lowercases before dispatch, like every other named route.
-    assert review_backends.resolve_backend("OMP:Kimi-Code/K3") is review_backends.review_omp
+    assert (
+        review_backends.resolve_backend("OMP:Kimi-Code/K3")
+        is review_backends.review_omp
+    )
     # `omp:` must NOT fall through to the opencode catch-all.
-    assert review_backends._match_named_backend("omp:kimi-code/k3") is review_backends.review_omp
+    assert (
+        review_backends._match_named_backend("omp:kimi-code/k3")
+        is review_backends.review_omp
+    )
 
 
 def test_omp_is_a_known_backend_token():
@@ -189,7 +199,9 @@ def test_omp_launches_print_ephemeral_readonly_with_at_file_payload():
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d) / "repo"
             repo.mkdir()
-            res = review_backends.review_omp("omp:kimi-code/k3", "Review.", "some diff", repo, 60)
+            res = review_backends.review_omp(
+                "omp:kimi-code/k3", "Review.", "some diff", repo, 60
+            )
         assert res.returncode == 0, res
         argv = cap.argv or []
         assert argv[0].endswith("/omp"), argv
@@ -219,7 +231,9 @@ def test_omp_launches_print_ephemeral_readonly_with_at_file_payload():
         env = cap.env or {}
         assert env.get("HOME") == str(cap.cwd / "home"), env.get("HOME")
         assert env.get("HOME") != os.path.expanduser("~"), env.get("HOME")
-        assert env.get("PI_CODING_AGENT_DIR") == str(review_backends._omp_agent_dir()), env
+        assert env.get("PI_CODING_AGENT_DIR") == str(
+            review_backends._omp_agent_dir()
+        ), env
         assert "OMP_PROFILE" not in env, env
         # The neutral launch cwd (and the payload with it) is cleaned up after the run.
         assert not cap.cwd.exists(), cap.cwd
@@ -238,7 +252,9 @@ def test_omp_launches_print_ephemeral_readonly_with_at_file_payload():
         assert cap.payload_existed is True, cap.argv
         assert cap.payload_text is not None and "Review." in cap.payload_text
         assert "some diff" in cap.payload_text
-        assert "some diff" not in " ".join(a for a in argv if not a.startswith("@")), argv
+        assert "some diff" not in " ".join(a for a in argv if not a.startswith("@")), (
+            argv
+        )
         # The payload file lives OUTSIDE the reviewed repo.
         assert cap.payload_path is not None
         assert repo not in cap.payload_path.parents, cap.payload_path
@@ -252,7 +268,9 @@ def test_omp_message_invites_reading_files_read_only():
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d) / "repo"
             repo.mkdir()
-            review_backends.review_omp("omp:kimi-code/k3", "Review.", "DIFFBODY", repo, 60)
+            review_backends.review_omp(
+                "omp:kimi-code/k3", "Review.", "DIFFBODY", repo, 60
+            )
         message = cap.payload_text or ""
         assert "read" in message.lower(), message
         assert "DIFFBODY" in message, message
@@ -276,14 +294,18 @@ def test_omp_bare_seat_passes_no_model_flag():
 def test_omp_keeps_requested_timeout():
     with _capture_omp() as cap:
         with tempfile.TemporaryDirectory() as d:
-            review_backends.review_omp("omp:kimi-code/k3", "Review.", "DIFF", Path(d), 1200)
+            review_backends.review_omp(
+                "omp:kimi-code/k3", "Review.", "DIFF", Path(d), 1200
+            )
         assert cap.timeout == 1200, cap.timeout
 
 
 def test_omp_effort_maps_to_thinking_flag():
     with _capture_omp() as cap:
         with tempfile.TemporaryDirectory() as d:
-            review_backends.review_omp("omp:kimi-code/k3", "Review.", "DIFF", Path(d), 60, effort="high")
+            review_backends.review_omp(
+                "omp:kimi-code/k3", "Review.", "DIFF", Path(d), 60, effort="high"
+            )
         argv = cap.argv or []
         assert "--thinking" in argv, argv
         assert argv[argv.index("--thinking") + 1] == "high", argv
@@ -345,7 +367,9 @@ def test_omp_available_with_provider_credential():
     review_backends._which = lambda name: f"/fake/bin/{name}"  # type: ignore[assignment]
     try:
         with _omp_auth_db([("kimi-code", None)]):
-            assert review_backends.backend_unavailable_reason("omp:kimi-code/k3") is None
+            assert (
+                review_backends.backend_unavailable_reason("omp:kimi-code/k3") is None
+            )
             assert review_backends.backend_available("omp:kimi-code/k3") is True
     finally:
         review_backends._which = orig_which
@@ -357,11 +381,19 @@ def test_omp_availability_is_provider_scoped():
     try:
         with _omp_auth_db([("kimi-code", None), ("openai", "quota exhausted")]):
             # A credential for ANOTHER provider does not make the kimi-code seat live...
-            assert review_backends.backend_unavailable_reason("omp:openai/gpt-5.5") is not None
+            assert (
+                review_backends.backend_unavailable_reason("omp:openai/gpt-5.5")
+                is not None
+            )
             # ...and a DISABLED credential does not count.
-            assert review_backends.backend_unavailable_reason("omp:kimi-code/k3") is None
+            assert (
+                review_backends.backend_unavailable_reason("omp:kimi-code/k3") is None
+            )
         with _omp_auth_db([("kimi-code", "token revoked")]):
-            assert review_backends.backend_unavailable_reason("omp:kimi-code/k3") is not None
+            assert (
+                review_backends.backend_unavailable_reason("omp:kimi-code/k3")
+                is not None
+            )
         # A bare `omp` seat is live when ANY usable credential exists.
         with _omp_auth_db([("kimi-code", None)]):
             assert review_backends.backend_unavailable_reason("omp") is None
@@ -433,7 +465,9 @@ def test_omp_forced_api_mode_fails_loudly():
         os.environ["REVIEW_LOG_DIR"] = log_dir
         try:
             with _capture_omp() as cap:
-                res = review_backends.review_omp("omp:kimi-code/k3", "q", "", REPO_ROOT, 10)
+                res = review_backends.review_omp(
+                    "omp:kimi-code/k3", "q", "", REPO_ROOT, 10
+                )
                 assert cap.argv is None  # never launched
             assert res.returncode == 1, res
             assert "REVIEW_OMP_MODE" in res.stderr, res.stderr
@@ -455,7 +489,14 @@ def test_omp_auth_db_follows_omp_storage_env():
     """The probe must look where omp ITSELF would (codex review of #174):
     PI_CODING_AGENT_DIR replaces the storage dir; OMP_PROFILE isolates under
     ~/.omp/profiles/<name>/agent; the OMP_AUTH_DB test override wins over both."""
-    saved = {k: os.environ.get(k) for k in ("PI_CODING_AGENT_DIR", "OMP_PROFILE", review_backends._OMP_AUTH_DB_ENV)}
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "PI_CODING_AGENT_DIR",
+            "OMP_PROFILE",
+            review_backends._OMP_AUTH_DB_ENV,
+        )
+    }
     try:
         os.environ.pop(review_backends._OMP_AUTH_DB_ENV, None)
         os.environ.pop("OMP_PROFILE", None)
@@ -463,7 +504,10 @@ def test_omp_auth_db_follows_omp_storage_env():
         assert review_backends._omp_auth_db() == Path("/tmp/custom-agent/agent.db")
         os.environ.pop("PI_CODING_AGENT_DIR", None)
         os.environ["OMP_PROFILE"] = "work"
-        assert review_backends._omp_auth_db() == Path.home() / ".omp" / "profiles" / "work" / "agent" / "agent.db"
+        assert (
+            review_backends._omp_auth_db()
+            == Path.home() / ".omp" / "profiles" / "work" / "agent" / "agent.db"
+        )
         # The explicit storage dir beats the profile; the test override beats everything.
         os.environ["PI_CODING_AGENT_DIR"] = "/tmp/custom-agent"
         assert review_backends._omp_auth_db() == Path("/tmp/custom-agent/agent.db")
@@ -571,12 +615,26 @@ def test_dashboard_attributes_omp_call_to_omp_board_seat():
 
     from reviewlib.dashboard import parser as p
 
-    call = p.CallLog("", "x.log", datetime(2026, 8, 1, tzinfo=timezone.utc), "omp", 0,
-                     "omp -m kimi-code/k3", "")
+    call = p.CallLog(
+        "",
+        "x.log",
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        "omp",
+        0,
+        "omp -m kimi-code/k3",
+        "",
+    )
     assert p.model_id_for_call(call) == "omp:kimi-code/k3"
     # A bare omp call with no -m stays the backend name (no mis-attribution).
-    bare = p.CallLog("", "y.log", datetime(2026, 8, 1, tzinfo=timezone.utc), "omp", 0,
-                     "/opt/homebrew/bin/omp", "")
+    bare = p.CallLog(
+        "",
+        "y.log",
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        "omp",
+        0,
+        "/opt/homebrew/bin/omp",
+        "",
+    )
     assert p.model_id_for_call(bare) == "omp"
 
 

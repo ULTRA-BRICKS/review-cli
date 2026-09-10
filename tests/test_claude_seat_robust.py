@@ -17,6 +17,7 @@ corrupting / blanking the verdict. The fix:
 These tests pin that contract without spawning a real model. Same plain-test harness
 as tests/test_streaming.py — no pytest dependency.
 """
+
 from __future__ import annotations
 
 import sys
@@ -41,15 +42,16 @@ def _with_effort_support(fn):
 
 # --- the strip helper is robust to real TUI noise --------------------------------------
 
+
 def test_strip_removes_csi_osc_and_c0_control_bytes():
     # A realistic smear: CSI colour codes, cursor moves, an OSC hyperlink, a spinner
     # frame (bare ESC), and stray C0 control bytes interleaved with the real verdict.
     noisy = (
-        "\x1b[2J\x1b[H"                       # clear screen + home (CSI)
-        "\x1b[38;5;213m## verdict\x1b[0m "    # coloured heading
+        "\x1b[2J\x1b[H"  # clear screen + home (CSI)
+        "\x1b[38;5;213m## verdict\x1b[0m "  # coloured heading
         "\x1b]8;;https://x\x07link\x1b]8;;\x07"  # OSC hyperlink
-        "\x07\x08[needs-changes]\x1bc"        # BEL, BS, then a lone ESC c (reset)
-        "\x1b[1A\x1b[2K done\n"               # cursor-up + erase-line, real text, newline
+        "\x07\x08[needs-changes]\x1bc"  # BEL, BS, then a lone ESC c (reset)
+        "\x1b[1A\x1b[2K done\n"  # cursor-up + erase-line, real text, newline
     )
     clean = strip_control_sequences(noisy)
     assert clean == "## verdict link[needs-changes] done\n", repr(clean)
@@ -62,11 +64,11 @@ def test_strip_parses_garbled_tui_transcript_to_correct_verdict():
     # A condensed sample of the kind of fullscreen-TUI bleed that historically reached
     # the seat: spinner frames + banner fragments + an erase-line, around the verdict.
     transcript = (
-        "\x1b[2K\x1b[1G✶ Transmuting…\x1b[0m"      # spinner frame
-        "\x1b[36mClaude Code v2.1.187\x1b[0m\n"               # banner
+        "\x1b[2K\x1b[1G✶ Transmuting…\x1b[0m"  # spinner frame
+        "\x1b[36mClaude Code v2.1.187\x1b[0m\n"  # banner
         "## claude:claude-opus-4-8 review\n"
         "The function subtracts instead of adding.\n"
-        "\x1b[31m## verdict [needs-changes]\x1b[0m\n"          # coloured verdict
+        "\x1b[31m## verdict [needs-changes]\x1b[0m\n"  # coloured verdict
     )
     clean = strip_control_sequences(transcript)
     assert "## verdict [needs-changes]" in clean
@@ -92,11 +94,18 @@ def test_strip_drops_carriage_return_keeps_tab_and_newline():
 
 # --- argv construction: direct `claude --print` path -----------------------------------
 
+
 def test_direct_claude_argv_uses_print_mode_no_tui_flags():
-    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
-        "/usr/local/bin/claude", direct=True, model="claude-opus-4-8",
-        cwd=Path("/tmp/repo"), timeout=120, effort="xhigh",
-    ))
+    argv = _with_effort_support(
+        lambda: _backends._claude_cli_argv(
+            "/usr/local/bin/claude",
+            direct=True,
+            model="claude-opus-4-8",
+            cwd=Path("/tmp/repo"),
+            timeout=120,
+            effort="xhigh",
+        )
+    )
     # Genuine print mode, text output (the clean non-TUI path).
     assert "--print" in argv
     assert argv[argv.index("--output-format") + 1] == "text"
@@ -112,25 +121,34 @@ def test_direct_claude_argv_uses_print_mode_no_tui_flags():
     assert argv[argv.index("--tools") + 1] == ""
     assert "--disallowedTools" not in argv
     # The direct path does NOT carry claude-p-only flags (those drive the TUI wrapper).
-    assert "--cwd" not in argv          # claude uses the process cwd
+    assert "--cwd" not in argv  # claude uses the process cwd
     assert "--timeout-sec" not in argv  # review-cli's own timeout governs the call
-    assert "-p" not in argv             # claude-p's print toggle; here we use --print
+    assert "-p" not in argv  # claude-p's print toggle; here we use --print
 
 
 def test_direct_claude_argv_omits_model_when_unspecified():
     argv = _backends._claude_cli_argv(
-        "/usr/local/bin/claude", direct=True, model=None,
-        cwd=Path("/tmp/repo"), timeout=120,
+        "/usr/local/bin/claude",
+        direct=True,
+        model=None,
+        cwd=Path("/tmp/repo"),
+        timeout=120,
     )
     assert "--model" not in argv
     assert "--print" in argv
 
 
 def test_direct_claude_argv_maps_minimal_effort_to_low():
-    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
-        "/usr/local/bin/claude", direct=True, model="claude-opus-4-8",
-        cwd=Path("/tmp/repo"), timeout=120, effort="minimal",
-    ))
+    argv = _with_effort_support(
+        lambda: _backends._claude_cli_argv(
+            "/usr/local/bin/claude",
+            direct=True,
+            model="claude-opus-4-8",
+            cwd=Path("/tmp/repo"),
+            timeout=120,
+            effort="minimal",
+        )
+    )
     assert argv[argv.index("--effort") + 1] == "low"
 
 
@@ -139,8 +157,12 @@ def test_direct_claude_argv_omits_effort_when_binary_lacks_flag():
     _backends._claude_cli_supports_effort = lambda _binary: False
     try:
         argv = _backends._claude_cli_argv(
-            "/usr/local/bin/claude", direct=True, model="claude-opus-4-8",
-            cwd=Path("/tmp/repo"), timeout=120, effort="high",
+            "/usr/local/bin/claude",
+            direct=True,
+            model="claude-opus-4-8",
+            cwd=Path("/tmp/repo"),
+            timeout=120,
+            effort="high",
         )
     finally:
         _backends._claude_cli_supports_effort = old_supports
@@ -169,11 +191,18 @@ def test_claude_effort_probe_degrades_to_prompt_hint_on_probe_failures():
 
 # --- argv construction: legacy claude-p fallback ---------------------------------------
 
+
 def test_claude_p_fallback_argv_keeps_wrapper_surface():
-    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
-        "/usr/local/bin/claude-p", direct=False, model="claude-opus-4-8",
-        cwd=Path("/tmp/repo"), timeout=90, effort="xhigh",
-    ))
+    argv = _with_effort_support(
+        lambda: _backends._claude_cli_argv(
+            "/usr/local/bin/claude-p",
+            direct=False,
+            model="claude-opus-4-8",
+            cwd=Path("/tmp/repo"),
+            timeout=90,
+            effort="xhigh",
+        )
+    )
     # The wrapper needs its own --cwd / --tools '' / --timeout-sec / -p surface, but
     # review-cli disables claude-p's wall timer so _run_streamed owns the idle timeout.
     assert argv[argv.index("--cwd") + 1] == "/tmp/repo"
@@ -189,31 +218,48 @@ def test_claude_p_fallback_argv_keeps_wrapper_surface():
 
 def test_claude_p_fallback_timeout_disables_wrapper_wall_reap():
     argv = _backends._claude_cli_argv(
-        "/usr/local/bin/claude-p", direct=False, model="claude-fable-5",
-        cwd=Path("/tmp/repo"), timeout=90,
+        "/usr/local/bin/claude-p",
+        direct=False,
+        model="claude-fable-5",
+        cwd=Path("/tmp/repo"),
+        timeout=90,
     )
     assert argv[argv.index("--timeout-sec") + 1] == "0"
 
 
 def test_claude_p_fallback_maps_minimal_effort_to_low():
-    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
-        "/usr/local/bin/claude-p", direct=False, model="claude-opus-4-8",
-        cwd=Path("/tmp/repo"), timeout=90, effort="minimal",
-    ))
+    argv = _with_effort_support(
+        lambda: _backends._claude_cli_argv(
+            "/usr/local/bin/claude-p",
+            direct=False,
+            model="claude-opus-4-8",
+            cwd=Path("/tmp/repo"),
+            timeout=90,
+            effort="minimal",
+        )
+    )
     assert argv[argv.index("--effort") + 1] == "low"
 
 
 def test_direct_claude_image_argv_threads_effort():
-    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
-        "/usr/local/bin/claude", direct=True, model="claude-fable-5",
-        cwd=Path("/tmp/repo"), timeout=90, image_dir=Path("/tmp/images"), effort="xhigh",
-    ))
+    argv = _with_effort_support(
+        lambda: _backends._claude_cli_argv(
+            "/usr/local/bin/claude",
+            direct=True,
+            model="claude-fable-5",
+            cwd=Path("/tmp/repo"),
+            timeout=90,
+            image_dir=Path("/tmp/images"),
+            effort="xhigh",
+        )
+    )
     assert argv[argv.index("--tools") + 1] == "Read"
     assert argv[argv.index("--add-dir") + 1] == "/tmp/images"
     assert argv[argv.index("--effort") + 1] == "xhigh"
 
 
 # --- binary resolution prefers the direct print binary ---------------------------------
+
 
 def test_binary_resolution_prefers_claude_over_claude_p():
     saved = _backends._which_optional
@@ -245,6 +291,7 @@ def test_binary_resolution_falls_back_to_claude_p_when_claude_absent():
 
 # --- decoration-hostile env ------------------------------------------------------------
 
+
 def test_claude_cli_env_disables_terminal_decoration():
     env = _backends._claude_cli_env()
     assert env["TERM"] == "dumb"
@@ -256,19 +303,35 @@ def test_claude_cli_env_disables_terminal_decoration():
 
 # --- end-to-end: the spawned argv + env are wired, and the verdict is stripped ----------
 
+
 def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     import tempfile
 
     captured = {}
 
-    def _fake_run_streamed(argv, *, cwd, input_text, env, timeout, backend, round_no, announce):
+    def _fake_run_streamed(
+        argv,
+        *,
+        cwd,
+        input_text,
+        env,
+        timeout,
+        backend,
+        round_no,
+        announce,
+        true_silence_timeout=None,
+    ):
         captured["argv"] = argv
         captured["env"] = env
         captured["timeout"] = timeout
         captured["backend"] = backend
         # Simulate a backend that leaked a coloured/cursor-noisy verdict into stdout.
-        noisy = "\x1b[32m## claude:claude-opus-4-8 review\x1b[0m\nlgtm\n## verdict [ok]\n"
-        return ReviewResult(model="x", command="x", returncode=0, stdout=noisy, stderr="")
+        noisy = (
+            "\x1b[32m## claude:claude-opus-4-8 review\x1b[0m\nlgtm\n## verdict [ok]\n"
+        )
+        return ReviewResult(
+            model="x", command="x", returncode=0, stdout=noisy, stderr=""
+        )
 
     saved_run = _backends._run_streamed
     saved_which = _backends._which_optional
@@ -278,7 +341,9 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     _backends._ensure_workspace_trusted = lambda cwd: None
     try:
         with tempfile.TemporaryDirectory() as d:
-            res = _backends.review_claude_cli("claude:claude-opus-4-8", "review", "diff", Path(d), 30)
+            res = _backends.review_claude_cli(
+                "claude:claude-opus-4-8", "review", "diff", Path(d), 30
+            )
     finally:
         _backends._run_streamed = saved_run
         _backends._which_optional = saved_which
@@ -303,7 +368,18 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
     captured = {}
     trusted: list[Path] = []
 
-    def _fake_run_streamed(argv, *, cwd, input_text, env, timeout, backend, round_no, announce):
+    def _fake_run_streamed(
+        argv,
+        *,
+        cwd,
+        input_text,
+        env,
+        timeout,
+        backend,
+        round_no,
+        announce,
+        true_silence_timeout=None,
+    ):
         captured["argv"] = argv
         captured["cwd"] = Path(cwd)
         captured["input_text"] = input_text
@@ -314,7 +390,9 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
         assert refs and Path(refs[0]).is_file()
         assert Path(refs[0]).parent == add_dir
         assert Path(cwd) == add_dir
-        return ReviewResult(model="x", command="x", returncode=0, stdout="I saw the pixels", stderr="")
+        return ReviewResult(
+            model="x", command="x", returncode=0, stdout="I saw the pixels", stderr=""
+        )
 
     saved_run = _backends._run_streamed
     saved_which = _backends._which_optional
@@ -328,7 +406,11 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
             image = root / "shot.png"
             image.write_bytes(b"\x89PNG\r\n\x1a\n")
             res = _backends.review_claude_cli_with_images(
-                "claude:claude-opus-4-8", "review this screenshot", "", root, 30,
+                "claude:claude-opus-4-8",
+                "review this screenshot",
+                "",
+                root,
+                30,
                 images=(image,),
             )
     finally:
@@ -354,21 +436,27 @@ def test_review_claude_cli_with_images_falls_back_when_no_image_can_be_staged():
 
     captured = {}
 
-    def _fake_review_claude_cli(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+    def _fake_review_claude_cli(
+        model, prompt, diff, cwd, timeout, round_no=0, effort=None
+    ):
         captured["model"] = model
         captured["prompt"] = prompt
         captured["diff"] = diff
         captured["cwd"] = Path(cwd)
         captured["timeout"] = timeout
         captured["round_no"] = round_no
-        return ReviewResult(model=model, command="text-only", returncode=0, stdout="fallback", stderr="")
+        return ReviewResult(
+            model=model, command="text-only", returncode=0, stdout="fallback", stderr=""
+        )
 
     saved_review = _backends.review_claude_cli
     saved_run = _backends._run_streamed
     saved_which = _backends._which_optional
     saved_trust = _backends._ensure_workspace_trusted
     _backends.review_claude_cli = _fake_review_claude_cli
-    _backends._run_streamed = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("image path should not run"))
+    _backends._run_streamed = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("image path should not run")
+    )
     _backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
     _backends._ensure_workspace_trusted = lambda cwd: None
     try:
@@ -376,7 +464,12 @@ def test_review_claude_cli_with_images_falls_back_when_no_image_can_be_staged():
             root = Path(d)
             missing = root / "missing.png"
             res = _backends.review_claude_cli_with_images(
-                "claude:claude-opus-4-8", "review", "diff", root, 30, round_no=4,
+                "claude:claude-opus-4-8",
+                "review",
+                "diff",
+                root,
+                30,
+                round_no=4,
                 images=(missing,),
             )
     finally:
@@ -394,9 +487,13 @@ def test_review_claude_cli_with_images_falls_back_when_no_image_can_be_staged():
 def test_have_claude_cli_true_with_either_binary():
     saved = _backends._which_optional
     try:
-        _backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+        _backends._which_optional = lambda name: (
+            "/bin/claude" if name == "claude" else None
+        )
         assert _backends._have_claude_cli() is True
-        _backends._which_optional = lambda name: "/bin/claude-p" if name == "claude-p" else None
+        _backends._which_optional = lambda name: (
+            "/bin/claude-p" if name == "claude-p" else None
+        )
         assert _backends._have_claude_cli() is True
         _backends._which_optional = lambda name: None
         assert _backends._have_claude_cli() is False
