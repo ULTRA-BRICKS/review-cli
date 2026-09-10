@@ -1607,6 +1607,15 @@ def compute_stats(sessions: list[Session]) -> dict:
     true_silence_calls = 0
     ok_calls = 0
     running_calls = 0
+    # `by_role` above only covers brainstorm PERSONAS (Session.roles() is empty for every
+    # other mode). `by_dimension` is the separate, always-populated counterpart: every call
+    # in every mode gets attributed to its BOARD lens (correctness/performance/quality/
+    # security/tests/consistency/contracts/architect — the static model->role assignment in
+    # DEFAULT_BOARD), with ok/error counts, so `review diff`/quorum runs — the vast majority
+    # of calls — show a real per-dimension pass/fail breakdown instead of nothing. Off-board
+    # models (no board-assigned lens) are skipped here; they already surface via `by_model`.
+    board_role_by_model = {b["model"]: b["role"] for b in _board_models()}
+    by_dimension: dict[str, dict] = {}
     for s in sessions:
         by_mode[s.mode] = by_mode.get(s.mode, 0) + 1
         by_day[s.started.date().isoformat()] = (
@@ -1657,6 +1666,19 @@ def compute_stats(sessions: list[Session]) -> dict:
                 error_calls += 1
             else:
                 ok_calls += 1
+            dim = board_role_by_model.get(model_id_for_call(c))
+            if dim is not None and c.completed:
+                entry = by_dimension.setdefault(dim, {"calls": 0, "ok": 0, "error": 0})
+                entry["calls"] += 1
+                # codex review finding (review-cli#351): `has_error` is EXIT-code-authoritative,
+                # but an EXIT-0 paywall/empty-output call is still a real failure (Fable returns
+                # 0 with an "unavailable" body). `classify_call` is the canonical health verdict
+                # used everywhere else in the dashboard (health badges, Models tab) -- use it
+                # here too so a lens's ok-rate can't hide a chronically paywalled/empty seat.
+                if classify_call(c) == HEALTH_OK:
+                    entry["ok"] += 1
+                else:
+                    entry["error"] += 1
     durations.sort()
 
     def _pct(p: float) -> float | None:
@@ -1671,6 +1693,11 @@ def compute_stats(sessions: list[Session]) -> dict:
         item["modes"] = sorted(item["modes"])
         tasks.append(item)
     tasks.sort(key=lambda item: item.get("last_started") or "", reverse=True)
+
+    for entry in by_dimension.values():
+        entry["ok_rate"] = (
+            round(entry["ok"] / entry["calls"], 4) if entry["calls"] else None
+        )
 
     return {
         "session_count": len(sessions),
@@ -1688,6 +1715,7 @@ def compute_stats(sessions: list[Session]) -> dict:
         "by_mode": by_mode,
         "by_model": by_model,
         "by_role": by_role,
+        "by_dimension": by_dimension,
         "by_task": by_task,
         "tasks": tasks,
         "by_day": dict(sorted(by_day.items())),

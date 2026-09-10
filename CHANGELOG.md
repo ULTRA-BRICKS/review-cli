@@ -3,6 +3,13 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.6 — 2026-09-10
+
+- **Feat(dashboard): interactive Stats timeline + per-review-dimension breakdown
+  (review-cli#343).** Replaces the old count-sorted per-day list with a horizontal
+  time-axis chart (day/week/month toggle, click-through drill-in) and surfaces
+  `compute_stats()`'s `by_dimension` breakdown (ok/error/ok_rate per board lens).
+
 ## 0.37.5 — 2026-09-10
 
 - **New `review entities` bare subcommand — read-only harness/provider/model/
