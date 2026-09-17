@@ -2385,10 +2385,92 @@ def _spec_web_lifecycle(action: str, rest: list[str]) -> int:
     return rc
 
 
+def _clip_text(text: str, limit: int, *, collapse_whitespace: bool = False) -> str:
+    """Truncate ``text`` to ``limit`` characters with a trailing ellipsis, stripping any
+    trailing whitespace left by the cut. ``collapse_whitespace`` additionally joins the
+    text onto one line first (used for the terminal reminder line, where an embedded
+    newline would otherwise break the "one line per comment" contract; not used for the
+    tg message body, which renders literal newlines fine)."""
+    if collapse_whitespace:
+        text = " ".join(text.split())
+    if limit <= 0:
+        return ""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+_WAITING_ON = {"submitted": "an agent reply", "answered": "reviewer resolution"}
+
+
+def _waiting_on_phrase(status: str | None) -> str:
+    """What a stalled comment in ``status`` is waiting on: an agent reply for
+    ``submitted``, reviewer resolution for ``answered``. Shared by `_stale_reminder_line`
+    and `_stale_summary_for_tg` so the per-comment line and the tg summary can't drift
+    into describing the same stall differently. `stale_comments()` only ever produces
+    these two statuses (`OPEN_CYCLE_STATUSES`); an unexpected value falls back to
+    "reviewer resolution" rather than raising, since this is a display-only formatter."""
+    return _WAITING_ON.get(status, "reviewer resolution")
+
+
+def _stale_reminder_line(stale: dict) -> str:
+    """One indented reminder line for a comment `specweb.store.stale_comments` flagged as
+    a stalled review-cycle: stuck in ``submitted`` (the agent hasn't replied) or
+    ``answered`` (the agent replied, the reviewer hasn't resolved it) well past the
+    reminder threshold. Shared verbatim (via `_print_stale_reminders`) by ``spec-web
+    list``, ``spec-web start``/``status``, and the ``spec-web reply`` command's stderr
+    nudge; the reply command's TG summary (`_stale_summary_for_tg`) uses different
+    wording for a multi-comment count, but the same `_waiting_on_phrase`, so at least
+    that half can't drift.
+
+    The quote is whitespace-collapsed before clipping: it is the reviewer's verbatim
+    selection, which can span a paragraph break, and a literal embedded newline would
+    otherwise break this "one line per stalled comment" contract."""
+    kind = stale.get("kind") or "remark"
+    waiting_on = _waiting_on_phrase(stale.get("status"))
+    age = stale.get("age_hours") or 0.0
+    raw_quote = stale.get("quote") or stale.get("body") or ""
+    clipped = _clip_text(str(raw_quote), 60, collapse_whitespace=True)
+    return (
+        f"    ⚠ stalled {kind} #{stale.get('id') or '?'} — {age:.1f}h waiting on "
+        f"{waiting_on}: \"{clipped}\""
+    )
+
+
+def _print_stale_reminders(stale: list[dict], *, stream: TextIO | None = None) -> None:
+    """Print one `_stale_reminder_line` per already-filtered stalled comment (the output
+    of `specweb.store.stale_comments` / `SpecStore.stale_comments`) — the single loop
+    shared by all three surfaces (`spec-web list`, `spec-web start`/`status`, and the
+    reply command's stderr nudge) so they can't drift out of sync with each other.
+    ``stream=None`` prints to stdout (``print``'s own default); the reply command passes
+    ``sys.stderr`` since its stdout is reserved for the "replied to ..." confirmation."""
+    for s in stale:
+        print(_stale_reminder_line(s), file=stream)
+
+
+def _comments_for_reminder(spec_path: Path | str) -> list[dict]:
+    """This spec's comments, or ``[]`` on any read failure (a deleted/corrupted store —
+    the caller is printing an at-a-glance summary, not doing something that should abort
+    on a single unreadable spec). Shared by `spec-web list` and `spec-web start`/
+    `status`, the two registry-driven callers that both fetch-then-reminder per spec; the
+    `spec-web reply` surface already has a live, known-good `SpecStore` in hand and calls
+    its `stale_comments()` method directly instead."""
+    from .specweb.store import SpecStore
+
+    try:
+        return SpecStore(spec_path).all_comments()
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _spec_web_print_registry(host: str, port: int) -> None:
-    """Print the navigator URL(s) + every registered spec's name-based URL (loopback + Tailscale)."""
+    """Print the navigator URL(s) + every registered spec's name-based URL (loopback +
+    Tailscale), plus a reminder line for any comment stuck in an open review cycle past
+    the staleness threshold (see ``specweb.store.stale_comments``). ``start``/``status``
+    is the OTHER place (besides ``spec-web list``) an operator glances at routinely, so it
+    gets the same lazily-computed nudge — never a background poller, just whatever this
+    already-running command happens to read."""
     from .specweb import registry
     from .specweb.server import _reachable_urls, daemon_spec_urls
+    from .specweb.store import stale_comments
 
     for url in _reachable_urls(host, port):
         print(f"[review spec-web] navigator {url}")
@@ -2403,6 +2485,8 @@ def _spec_web_print_registry(host: str, port: int) -> None:
         missing = "" if rec["exists"] else "  (file missing)"
         agent = f"  (agent: {rec['agent']})" if rec.get("agent") else ""
         print(f"[review spec-web]   {rec['name']}: {urls}{agent}{missing}")
+        comments = _comments_for_reminder(rec["path"])
+        _print_stale_reminders(stale_comments(comments))
 
 
 def _spec_web_add(rest: list[str], *, watch: bool) -> int:
@@ -2585,9 +2669,12 @@ def _spec_web_legacy_foreground(spec: Path, ns) -> int:
 
 
 def _spec_web_list(rest: list[str]) -> int:
-    """``review spec-web list`` — every registered spec with its open-note count."""
+    """``review spec-web list`` — every registered spec with its open-note count, plus a
+    reminder line for any comment stuck in an open review cycle (submitted/answered) past
+    the staleness threshold (see ``specweb.store.stale_comments``) — otherwise a stalled
+    thread is silent until someone happens to open the spec-web UI and notices its age."""
     from .specweb import registry
-    from .specweb.store import SpecStore
+    from .specweb.store import stale_comments
 
     specs = registry.list_specs()
     if not specs:
@@ -2596,15 +2683,13 @@ def _spec_web_list(rest: list[str]) -> int:
         )
         return 0
     for rec in specs:
-        try:
-            comments = SpecStore(rec["path"]).all_comments()
-        except Exception:  # noqa: BLE001
-            comments = []
+        comments = _comments_for_reminder(rec["path"])
         openc = sum(1 for c in comments if c.get("status") in ("pending", "submitted"))
         flag = "" if rec["exists"] else "  (file missing)"
         print(
             f"  {rec['name']:<28} {openc} open / {len(comments)} total  {rec['path']}{flag}"
         )
+        _print_stale_reminders(stale_comments(comments))
     return 0
 
 
@@ -2714,15 +2799,69 @@ def _spec_web_reply(argv: list[str]) -> int:
         flush=True,
     )
 
+    # Piggyback the proactive reminder on a command that's already touching this spec's
+    # store — a reply is exactly the moment an agent is paying attention to this thread,
+    # so it's the cheapest place to also flag every OTHER thread still stuck in an open
+    # review cycle, with no background poller involved (see specweb.store.stale_comments).
+    stale_others = [s for s in store.stale_comments() if s.get("id") != rec.get("id")]
+    _print_stale_reminders(stale_others, stream=sys.stderr)
+
     if not ns.no_tg:
-        _spec_web_reply_to_tg(spec, rec, answer)
+        _spec_web_reply_to_tg(spec, rec, answer, stale_others=stale_others)
     return 0
 
 
-def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
+def _stale_summary_for_tg(stale: list[dict]) -> str:
+    """A one-line proactive nudge for the tg reply message: how many OTHER comments on
+    this spec are stuck in an open review cycle past the staleness threshold, and how
+    long the oldest one has been waiting. Empty when there is nothing stale (the common
+    case), so a normal reply's tg message is unchanged — this only adds a block when
+    there is actually something to nudge about."""
+    if not stale:
+        return ""
+    # max() by age rather than trusting stale[0]: stale_comments() sorts oldest-first, and
+    # the production caller (_spec_web_reply) preserves that via a plain list-comp filter,
+    # but nothing enforces it on this function's own signature.
+    oldest = max(stale, key=lambda s: s.get("age_hours") or 0.0)
+    age = oldest.get("age_hours") or 0.0
+    plural = "" if len(stale) == 1 else "s"
+    statuses = {s.get("status") for s in stale}
+    if len(statuses) <= 1:
+        # every stalled comment is waiting on the same thing — the single-phrase form
+        # from the oldest applies to the whole group.
+        waiting_on = _waiting_on_phrase(oldest.get("status"))
+        return (
+            f"⚠ {len(stale)} other stalled review thread{plural} on this spec "
+            f"(oldest {age:.1f}h, waiting on {waiting_on})."
+        )
+    # A mix of submitted/answered comments: attributing the OLDEST one's wait-phrase to
+    # the whole group would misdescribe the others (e.g. "waiting on reviewer resolution"
+    # when a different thread in the same count is actually waiting on an agent reply).
+    # Break the count down per status instead of picking one phrase for everything.
+    submitted_n = sum(1 for s in stale if s.get("status") == "submitted")
+    answered_n = len(stale) - submitted_n
+    return (
+        f"⚠ {len(stale)} other stalled review thread{plural} on this spec "
+        f"({submitted_n} awaiting an agent reply, {answered_n} awaiting reviewer "
+        f"resolution; oldest {age:.1f}h)."
+    )
+
+
+def _spec_web_reply_to_tg(
+    spec: Path,
+    comment: dict,
+    answer: str,
+    *,
+    stale_others: list[dict] | None = None,
+) -> None:
     """Best-effort: deliver the agent's reply to the user via the `tg` CLI on PATH. NEVER
     raises — tg being absent/failing must not fail the reply (it is already in the store /
-    UI). Logs the outcome."""
+    UI). Logs the outcome.
+
+    ``stale_others`` (this reply's own comment already excluded by the caller) is appended
+    as a short proactive-reminder block — the tg message that already tells the reviewer
+    "here's my answer" is also the cheapest existing delivery channel to surface OTHER
+    threads still stuck in an open review cycle, with zero new infrastructure."""
     import shutil
     import subprocess
 
@@ -2737,20 +2876,21 @@ def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
     quote = (comment.get("quote") or "").strip()
     kind = comment.get("kind") or "remark"
 
-    def _clip(text: str, limit: int) -> str:
-        # Bound the reviewer's free text so a long multi-paragraph remark can't blow past
-        # Telegram's ~4096-char message limit (the answer is always shown in full).
-        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
+    # Bound the reviewer's free text so a long multi-paragraph remark can't blow past
+    # Telegram's ~4096-char message limit (the answer is always shown in full).
     # Plain-text message (no --format html) so we never have to escape the spec/question
     # free text. tg's own --title/--tag give it structure.
     lines = [f"Spec: {spec.name}"]
     if quote:
-        lines.append(f"On: “{_clip(quote, 200)}”")
+        lines.append(f"On: “{_clip_text(quote, 200)}”")
     lines.append(
-        f"{'Question' if kind == 'question' else 'Remark'}: {_clip(question, 600)}"
+        f"{'Question' if kind == 'question' else 'Remark'}: {_clip_text(question, 600)}"
     )
-    lines.append(f"Agent answer: {_clip(answer, 3000)}")
+    lines.append(f"Agent answer: {_clip_text(answer, 3000)}")
+    summary = _stale_summary_for_tg(stale_others or [])
+    if summary:
+        lines.append("")
+        lines.append(summary)
     message = "\n".join(lines)
     try:
         proc = subprocess.run(

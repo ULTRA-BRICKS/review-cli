@@ -1022,7 +1022,7 @@ review spec-web enable --agent ext  # OS autostart at login (disable removes it)
 review spec-web add docs/specs/my-spec.md      # register + print its /spec/<name> URL
 review spec-web serve docs/specs/my-spec.md --agent ext   # add + BLOCK until the review is submitted
 review spec-web docs/specs/my-spec.md --agent ext         # same as `serve` (backward-compatible form)
-review spec-web list                           # every registered spec + open-note counts
+review spec-web list                           # every registered spec + open-note counts (+ stalled-thread reminders)
 review spec-web remove <name>                  # unregister (comments stay on disk)
 review spec-web watch <name|path>              # wait for a submit on a registered spec
 
@@ -1086,6 +1086,15 @@ the UI styles it distinctly), and **also** delivers it to Telegram via the `tg` 
 skips it). An open spec-web page **polls** the comments API, so the agent's reply appears under
 the question without a manual refresh.
 
+**Stalled review-cycle reminders.** A comment stuck in `submitted` (awaiting an agent reply) or
+`answered` (awaiting reviewer resolution) for more than 24h (override via
+`$REVIEW_SPECWEB_STALE_HOURS`) is flagged with a `⚠ stalled ...` line — lazily, whenever an
+already-running command reads the store, never via a background poller. `review spec-web list`
+and `review spec-web status`/`start` print one line per stalled comment for every spec; `review
+spec-web reply` prints the same for every OTHER stalled comment on that spec to stderr, and
+appends a short summary to its Telegram delivery (e.g. "2 other stalled review threads on this
+spec (oldest 36.2h, waiting on an agent reply)."), skipped when nothing else is stale.
+
 **Drafts (reload-safe).** While you type a note, the composer **autosaves** the in-progress
 text to the server (debounced, persisted to disk) under a per-slot key (the new-note composer
 and each edit-in-progress have their own slot). On page load the most recent draft is **restored
@@ -1118,7 +1127,8 @@ quote that can't be re-found shows in the sidebar as **unanchored** (never a cra
 **registry** (`registry.json`, name → path) lives in the same directory — and the comment
 stores are keyed by spec PATH, not by name, so specs reviewed under the old one-server-per-spec
 mode keep their full history when the daemon takes over. Override the directory with
-`$REVIEW_SPECWEB_DIR`.
+`$REVIEW_SPECWEB_DIR`. Override the stalled-review-cycle reminder threshold (default 24h) with
+`$REVIEW_SPECWEB_STALE_HOURS`.
 
 **Security.** Reads (spec, assets, comments, **drafts**) are open — same model as comments
 (the in-progress composer text is readable by anyone who can reach the port; there are no
