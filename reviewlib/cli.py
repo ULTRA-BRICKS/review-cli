@@ -29,6 +29,7 @@ from .process import _open_log_with_fallback, install_signal_reaper
 from .config import (
     CONFIG_PATH,
     DEFAULT_PRESET,
+    DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
     SHIP_MIN_ROLES,
@@ -4881,6 +4882,22 @@ def _pool_guard_candidates(
     return candidates
 
 
+def _announce_quorum_auto_roles(seats: list) -> None:
+    """Operator-facing stderr notice for "which model filled which REVIEW_ROLES
+    role" when quorum's default (no `-m`, no config `models:`/`board:`) path
+    auto-assigns its own board (see `DEFAULT_BOARD` fallback in `_dispatch`) --
+    otherwise nothing surfaces the mapping before the panel itself runs, and an
+    operator has no way to tell which live model is speaking for which role."""
+    if not seats:
+        return
+    pairs = ", ".join(f"{r.model} -> {r.role}" for r in seats)
+    print(
+        f"[review-cli] quorum auto-assigned roles (no -m): {pairs}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _warn_if_panel_padded(models: list[str]) -> None:
     """Operator-facing stderr notice for the flat quorum panel, fired iff
     `models` contains a repeat -- the only way a repeat can appear here is
@@ -5483,6 +5500,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
             model, samples=_usage_snapshot, cards=_usage_cards
         )
 
+    # Populated ONLY on quorum's own default path (no -m, no config
+    # `models:`/`board:` override) when the DEFAULT_BOARD fallback below finds
+    # live seats -- carries the role each auto-picked model was assigned so it
+    # can be merged into `panel_task_roles` further down and threaded through
+    # `ctx.extra["task_roles"]` to `mode_quorum`'s real `_seat_assignments`.
+    quorum_auto_roles: list[str] = []
     if explicit_models:
         models = explicit_models
     elif is_brainstorm:
@@ -5508,71 +5531,93 @@ def _dispatch(argv: list[str] | None = None) -> int:
     else:
         src = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
         if mode.name == "quorum":
-            # Scoped to quorum specifically: `review` builds its OWN board
-            # from `config_models`/`load_board` (never reads this `models`
-            # var) and `visual`/`qa` use their own model lists too — this
-            # `else` branch is also their fallthrough, so padding it
-            # unconditionally printed a spurious "panel padded" warning for a
-            # panel that was never actually dispatched (k3/Fable review
-            # finding). `just-ask` is EXCLUDED too, deliberately: it sends the
-            # identical prompt to every seat with no per-seat role/lens (see
-            # config's role-less-board carve-out for the same reasoning), so a
-            # duplicated seat there is pure cost with zero added diversity —
-            # unlike quorum, which labels + discloses duplicates to its
-            # moderator so a repeated model is at least an INFORMED tradeoff.
-            #
-            # Availability-filter BEFORE padding (k3 review finding, round 3):
-            # `_is_near_limit` fails OPEN on unknown usage data, so an
-            # UNREACHABLE model (missing API key/CLI — unknown to
-            # usage_percent, hence "not excluded") could otherwise survive
-            # padding while a REACHABLE-but-near-limit model gets excluded —
-            # e.g. src=[claude:opus@90%, gemini(keyless)] would pad to
-            # ["gemini","gemini"], a panel with ZERO live seats, worse than
-            # quorum's pre-reuse behavior of just dispatching both and letting
-            # the dead one fail per-call. Filtering first keeps padding
-            # scoped to seats that can actually answer; the all-unreachable
-            # case is handled below (dispatch `src` unfiltered, no exclusion
-            # — k3 review finding, round 5).
-            #
-            # Target `len(reachable)`, NOT `len(src)` (k3/Fable review finding,
-            # round 4): padding must compensate ONLY usage-limit exclusions,
-            # exactly like the brainstorm branch above — targeting `len(src)`
-            # would ALSO duplicate a live model to paper over a plain
-            # unreachable one (a real paid call replacing what used to be a
-            # free per-call failure), which is a different, unrequested
-            # feature and made `_warn_if_panel_padded`'s "near their usage
-            # limit" text false in that case.
-            #
-            # `_chain_aware_available`, NOT raw `backend_available` (k3/Fable
-            # review finding, round 6): the raw probe false-negatives on a
-            # seat whose HEAD provider is down but has a live failover
-            # alternate (e.g. no ZAI_API_KEY but an authenticated `oc:zai`) —
-            # exactly the case `_chain_aware_available`'s own docstring exists
-            # to cover for every OTHER pre-dispatch liveness decision (the
-            # pool guard, the board split, the ETA). Using the raw probe here
-            # would silently drop a chain-recoverable model from the quorum
-            # panel instead of just letting `run_panel`'s own provider
-            # failover (panel.py) route around the down head provider.
-            reachable = [m for m in src if _chain_aware_available(m)]
-            if reachable:
-                models = expand_flat_models_with_reuse(
-                    reachable, len(reachable), usage_percent=_usage_percent
+            # Default (no -m) quorum path: try the SAME role-tagged
+            # DEFAULT_BOARD + reuse-aware selector `review diff`'s own board
+            # dispatch already uses, so a plain `review quorum "<question>"
+            # --task CODE` gets a real REVIEW_ROLES role-to-model mapping
+            # instead of falling back to generic literary PERSONAS
+            # (`_seat_assignments` in modes/quorum.py). Scoped to quorum's
+            # OWN unconfigured default only: a config `models:` roster or a
+            # config `board:` is an explicit operator choice and must keep
+            # using the flat `src` path below untouched, exactly like
+            # today.
+            if not config_models and not config_has_board:
+                quorum_board_seats, _ = select_pool_and_reserve_with_reuse(
+                    list(DEFAULT_BOARD),
+                    effective_pool_size,
+                    lambda r: _chain_aware_available(r.model),
+                    usage_percent=_usage_percent,
                 )
-                _warn_if_panel_padded(models)
-            else:
-                # EVERYTHING reads unreachable -- dispatch `src` UNFILTERED
-                # and skip usage-limit exclusion entirely (k3 review finding,
-                # round 5): the comment above claimed this fallback matches
-                # brainstorm's "identical" one, but it didn't -- brainstorm's
-                # actual all-unreachable fallback (`config_models or
-                # [_expand_alias(x) for x in DEFAULT_MODELS]`, a few lines up)
-                # dispatches the raw list with NO exclusion, letting each dead
-                # seat fail per-call (and its provider-chain failover a real
-                # chance to recover a false-negative availability probe).
-                # Applying exclusion here too would silently drop a near-limit
-                # model in favor of duplicating another EQUALLY DEAD one --
-                # pure noise when nothing is going to answer regardless.
-                models = src
+                if quorum_board_seats:
+                    models = [r.model for r in quorum_board_seats]
+                    quorum_auto_roles = [r.role for r in quorum_board_seats]
+                    _announce_quorum_auto_roles(quorum_board_seats)
+            if not quorum_auto_roles:
+                # Scoped to quorum specifically: `review` builds its OWN board
+                # from `config_models`/`load_board` (never reads this `models`
+                # var) and `visual`/`qa` use their own model lists too — this
+                # `else` branch is also their fallthrough, so padding it
+                # unconditionally printed a spurious "panel padded" warning for a
+                # panel that was never actually dispatched (k3/Fable review
+                # finding). `just-ask` is EXCLUDED too, deliberately: it sends the
+                # identical prompt to every seat with no per-seat role/lens (see
+                # config's role-less-board carve-out for the same reasoning), so a
+                # duplicated seat there is pure cost with zero added diversity —
+                # unlike quorum, which labels + discloses duplicates to its
+                # moderator so a repeated model is at least an INFORMED tradeoff.
+                #
+                # Availability-filter BEFORE padding (k3 review finding, round 3):
+                # `_is_near_limit` fails OPEN on unknown usage data, so an
+                # UNREACHABLE model (missing API key/CLI — unknown to
+                # usage_percent, hence "not excluded") could otherwise survive
+                # padding while a REACHABLE-but-near-limit model gets excluded —
+                # e.g. src=[claude:opus@90%, gemini(keyless)] would pad to
+                # ["gemini","gemini"], a panel with ZERO live seats, worse than
+                # quorum's pre-reuse behavior of just dispatching both and letting
+                # the dead one fail per-call. Filtering first keeps padding
+                # scoped to seats that can actually answer; the all-unreachable
+                # case is handled below (dispatch `src` unfiltered, no exclusion
+                # — k3 review finding, round 5).
+                #
+                # Target `len(reachable)`, NOT `len(src)` (k3/Fable review finding,
+                # round 4): padding must compensate ONLY usage-limit exclusions,
+                # exactly like the brainstorm branch above — targeting `len(src)`
+                # would ALSO duplicate a live model to paper over a plain
+                # unreachable one (a real paid call replacing what used to be a
+                # free per-call failure), which is a different, unrequested
+                # feature and made `_warn_if_panel_padded`'s "near their usage
+                # limit" text false in that case.
+                #
+                # `_chain_aware_available`, NOT raw `backend_available` (k3/Fable
+                # review finding, round 6): the raw probe false-negatives on a
+                # seat whose HEAD provider is down but has a live failover
+                # alternate (e.g. no ZAI_API_KEY but an authenticated `oc:zai`) —
+                # exactly the case `_chain_aware_available`'s own docstring exists
+                # to cover for every OTHER pre-dispatch liveness decision (the
+                # pool guard, the board split, the ETA). Using the raw probe here
+                # would silently drop a chain-recoverable model from the quorum
+                # panel instead of just letting `run_panel`'s own provider
+                # failover (panel.py) route around the down head provider.
+                reachable = [m for m in src if _chain_aware_available(m)]
+                if reachable:
+                    models = expand_flat_models_with_reuse(
+                        reachable, len(reachable), usage_percent=_usage_percent
+                    )
+                    _warn_if_panel_padded(models)
+                else:
+                    # EVERYTHING reads unreachable -- dispatch `src` UNFILTERED
+                    # and skip usage-limit exclusion entirely (k3 review finding,
+                    # round 5): the comment above claimed this fallback matches
+                    # brainstorm's "identical" one, but it didn't -- brainstorm's
+                    # actual all-unreachable fallback (`config_models or
+                    # [_expand_alias(x) for x in DEFAULT_MODELS]`, a few lines up)
+                    # dispatches the raw list with NO exclusion, letting each dead
+                    # seat fail per-call (and its provider-chain failover a real
+                    # chance to recover a false-negative availability probe).
+                    # Applying exclusion here too would silently drop a near-limit
+                    # model in favor of duplicating another EQUALLY DEAD one --
+                    # pure noise when nothing is going to answer regardless.
+                    models = src
         else:
             # just-ask (visual/qa also fall through here but ignore `models`):
             # drop unreachable defaults so a missing xAI OAuth seat cannot fail
@@ -5660,6 +5705,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
         )
         models = [r.model for r in padded_board]
         panel_task_roles = [r.role for r in padded_board]
+    elif quorum_auto_roles:
+        # Mutually exclusive with task_role_pad in practice (quorum_auto_roles
+        # is only ever populated on the no-`-m` default path, task_role_pad
+        # requires exactly one explicit `-m`), but kept as `elif` defensively
+        # -- task_role_pad's own role assignment wins if both were somehow true.
+        panel_task_roles = quorum_auto_roles
 
     use_board = not panel_mode and (
         not explicit_models
