@@ -8,7 +8,9 @@ down per test. No API keys, no network beyond loopback.
 """
 from __future__ import annotations
 
+import contextlib
 import http.client
+import io
 import json
 import os
 import re
@@ -18,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -37,6 +40,8 @@ from reviewlib.specweb.store import (  # noqa: E402
     SpecStore,
     edit_draft_slot,
     spec_key,
+    stale_comments,
+    stale_threshold_hours,
 )
 
 FIXTURE = REPO_ROOT / "fixtures" / "specweb" / "sample-spec.md"
@@ -45,12 +50,17 @@ SEED = REPO_ROOT / "fixtures" / "specweb" / "seed-thread.json"
 
 # --------------------------------------------------------------------------- #
 # Test isolation: point the store at a temp dir so we never touch ~/.config.
+# Also pins $REVIEW_SPECWEB_STALE_HOURS to unset for the duration: every test in this
+# file that relies on the default 24h staleness threshold (rather than passing an
+# explicit `threshold_hours=`) would otherwise fail under a developer/CI environment
+# that happens to export an override.
 # --------------------------------------------------------------------------- #
 class _TempStoreEnv:
     def __enter__(self):
         self._tmp = tempfile.mkdtemp(prefix="specweb-test-")
         self._old = os.environ.get("REVIEW_SPECWEB_DIR")
         os.environ["REVIEW_SPECWEB_DIR"] = self._tmp
+        self._old_stale_hours = os.environ.pop("REVIEW_SPECWEB_STALE_HOURS", None)
         return Path(self._tmp)
 
     def __exit__(self, *exc):
@@ -58,6 +68,8 @@ class _TempStoreEnv:
             os.environ.pop("REVIEW_SPECWEB_DIR", None)
         else:
             os.environ["REVIEW_SPECWEB_DIR"] = self._old
+        if self._old_stale_hours is not None:
+            os.environ["REVIEW_SPECWEB_STALE_HOURS"] = self._old_stale_hours
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +330,489 @@ def test_store_submit_pending_only_touches_pending():
         # a keeps its original batch (not re-stamped)
         assert store.get_comment(a["id"])["batch"] != res["batch"]
         assert store.get_comment(b["id"])["status"] == "submitted"
+
+
+# === stalled review-cycle reminder (a comment stuck in submitted/answered) ================
+
+def _backdate_batch(store: SpecStore, comment_id: str, *, hours_ago: float) -> None:
+    """Test helper: rewrite a persisted comment's ``batch`` timestamp to ``hours_ago`` in
+    the past, bypassing the store's normal API (there is no public "submit this a day
+    ago" call) so staleness tests don't have to sleep for real wall-clock time."""
+    data = store.load()
+    stamp = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    for c in data["comments"]:
+        if c.get("id") == comment_id:
+            c["batch"] = stamp
+    store._write(data)
+
+
+def test_store_stale_threshold_hours_env_override_and_fallback():
+    old = os.environ.get("REVIEW_SPECWEB_STALE_HOURS")
+    try:
+        os.environ.pop("REVIEW_SPECWEB_STALE_HOURS", None)
+        assert stale_threshold_hours() == 24.0
+        os.environ["REVIEW_SPECWEB_STALE_HOURS"] = "0.5"
+        assert stale_threshold_hours() == 0.5
+        # non-positive / unparsable / empty falls back to the default rather than
+        # flagging every open-cycle comment immediately, or (inf/nan) silently disabling
+        # the reminder forever / never settling on a real threshold.
+        for bad in ("0", "-3", "not-a-number", "", "inf", "-inf", "nan"):
+            os.environ["REVIEW_SPECWEB_STALE_HOURS"] = bad
+            assert stale_threshold_hours() == 24.0, bad
+    finally:
+        if old is None:
+            os.environ.pop("REVIEW_SPECWEB_STALE_HOURS", None)
+        else:
+            os.environ["REVIEW_SPECWEB_STALE_HOURS"] = old
+
+
+def test_store_stale_comments_flags_stuck_submitted_not_fresh():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        stuck = store.add_comment(quote="the cascade winner", body="why this one specifically?", kind="question")
+        store.submit_pending()  # stuck -> submitted, batch = now
+        _backdate_batch(store, stuck["id"], hours_ago=48)
+        fresh = store.add_comment(quote="fresh one", body="just filed")
+        store.submit_pending()  # fresh -> submitted, batch = now (well under the threshold)
+
+        stale = store.stale_comments()
+        assert [s["id"] for s in stale] == [stuck["id"]], stale
+        assert stale[0]["status"] == "submitted"
+        assert stale[0]["age_hours"] >= 24.0
+        assert fresh["id"] not in [s["id"] for s in stale]
+
+        # the module-level function (given the same comments) agrees with the method
+        assert [s["id"] for s in stale_comments(store.all_comments())] == [stuck["id"]]
+
+        # a threshold the backdated comment hasn't cleared yet finds nothing
+        assert store.stale_comments(threshold_hours=72) == []
+
+
+def test_store_stale_comments_ignores_pending_and_resolved():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        # a PENDING comment is never flagged, no matter how old its creation date is —
+        # nobody is waiting on anything until it is actually submitted.
+        pending = store.add_comment(quote="p", body="not submitted yet")
+        data = store.load()
+        for c in data["comments"]:
+            if c["id"] == pending["id"]:
+                c["created"] = (datetime.now(timezone.utc) - timedelta(hours=1000)).isoformat()
+        store._write(data)
+        assert store.stale_comments() == []
+
+        # a RESOLVED comment is never flagged either — the cycle already landed.
+        resolved = store.add_comment(quote="r", body="a settled thread")
+        store.submit_pending()
+        _backdate_batch(store, resolved["id"], hours_ago=1000)
+        store.set_status(resolved["id"], "resolved")
+        assert store.stale_comments() == []
+
+
+def _backdate_reply(store: SpecStore, comment_id: str, reply_index: int, *, hours_ago: float) -> None:
+    """Test helper: rewrite one persisted reply's ``created`` timestamp to ``hours_ago``
+    in the past, so tests can exercise `_last_activity`'s reply-priority path without
+    sleeping for real wall-clock time."""
+    data = store.load()
+    stamp = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    for c in data["comments"]:
+        if c.get("id") == comment_id:
+            c["replies"][reply_index]["created"] = stamp
+    store._write(data)
+
+
+def test_store_age_hours_accepts_explicit_now_and_normalizes_z_and_naive():
+    # Direct unit coverage of `_age_hours`'s `now=` parameter and its Z/naive handling —
+    # every other test drives it indirectly via `stale_comments()`'s real-clock default.
+    from reviewlib.specweb.store import _age_hours
+
+    fixed_now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert _age_hours("2026-01-01T00:00:00Z", now=fixed_now) == 24.0
+    # a naive `now` (no tzinfo) must not raise a naive/aware TypeError — treated as UTC.
+    assert _age_hours("2026-01-01T00:00:00+00:00", now=datetime(2026, 1, 2)) == 24.0
+    assert _age_hours("", now=fixed_now) is None
+    assert _age_hours(None, now=fixed_now) is None
+    assert _age_hours("not-a-timestamp", now=fixed_now) is None
+
+
+def test_store_stale_comments_flags_old_answered_comment():
+    # OPEN_CYCLE_STATUSES covers "answered" as well as "submitted" — a comment whose only
+    # reply happened long ago (not just its submit batch) must still be flagged. Every
+    # OTHER staleness test on an "answered" comment only asserts the negative ("stays
+    # fresh" after a recent reply); this is the one regression guard for the positive case.
+    # Realistic chronology: submitted 50h ago, answered 2h later (48h ago), unresolved
+    # since — the batch is backdated too so `_last_activity`'s max-over-batch-and-replies
+    # picks the (still older) reply, not a fresh batch masking a stale reply.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="why?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, c["id"], hours_ago=50)
+        store.add_reply(c["id"], body="an answer", author="claude")
+        assert store.get_comment(c["id"])["status"] == "answered"
+        _backdate_reply(store, c["id"], 0, hours_ago=48)
+
+        stale = store.stale_comments()
+        assert len(stale) == 1 and stale[0]["id"] == c["id"], stale
+        assert stale[0]["status"] == "answered"
+        assert stale[0]["age_hours"] >= 48.0
+
+
+def test_store_stale_comments_last_activity_prefers_later_batch_over_earlier_reply():
+    # A reply can PREDATE a later submit batch: `add_reply` on a still-pending comment
+    # leaves it pending, so a reviewer can self-reply immediately and only submit hours
+    # afterward. That old self-reply must not be mistaken for "just submitted, agent
+    # notified now" once a later batch exists — `_last_activity` must compare the reply
+    # against the batch, not take reply-priority unconditionally.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="why?", kind="question")
+        # self-reply while still pending: leaves status pending, per add_reply's contract
+        store.add_reply(c["id"], body="a quick self-note", author="reviewer")
+        assert store.get_comment(c["id"])["status"] == "pending"
+        # backdate that reply far in the past, then submit NOW (batch = now, the true
+        # most-recent activity)
+        _backdate_reply(store, c["id"], 0, hours_ago=1000)
+        store.submit_pending()
+        assert store.get_comment(c["id"])["status"] == "submitted"
+
+        assert store.stale_comments() == [], "a fresh batch must win over an old pre-submit reply"
+
+
+def test_store_last_activity_uses_parsed_instant_not_string_order_across_offsets():
+    # Two ISO-8601 offsets that sort the WRONG way as raw strings: "+05:00" (23:00 local)
+    # is lexicographically GREATER than the "Z"-suffixed string even though it names an
+    # instant 2 hours EARLIER in real time. A naive string max would pick the wrong
+    # "latest" reply for a foreign import_thread seed that mixes offsets.
+    from reviewlib.specweb.store import _last_activity
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        earlier_but_string_greater = "2023-06-01T23:00:00+05:00"  # = 18:00 UTC
+        later_but_string_smaller = "2023-06-01T20:00:00Z"  # = 20:00 UTC, truly latest
+        store.import_thread(
+            {
+                "comments": [
+                    {
+                        "body": "q",
+                        "kind": "question",
+                        "status": "answered",
+                        "batch": earlier_but_string_greater,
+                        "replies": [
+                            {"author": "reviewer", "body": "a", "created": earlier_but_string_greater},
+                            {"author": "claude", "body": "b", "created": later_but_string_smaller},
+                        ],
+                    },
+                ]
+            }
+        )
+        comment = store.all_comments()[0]
+        assert _last_activity(comment) == later_but_string_smaller, _last_activity(comment)
+
+
+def test_store_stale_comments_reply_resets_the_clock():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="why?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, c["id"], hours_ago=1000)
+        # a fresh reply flips the status to "answered" (still an OPEN_CYCLE_STATUS) but
+        # ALSO resets last-activity to now — the reviewer/agent is actively engaged, so a
+        # thousand-hour-old submit batch must not still read as abandoned.
+        store.add_reply(c["id"], body="here's a partial answer", author="claude")
+        assert store.get_comment(c["id"])["status"] == "answered"
+        assert store.stale_comments() == [], "a fresh reply must reset the staleness clock"
+
+
+def test_cli_spec_web_list_prints_stale_reminder_for_stuck_question():
+    import reviewlib.cli as cli
+    from reviewlib.specweb import registry
+
+    with _TempStoreEnv():
+        registry.register(FIXTURE)
+        store = SpecStore(FIXTURE)
+        stuck = store.add_comment(quote="the cascade winner", body="why this one specifically?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, stuck["id"], hours_ago=48)
+        fresh = store.add_comment(quote="fresh one", body="just filed")
+        store.submit_pending()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli._spec_web(["list"])
+        assert rc == 0, rc
+        out = buf.getvalue()
+        assert "stalled question" in out, out
+        assert f"#{stuck['id']}" in out, out
+        assert "waiting on an agent reply" in out, out
+        assert "cascade winner" in out, out
+        # pins the actual CLI-output filtering, not just the store-level filter: a
+        # regression that dropped the `stale_comments(...)` filter (printing every open
+        # comment) would still pass every assertion above.
+        assert f"#{fresh['id']}" not in out, out
+
+
+def test_store_stale_comments_handles_z_suffix_timestamps_from_import():
+    # import_thread passes caller-supplied batch/created strings through verbatim; a
+    # trailing "Z" (valid ISO-8601, and what many external tools emit) must parse on the
+    # project's declared Python 3.9 floor, not only on 3.11+ where fromisoformat added
+    # native "Z" support.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        old_z = "2000-01-01T00:00:00Z"
+        store.import_thread(
+            {
+                "comments": [
+                    {"body": "why?", "kind": "question", "status": "submitted", "batch": old_z},
+                ]
+            }
+        )
+        stale = store.stale_comments()
+        assert len(stale) == 1, stale
+        assert stale[0]["age_hours"] > 24.0
+
+
+def test_store_stale_comments_uses_latest_reply_by_timestamp_not_position():
+    # import_thread preserves an external seed's reply order verbatim; a seed listing
+    # replies newest-first must still find the truly latest one by `created`, not by
+    # trusting replies[-1] (which the store's OWN writer, add_reply, always appends to,
+    # but a foreign seed has no obligation to).
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(hours=1000)).isoformat()
+        store.import_thread(
+            {
+                "comments": [
+                    {
+                        "body": "q",
+                        "kind": "question",
+                        "status": "answered",
+                        "batch": old,
+                        "replies": [
+                            {"author": "claude", "body": "recent answer", "created": recent},
+                            {"author": "reviewer", "body": "old followup", "created": old},
+                        ],
+                    },
+                ]
+            }
+        )
+        assert store.stale_comments() == [], "must use the reply with the latest created, not its position"
+
+
+def test_cli_stale_reminder_line_collapses_multiline_quote():
+    # The reviewer's verbatim selection can span a paragraph break; an embedded newline
+    # must not turn "one reminder line" into several, breaking alignment.
+    from reviewlib.cli import _stale_reminder_line
+
+    stale = {
+        "id": "abc123",
+        "kind": "question",
+        "status": "submitted",
+        "age_hours": 30.0,
+        "quote": "first line\n\nsecond   line",
+    }
+    line = _stale_reminder_line(stale)
+    assert "\n" not in line, line
+    assert "first line second line" in line, line
+
+
+def test_cli_stale_reminder_line_survives_non_string_quote_and_body():
+    # A hand-edited/foreign store file can carry a non-string quote/body (e.g. a stray
+    # int from a malformed import) — this must degrade to a stringified value, never
+    # raise AttributeError from `.split()` on a non-string, matching the "never crash a
+    # spec-web list" posture the rest of this feature is held to.
+    from reviewlib.cli import _stale_reminder_line
+
+    line = _stale_reminder_line(
+        {"id": "x", "kind": "remark", "status": "submitted", "age_hours": 1.0, "quote": 123}
+    )
+    assert "123" in line, line
+
+    line2 = _stale_reminder_line(
+        {"id": "y", "kind": "remark", "status": "submitted", "age_hours": 1.0, "quote": None, "body": 456}
+    )
+    assert "456" in line2, line2
+
+
+def test_cli_stale_summary_for_tg_plural_and_status_wording():
+    from reviewlib.cli import _stale_summary_for_tg
+
+    assert _stale_summary_for_tg([]) == ""
+    one = [{"status": "submitted", "age_hours": 10.0}]
+    msg = _stale_summary_for_tg(one)
+    assert "1 other stalled review thread " in msg and "threads" not in msg, msg
+    assert "waiting on an agent reply" in msg, msg
+
+    same_status = [{"status": "submitted", "age_hours": 50.0}, {"status": "submitted", "age_hours": 10.0}]
+    msg_same = _stale_summary_for_tg(same_status)
+    assert "2 other stalled review threads " in msg_same, msg_same
+    assert "waiting on an agent reply" in msg_same, msg_same
+
+    # a MIX of submitted/answered must not attribute one status's wait-phrase to the
+    # whole group (the oldest here is "answered", but the other thread is "submitted" -
+    # a single "waiting on reviewer resolution" clause would misdescribe it).
+    mixed = [{"status": "answered", "age_hours": 50.0}, {"status": "submitted", "age_hours": 10.0}]
+    msg_mixed = _stale_summary_for_tg(mixed)
+    assert "2 other stalled review threads " in msg_mixed, msg_mixed
+    assert "1 awaiting an agent reply" in msg_mixed, msg_mixed
+    assert "1 awaiting reviewer resolution" in msg_mixed, msg_mixed
+    assert "oldest 50.0h" in msg_mixed, msg_mixed
+
+
+def test_cli_spec_web_print_registry_prints_stale_reminder():
+    # `spec-web start`/`status` is the THIRD surface sharing the reminder wording; it must
+    # get the same nudge as `spec-web list`, not just describe it in a docstring.
+    import reviewlib.cli as cli
+    from reviewlib.specweb import registry
+
+    with _TempStoreEnv():
+        registry.register(FIXTURE)
+        store = SpecStore(FIXTURE)
+        stuck = store.add_comment(quote="the cascade winner", body="why this one?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, stuck["id"], hours_ago=48)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli._spec_web_print_registry("127.0.0.1", 54329)
+        out = buf.getvalue()
+        assert "stalled question" in out, out
+        assert "waiting on an agent reply" in out, out
+
+
+def test_cli_spec_web_print_registry_survives_missing_spec_file():
+    # A registered spec whose file was deleted after registration flags "(file missing)"
+    # and shows no stale reminders (its never-written comment store loads as empty via
+    # SpecStore.load()'s own missing-file branch — no exception involved here; see
+    # test_cli_spec_web_print_registry_survives_store_read_error for the actual
+    # `except Exception` fallback).
+    import reviewlib.cli as cli
+    from reviewlib.specweb import registry
+
+    with _TempStoreEnv() as tmp:
+        missing_spec = Path(tmp) / "gone.md"
+        missing_spec.write_text("# gone\n", encoding="utf-8")
+        registry.register(missing_spec)
+        missing_spec.unlink()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli._spec_web_print_registry("127.0.0.1", 54330)
+        out = buf.getvalue()
+        assert "file missing" in out, out
+        assert "stalled" not in out, out
+
+
+def test_cli_spec_web_print_registry_survives_store_read_error():
+    # Force SpecStore.all_comments() itself to raise (a real I/O/corruption error, not
+    # just a missing spec file) and confirm _spec_web_print_registry's
+    # `except Exception: comments = []` fallback degrades to no reminders rather than
+    # propagating a traceback.
+    import reviewlib.cli as cli
+    from reviewlib.specweb import registry
+    from reviewlib.specweb.store import SpecStore as _Store
+
+    with _TempStoreEnv():
+        registry.register(FIXTURE)
+        store = SpecStore(FIXTURE)
+        stuck = store.add_comment(quote="q", body="why?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, stuck["id"], hours_ago=48)
+
+        old_all_comments = _Store.all_comments
+
+        def _raise(self):
+            raise RuntimeError("simulated store read failure")
+
+        _Store.all_comments = _raise
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cli._spec_web_print_registry("127.0.0.1", 54331)
+        finally:
+            _Store.all_comments = old_all_comments
+        out = buf.getvalue()
+        assert "stalled" not in out, out
+
+
+def test_cli_spec_web_reply_forwards_other_stale_comments_to_tg():
+    # answering ONE comment must report+forward the OTHER stalled comment(s) on the same
+    # spec (proactive reminder piggybacked on the existing tg delivery), while the just-
+    # answered comment itself is never counted as "other".
+    import reviewlib.cli as cli
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        stuck = store.add_comment(quote="stuck one", body="are we sure about this?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, stuck["id"], hours_ago=48)
+        fresh = store.add_comment(quote="fresh one", body="a quick one")
+        store.submit_pending()
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _R()
+
+        old_which = shutil.which
+        old_run = subprocess.run
+        shutil.which = lambda name: "/fake/tg" if name == "tg" else old_which(name)
+        subprocess.run = fake_run
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = cli._spec_web(
+                    ["reply", fresh["id"], "answering the fresh one", "--spec", str(FIXTURE)]
+                )
+        finally:
+            shutil.which = old_which
+            subprocess.run = old_run
+        assert rc == 0, rc
+        assert len(calls) == 1, calls
+        message = calls[0][0][-1]
+        assert "1 other stalled review thread" in message, message
+        assert "waiting on an agent reply" in message, message
+        # the reminder for the OTHER stalled comment goes to stderr, not stdout — stdout
+        # is reserved for the "replied to ..." confirmation.
+        stdout_text, stderr_text = out_buf.getvalue(), err_buf.getvalue()
+        assert f"#{stuck['id']}" in stderr_text, stderr_text
+        assert "stalled question" in stderr_text, stderr_text
+        assert f"#{stuck['id']}" not in stdout_text, stdout_text
+        assert "replied to" in stdout_text, stdout_text
+
+
+def test_cli_spec_web_reply_no_tg_still_prints_stderr_reminder():
+    # `--no-tg` only skips the Telegram delivery — the stderr nudge about OTHER stalled
+    # comments on the same spec is unconditional and must still fire. The two live right
+    # next to each other in `_spec_web_reply`; a future refactor could easily (and
+    # wrongly) nest the stderr print inside the `if not ns.no_tg:` block.
+    import reviewlib.cli as cli
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        stuck = store.add_comment(quote="stuck one", body="are we sure about this?", kind="question")
+        store.submit_pending()
+        _backdate_batch(store, stuck["id"], hours_ago=48)
+        fresh = store.add_comment(quote="fresh one", body="a quick one")
+        store.submit_pending()
+
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            rc = cli._spec_web(
+                ["reply", fresh["id"], "answering the fresh one", "--spec", str(FIXTURE), "--no-tg"]
+            )
+        assert rc == 0, rc
+        stderr_text = err_buf.getvalue()
+        assert f"#{stuck['id']}" in stderr_text, stderr_text
+        assert "stalled question" in stderr_text, stderr_text
 
 
 def test_store_delete():

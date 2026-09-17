@@ -40,6 +40,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -65,6 +66,151 @@ VALID_STATUSES = ("pending", "submitted", "answered", "resolved")
 # every legacy comment persisted before this field existed, reads as a remark.
 VALID_KINDS = ("question", "remark")
 DEFAULT_KIND = "remark"
+
+# A comment stuck in ``submitted`` (submitted to the agent, awaiting a reply) or
+# ``answered`` (the agent replied, awaiting reviewer resolution) is a review cycle that
+# has not landed yet — the two statuses "in flight" between a human and an agent, as
+# opposed to ``pending`` (not yet submitted, nobody is waiting) or ``resolved`` (done).
+# Staleness is about THESE two statuses specifically: a stuck cycle is what a reminder is
+# for, not a comment nobody has acted on yet.
+OPEN_CYCLE_STATUSES = ("submitted", "answered")
+
+# Default reminder threshold, in hours, before an open-cycle comment is flagged as a
+# stalled review-cycle. Chosen to match a "came back the next day and it's still stuck"
+# cadence — long enough that a same-day back-and-forth never trips it, short enough that a
+# genuinely abandoned thread gets surfaced the first time anyone looks at the spec again.
+DEFAULT_STALE_HOURS = 24.0
+
+
+def stale_threshold_hours() -> float:
+    """Reminder threshold in hours; overridable via ``$REVIEW_SPECWEB_STALE_HOURS`` so
+    tests can use a tiny value instead of sleeping (or fabricating) real wall-clock time.
+    Falls back to ``DEFAULT_STALE_HOURS`` on anything missing, non-numeric, non-positive,
+    or non-finite (``inf``/``nan`` both parse as a float but would silently disable every
+    reminder or flag nothing forever) — none of those is ever what an operator setting
+    this env var wants."""
+    raw = os.environ.get("REVIEW_SPECWEB_STALE_HOURS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return DEFAULT_STALE_HOURS
+        if value > 0 and math.isfinite(value):
+            return value
+    return DEFAULT_STALE_HOURS
+
+
+def _coerce_ts(iso_ts: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp into a tz-aware ``datetime``, or ``None`` if ``iso_ts``
+    isn't a non-empty string or fails to parse — never raises, since a reminder
+    computation must degrade gracefully, not crash a `spec-web list`.
+
+    Every timestamp THIS module writes comes from ``_now()``
+    (``datetime.now(timezone.utc).isoformat()``), so a malformed value should never occur
+    from normal use. ``import_thread`` itself coerces every seeded ``batch``/``created``
+    through ``_str()`` before persisting, so a non-string field can only reach this
+    function via a store file hand-edited (or corrupted) directly on disk rather than
+    through the import path — the ``isinstance`` guard below is for THAT case. A trailing
+    ``Z`` (which ``datetime.fromisoformat`` only accepts directly from Python 3.11
+    onward; this project supports 3.9+) is a real, reachable case though: `import_thread`
+    passes a seed's timestamp STRINGS through unnormalized. ``reviewlib.stats`` has its
+    own ``parse_iso_ts`` doing the identical Z-normalization for the dashboard/stats
+    store; it is duplicated here (under a name distinct from ``parse_iso_ts`` — see
+    ``reviewlib.stats._record_ts_str``'s docstring for why this repo already treats a
+    ``_parse_ts``/``parse_iso_ts`` name pair as a documented call-site-mixup hazard)
+    rather than imported, so this store adds no cross-module dependency of its own, in
+    the spirit of the module docstring's "intentionally independent" design choice
+    (which names the dashboard store, the nearest sibling, as the thing it stays
+    independent of). A naive (tz-less) result is treated as UTC, since a naive value can
+    only reach here via a foreign seed — this module's own writer is always tz-aware."""
+    if not isinstance(iso_ts, str) or not iso_ts:
+        return None
+    normalized = iso_ts[:-1] + "+00:00" if iso_ts.endswith("Z") else iso_ts
+    try:
+        ts = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _last_activity(comment: dict) -> str:
+    """ISO timestamp of the comment's most recent activity: the MAX of every candidate —
+    the comment's own batch/created, AND each reply's created — never reply-priority
+    unconditionally. A reply is *usually* the latest activity (the store's own
+    ``add_reply`` always appends after any existing batch, and a fresh reply resets the
+    clock even if status hasn't moved yet), but a reply can PREDATE a later submit batch:
+    ``add_reply`` on a still-``pending`` comment leaves it pending (see its docstring),
+    so a reviewer can self-reply immediately and only submit hours later — comparing
+    against the batch too stops that old self-reply from being mistaken for "just
+    submitted, agent notified now" once a later batch exists.
+
+    Candidates are compared by PARSED instant, not raw string order and not
+    ``replies[-1]``: the store's own writer emits same-offset UTC timestamps, so
+    position/string/parsed order all agree for everything created through the UI/CLI —
+    but ``import_thread`` preserves an external seed's reply order AND offsets verbatim,
+    and ISO-8601 strings only sort correctly as strings when every value shares one
+    offset representation (``"...T23:00:00+05:00"`` sorts AFTER ``"...T20:00:00Z"``
+    lexicographically despite being 2 hours EARLIER in real time). A candidate whose
+    timestamp fails to parse is excluded rather than crashing the comparison."""
+    base = comment.get("batch") or comment.get("created") or ""
+    candidates: list[tuple[datetime, object]] = []
+    base_ts = _coerce_ts(base)
+    if base_ts is not None:
+        candidates.append((base_ts, base))
+    replies = comment.get("replies") or []
+    if isinstance(replies, list):
+        for r in replies:
+            if not isinstance(r, dict):
+                continue
+            created = r.get("created")
+            ts = _coerce_ts(created)
+            if ts is not None:
+                candidates.append((ts, created))
+    if candidates:
+        return max(candidates, key=lambda pair: pair[0])[1]
+    return base
+
+
+def _age_hours(iso_ts: object, *, now: datetime | None = None) -> float | None:
+    """Hours between ``iso_ts`` and ``now`` (default: the real current UTC time), or
+    ``None`` when ``iso_ts`` doesn't parse (see `_coerce_ts`) — never raises. A naive
+    ``now`` (no tzinfo) is also treated as UTC, so a caller passing
+    ``datetime.now()`` instead of ``datetime.now(timezone.utc)`` degrades gracefully
+    rather than raising ``TypeError`` on the naive/aware subtraction."""
+    ts = _coerce_ts(iso_ts)
+    if ts is None:
+        return None
+    reference = now if now is not None else datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return (reference - ts).total_seconds() / 3600.0
+
+
+def stale_comments(comments: list[dict], *, threshold_hours: float | None = None) -> list[dict]:
+    """Comments stuck in an ``OPEN_CYCLE_STATUSES`` status whose last activity is AT OR
+    PAST the threshold (``age_hours >= threshold``, not strictly greater) — a stalled
+    review-cycle. Returns COPIES with an added ``age_hours`` float
+    (never mutates the caller's comment dicts, which may be live store state), oldest
+    (largest age) first so the most overdue thread is always what a caller prints/reports
+    first. Pure and called on demand from an already-running command (``list``,
+    ``status``/``start``, ``reply``) — never from a background loop/poller/timer, per this
+    project's own house rule against timer-based fixes (event-driven only)."""
+    threshold = threshold_hours if threshold_hours is not None else stale_threshold_hours()
+    flagged = []
+    for comment in comments:
+        if not isinstance(comment, dict) or comment.get("status") not in OPEN_CYCLE_STATUSES:
+            continue
+        age = _age_hours(_last_activity(comment))
+        if age is None or age < threshold:
+            continue
+        stale = dict(comment)
+        stale["age_hours"] = age
+        flagged.append(stale)
+    flagged.sort(key=lambda c: c["age_hours"], reverse=True)
+    return flagged
+
 
 # The author string stamped on a reply left by the AGENT (via `review spec-web reply`),
 # vs the human reviewer's "reviewer". The UI styles an agent reply distinctly (it is the
@@ -279,6 +425,13 @@ class SpecStore:
     def all_comments(self) -> list[dict]:
         with _LOCK:
             return list(self.load()["comments"])
+
+    def stale_comments(self, *, threshold_hours: float | None = None) -> list[dict]:
+        """This spec's comments stuck in an open review cycle (``submitted``/``answered``)
+        past the reminder threshold — see the module-level ``stale_comments`` for the
+        staleness rule. Read-only and cheap enough to call from every ``list``/``status``/
+        ``reply`` invocation; there is no cached/precomputed staleness state to go stale."""
+        return stale_comments(self.all_comments(), threshold_hours=threshold_hours)
 
     def get_comment(self, comment_id: str) -> dict | None:
         with _LOCK:
