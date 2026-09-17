@@ -4442,10 +4442,32 @@ def test_cli_recorded_task_pool_zero_default_board_does_not_warn():
     assert "warning" not in err.getvalue().lower(), err.getvalue()
 
 
-def _capture_panel_task_dispatch(argv: list[str]) -> dict:
+def _capture_panel_task_dispatch(
+    argv: list[str], *, config: dict | None = None, available: bool = True
+) -> dict:
     """Run `cli.main(argv)` for a panel mode, capturing the ModeContext the
-    handler actually received. Offline: empty config, every backend live,
-    handler stubbed so no model is called.
+    handler actually received. Offline: empty config by default (or `config`
+    when given), every backend live by default (or dead everywhere when
+    `available=False`, for exercising an all-unreachable fallback), handler
+    stubbed so no model is called.
+
+    Also monkeypatches `cli._chain_aware_available` (not just
+    `backends.backend_available`): the real chain-aware probe walks each
+    seat's `provider_failover` chain and consults
+    `backends.runtime_provider_marked_unpaid`, which is NOT patched here —
+    leaving it live means a seat's liveness can depend on this machine's
+    actual paid-provider bookkeeping, defeating the offline determinism the
+    other two patches exist for. Every quorum-default-board caller (the
+    `select_pool_and_reserve_with_reuse(DEFAULT_BOARD, ...)` path) probes
+    seats via `cli._chain_aware_available`, so it must be forced live too.
+
+    Also neutralizes real usage-limit data (`REVIEW_USAGE_LIMITS_DIR` ->
+    a nonexistent path, `REVIEW_HARNESS_LIMITS_JSON` -> `"{}"`): `_dispatch`
+    calls the real `usage_limits.load_snapshot()`/`load_harness_cards()`,
+    which on a host with real tg-ctl usage data could mark DEFAULT_BOARD
+    seats near their limit and make `select_pool_and_reserve_with_reuse`
+    collapse to fewer distinct seats than expected -- flaky depending on
+    this machine's actual usage bookkeeping (Fable/GLM review finding).
 
     Fails closed if the CLI never reaches the handler (`rc` set, models/roles
     absent) so a usage-error path cannot silently look like a 0-role pad.
@@ -4468,30 +4490,39 @@ def _capture_panel_task_dispatch(argv: list[str]) -> dict:
     orig_modes = reg.MODES
     orig_load = cli.load_config
     orig_avail = backends.backend_available
+    orig_chain_avail = cli._chain_aware_available
     orig_stdin = sys.stdin
     old_task = os.environ.get("REVIEW_TASK_CODE")
     old_env = os.environ.get("GEMINI_ENV_FILE")
     old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
+    old_usage_dir = os.environ.get("REVIEW_USAGE_LIMITS_DIR")
+    old_harness_json = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
     reg.MODES = tuple(
         replace(m, handler=_fake_handler) if m.subcommand == sub else m
         for m in orig_modes
     )
-    cli.load_config = lambda: {}
-    backends.backend_available = lambda _m: True
+    cli.load_config = lambda: dict(config) if config is not None else {}
+    backends.backend_available = lambda _m: available
+    cli._chain_aware_available = lambda _m: available
     sys.stdin = io.StringIO("")
     os.environ.pop("REVIEW_TASK_CODE", None)
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
     os.environ.pop("REVIEW_FAKE_BACKEND", None)
+    os.environ["REVIEW_USAGE_LIMITS_DIR"] = "/nonexistent/review-cli/.usage"
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = "{}"
     try:
+        stderr_buf = io.StringIO()
         with (
             contextlib.redirect_stdout(io.StringIO()),
-            contextlib.redirect_stderr(io.StringIO()),
+            contextlib.redirect_stderr(stderr_buf),
         ):
             captured["rc"] = cli.main(argv)
+        captured["stderr"] = stderr_buf.getvalue()
     finally:
         reg.MODES = orig_modes
         cli.load_config = orig_load
         backends.backend_available = orig_avail
+        cli._chain_aware_available = orig_chain_avail
         sys.stdin = orig_stdin
         if old_task is None:
             os.environ.pop("REVIEW_TASK_CODE", None)
@@ -4505,6 +4536,14 @@ def _capture_panel_task_dispatch(argv: list[str]) -> dict:
             os.environ.pop("REVIEW_FAKE_BACKEND", None)
         else:
             os.environ["REVIEW_FAKE_BACKEND"] = old_fake
+        if old_usage_dir is None:
+            os.environ.pop("REVIEW_USAGE_LIMITS_DIR", None)
+        else:
+            os.environ["REVIEW_USAGE_LIMITS_DIR"] = old_usage_dir
+        if old_harness_json is None:
+            os.environ.pop("REVIEW_HARNESS_LIMITS_JSON", None)
+        else:
+            os.environ["REVIEW_HARNESS_LIMITS_JSON"] = old_harness_json
     return captured
 
 
@@ -4541,6 +4580,109 @@ def test_cli_panel_task_one_model_pads_to_ship_min_roles():
             roles,
             models,
         )
+
+
+def test_quorum_no_dash_m_auto_assigns_distinct_roles():
+    """review-cli quorum default-role-assignment fix: `review quorum "<question>"
+    --task CODE` with NO `-m` and NO config `models:`/`board:` override used to
+    dispatch a real model panel but leave `ctx.extra["task_roles"]` empty --
+    the only path that ever produced REVIEW_ROLES labels for quorum was
+    `task_role_pad`, gated on exactly one explicit `-m` model. Every OTHER
+    quorum invocation (this one included) fell back through the flat
+    `config_models or DEFAULT_MODELS` branch, which carries no role metadata,
+    so `_seat_assignments()` (reviewlib/modes/quorum.py) silently cycled
+    generic literary PERSONAS instead of real review roles.
+
+    The fix selects from the SAME role-tagged `DEFAULT_BOARD` +
+    `select_pool_and_reserve_with_reuse` that `review diff`'s own board
+    dispatch already uses, scoped to quorum's unconfigured default only, and
+    threads the picked roles into `ctx.extra["task_roles"]` via
+    `panel_task_roles`. Proves: more than one seat, one role per seat, every
+    role non-empty, roles are DISTINCT (not one role repeated), models are
+    DISTINCT (not one model cloned across every seat), and the operator-facing
+    `_announce_quorum_auto_roles` stderr notice fires with the real mapping."""
+    captured = _capture_panel_task_dispatch(
+        ["quorum", "test question", "--task", "SOMECODE", "-C", str(REPO_ROOT)]
+    )
+    assert captured.get("rc") == 0, captured
+    models = captured.get("models") or []
+    roles = captured.get("roles") or []
+    assert len(models) > 1, (models, captured)
+    assert len(roles) == len(models), (roles, models)
+    assert all(roles), (roles, models)
+    assert len(set(roles)) > 1, (roles, models)
+    assert len(set(models)) > 1, (roles, models)
+    stderr = captured.get("stderr") or ""
+    assert "quorum auto-assigned roles (no -m):" in stderr, stderr
+    for model, role in zip(models, roles):
+        assert f"{model} -> {role}" in stderr, (model, role, stderr)
+
+
+def test_quorum_no_dash_m_with_config_models_skips_auto_board():
+    """The quorum-default-board auto-role path is scoped strictly to quorum's
+    OWN unconfigured default (`if not config_models and not config_has_board`
+    in `_dispatch`) -- an operator-configured `models:` roster is a deliberate
+    choice and must keep dispatching through the pre-existing flat
+    `config_models` path with NO role metadata, exactly like before this fix.
+    Regression coverage for exactly the scoping condition the new branch's
+    own comment calls out; nothing else pinned that a future edit dropping
+    the guard would go unnoticed."""
+    captured = _capture_panel_task_dispatch(
+        ["quorum", "test question", "--task", "SOMECODE", "-C", str(REPO_ROOT)],
+        config={"models": ["grok", "gemini", "mimo"]},
+    )
+    assert captured.get("rc") == 0, captured
+    models = captured.get("models") or []
+    roles = captured.get("roles") or []
+    assert models, captured
+    assert set(models) <= {GROK_SEAT, "gemini", MIMO_SEAT}, models
+    assert roles == [], (
+        "config `models:` must bypass the DEFAULT_BOARD auto-role path",
+        roles,
+        models,
+    )
+
+
+def test_quorum_no_dash_m_with_config_board_skips_auto_board():
+    """The scoping guard (`if not config_models and not config_has_board`) has
+    TWO independent halves; the sibling test above only exercises the
+    `config_models` half. A config `board:` with no top-level `models:` is
+    the OTHER deliberate operator override the guard must also leave alone
+    (Opus/GLM review finding, round 2) -- if `config_has_board` were ever
+    mis-wired, this is the regression that would silently fire the
+    DEFAULT_BOARD auto-role path over an operator's configured board."""
+    captured = _capture_panel_task_dispatch(
+        ["quorum", "test question", "--task", "SOMECODE", "-C", str(REPO_ROOT)],
+        config={"board": [{"model": "grok", "role": "architect"}]},
+    )
+    assert captured.get("rc") == 0, captured
+    models = captured.get("models") or []
+    roles = captured.get("roles") or []
+    assert models, captured
+    assert roles == [], (
+        "config `board:` (no top-level models:) must bypass the "
+        "DEFAULT_BOARD auto-role path too",
+        roles,
+        models,
+    )
+
+
+def test_quorum_no_dash_m_all_unreachable_falls_back_to_flat_src():
+    """When every `DEFAULT_BOARD` seat reads unreachable, the auto-role
+    branch's `select_pool_and_reserve_with_reuse` returns no seats,
+    `quorum_auto_roles` stays empty, and dispatch must fall through to the
+    pre-existing flat `src` fallback (dispatch `src` UNFILTERED, no roles) —
+    never crash, never dispatch zero seats. Regression coverage for the
+    empty-selection edge of the new branch (Sonnet/Fable review finding)."""
+    captured = _capture_panel_task_dispatch(
+        ["quorum", "test question", "--task", "SOMECODE", "-C", str(REPO_ROOT)],
+        available=False,
+    )
+    assert captured.get("rc") == 0, captured
+    models = captured.get("models") or []
+    roles = captured.get("roles") or []
+    assert models, captured
+    assert roles == [], (roles, models)
 
 
 def test_run_panel_retry_unusable_retries_failed_slots_only():
