@@ -70,16 +70,33 @@ def _with_store(fn):
     TTL and record explicit ttl_seconds values, but `active_cooldown` also re-checks
     this var on every read — a developer who exported `REVIEW_SEAT_COOLDOWN_SECONDS=0`
     (the module's own documented un-stick escape hatch) would otherwise see these tests
-    fail (codex review finding)."""
+    fail (codex review finding).
+
+    Also neutralizes usage_limits' live data sources ($REVIEW_HARNESS_LIMITS_JSON to an
+    empty card list, $REVIEW_USAGE_LIMITS_FILE to a path that does not exist): once
+    `backends._cooldown_after_recovery_probe` wired `usage_percent_for_model` into the
+    cooldown-skip path, a wiring test asserting "still cooling down, real dispatch never
+    happens" started reading the DEVELOPER'S OWN real Claude Code usage percent -- on a
+    host where that happens to read comfortably under 100%, the probe would (correctly,
+    for a real user) clear the cooldown and let the real dispatch through, breaking the
+    test's fixed assumption. Forcing "no usage data" here makes every cooldown-skip
+    assertion deterministic regardless of the host's real quota state; a test that wants
+    to exercise actual recovery instead monkeypatches `backends.usage_percent_for_model`
+    directly (see the recovery-probe tests below), bypassing this env-based path
+    entirely."""
     with tempfile.TemporaryDirectory() as d:
         saved_store = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
         saved_logs = os.environ.get("REVIEW_LOG_DIR")
         saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
         saved_ttl = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+        saved_harness_json = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
+        saved_usage_file = os.environ.get("REVIEW_USAGE_LIMITS_FILE")
         os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
         os.environ["REVIEW_LOG_DIR"] = str(Path(d) / "logs")
         os.environ["REVIEW_CLAUDE_MODE"] = "cli"
         os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+        os.environ["REVIEW_HARNESS_LIMITS_JSON"] = '{"cards": []}'
+        os.environ["REVIEW_USAGE_LIMITS_FILE"] = str(Path(d) / "no-such-usage-file.json")
         try:
             return fn()
         finally:
@@ -88,6 +105,8 @@ def _with_store(fn):
                 ("REVIEW_LOG_DIR", saved_logs),
                 ("REVIEW_CLAUDE_MODE", saved_mode),
                 ("REVIEW_SEAT_COOLDOWN_SECONDS", saved_ttl),
+                ("REVIEW_HARNESS_LIMITS_JSON", saved_harness_json),
+                ("REVIEW_USAGE_LIMITS_FILE", saved_usage_file),
             ):
                 if saved is None:
                     os.environ.pop(key, None)
@@ -3121,6 +3140,140 @@ def test_wiring_review_claude_rc0_seat_fatal_stderr_does_not_cache():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
+
+    _with_store(_run)
+
+
+
+# ---- usage-limit recovery probe (backends._cooldown_after_recovery_probe) -----------------
+def test_recovery_probe_clears_a_quota_cooldown_when_usage_shows_recovery():
+    """A cooldown recorded for a QUOTA reason ("session limit") is cleared -- not just
+    ignored for this one call -- the moment a live usage-limit reading proves the
+    window has actually reset, so a LATER probe/report also sees the seat as healthy,
+    not merely this one dispatch decision."""
+
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "session limit", now=t0, access_method="test")
+        saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 10.0)
+        try:
+            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+        finally:
+            backends.usage_percent_for_model = saved
+        assert result is None, "a recovered quota cooldown must read as not-cooling-down"
+        assert sc.active_cooldown(MODEL, access_method="test") is None, (
+            "recovery must actually CLEAR the store, not just this call's return value"
+        )
+
+    _with_store(_run)
+
+
+def test_recovery_probe_keeps_a_quota_cooldown_when_usage_data_is_unknown():
+    """Critical fail-safe: `usage_percent_for_model` returning `None` ("no data" -- no
+    harness-cli installed, no tg-ctl sample, an unmapped provider) must NOT read as
+    recovered. Fail-open here would silently defeat the whole cooldown feature for
+    every user without harness-cli installed -- their very first re-check would
+    always read "recovered" despite having no evidence at all."""
+
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "usage-credits", now=t0, access_method="test")
+        saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: None)
+        try:
+            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+        finally:
+            backends.usage_percent_for_model = saved
+        assert result is not None, "unknown usage data must never read as recovered"
+        assert sc.active_cooldown(MODEL, access_method="test") is not None
+
+    _with_store(_run)
+
+
+def test_recovery_probe_keeps_a_quota_cooldown_when_usage_is_still_exhausted():
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "session limit", now=t0, access_method="test")
+        saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 100.0)
+        try:
+            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+        finally:
+            backends.usage_percent_for_model = saved
+        assert result is not None, "a still-exhausted usage window must not be cleared"
+        assert sc.active_cooldown(MODEL, access_method="test") is not None
+
+    _with_store(_run)
+
+
+def test_recovery_probe_never_clears_a_non_quota_cooldown():
+    """A true-silence timeout (or any non-quota reason) is not modeled by the usage
+    percent at all -- a healthy quota reading says nothing about whether the actual
+    hang/notice cleared, so it must never be treated as recovery evidence."""
+
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "true-silence timeout", now=t0, access_method="test")
+        saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 5.0)
+        try:
+            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+        finally:
+            backends.usage_percent_for_model = saved
+        assert result is not None, "a non-quota reason must never be probe-cleared"
+        assert sc.active_cooldown(MODEL, access_method="test") is not None
+
+    _with_store(_run)
+
+
+def test_recovery_probe_never_clears_an_api_access_method_cooldown():
+    """usage_percent_for_model measures the Claude Code CLI SUBSCRIPTION window, not
+    the separate paid Anthropic API account -- a healthy CLI reading is not evidence
+    the API transport's own problem (a bad key, a billing issue) has cleared. This
+    must never be probed regardless of how healthy the usage reading looks."""
+
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "session limit", now=t0, access_method="api")
+        saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 1.0)
+        try:
+            result = backends._cooldown_after_recovery_probe(MODEL, access_method="api")
+        finally:
+            backends.usage_percent_for_model = saved
+        assert result is not None, "an api-transport cooldown must never be probe-cleared"
+        assert sc.active_cooldown(MODEL, access_method="api") is not None
+
+    _with_store(_run)
+
+
+def test_wiring_review_claude_dispatches_after_recovery_probe_clears_cooldown():
+    """End-to-end: a quota-cooled-down seat with a live usage reading showing recovery
+    must reach the REAL dispatch on the very next `review_claude` call -- not the
+    synthetic cooldown-skip sentinel -- with no manual restart/env-var hatch needed."""
+
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "session limit", now=t0, access_method="cli")
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
+
+        real_result = ReviewResult(
+            model=MODEL,
+            command="fake",
+            returncode=0,
+            stdout="a real review body",
+            stderr="",
+        )
+        saved_cli = _patched(backends, "review_claude_cli", lambda *a, **k: real_result)
+        saved_unpaid = _patched(backends, "unpaid_provider_result", lambda *a, **k: None)
+        saved_usage = _patched(backends, "usage_percent_for_model", lambda *a, **k: 12.0)
+        try:
+            result = backends.review_claude(MODEL, "prompt", "", Path("."), 60, 0)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+            backends.usage_percent_for_model = saved_usage
+
+        assert result is real_result, (
+            "recovery must let the real dispatch through, not the cooldown-skip sentinel"
+        )
         assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
