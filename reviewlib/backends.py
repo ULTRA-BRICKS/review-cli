@@ -41,7 +41,11 @@ from .process import (
     write_sidecar_log,
 )
 from .seat_cooldown import active_cooldown, clear_cooldown, record_cooldown
-from .usage_limits import allow_spawn_for_model, spawn_refuse_reason, usage_percent_for_model
+from .usage_limits import (
+    allow_spawn_for_model,
+    spawn_refuse_reason,
+    usage_percent_for_model,
+)
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -2919,7 +2923,23 @@ def _cooldown_after_recovery_probe(model: str, *, access_method: str) -> dict | 
     reading proves recovery. A recovered seat's cooldown is cleared via
     `clear_cooldown` (not merely ignored for this one call) so the NEXT probe/report
     also sees it as healthy, matching `clear_cooldown`'s existing genuine-success
-    contract elsewhere in this module."""
+    contract elsewhere in this module.
+
+    Also narrow on the ACCESS METHOD: `access_method="api"` is never probed either.
+    `usage_percent_for_model` measures the Claude Code CLI subscription window, not
+    the separate paid Anthropic API account -- a healthy CLI reading is no evidence
+    the API transport's own problem (a bad key, a billing issue) has cleared.
+
+    KNOWN ACCEPTED TRADE-OFF (review finding, tracked in review-cli#530 for a future
+    pass, not fixed here to keep this change minimal): a `clear_cooldown` recovery
+    also wipes the seat's escalation `fail_count` history (same as any other genuine-
+    success clear in this module), and a tg-ctl fallback reading from
+    `usage_percent_for_model` may be up to `usage_limits.DEFAULT_MAX_AGE_SECONDS`
+    (24h) stale -- a stale-but-still-"fresh" sample could clear a chronic seat's
+    escalation history early. This inherits the SAME trust window `allow_spawn_for_
+    model` already uses to gate real dispatch for a seat with no cooldown at all; it
+    is not a new risk this probe introduces, just an existing one now also reachable
+    through the escalation path."""
     cooldown = active_cooldown(model, access_method=access_method)
     if cooldown is None:
         return None
@@ -2927,11 +2947,24 @@ def _cooldown_after_recovery_probe(model: str, *, access_method: str) -> dict | 
         marker in cooldown["reason"].lower() for marker in _CHRONIC_QUOTA_MARKERS
     ):
         return cooldown
+    # review-cli's own review gate (round 1, HIGH): `usage_percent_for_model` measures
+    # the Claude Code CLI SUBSCRIPTION window (harness-card/tg-ctl), not the separate
+    # paid Anthropic API account -- review_claude's own cooldown-check comment already
+    # makes this exact distinction ("gating the API transport on that card would
+    # suppress a valid Anthropic-compatible call when local Claude Code is exhausted").
+    # The reverse direction is just as wrong: treating a healthy CLI-subscription
+    # reading as evidence the API transport recovered would clear an API cooldown for
+    # a problem (a bad key, a billing issue) the CLI signal says nothing about. Never
+    # probe the "api" access method with this signal -- it keeps relying purely on the
+    # existing TTL, same as any other reason this probe doesn't model.
+    if access_method == "api":
+        return cooldown
     pct = usage_percent_for_model(model)
     if pct is not None and pct < 100.0:
         clear_cooldown(model, access_method=access_method)
         return None
     return cooldown
+
 
 # Byte-exact match for the numeric codes retry.py's `_TRANSIENT_PATTERNS` regex
 # targets (`\b429\b`, `\b5(?:0[0234]|2[0-4]|29)\b`): 429, 500/502/503/504, 520-524,
