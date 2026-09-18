@@ -96,7 +96,9 @@ def _with_store(fn):
         os.environ["REVIEW_CLAUDE_MODE"] = "cli"
         os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
         os.environ["REVIEW_HARNESS_LIMITS_JSON"] = '{"cards": []}'
-        os.environ["REVIEW_USAGE_LIMITS_FILE"] = str(Path(d) / "no-such-usage-file.json")
+        os.environ["REVIEW_USAGE_LIMITS_FILE"] = str(
+            Path(d) / "no-such-usage-file.json"
+        )
         try:
             return fn()
         finally:
@@ -176,7 +178,9 @@ def test_pre_187_flat_store_shape_reads_as_no_cooldown_and_is_replaced_on_write(
         assert "until" not in data[model], data  # flat shape discarded, not merged
         assert set(data[model]) == {"opencode"}, data
         fresh = sc.active_cooldown(model, access_method="opencode")
-        assert fresh is not None and fresh["fail_count"] == 1, fresh  # no legacy history
+        assert fresh is not None and fresh["fail_count"] == 1, (
+            fresh
+        )  # no legacy history
         assert sc.active_cooldown(model, access_method="cli") is None
         sc.clear_cooldown(model, access_method="opencode")
         assert sc.active_cooldown(model, access_method="opencode") is None
@@ -3080,7 +3084,10 @@ def test_wiring_review_claude_rc0_transient_stderr_sentinel_does_not_clear_coold
     def _run():
         sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="cli")
         sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="cli")
-        assert sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"] == 2
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"]
+            == 2
+        )
 
         saved = backends.review_claude_cli
         saved_unpaid = _patched(
@@ -3145,7 +3152,6 @@ def test_wiring_review_claude_rc0_seat_fatal_stderr_does_not_cache():
     _with_store(_run)
 
 
-
 # ---- usage-limit recovery probe (backends._cooldown_after_recovery_probe) -----------------
 def test_recovery_probe_clears_a_quota_cooldown_when_usage_shows_recovery():
     """A cooldown recorded for a QUOTA reason ("session limit") is cleared -- not just
@@ -3158,10 +3164,14 @@ def test_recovery_probe_clears_a_quota_cooldown_when_usage_shows_recovery():
         sc.record_cooldown(MODEL, "session limit", now=t0, access_method="test")
         saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 10.0)
         try:
-            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+            result = backends._cooldown_after_recovery_probe(
+                MODEL, access_method="test"
+            )
         finally:
             backends.usage_percent_for_model = saved
-        assert result is None, "a recovered quota cooldown must read as not-cooling-down"
+        assert result is None, (
+            "a recovered quota cooldown must read as not-cooling-down"
+        )
         assert sc.active_cooldown(MODEL, access_method="test") is None, (
             "recovery must actually CLEAR the store, not just this call's return value"
         )
@@ -3181,7 +3191,9 @@ def test_recovery_probe_keeps_a_quota_cooldown_when_usage_data_is_unknown():
         sc.record_cooldown(MODEL, "usage-credits", now=t0, access_method="test")
         saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: None)
         try:
-            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+            result = backends._cooldown_after_recovery_probe(
+                MODEL, access_method="test"
+            )
         finally:
             backends.usage_percent_for_model = saved
         assert result is not None, "unknown usage data must never read as recovered"
@@ -3196,7 +3208,9 @@ def test_recovery_probe_keeps_a_quota_cooldown_when_usage_is_still_exhausted():
         sc.record_cooldown(MODEL, "session limit", now=t0, access_method="test")
         saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 100.0)
         try:
-            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+            result = backends._cooldown_after_recovery_probe(
+                MODEL, access_method="test"
+            )
         finally:
             backends.usage_percent_for_model = saved
         assert result is not None, "a still-exhausted usage window must not be cleared"
@@ -3215,7 +3229,9 @@ def test_recovery_probe_never_clears_a_non_quota_cooldown():
         sc.record_cooldown(MODEL, "true-silence timeout", now=t0, access_method="test")
         saved = _patched(backends, "usage_percent_for_model", lambda *a, **k: 5.0)
         try:
-            result = backends._cooldown_after_recovery_probe(MODEL, access_method="test")
+            result = backends._cooldown_after_recovery_probe(
+                MODEL, access_method="test"
+            )
         finally:
             backends.usage_percent_for_model = saved
         assert result is not None, "a non-quota reason must never be probe-cleared"
@@ -3238,7 +3254,50 @@ def test_recovery_probe_never_clears_an_api_access_method_cooldown():
             result = backends._cooldown_after_recovery_probe(MODEL, access_method="api")
         finally:
             backends.usage_percent_for_model = saved
-        assert result is not None, "an api-transport cooldown must never be probe-cleared"
+        assert result is not None, (
+            "an api-transport cooldown must never be probe-cleared"
+        )
+        assert sc.active_cooldown(MODEL, access_method="api") is not None
+
+    _with_store(_run)
+
+
+def test_wiring_review_claude_never_dispatches_api_after_recovery_probe_skip():
+    """End-to-end mirror of the api-direction unit test above: even a healthy CLI-
+    subscription usage reading must not let a genuinely cooled-down API transport
+    reach the real `review_claude_api` dispatch -- the seat-cooldown skip sentinel
+    must come back instead, and the api cooldown must stay recorded."""
+
+    def _run():
+        t0 = time.time()
+        sc.record_cooldown(MODEL, "session limit", now=t0, access_method="api")
+        assert sc.active_cooldown(MODEL, access_method="api") is not None
+
+        saved_api = _patched(
+            backends,
+            "review_claude_api",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("real API dispatch was NOT skipped")
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        saved_usage = _patched(backends, "usage_percent_for_model", lambda *a, **k: 5.0)
+        saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
+        os.environ["REVIEW_CLAUDE_MODE"] = "api"
+        try:
+            result = backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_api = saved_api
+            backends.unpaid_provider_result = saved_unpaid
+            backends.usage_percent_for_model = saved_usage
+            if saved_mode is None:
+                os.environ.pop("REVIEW_CLAUDE_MODE", None)
+            else:
+                os.environ["REVIEW_CLAUDE_MODE"] = saved_mode
+
+        assert result.command == "seat-cooldown skip (claude)"
         assert sc.active_cooldown(MODEL, access_method="api") is not None
 
     _with_store(_run)
@@ -3262,8 +3321,12 @@ def test_wiring_review_claude_dispatches_after_recovery_probe_clears_cooldown():
             stderr="",
         )
         saved_cli = _patched(backends, "review_claude_cli", lambda *a, **k: real_result)
-        saved_unpaid = _patched(backends, "unpaid_provider_result", lambda *a, **k: None)
-        saved_usage = _patched(backends, "usage_percent_for_model", lambda *a, **k: 12.0)
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        saved_usage = _patched(
+            backends, "usage_percent_for_model", lambda *a, **k: 12.0
+        )
         try:
             result = backends.review_claude(MODEL, "prompt", "", Path("."), 60, 0)
         finally:
