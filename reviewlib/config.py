@@ -1239,6 +1239,34 @@ def _parse_board_entry(entry: object) -> BoardReviewer | None:
     return BoardReviewer(model=model, role=role, display=display, effort=effort)
 
 
+def _drop_malformed_board_entries(config: dict | None) -> dict:
+    """A shallow copy of `config` with only the `board:` entries that pass
+    `_parse_board_entry` retained -- an entry that raises `BoardConfigError` (an
+    unrecognized/non-string `role:`, review-cli#422) is dropped individually instead of
+    the caller discarding metadata for every OTHER entry too.
+
+    Used by the CLI's `_board_from_models_lenient` retry path: an operator naming
+    models directly via explicit `-m` only cares about metadata for THOSE models: one
+    unrelated, unrecognized-role entry sitting elsewhere in the same `board:` list must
+    not wipe out role/name/effort metadata for an entry that DOES match and IS valid.
+    Non-role parse failures (no usable `model`/`capability`) are already tolerated by
+    `_parse_board_entry` returning `None` rather than raising, so those pass straight
+    through unaffected; only entries that would actually raise are dropped here."""
+    if not isinstance(config, dict):
+        return {}
+    raw_board = config.get("board")
+    if not isinstance(raw_board, list):
+        return {**config}
+    sanitized = []
+    for entry in raw_board:
+        try:
+            _parse_board_entry(entry)  # only care whether this raises, not the result
+        except BoardConfigError:
+            continue
+        sanitized.append(entry)
+    return {**config, "board": sanitized}
+
+
 def load_board(
     config: dict | None = None, *, preset: str | None = None
 ) -> list[BoardReviewer]:
