@@ -301,15 +301,25 @@ _LIVE_CHILDREN_LOCK = threading.Lock()
 _LIVE_CHILDREN: set[tuple[subprocess.Popen, int | None]] = set()
 
 
+def _register_child_locked(
+    proc: subprocess.Popen, pgid: int | None
+) -> tuple[subprocess.Popen, int | None]:
+    """Same bookkeeping as `_register_child`, for a caller that ALREADY holds
+    `_LIVE_CHILDREN_LOCK` (review-cli#163: `_run_streamed` widens its critical
+    section to cover the `Popen()` call itself, not just the registration that
+    follows it -- see that call site below for why)."""
+    handle = (proc, pgid)
+    _LIVE_CHILDREN.add(handle)
+    return handle
+
+
 def _register_child(
     proc: subprocess.Popen, pgid: int | None
 ) -> tuple[subprocess.Popen, int | None]:
     """Track a live backend child so the backstop can reap it. Returns the handle to
     pass back to `_unregister_child` in a finally."""
-    handle = (proc, pgid)
     with _LIVE_CHILDREN_LOCK:
-        _LIVE_CHILDREN.add(handle)
-    return handle
+        return _register_child_locked(proc, pgid)
 
 
 def _unregister_child(handle: tuple[subprocess.Popen, int | None]) -> None:
@@ -1443,33 +1453,48 @@ def _run_streamed(
             else None
         )
 
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            # Never inherit this process's real stdin fd: an argv-only backend
-            # call (opencode/omp -- codex/claude always pass input_text) must
-            # get a closed stdin, not whatever the CALLER's own stdin happens to
-            # be. review-cli routinely runs as a subprocess of an orchestrating
-            # agent whose own stdin is an open, non-EOF pipe/tty; if the child
-            # CLI reads stdin at all (a common non-TTY pattern), a bare `None`
-            # here lets it inherit that fd and block forever at 0% CPU with zero
-            # output (review-cli#428). DEVNULL gives it an immediately-EOF'd
-            # stdin regardless of what the caller's own stdin is doing.
-            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            # BINARY pipes: we read fixed CHUNKS off the raw fd (os.read), not lines, so
-            # flushed-but-newline-less output is captured immediately and is never lost
-            # if a descendant keeps the pipe open past the deadline.
-            start_new_session=True,  # own process group, so we can kill the whole tree
-        )
-        running = proc  # non-None alias for the nested closures
-        # Register IMMEDIATELY — before resolving the pgid — so a backstop fire can never
-        # orphan a just-Popen'd backend in the window before `os.getpgid` returns. At this
-        # instant the child has no descendants yet, so the pgid=None handle (which reaps
-        # via `proc.kill()` on its own pid) is sufficient cover for that window.
-        child_handle = _register_child(proc, None)
+        # Widen the lock to cover Popen() itself, not just the registration
+        # that follows it (review-cli#163 signal-reaper spawn race): the
+        # previous version left this window LOCK-FREE, so an external signal
+        # landing here -- main thread idle in a panel's as_completed loop,
+        # this call running on a worker thread -- let kill_live_children()
+        # snapshot read succeed instantly against an empty/stale
+        # _LIVE_CHILDREN, reaping nothing and orphaning the child before this
+        # thread ever reached _register_child. Now that same signal makes
+        # kill_live_children()'s bounded acquire(timeout=0.5) BLOCK until this
+        # thread finishes spawning and registering (Popen completes in low
+        # milliseconds, far under the 0.5s budget), then reap the
+        # now-registered child instead of missing it. Concurrent seats briefly
+        # serialize on this lock only for their own Popen() call, never for
+        # the review itself.
+        with _LIVE_CHILDREN_LOCK:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                # Never inherit this process's real stdin fd: an argv-only backend
+                # call (opencode/omp -- codex/claude always pass input_text) must
+                # get a closed stdin, not whatever the CALLER's own stdin happens to
+                # be. review-cli routinely runs as a subprocess of an orchestrating
+                # agent whose own stdin is an open, non-EOF pipe/tty; if the child
+                # CLI reads stdin at all (a common non-TTY pattern), a bare `None`
+                # here lets it inherit that fd and block forever at 0% CPU with zero
+                # output (review-cli#428). DEVNULL gives it an immediately-EOF'd
+                # stdin regardless of what the caller's own stdin is doing.
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                # BINARY pipes: we read fixed CHUNKS off the raw fd (os.read), not lines, so
+                # flushed-but-newline-less output is captured immediately and is never lost
+                # if a descendant keeps the pipe open past the deadline.
+                start_new_session=True,  # own process group, so we can kill the whole tree
+            )
+            running = proc  # non-None alias for the nested closures
+            # Register IMMEDIATELY — before resolving the pgid — so a backstop fire can never
+            # orphan a just-Popen'd backend in the window before `os.getpgid` returns. At this
+            # instant the child has no descendants yet, so the pgid=None handle (which reaps
+            # via `proc.kill()` on its own pid) is sufficient cover for that window.
+            child_handle = _register_child_locked(proc, None)
         # Capture the group id NOW, while the child is alive. We need it later even
         # after the direct child is reaped, because a grandchild in the same group
         # may still be holding the stdout pipe open.
