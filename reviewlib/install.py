@@ -23,12 +23,10 @@ SKILL_MD = """\
 ---
 name: review
 description: >-
-  Read-only multi-model code review and AI panel. Modes are SUBCOMMANDS. Use BEFORE
-  committing to check a diff across several models at once (`review diff --task CODE`), to get a
-  multi-model second opinion on a question (`review just-ask "Q" --task CODE`), to settle a
-  contested technical decision with cited evidence (`review quorum "Q" --task CODE`), or to
-  brainstorm an open design space across rotating expert personas in a loop
-  (`review brainstorm "TOPIC" --task CODE`). e.g. `review diff --task CODE` on the current diff.
+  Read-only multi-model code review and AI panel. Use BEFORE committing to check a
+  diff across models (`review diff --task CODE`), get a second opinion (`review
+  just-ask "Q"`), settle a contested decision with evidence (`review quorum "Q"`), or
+  brainstorm across personas (`review brainstorm "TOPIC"`).
 metadata:
   author: alex-mextner
   repo: https://github.com/alex-mextner/review-cli
