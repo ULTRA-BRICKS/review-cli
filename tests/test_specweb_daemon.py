@@ -605,7 +605,10 @@ def test_format_review_message_is_batch_scoped_and_one_line_per_comment():
 
 def test_daemon_submit_delivers_to_the_specs_registered_agent():
     """POST /api/submit on a spec registered with --agent must hand the batch to deliver
-    (the tg-ctl-style tmux injection) and report the outcome in the response."""
+    (the tg-ctl-style tmux injection) and report the outcome in the response. A SUCCESSFUL
+    tmux delivery must never fall back to the Telegram admin notify — that fallback exists
+    only for a FAILED hand-off (see test_daemon_submit_falls_back_to_telegram_when_tmux_fails
+    below)."""
     with _TempStoreEnv():
         name = sregistry.register(FIXTURE, agent="ext")
         d = _Daemon(agent="daemon-default")
@@ -620,8 +623,16 @@ def test_daemon_submit_delivers_to_the_specs_registered_agent():
             )
             return True, "injected into pane %7 (fake)"
 
+        def _fail_if_called(**kw):
+            raise AssertionError(
+                f"notify_admin_via_tg must not fire on a successful tmux delivery: {kw}"
+            )
+
         try:
-            with mock.patch.object(sdeliver, "deliver_review", _fake_deliver):
+            with (
+                mock.patch.object(sdeliver, "deliver_review", _fake_deliver),
+                mock.patch.object(sdeliver, "notify_admin_via_tg", _fail_if_called),
+            ):
                 st, _, _ = d.post(
                     f"/spec/{name}/api/comments", {"quote": "q", "body": "deliver me"}
                 )
@@ -642,31 +653,553 @@ def test_daemon_submit_delivers_to_the_specs_registered_agent():
             "agent": "ext",
             "delivered": True,
             "detail": "injected into pane %7 (fake)",
+            "telegram_notified": False,
+            "telegram_detail": None,
         }, resp
 
 
-def test_daemon_submit_falls_back_to_daemon_default_agent():
+def test_daemon_submit_falls_back_to_telegram_when_tmux_fails():
+    """When the owning agent's pane can't be found (e.g. launched with no tmux/omp session
+    at all — a ChatGPT-plugin agent), the server must fall back to notify_admin_via_tg and
+    fold its outcome into the response, and the submit itself must never raise/500."""
     with _TempStoreEnv():
-        name = sregistry.register(FIXTURE)  # no per-spec agent
+        name = sregistry.register(FIXTURE, agent="rig")
         d = _Daemon(agent="daemon-default")
-        calls = {}
+        tg_calls = {}
 
         def _fake_deliver(**kw):
-            calls.update(kw)
-            return True, "ok"
+            return False, "no tmux window/session named 'rig'"
+
+        def _fake_notify(*, agent, spec_name, spec_path, review, batch, reason):
+            tg_calls.update(
+                agent=agent,
+                spec_name=spec_name,
+                batch=batch,
+                reason=reason,
+                n=len(review.get("comments") or []),
+            )
+            return True, "notified admin via tg"
 
         try:
-            with mock.patch.object(sdeliver, "deliver_review", _fake_deliver):
-                d.post(f"/spec/{name}/api/comments", {"quote": "", "body": "note"})
+            with (
+                mock.patch.object(sdeliver, "deliver_review", _fake_deliver),
+                mock.patch.object(sdeliver, "notify_admin_via_tg", _fake_notify),
+            ):
+                d.post(
+                    f"/spec/{name}/api/comments", {"quote": "q", "body": "deliver me"}
+                )
                 st, body, _ = d.post(f"/spec/{name}/api/submit", {})
         finally:
             d.stop()
-        assert st == 200 and calls["agent"] == "daemon-default", (st, calls)
+        assert st == 200, (st, body)
+        resp = json.loads(body)
+        assert tg_calls["agent"] == "rig" and tg_calls["spec_name"] == name, tg_calls
+        assert tg_calls["reason"] == "no tmux window/session named 'rig'", tg_calls
+        assert resp["delivery"]["delivered"] is False, resp
+        assert resp["delivery"]["telegram_notified"] is True, resp
+        assert resp["delivery"]["telegram_detail"] == "notified admin via tg", resp
+
+
+def test_daemon_submit_falls_back_to_telegram_using_daemon_default_agent():
+    """A spec with NO per-spec ``--agent`` still resolves an owner via the daemon's own
+    default agent (``_owning_agent``'s ``agent or default_agent`` fallback) — and that
+    resolved name is what the Telegram fallback reports, not the per-spec absence. Restores
+    the daemon-default coverage the tmux-success test used to carry before this fallback
+    was added (every other test here now registers a per-spec agent)."""
+    with _TempStoreEnv():
+        name = sregistry.register(FIXTURE)  # no per-spec agent
+        d = _Daemon(agent="daemon-default")
+        tg_calls = {}
+
+        def _fake_deliver(**kw):
+            return False, "no tmux window/session named 'daemon-default'"
+
+        def _fake_notify(*, agent, spec_name, spec_path, review, batch, reason):
+            tg_calls.update(agent=agent, spec_name=spec_name)
+            return True, "notified admin via tg"
+
+        try:
+            with (
+                mock.patch.object(sdeliver, "deliver_review", _fake_deliver),
+                mock.patch.object(sdeliver, "notify_admin_via_tg", _fake_notify),
+            ):
+                d.post(
+                    f"/spec/{name}/api/comments", {"quote": "q", "body": "deliver me"}
+                )
+                st, body, _ = d.post(f"/spec/{name}/api/submit", {})
+        finally:
+            d.stop()
+        assert st == 200, (st, body)
+        resp = json.loads(body)
+        assert tg_calls["agent"] == "daemon-default", tg_calls
+        assert resp["delivery"]["agent"] == "daemon-default", resp
+        assert resp["delivery"]["telegram_notified"] is True, resp
+
+
+def test_daemon_submit_telegram_fallback_absent_tg_is_still_best_effort():
+    """`tg` missing (or failing) for the fallback must ALSO never fail the submit — the
+    review is already durably in the store either way."""
+    with _TempStoreEnv():
+        name = sregistry.register(FIXTURE, agent="rig")
+        d = _Daemon()
+
+        def _fake_deliver(**kw):
+            return False, "no tmux window/session named 'rig'"
+
+        def _fake_notify(**kw):
+            return False, "tg not on PATH"
+
+        try:
+            with (
+                mock.patch.object(sdeliver, "deliver_review", _fake_deliver),
+                mock.patch.object(sdeliver, "notify_admin_via_tg", _fake_notify),
+            ):
+                d.post(
+                    f"/spec/{name}/api/comments", {"quote": "q", "body": "deliver me"}
+                )
+                st, body, _ = d.post(f"/spec/{name}/api/submit", {})
+        finally:
+            d.stop()
+        assert st == 200, (st, body)
+        resp = json.loads(body)
+        assert resp["delivery"]["delivered"] is False, resp
+        assert resp["delivery"]["telegram_notified"] is False, resp
+        assert resp["delivery"]["telegram_detail"] == "tg not on PATH", resp
+
+
+def test_notify_admin_via_tg_builds_message_with_agent_reason_and_comments():
+    """Pure unit test on the fallback's own tg call: no tmux/daemon involved, just stub
+    shutil.which/subprocess.run at the module boundary (same pattern the existing
+    _spec_web_reply_to_tg tests use) and inspect the message tg was actually sent."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    review = {
+        "comments": [
+            {
+                "id": "aaa",
+                "kind": "remark",
+                "batch": "B1",
+                "section_title": "5. Ownership",
+                "quote": "Product issue title",
+                "body": "Telos pursuit is a graph of goals",
+            }
+        ]
+    }
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    old_which = _shutil.which
+    old_run = _subprocess.run
+    _shutil.which = lambda n: "/fake/tg" if n == "tg" else old_which(n)
+    _subprocess.run = fake_run
+    try:
+        ok, detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="rig-axe-pilot-master-spec",
+            spec_path="/x/rig-axe-pilot-master-spec.md",
+            review=review,
+            batch="B1",
+            reason="no tmux window/session named 'rig'",
+        )
+    finally:
+        _shutil.which = old_which
+        _subprocess.run = old_run
+    assert ok is True and detail == "notified admin via tg", (ok, detail)
+    assert len(calls) == 1, calls
+    args = calls[0]
+    assert args[0] == "/fake/tg", args
+    assert "--tag" in args and args[args.index("--tag") + 1] == "report", args
+    assert "--format" in args and args[args.index("--format") + 1] == "html", args
+    # --format html is forced deterministically (not left to tg's content-based
+    # detectHtmlTags autodetection) — see _format_admin_fallback_message's docstring.
+    # invalid --tag SPEC-WEB (tg only accepts answer/decision/problem/report) would mean
+    # the fallback silently never sends in production; pin the valid lowercase tag.
+    no_feature_values = [args[i + 1] for i, a in enumerate(args) if a == "--no-feature"]
+    assert "auto-attach" in no_feature_values, args
+    assert "screenshot-guard" in no_feature_values, args
+    message = args[-1]
+    assert 'agent "rig"' in message, message
+    assert "no tmux window/session named 'rig'" in message, message
+    assert "5. Ownership" in message, message
+    assert "Product issue title" in message, message
+    assert "rig-axe-pilot-master-spec" in message, message
+    assert "--emit-current" in message, message
+
+
+def test_notify_admin_via_tg_bounds_message_length_for_large_batches():
+    """Batch size (comment count) is unbounded; a large batch must not blow past Telegram's
+    ~4096-char limit and silently defeat the fallback it's meant to rescue."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    review = {
+        "comments": [
+            {
+                "id": f"c{i}",
+                "kind": "remark",
+                "batch": "B1",
+                "section_title": f"Section {i}",
+                "quote": "x" * 150,
+                "body": "y" * 900,
+            }
+            for i in range(20)
+        ]
+    }
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    old_which = _shutil.which
+    old_run = _subprocess.run
+    _shutil.which = lambda n: "/fake/tg" if n == "tg" else old_which(n)
+    _subprocess.run = fake_run
+    try:
+        ok, _detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="big-spec",
+            spec_path="/x/big-spec.md",
+            review=review,
+            batch="B1",
+            reason="no tmux window/session named 'rig'",
+        )
+    finally:
+        _shutil.which = old_which
+        _subprocess.run = old_run
+    assert ok is True
+    message = calls[0][-1]
+    assert sdeliver._telegram_len(message) <= sdeliver._TELEGRAM_MESSAGE_CAP, (
+        sdeliver._telegram_len(message)
+    )
+    assert "--emit-current" in message, message  # recovery command survives truncation
+    assert "truncated" in message, message  # batch is well over _FALLBACK_BODY_CLIP
+
+
+def test_notify_admin_via_tg_escapes_message_and_forces_format_html():
+    """`tg` auto-upgrades a message to `parse_mode=HTML` whenever the body merely CONTAINS a
+    recognized Telegram tag name — no `--format` flag needed (tg-cli
+    ``features/render/html.ts::detectHtmlTags``, confirmed live by tg-cli's own
+    ``tests/html-auto-detect.test.ts``). A batch heavy in `&`/`<`/`>`/real tag names must (a)
+    reach tg fully HTML-escaped (so a stray ``<code>``/``<b>`` in reviewer text can't flip
+    parse mode on tg's content-based autodetection and break the send on the fixed
+    ``<id>``/``<answer>`` framing) and (b) still fit under Telegram's ~4096-char cap on the
+    string actually sent, with `--format html` passed explicitly."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    review = {
+        "comments": [
+            {
+                "id": "c1",
+                "kind": "remark",
+                "batch": "B1",
+                "section_title": "Section 1",
+                "quote": "<code>x</code>" * 20,
+                "body": "<b>bold</b> & <a href=evil>link</a> " * 20,
+            }
+        ]
+    }
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    old_which = _shutil.which
+    old_run = _subprocess.run
+    _shutil.which = lambda n: "/fake/tg" if n == "tg" else old_which(n)
+    _subprocess.run = fake_run
+    try:
+        ok, _detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="html-spec",
+            spec_path="/x/html-spec.md",
+            review=review,
+            batch="B1",
+            reason="no tmux window/session named 'rig'",
+        )
+    finally:
+        _shutil.which = old_which
+        _subprocess.run = old_run
+    assert ok is True
+    args = calls[0]
+    assert "--format" in args and args[args.index("--format") + 1] == "html", args
+    message = args[-1]
+    assert sdeliver._telegram_len(message) <= sdeliver._TELEGRAM_MESSAGE_CAP, (
+        sdeliver._telegram_len(message)
+    )
+    # No real (unescaped) Telegram tag reaches tg — every `<`/`&` is escaped, so tg's own
+    # content-based detectHtmlTags can never fire on OUR text (we force --format html
+    # ourselves instead), and Telegram's HTML parser sees only valid entities, never a
+    # dangling one from the length clamp.
+    assert "<code>" not in message and "<b>" not in message, message
+    assert "&lt;code&gt;" in message, message
+    assert "&amp;" in message, message
+    import re as _re
+
+    assert not _re.search(r"&[a-zA-Z]*$", message), message[-40:]
+
+
+def test_esc_clip_never_leaves_a_dangling_entity_at_any_cut_boundary():
+    """`html.escape` only ever emits `&amp;`/`&lt;`/`&gt;`; a length-based clip on already-
+    escaped text can land at ANY offset inside one of those three entities (not just their
+    complete-minus-semicolon spellings `&amp`/`&lt`/`&gt` — the shorter prefixes `&a`/`&am`/
+    `&l`/`&g` are just as reachable and are the exact fragments a naive partial-entity regex
+    misses). Sweep every possible cut point across a run of `&` characters and assert the
+    result never ends in a dangling, non-`;`-terminated entity fragment."""
+    import re as _re
+
+    dangling = _re.compile(r"&[a-zA-Z]*$")
+    for limit in range(1, 40):
+        for n in (limit - 2, limit - 1, limit, limit + 1, limit + 5):
+            if n < 0:
+                continue
+            out = sdeliver._esc_clip("&" * n, limit)
+            assert not dangling.search(out), (limit, n, out)
+            assert sdeliver._telegram_len(out) <= limit, (limit, n, out)
+
+
+def test_clip_escaped_strips_trailing_whitespace_before_the_entity_check():
+    """A cut landing on a partial entity immediately followed by non-newline whitespace
+    (e.g. `"...&am "`) must not survive: stripping the dangling entity tail BEFORE the
+    final `.rstrip()` (the pre-fix order) leaves whitespace between the fragment and the
+    end-of-string anchor, so the `$`-anchored regex never matches and the whitespace-strip
+    re-exposes the same dangling `&am` afterward. `.rstrip()` must run first."""
+    out = sdeliver._clip_escaped("z &am qqqqqqq", 6, marker="")
+    import re as _re
+
+    assert not _re.search(r"&[a-zA-Z]*$", out), out
+    assert "&am" not in out, out
+
+
+def test_clip_escaped_rejects_a_limit_smaller_than_its_marker():
+    """`_clip_escaped(text, limit, marker=...)` requires `limit >= len(marker)` — a caller
+    bug, not reachable input from any current call site — and must fail LOUDLY with a real
+    exception (not a bare `assert`, which `python -O` strips) rather than risk the trim
+    loop spinning on a negative budget."""
+    try:
+        sdeliver._clip_escaped("x" * 100, 0, marker="…")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for limit < marker width")
+
+
+def test_telegram_len_counts_utf16_units_not_code_points():
+    """Telegram's real message-length limit is in UTF-16 code units; a plain Python
+    `len()` undercounts astral-plane characters (most emoji: 1 code point, 2 UTF-16
+    units) and would silently let an over-budget message through. Pins the exact
+    counting `_clip_escaped`'s emoji-safety guarantee depends on — deleting the
+    `encode("utf-16-le")` and falling back to bare `len()` (a one-line "simplification"
+    that looks harmless) must fail this test even though it wouldn't fail anything
+    ASCII-only."""
+    assert sdeliver._telegram_len("a") == 1
+    assert (
+        sdeliver._telegram_len("😀") == 2
+    )  # astral-plane: 1 code point, 2 UTF-16 units
+    assert sdeliver._telegram_len("😀" * 50) == 100
+
+
+def test_esc_clip_respects_utf16_budget_for_astral_plane_text():
+    """A run of emoji (astral-plane, 2 UTF-16 units each) clipped to a code-point-sized
+    limit must still fit under that limit in Telegram's own UTF-16 units — the failure
+    this guards: a `_FALLBACK_BODY_CLIP`-sized batch of emoji reviewer text that looks
+    "under budget" by Python `len()` but is actually double that in the units Telegram
+    counts, silently defeating the fallback exactly like the entity-boundary bug did."""
+    out = sdeliver._esc_clip("😀" * 50, 30)
+    assert sdeliver._telegram_len(out) <= 30, (sdeliver._telegram_len(out), out)
+
+
+def test_notify_admin_via_tg_title_carries_agent_and_spec_name_unescaped():
+    """``--title`` is always treated as a plain field by `tg` itself, which escapes it
+    internally regardless of ``--format`` (tg-cli ``features/cli/dict-gate.ts``: "The
+    --title is always a plain field (the header renderer escapes it)") — unlike the message
+    body, ``notify_admin_via_tg`` must NOT double-escape an operator-configured agent/spec
+    name before handing it to ``--title``."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    review = {"comments": []}
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    old_which = _shutil.which
+    old_run = _subprocess.run
+    _shutil.which = lambda n: "/fake/tg" if n == "tg" else old_which(n)
+    _subprocess.run = fake_run
+    try:
+        ok, _detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="a<b>&c-spec",
+            spec_path="/x/a<b>&c-spec.md",
+            review=review,
+            batch=None,
+            reason="no tmux window/session named 'rig'",
+        )
+    finally:
+        _shutil.which = old_which
+        _subprocess.run = old_run
+    assert ok is True
+    args = calls[0]
+    title = args[args.index("--title") + 1]
+    assert "<b>" in title, title
+    assert "&lt;b&gt;" not in title, title
+
+
+def test_notify_admin_via_tg_hard_clamps_the_assembled_message_to_telegram_cap():
+    """The recovery line's ``agent``/``spec_name`` are deliberately NOT field-clipped (they
+    must stay byte-for-byte correct for the printed command to work when pasted), so a
+    pathologically long or HTML-special-char-heavy agent/spec name must not be able to push
+    the ASSEMBLED message over Telegram's ~4096-char cap on its own — the final hard clamp
+    on the whole message is what actually guarantees that, not the per-field clips alone."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    review = {
+        "comments": [
+            {
+                "id": f"c{i}",
+                "kind": "remark",
+                "batch": "B1",
+                "section_title": f"S{i}",
+                "quote": "q" * 150,
+                "body": "b" * 900,
+            }
+            for i in range(6)
+        ]
+    }
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    old_which = _shutil.which
+    old_run = _subprocess.run
+    _shutil.which = lambda n: "/fake/tg" if n == "tg" else old_which(n)
+    _subprocess.run = fake_run
+    try:
+        ok, _detail = sdeliver.notify_admin_via_tg(
+            agent="&" * 300,
+            spec_name="<b>x</b>&" * 40,
+            spec_path="/x/spec.md",
+            review=review,
+            batch="B1",
+            reason="no tmux window/session named for a very long name " * 5,
+        )
+    finally:
+        _shutil.which = old_which
+        _subprocess.run = old_run
+    assert ok is True
+    message = calls[0][-1]
+    assert sdeliver._telegram_len(message) <= sdeliver._TELEGRAM_MESSAGE_CAP, (
+        sdeliver._telegram_len(message)
+    )
+    title = calls[0][calls[0].index("--title") + 1]
+    assert len(title) < 300, len(title)
+
+
+def test_notify_admin_via_tg_returns_false_without_raising_when_tg_absent_or_failing():
+    """Real (unmocked) failure branches: absent tg, non-zero exit, and a raising subprocess
+    must each report (False, <detail>) — never raise — matching the module's best-effort
+    contract."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    review = {"comments": []}
+    old_which = _shutil.which
+    old_run = _subprocess.run
+    try:
+        _shutil.which = lambda n: None
+        ok, detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="s",
+            spec_path="/x/s.md",
+            review=review,
+            batch=None,
+            reason="r",
+        )
+        assert (ok, detail) == (False, "tg not on PATH"), (ok, detail)
+
+        _shutil.which = lambda n: "/fake/tg" if n == "tg" else None
+
+        class _NonZero:
+            returncode = 3
+            stdout = ""
+            stderr = "boom"
+
+        _subprocess.run = lambda *a, **kw: _NonZero()
+        ok, detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="s",
+            spec_path="/x/s.md",
+            review=review,
+            batch=None,
+            reason="r",
+        )
+        assert ok is False and "tg exit 3" in detail and "boom" in detail, (ok, detail)
+
+        def _raise(*a, **kw):
+            raise OSError("no such process")
+
+        _subprocess.run = _raise
+        ok, detail = sdeliver.notify_admin_via_tg(
+            agent="rig",
+            spec_name="s",
+            spec_path="/x/s.md",
+            review=review,
+            batch=None,
+            reason="r",
+        )
+        assert ok is False and "no such process" in detail, (ok, detail)
+    finally:
+        _shutil.which = old_which
+        _subprocess.run = old_run
 
 
 def test_daemon_submit_without_any_agent_still_succeeds():
     """No owner anywhere (old registry, agentless test server): the submit itself must keep
-    working — the review stays in the store; the response reports the undelivered state."""
+    working — the review stays in the store; the response reports the undelivered state.
+    No agent name means no fallback target to report either, so notify_admin_via_tg is
+    intentionally never attempted here (see server.py's docstring for the reasoning)."""
     with _TempStoreEnv():
         name = sregistry.register(FIXTURE)
         d = _Daemon()  # no daemon default either
@@ -680,6 +1213,7 @@ def test_daemon_submit_without_any_agent_still_succeeds():
         assert resp["ok"] is True and resp["count"] == 1, resp
         assert resp["delivery"]["delivered"] is False, resp
         assert resp["delivery"]["agent"] is None, resp
+        assert resp["delivery"]["telegram_notified"] is False, resp
 
 
 # --------------------------------------------------------------------------- #

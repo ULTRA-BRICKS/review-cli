@@ -1826,9 +1826,14 @@
             if (r.count) setFilter('submitted');
             // Surface a FAILED hand-off to the owning agent: the batch is safely in the
             // store, but if delivery into the agent's session failed the reviewer must know
-            // their notes haven't reached anyone yet (the exact "comments reach nobody" gap
-            // the --agent delivery closes). A successful delivery stays quiet — the filter
-            // switch to Submitted is the success signal.
+            // where their notes actually landed (the exact "comments reach nobody" gap the
+            // --agent delivery closes). A successful tmux delivery stays quiet — the filter
+            // switch to Submitted is the success signal. A failed tmux delivery that WAS
+            // rescued by the server's Telegram fallback (delivery.telegram_notified) is
+            // still logged, but as a quiet console note, not a scary alert — the reviewer's
+            // notes DID reach someone (the admin's phone), just not the agent's pane
+            // directly. Only when BOTH channels failed is this the last-resort blocking
+            // alert with the manual recovery command.
             var d = r.delivery;
             if (r.count && d && d.agent && !d.delivered) {
               // Recovery command must EMIT the already-submitted batch, not wait for a future
@@ -1837,9 +1842,15 @@
               // spec when we know it (daemon mode: API_BASE is "/spec/<name>").
               var name = API_BASE.indexOf('/spec/') === 0 ? API_BASE.slice('/spec/'.length) : '';
               var pull = 'review spec-web watch ' + (name || '<spec>') + ' --emit-current';
-              alert('Review submitted and saved, but delivery to agent "' + d.agent +
-                    '" failed: ' + (d.detail || 'unknown reason') +
-                    '.\nIt is safe in the store — the agent can pull it now with:\n  ' + pull);
+              if (d.telegram_notified) {
+                console.log('Review submitted: hand-off to agent "' + d.agent +
+                  '" failed (' + (d.detail || 'unknown reason') +
+                  '), but the notes were sent to the admin via Telegram instead.');
+              } else {
+                alert('Review submitted and saved, but delivery to agent "' + d.agent +
+                      '" failed: ' + (d.detail || 'unknown reason') +
+                      '.\nIt is safe in the store — the agent can pull it now with:\n  ' + pull);
+              }
             }
           });
         })

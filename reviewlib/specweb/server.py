@@ -594,26 +594,70 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         Best-effort: the review is already durably in the store, so a failed delivery is
         LOGGED (daemon log) + reported in the response, never a 500. The tg-ctl-style
         injection is what makes a submit actually REACH someone — before this, batches sat
-        in the store until a watcher happened to poll (i.e. usually never)."""
+        in the store until a watcher happened to poll (i.e. usually never).
+
+        When the tmux hand-off fails (e.g. the review was launched from a process with no
+        tmux/omp session at all — a ChatGPT-plugin agent), a SECOND best-effort channel
+        kicks in: ``deliver.notify_admin_via_tg`` pings the human reviewer directly on
+        Telegram so the batch doesn't just sit in the store. ``detail`` keeps its existing
+        meaning (the tmux outcome only); the tg fallback's own outcome is reported
+        separately as ``telegram_notified`` (bool) / ``telegram_detail`` (str, only set when
+        the fallback was attempted) so neither channel's detail string clobbers the other's.
+        The tg fallback is only attempted when an agent WAS configured but unreachable — an
+        unconfigured agent (the early return below) has no name to report in the fallback
+        message either, and firing tg on every anonymous/local/test submission would be
+        noisy for no benefit, so that branch is intentionally left as a bare early return."""
         from . import deliver
 
         ctx = self._ctx
         agent = self._owning_agent()
         if not agent:
-            return {"agent": None, "delivered": False, "detail": "no owning agent configured"}
+            return {
+                "agent": None,
+                "delivered": False,
+                "detail": "no owning agent configured",
+                "telegram_notified": False,
+                "telegram_detail": None,
+            }
+        spec_name = ctx.name or ctx.spec_path.name  # type: ignore[union-attr]
+        spec_path = ctx.spec_path  # type: ignore[union-attr]
+        review = result.get("review") or {}
+        batch = result.get("batch")
         ok, detail = deliver.deliver_review(
             agent=agent,
-            spec_name=ctx.name or ctx.spec_path.name,  # type: ignore[union-attr]
-            spec_path=ctx.spec_path,  # type: ignore[union-attr]
-            review=result.get("review") or {},
-            batch=result.get("batch"),
+            spec_name=spec_name,
+            spec_path=spec_path,
+            review=review,
+            batch=batch,
+        )
+        telegram_notified = False
+        telegram_detail = None
+        if not ok:
+            telegram_notified, telegram_detail = deliver.notify_admin_via_tg(
+                agent=agent,
+                spec_name=spec_name,
+                spec_path=spec_path,
+                review=review,
+                batch=batch,
+                reason=detail,
+            )
+        tg_part = (
+            f" | tg fallback: {'ok' if telegram_notified else 'FAILED'} ({telegram_detail})"
+            if not ok
+            else ""
         )
         print(
             f"[review spec-web] submit delivery -> agent '{agent}': "
-            f"{'ok' if ok else 'FAILED'} ({detail})",
+            f"{'ok' if ok else 'FAILED'} ({detail}){tg_part}",
             flush=True,
         )
-        return {"agent": agent, "delivered": ok, "detail": detail}
+        return {
+            "agent": agent,
+            "delivered": ok,
+            "detail": detail,
+            "telegram_notified": telegram_notified,
+            "telegram_detail": telegram_detail,
+        }
 
     # ---- POST handlers ---------------------------------------------------- #
     def _create_comment(self, body: dict) -> None:
