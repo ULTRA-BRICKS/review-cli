@@ -40,6 +40,7 @@ from .config import (
     VISUAL_MODELS,
     BoardConfigError,
     EffortValueError,
+    _drop_malformed_board_entries,
     _expand_alias,
     _effective_pool_size,
     _split_models,
@@ -4968,11 +4969,20 @@ def _board_from_models_lenient(
     """`board_from_models(models, config, preset=preset)`, but a malformed config
     `board:` entry (`BoardConfigError` -- e.g. review-cli#422's unrecognized `role:`)
     is a WARNING, not a hard failure, when the operator named MODELS directly via
-    explicit `-m`: losing the config's role/name/effort METADATA for them is
-    recoverable, so this retries with an empty config instead of aborting an explicit
-    `-m` request over unrelated/malformed board metadata. Shared by every explicit-`-m`
-    call site (the --task panel role-pad, `validate_board`, `_show_board`) so the
-    fallback message/behavior can't drift between them."""
+    explicit `-m`: losing that ONE entry's role/name/effort METADATA is recoverable, so
+    this retries with the offending `board:` entries dropped rather than aborting an
+    explicit `-m` request over unrelated/malformed board metadata. The retry only drops
+    entries that actually fail to parse (`_drop_malformed_board_entries`) -- an
+    unrelated bad-role entry elsewhere in `board:` must not also erase metadata for an
+    entry that DOES match the requested models and IS valid (Fable review finding,
+    review-cli#422: `board_from_models` used to wipe the WHOLE config's board metadata,
+    including perfectly valid entries, on any single unrelated typo). Shared by every
+    explicit-`-m` call site (the --task panel role-pad, `validate_board`, `_show_board`)
+    so the fallback message/behavior can't drift between them.
+
+    The sanitized retry is guaranteed to succeed: `_parse_board_entry`'s only raise
+    path is `BoardConfigError` on `role:` validation, and the sanitizer drops every
+    entry that raises it, so nothing is left for `board_from_models` to reject."""
     try:
         return board_from_models(models, config, preset=preset)
     except BoardConfigError as exc:
@@ -4981,7 +4991,9 @@ def _board_from_models_lenient(
             file=sys.stderr,
             flush=True,
         )
-        return board_from_models(models, {}, preset=preset)
+        return board_from_models(
+            models, _drop_malformed_board_entries(config), preset=preset
+        )
 
 
 def _default_review_board(

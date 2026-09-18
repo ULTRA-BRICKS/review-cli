@@ -4676,6 +4676,70 @@ def test_cli_panel_task_pad_recovers_from_typo_role_in_config_board():
     assert "ignoring malformed board metadata" in stderr, stderr
 
 
+def test_lenient_board_retry_keeps_matching_entry_metadata_despite_unrelated_bad_role():
+    """review-cli#422 follow-up (Fable review finding): `board_from_models` parses
+    EVERY `board:` entry to build its model->metadata lookup, not just entries for the
+    caller's requested models -- so a single unrelated entry with a typo'd role used to
+    make `_board_from_models_lenient`'s retry wipe metadata for the WHOLE config board,
+    including a different entry that both matches the requested `-m` model and is
+    completely valid. The retry must drop only the entry that actually fails to parse,
+    not every entry in the list."""
+    import contextlib
+    import io
+
+    from reviewlib.cli import _board_from_models_lenient
+
+    cfg = {
+        "board": [
+            {"model": "grok", "role": "correctness", "name": "Grok Custom"},
+            {"model": "gemini", "role": "not-a-real-role"},  # unrelated typo
+        ]
+    }
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        board = _board_from_models_lenient([GROK_SEAT], cfg)
+    assert len(board) == 1, board
+    # the matching, valid entry's role/name metadata survived the retry --
+    # it was NOT wiped just because an unrelated entry elsewhere was malformed.
+    assert board[0].role == "correctness", board[0]
+    assert board[0].display == "Grok Custom", board[0]
+    assert "not-a-real-role" in stderr.getvalue(), stderr.getvalue()
+
+
+def test_drop_malformed_board_entries_never_leaves_the_retry_unsafe():
+    """`_drop_malformed_board_entries`'s own branches, unit-tested directly against
+    the invariant `_board_from_models_lenient`'s retry depends on: `board_from_models`
+    never raises `BoardConfigError` for anything OTHER than an individual entry that
+    fails `_parse_board_entry` -- a non-dict `config`, and a `board:` that isn't a list
+    at all, are both already silently tolerated by `board_from_models` itself (it only
+    iterates `board:` when `isinstance(raw_board, list)`), so the sanitizer passing
+    them through unchanged can never hand `board_from_models` something that raises."""
+    from reviewlib.cli import _board_from_models_lenient
+    from reviewlib.config import _drop_malformed_board_entries, board_from_models
+
+    assert _drop_malformed_board_entries(None) == {}
+    assert _drop_malformed_board_entries("not-a-dict") == {}
+    # `board:` present but not a list -- passed through unchanged, and confirmed
+    # (not just asserted) that `board_from_models` tolerates it without raising.
+    non_list_cfg = {"board": "oops-not-a-list", "models": ["grok"]}
+    assert _drop_malformed_board_entries(non_list_cfg) == non_list_cfg
+    board_from_models(["grok"], non_list_cfg)  # must not raise
+    # every entry malformed -> sanitized down to an empty list, still tolerated.
+    all_bad_cfg = {
+        "board": [
+            {"model": "grok", "role": "typo-a"},
+            {"model": "gemini", "role": "typo-b"},
+        ]
+    }
+    sanitized = _drop_malformed_board_entries(all_bad_cfg)
+    assert sanitized["board"] == [], sanitized
+    board_from_models(["grok"], sanitized)  # must not raise
+    # end to end: the lenient retry survives a config whose `board:` is malformed at
+    # the CONTAINER level, not just at the per-entry level.
+    board = _board_from_models_lenient(["grok"], {"board": "oops"})
+    assert len(board) == 1, board
+
+
 def test_quorum_no_dash_m_auto_assigns_distinct_roles():
     """review-cli quorum default-role-assignment fix: `review quorum "<question>"
     --task CODE` with NO `-m` and NO config `models:`/`board:` override used to
