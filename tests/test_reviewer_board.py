@@ -5,8 +5,9 @@ A board assigns each reviewer model its OWN role/lens. These tests prove, all
 offline (no model call, no network — backends are monkeypatched / forced
 unavailable):
   (a) DEFAULT_BOARD matches the directive table byte-exact (model -> role);
-  (b) config.yaml `board:` parsing — valid entries, unknown-role fallback to the
-      generic prompt (no crash), bad entries skipped, empty/absent -> DEFAULT_BOARD;
+  (b) config.yaml `board:` parsing — valid entries kept, an unrecognized `role:`
+      raises BoardConfigError immediately (review-cli#422), a malformed model/
+      capability entry is skipped, empty/absent -> DEFAULT_BOARD;
   (c) role-lens injection — an available reviewer's PanelJob prompt is
       `base_prompt + lens` and its label is `"<display> [<role>]"`;
   (d) graceful skip — an unavailable reviewer is dropped (not crashed) and surfaced
@@ -1775,12 +1776,81 @@ def test_board_alias_in_model_is_expanded():
     assert board[0].model == "zai:glm-4.6", board[0].model
 
 
-def test_unknown_role_keeps_reviewer_with_generic_prompt():
-    board = load_board({"board": [{"model": "codex", "role": "made-up-role"}]})
-    assert len(board) == 1
-    assert board[0].role == "made-up-role"
-    # Unknown role -> empty lens -> the job uses the generic prompt (no crash).
-    assert board[0].role_lens == ""
+def test_unknown_role_fails_fast_with_clear_error():
+    """review-cli#422: an unrecognized `role:` string used to be silently kept with the
+    generic prompt (a stderr warning easy to miss) -- on a mixed board with more than one
+    typo'd role, every such seat collapsed onto the SAME generic prompt, so "N roles
+    reviewed" quietly became "N duplicate generic passes". Board composition now rejects
+    it outright, naming both the bad value and the valid REVIEW_ROLES enum."""
+    try:
+        load_board({"board": [{"model": "codex", "role": "made-up-role"}]})
+    except BoardConfigError as exc:
+        message = str(exc)
+        assert "made-up-role" in message, message
+        for known_role in REVIEW_ROLES:
+            assert known_role in message, message
+    else:
+        raise AssertionError("unknown role should raise BoardConfigError, not degrade")
+
+
+def test_non_string_role_fails_fast_same_as_unknown_string():
+    """review-cli#422: a non-string, non-omitted `role:` (a YAML type-confusion typo --
+    e.g. an unquoted `role: true` parsed as a bool, or `role: 123`) is the SAME class of
+    config bug as an unrecognized string. It must raise BoardConfigError too, not silently
+    coerce to the empty/general role and degrade with no warning."""
+    for bad_role in (True, 123, ["security"], {"k": "v"}):
+        try:
+            load_board({"board": [{"model": "codex", "role": bad_role}]})
+        except BoardConfigError as exc:
+            assert repr(bad_role) in str(exc), (bad_role, exc)
+        else:
+            raise AssertionError(
+                f"non-string role {bad_role!r} should raise BoardConfigError, not degrade"
+            )
+
+
+def test_entry_with_unusable_model_skips_before_role_is_checked():
+    """review-cli#422 precedence: `_parse_board_entry` resolves model/capability FIRST --
+    an entry with no usable `model:`/`capability:` is skipped (with a warning) before its
+    `role:` is ever inspected, even when that role is ALSO an unrecognized string. Only an
+    entry that DOES resolve to a real seat has its role validated; a board with one other
+    valid entry proves the bad-model+bad-role entry was silently skipped, not fatal."""
+    cfg = {
+        "board": [
+            {"model": "   ", "role": "not-a-real-role"},  # blank model: skipped first
+            {"model": "codex", "role": "correctness"},  # the only valid entry
+        ]
+    }
+    board = load_board(cfg)
+    assert [r.model for r in board] == ["codex"], [r.model for r in board]
+
+
+def test_mixed_board_with_one_bad_role_fails_fast_not_silently_duplicated():
+    """review-cli#422 regression: a board with several VALID distinct-role seats plus ONE
+    typo'd role must fail the whole board load with a clear error naming the bad seat --
+    not silently generate a duplicate generic prompt for just that one seat while the rest
+    of the board dispatches normally."""
+    cfg = {
+        "board": [
+            {"model": "codex", "role": "correctness"},
+            {"model": "gemini", "role": "securty"},  # typo: should be "security"
+            {"model": "claude:claude-opus-4-8", "role": "performance"},
+        ]
+    }
+    try:
+        load_board(cfg)
+    except BoardConfigError as exc:
+        message = str(exc)
+        assert "gemini" in message, message
+        assert "securty" in message, message
+        # "security" is one of the alphabetically-listed valid roles in the message
+        # (the error lists the whole enum, it does not guess a typo-correction).
+        assert "security" in message, message
+    else:
+        raise AssertionError(
+            "a mixed board with one bad role must fail fast, not silently keep the "
+            "typo'd seat on a duplicate generic prompt"
+        )
 
 
 def test_bad_entries_are_skipped_not_crashed():
@@ -4580,6 +4650,30 @@ def test_cli_panel_task_one_model_pads_to_ship_min_roles():
             roles,
             models,
         )
+
+
+def test_cli_panel_task_pad_recovers_from_typo_role_in_config_board():
+    """review-cli#422 CLI-level regression: `board_from_models(explicit_models, config)`
+    inside the --task panel role-pad path (just-ask/quorum/brainstorm, one explicit -m)
+    used to call straight into the now-validating `_parse_board_entry` with NO
+    try/except -- a config `board:` entry naming the SAME model under a typo'd role
+    crashed the whole CLI dispatch with an unhandled BoardConfigError traceback instead
+    of the friendly [review-cli] error every sibling board_from_models call site prints.
+    The fix mirrors the sibling explicit -m fallback: warn to stderr naming the bad
+    role, ignore the malformed board metadata, and still pad the ship floor."""
+    cfg = {"board": [{"model": "grok", "role": "not-a-real-role"}]}
+    captured = _capture_panel_task_dispatch(
+        ["quorum", "q", "--task", "422", "-m", "grok", "-C", str(REPO_ROOT)],
+        config=cfg,
+    )
+    assert captured.get("rc") == 0, captured  # no crash, dispatch still completes
+    models = captured.get("models") or []
+    roles = captured.get("roles") or []
+    assert set(models) == {GROK_SEAT}, captured
+    assert len(roles) == len(models) and all(roles), captured
+    stderr = captured.get("stderr") or ""
+    assert "not-a-real-role" in stderr, stderr
+    assert "ignoring malformed board metadata" in stderr, stderr
 
 
 def test_quorum_no_dash_m_auto_assigns_distinct_roles():

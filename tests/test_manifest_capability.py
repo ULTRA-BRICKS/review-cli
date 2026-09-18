@@ -367,14 +367,18 @@ def test_board_literal_model_wins_over_capability():
     assert board[0].model == "gemini", board[0].model  # the literal model, NOT the resolved opus
 
 
-def test_board_capability_seat_with_unknown_role_uses_generic_prompt():
-    """A capability-resolved seat with a role NOT in REVIEW_ROLES is kept (warned), using the
-    generic prompt (role_lens == "") — the board degrades, never crashes."""
+def test_board_capability_seat_with_unknown_role_fails_fast():
+    """review-cli#422: a capability-resolved seat with a role NOT in REVIEW_ROLES fails board
+    composition the same as a literal `model:` seat — capability resolution only changes
+    HOW the model is named, not the role validation path (both go through
+    `_parse_board_entry`)."""
     _set_manifest()
-    board = load_board({"board": [{"capability": "role:reasoning", "role": "made-up-role"}]})
-    assert board[0].model == "claude:claude-opus-4-8"
-    assert board[0].role == "made-up-role"
-    assert board[0].role_lens == ""  # unknown role -> generic prompt
+    try:
+        load_board({"board": [{"capability": "role:reasoning", "role": "made-up-role"}]})
+    except BoardConfigError as exc:
+        assert "made-up-role" in str(exc), exc
+    else:
+        raise AssertionError("unknown role should raise BoardConfigError, not degrade")
 
 
 def test_board_keeps_duplicate_seats_for_per_seat_tagging():

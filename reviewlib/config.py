@@ -316,8 +316,12 @@ class BoardReviewer:
     `model` is the backend string (e.g. `claude:claude-opus-4-8`,
     `commandcode:deepseek/deepseek-v4-pro`). `role` is a key into REVIEW_ROLES;
     `display` is a short human name for the --show-board listing / result label.
-    `role_lens` resolves the lens text (empty string for an unknown role, so the
-    job falls back to the generic prompt — never a crash)."""
+    `role_lens` resolves the lens text (empty string for a role that isn't a
+    REVIEW_ROLES key, so the job falls back to the generic prompt — never a crash).
+    This dataclass itself stays permissive on `role` for non-config callers (the
+    `--task` role pad, `DEFAULT_BOARD`'s own literals, brainstorm/quorum personas);
+    only the config.yaml `board:` parser (`_parse_board_entry`) validates `role`
+    against REVIEW_ROLES and rejects an unrecognized one, review-cli#422."""
 
     model: str
     role: str
@@ -1184,7 +1188,19 @@ def _resolve_entry_model(entry: dict) -> str | None:
 def _parse_board_entry(entry: object) -> BoardReviewer | None:
     """Parse ONE config `board:` entry into a BoardReviewer, or `None` (with a warning) when
     it's unusable so `load_board` skips it. A seat comes from a literal `model:` or a
-    capability-resolved `capability:` (rig-cli#8)."""
+    capability-resolved `capability:` (rig-cli#8).
+
+    An unrecognized (non-empty) `role:` string is a HARD error (`BoardConfigError`), not a
+    skip-with-warning: review-cli#422. It used to be kept with a stderr warning and silently
+    degraded to the generic review prompt (role_lens == "") — harmless for one typo, but on a
+    board with MULTIPLE unrecognized roles every one of those seats collapsed onto the exact
+    same generic prompt, so "N roles reviewed" quietly became "N duplicate generic passes"
+    with no signal beyond an easy-to-miss stderr line. A typo'd role is a config bug the
+    operator should fix, not a board that degrades and keeps running — same cost-safety
+    stance as the ALL-entries-malformed case in `load_board` below, just triggered by one bad
+    `role:` instead of a whole board of them. An OMITTED role (`role: ""` / no `role` key) is
+    unaffected — that is the intentional 'general, no lens' seat exercised by
+    `test_role_omitted_is_general_with_generic_prompt`."""
     if not isinstance(entry, dict):
         print(
             f"[review-cli] board entry ignored (not a mapping): {entry!r}",
@@ -1195,15 +1211,25 @@ def _parse_board_entry(entry: object) -> BoardReviewer | None:
     model = _resolve_entry_model(entry)
     if model is None:
         return None
-    role = entry.get("role")
-    role = role.strip() if isinstance(role, str) else ""
+    raw_role = entry.get("role")
+    if raw_role is not None and not isinstance(raw_role, str):
+        # A non-string, non-omitted `role:` (e.g. an unquoted `role: true`/`role: no`
+        # parsed by YAML as a bool, or `role: 123`) is the SAME class of config typo as
+        # an unrecognized string -- catch it here too, or it would silently coerce to ""
+        # and degrade to the generic prompt with no warning, defeating review-cli#422's
+        # fail-fast contract via a type-confusion typo instead of a spelling one.
+        raise BoardConfigError(
+            f"config.yaml board reviewer {model!r} has a non-string role {raw_role!r} "
+            f"({type(raw_role).__name__}) — valid roles are: "
+            f"{', '.join(sorted(REVIEW_ROLES))}. Quote the role value, or omit it to use "
+            "the generic review prompt."
+        )
+    role = raw_role.strip() if isinstance(raw_role, str) else ""
     if role and role not in REVIEW_ROLES:
-        print(
-            f"[review-cli] board reviewer {model!r}: unknown role {role!r} — "
-            f"using the generic review prompt (known roles: "
-            f"{', '.join(sorted(REVIEW_ROLES))})",
-            file=sys.stderr,
-            flush=True,
+        raise BoardConfigError(
+            f"config.yaml board reviewer {model!r} has unknown role {role!r} — "
+            f"valid roles are: {', '.join(sorted(REVIEW_ROLES))}. Fix the role, or "
+            "omit it to use the generic review prompt."
         )
     name = entry.get("name")
     display = (
@@ -1232,8 +1258,11 @@ def load_board(
         ones; each bad entry is skipped with a warning;
       * an entry with neither a usable `model` nor a resolvable `capability` ->
         skipped with a warning;
-      * an unknown `role` -> kept, but the reviewer uses the generic prompt
-        (role_lens == "") and a warning is logged — the board degrades;
+      * an unknown, non-empty `role` -> raises BoardConfigError immediately (review-cli#422:
+        it used to be kept with the generic prompt and a warning, letting a mixed board with
+        several typo'd roles quietly collapse onto duplicate generic-prompt seats). An
+        OMITTED role (`""` / no `role` key) is unaffected — still the generic prompt, no
+        error, no warning;
       * a PRESENT non-empty `board:` whose entries are ALL malformed (no usable
         reviewer survives) -> raise BoardConfigError. This is NOT a silent
         fall-back to DEFAULT_PRESET_BOARD: the user asked for a specific board and got

@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.11 — 2026-09-18
+
+- **Fix(config): board composition rejects an unrecognized `role:` string instead of
+  silently duplicating the generic prompt (review-cli#422).** A `board:` entry (literal
+  `model:` or `capability:`-resolved) whose `role` isn't a `REVIEW_ROLES` key used to be
+  kept with a stderr warning and fall back to the generic review prompt — harmless for one
+  typo, but a mixed board with SEVERAL typo'd roles collapsed every one of those seats onto
+  the exact same generic prompt, silently turning "N roles reviewed" into "N duplicate
+  generic passes". `_parse_board_entry` now raises `BoardConfigError` immediately, naming
+  the bad value and the full valid-role enum, the same cost-safety stance `load_board`
+  already takes for an all-malformed board. An omitted role (`role: ""` / no `role` key) is
+  unaffected — still the intentional generic-prompt seat, no error. Also fixes a regression
+  the new validation exposed: the `--task` single-`-m` panel role-pad path
+  (just-ask/quorum/brainstorm) called `board_from_models` with no `BoardConfigError` guard,
+  so a typo'd config `board:` role would have crashed the whole CLI dispatch with a raw
+  traceback instead of the friendly `[review-cli]` warning every sibling call site prints
+  — now wrapped to match, warning and retrying with the malformed board metadata ignored
+  (the fix is one shared `_board_from_models_lenient` helper, reused by all three explicit
+  `-m` call sites). A non-string `role:` (e.g. an unquoted `role: true`/`role: no` parsed
+  by YAML as a bool) is rejected the same way a typo'd string is, instead of silently
+  coercing to the empty/general role.
+
 ## 0.37.10 — 2026-09-10
 
 - **Perf: dashboard hot path no longer scales with the full log corpus (review-cli#447).**
