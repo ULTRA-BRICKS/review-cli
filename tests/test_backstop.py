@@ -17,6 +17,7 @@ Same harness style as the other test_* files: plain test_* functions run by the
 __main__ block (and pytest-collectable). No live model call is ever made — the
 wedged-run tests sleep in a throwaway child, they don't dispatch a backend.
 """
+
 from __future__ import annotations
 
 import os
@@ -111,7 +112,7 @@ _CHILD_WEDGED = (
     "from reviewlib.backstop import run_backstop\n"
     "import time\n"
     "with run_backstop(1):\n"  # 1s backstop ...
-    "    time.sleep(60)\n"     # ... around a 60s 'wedged' block
+    "    time.sleep(60)\n"  # ... around a 60s 'wedged' block
     "print('UNREACHABLE')\n"
 ) % str(REPO_ROOT)
 
@@ -119,10 +120,15 @@ _CHILD_WEDGED = (
 def test_backstop_fires_and_exits_124_for_a_wedged_run():
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD_WEDGED],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
     # It must NOT have run the full 60s sleep; the 1s backstop terminates it.
-    assert proc.returncode == _bs.BACKSTOP_EXIT_CODE == 124, (proc.returncode, proc.stderr)
+    assert proc.returncode == _bs.BACKSTOP_EXIT_CODE == 124, (
+        proc.returncode,
+        proc.stderr,
+    )
     assert "INTERNAL BACKSTOP fired" in proc.stderr, proc.stderr
     assert "4h" in proc.stderr  # the ceiling is named in the loud line
     assert "UNREACHABLE" not in proc.stdout  # the block never completed
@@ -135,7 +141,9 @@ def test_backstop_fires_within_seconds_not_minutes():
     t0 = time.monotonic()
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD_WEDGED],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
     elapsed = time.monotonic() - t0
     assert proc.returncode == 124, (proc.returncode, proc.stderr)
@@ -182,7 +190,9 @@ def test_backstop_reaps_registered_backend_children_before_exit():
         pid_file = os.path.join(d, "backend.pid")
         proc = subprocess.run(
             [sys.executable, "-c", _CHILD_REGISTERS_BACKEND % str(REPO_ROOT), pid_file],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         assert proc.returncode == 124, (proc.returncode, proc.stderr)
         backend_pid = int(Path(pid_file).read_text().strip())
@@ -197,7 +207,9 @@ def test_backstop_reaps_registered_backend_children_before_exit():
                 os.kill(backend_pid, 9)
             except OSError:
                 pass
-            raise AssertionError(f"backend pid {backend_pid} survived the backstop fire")
+            raise AssertionError(
+                f"backend pid {backend_pid} survived the backstop fire"
+            )
 
 
 # A child that brings up a REAL qa hook env (registered in the qa pending-teardown registry),
@@ -217,7 +229,7 @@ _CHILD_REGISTERS_QA_ENV = (
     "(sut / 'qa').mkdir(parents=True, exist_ok=True)\n"
     "hook = sut / 'qa' / 'setup.sh'\n"
     "hook.write_text('#!/bin/sh\\n'\n"
-    "  'cd \"$(dirname \"$0\")/..\" || exit 1\\n'\n"
+    '  \'cd "$(dirname "$0")/.." || exit 1\\n\'\n'
     "  'case \"$1\" in\\n'\n"
     "  '  up) touch UP; exit 0 ;;\\n'\n"
     "  '  down) rm -f UP; touch DOWN; exit 0 ;;\\n'\n"
@@ -242,7 +254,9 @@ def test_backstop_fire_sweeps_pending_qa_env():
         os.mkdir(sut)
         proc = subprocess.run(
             [sys.executable, "-c", _CHILD_REGISTERS_QA_ENV % str(REPO_ROOT), sut],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         assert proc.returncode == 124, (proc.returncode, proc.stderr)
         assert (Path(sut) / "DOWN").exists(), (
@@ -284,8 +298,15 @@ def test_backstop_kills_sigterm_ignoring_backend():
     with tempfile.TemporaryDirectory() as d:
         pid_file = os.path.join(d, "backend.pid")
         proc = subprocess.run(
-            [sys.executable, "-c", _CHILD_SIGTERM_IGNORING_BACKEND % str(REPO_ROOT), pid_file],
-            capture_output=True, text=True, timeout=20,
+            [
+                sys.executable,
+                "-c",
+                _CHILD_SIGTERM_IGNORING_BACKEND % str(REPO_ROOT),
+                pid_file,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         assert proc.returncode == 124, (proc.returncode, proc.stderr)
         backend_pid = int(Path(pid_file).read_text().strip())
@@ -297,7 +318,9 @@ def test_backstop_kills_sigterm_ignoring_backend():
                 os.kill(backend_pid, 9)
             except OSError:
                 pass
-            raise AssertionError(f"SIGTERM-ignoring backend {backend_pid} survived the backstop")
+            raise AssertionError(
+                f"SIGTERM-ignoring backend {backend_pid} survived the backstop"
+            )
 
 
 # A child that wedges with its stderr ALREADY FILLED — exactly codex's scenario: a
@@ -326,7 +349,8 @@ def test_backstop_fires_even_when_stderr_pipe_is_full():
     well within the deadman grace — proving the announce can't deadlock the backstop."""
     proc = subprocess.Popen(
         [sys.executable, "-c", _CHILD_FULL_STDERR % str(REPO_ROOT)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     try:
         # Do NOT communicate()/read the pipe — that would drain it and mask the bug.
@@ -334,7 +358,9 @@ def test_backstop_fires_even_when_stderr_pipe_is_full():
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise AssertionError("backstop did not terminate the process with a full stderr pipe")
+        raise AssertionError(
+            "backstop did not terminate the process with a full stderr pipe"
+        )
     assert rc == 124, rc
 
 
@@ -357,7 +383,10 @@ def test_main_arms_the_backstop_around_dispatch():
     env = dict(os.environ, REVIEW_BACKSTOP_SECONDS="1")
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD_MAIN_HANGS],
-        capture_output=True, text=True, timeout=20, env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
     )
     assert proc.returncode == 124, (proc.returncode, proc.stderr)
     assert "INTERNAL BACKSTOP fired" in proc.stderr, proc.stderr
@@ -388,7 +417,10 @@ def test_main_does_not_backstop_persistent_server_subcommands():
     env = dict(os.environ, REVIEW_BACKSTOP_SECONDS="1")
     proc = subprocess.run(
         [sys.executable, "-c", child],
-        capture_output=True, text=True, timeout=20, env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
     )
     assert proc.returncode == 0, (proc.returncode, proc.stderr)
     assert "SERVER-RAN" in proc.stdout, proc.stdout

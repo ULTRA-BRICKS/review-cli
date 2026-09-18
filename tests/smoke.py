@@ -683,7 +683,9 @@ def test_entities_subcommand():
         "CALL STATS",
     ):
         assert_in(section, text)
-    assert_in("none registered", text)  # throwaway smoke HOME has no claude-accounts registry
+    assert_in(
+        "none registered", text
+    )  # throwaway smoke HOME has no claude-accounts registry
 
     import json
 
@@ -914,6 +916,11 @@ _UNIT_FILES = [
     # backend child + the actual `bin/review` CLI with the deterministic fake backend)
     # but need no network/creds/real model CLIs.
     ("test_signal_reaper.py", {}),
+    # review-cli#163 signal-reaper spawn-race regression: the window between a real
+    # subprocess.Popen() and _register_child() adding it to _LIVE_CHILDREN used to be
+    # lock-free. Drives a genuine _run_streamed call (real log write), so it needs a
+    # fresh log dir like the other log-touching tests (review-cli#65).
+    ("test_signal_reaper_spawn_race.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_detach_jobs.py", {}),
     # Log-dir/log-file sandboxed-write fallback (review-cli#162): a seat must survive an
     # unwritable log location rather than crashing before its backend subprocess spawns.
