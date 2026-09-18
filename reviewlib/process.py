@@ -297,17 +297,40 @@ def _reset_concurrency_sem_for_tests() -> None:
 # drains the registry and `_kill_tree`s each. Holds ONLY backend children's own session
 # groups — never the CLI's group or its caller's — so draining it can't take down the
 # caller. Lock-guarded because backends run in parallel panel threads.
-_LIVE_CHILDREN_LOCK = threading.Lock()
+# threading.RLock, not a plain Lock: kill_live_children() (below) is invoked from a
+# signal handler that always runs on the MAIN thread, and _run_streamed can ALSO run
+# synchronously on the main thread (a single-seat `--pool 1` / non-panel call). If a
+# signal lands while that same main thread is inside this lock's critical section, the
+# handler's acquire would be a same-thread re-entry — a plain Lock treats that
+# identically to a different thread holding it (blocks for the full timeout, then
+# falls back to a stale read); RLock lets the SAME thread re-enter immediately, so the
+# handler reads promptly instead of burning its whole timeout budget for no benefit
+# (review-cli#163 review). Cross-thread contention (the common panel-seat case: a
+# worker thread spawning, the reaper on the main thread) is unaffected — RLock blocks
+# a different thread exactly like Lock does until the owner releases every hold.
+_LIVE_CHILDREN_LOCK = threading.RLock()
 _LIVE_CHILDREN: set[tuple[subprocess.Popen, int | None]] = set()
+
+# Default bound on how long kill_live_children() waits to acquire _LIVE_CHILDREN_LOCK
+# from a DIFFERENT thread before giving up and falling back to an unlocked, possibly-
+# stale read (see that function's docstring). review-cli#163 widened _run_streamed's
+# critical section to cover subprocess.Popen() itself, so this is now also the margin
+# a signal has to wait for an in-flight spawn on another thread to finish and register
+# before the fallback read might miss it — a real Popen() occasionally runs well past
+# what the pre-#163 registration-only critical section needed. This default is for
+# `install_signal_reaper`'s handler, which has no competing deadline. A caller racing
+# its OWN deadline (the backstop's deadman — see backstop.py) MUST pass a smaller
+# `lock_timeout` that leaves it real margin, not this default.
+_REAP_LOCK_TIMEOUT = 3.0
 
 
 def _register_child_locked(
     proc: subprocess.Popen, pgid: int | None
 ) -> tuple[subprocess.Popen, int | None]:
     """Same bookkeeping as `_register_child`, for a caller that ALREADY holds
-    `_LIVE_CHILDREN_LOCK` (review-cli#163: `_run_streamed` widens its critical
-    section to cover the `Popen()` call itself, not just the registration that
-    follows it -- see that call site below for why)."""
+    `_LIVE_CHILDREN_LOCK` (review-cli#163: `_run_streamed`'s spawn `with
+    _LIVE_CHILDREN_LOCK:` block widens its critical section to cover the
+    `Popen()` call itself, not just the registration that follows it)."""
     handle = (proc, pgid)
     _LIVE_CHILDREN.add(handle)
     return handle
@@ -366,7 +389,23 @@ def unregister_external_child(handle: tuple[subprocess.Popen, int | None]) -> No
     _unregister_child(handle)
 
 
-def kill_live_children() -> None:
+def _kill_handles(handles: list[tuple[subprocess.Popen, int | None]]) -> None:
+    """SIGKILL every `(proc, pgid)` handle's process group (or bare pid when no pgid
+    was captured). Non-blocking, never raises -- shared by `kill_live_children`'s two
+    passes (see there)."""
+    for proc, pgid in handles:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        except Exception:  # noqa: BLE001 — best-effort; reaping must never block the exit
+            pass
+
+
+def kill_live_children(*, lock_timeout: float = _REAP_LOCK_TIMEOUT) -> None:
     """Reap every still-registered backend child's process group. Best-effort, never
     raises — called from the backstop's `_fire` right before its hard exit, AND from
     `install_signal_reaper`'s SIGTERM/SIGINT handler, so a wedged/killed run's backend
@@ -387,23 +426,69 @@ def kill_live_children() -> None:
     whole reap is a handful of non-blocking signals that complete in microseconds and
     cannot be preempted.
 
-    The snapshot read is lock-guarded with a SHORT TIMEOUT, not an unbounded `with
-    _LIVE_CHILDREN_LOCK:` (codex review, review-cli#160 follow-up). Reason: since
-    `install_signal_reaper`'s handler runs this on the MAIN thread — signal handlers in
-    CPython always execute there regardless of which thread the signal targets — a
-    signal that lands while the MAIN thread itself is inside `_register_child`/
-    `_reregister_child`/`_unregister_child`'s critical section (any call path where
-    `_run_streamed` runs synchronously on the main thread, e.g. a single-seat `--pool 1`
-    or non-panel call, not routed through the panel's ThreadPoolExecutor workers) would
-    otherwise try to re-acquire that SAME non-reentrant lock from within itself — an
-    unconditional `with _LIVE_CHILDREN_LOCK:` deadlocks FOREVER in exactly that window,
-    which defeats the entire point of this reaper (the process can no longer die at
-    all). A bounded `acquire(timeout=...)` caps the wait; if it can't get the lock in
-    time we fall back to an unlocked, best-effort read of `_LIVE_CHILDREN` (wrapped
-    against the rare `RuntimeError: set changed size during iteration` a concurrent
-    mutation can raise) rather than hang — a stale/partial snapshot here is far better
-    than never reaping and never exiting."""
-    got_lock = _LIVE_CHILDREN_LOCK.acquire(timeout=0.5)
+    TWO PASSES, not one (review-cli#163 review, GLM): an IMMEDIATE unlocked read of
+    `_LIVE_CHILDREN` is killed FIRST, before touching the lock at all, so every already-
+    registered child is reaped in microseconds regardless of lock contention — an
+    aggressive external SIGTERM-then-SIGKILL harness that lands its SIGKILL while this
+    function is still waiting on a contended lock can no longer wipe out children this
+    reaper would otherwise have caught. Only THEN does it wait (bounded) for the lock and
+    kill whatever is new in that second snapshot, to also catch a child that finished
+    registering while the first pass was killing or while the lock was held by an
+    in-flight spawn. Both passes share `_kill_handles`; re-killing an already-dead handle
+    in the second pass is harmless (`ProcessLookupError`, swallowed).
+
+    The bounded second pass is lock-guarded with a BOUNDED TIMEOUT, not an unbounded
+    `with _LIVE_CHILDREN_LOCK:` (codex review, review-cli#160 follow-up).
+    `_LIVE_CHILDREN_LOCK` is an `RLock`, so a same-thread re-entry (the handler firing on
+    the main thread while the main thread itself is mid-critical-section — any call path
+    where `_run_streamed` runs synchronously, e.g. a single-seat `--pool 1` or non-panel
+    call) acquires instantly instead of blocking; a bounded `acquire(timeout=lock_timeout)`
+    still caps the wait for the genuinely cross-thread case (a worker thread mid-spawn).
+    If it can't get the lock in time we fall back to an unlocked, best-effort read of
+    `_LIVE_CHILDREN` (wrapped against the rare `RuntimeError: set changed size during
+    iteration` a concurrent mutation can raise) rather than hang — a stale/partial
+    snapshot here is far better than never reaping and never exiting. A negative OR
+    non-finite (`inf`/`nan`) `lock_timeout` is CLAMPED to 0 (an immediate poll), never
+    passed through to `RLock.acquire` as-is: `acquire(timeout=<0)` or `timeout=inf`
+    means block FOREVER, and this function is documented never to raise or hang — a
+    signal handler must always be able to call it and get control back.
+
+    `lock_timeout` defaults to `_REAP_LOCK_TIMEOUT`, sized for `install_signal_reaper`'s
+    handler, which has no competing internal deadline. `backstop._fire` passes its own
+    smaller value instead — its deadman fires unconditionally after
+    `_DEADMAN_GRACE_SECONDS`, so waiting anywhere near that long here would leave the
+    second pass preempted before it even reaches its kill loop (the first, immediate
+    pass above is unaffected by `lock_timeout` either way). See
+    `backstop._BACKSTOP_REAP_LOCK_TIMEOUT`.
+
+    KNOWN RESIDUAL GAP (review-cli#163 follow-up), two shapes -- both now bounded to a
+    child that is genuinely STILL SPAWNING (not yet registered by either pass), never
+    one that was already registered before this function was called:
+      * Cross-thread: `_run_streamed` holds the lock across `subprocess.Popen()` itself,
+        not just the registration after it, so a signal on a DIFFERENT thread landing
+        mid-spawn makes the second pass's acquire wait for that Popen() to finish rather
+        than missing the child outright — closing the gap for the overwhelmingly common
+        case (Popen() takes low milliseconds). If the spawn is still running past
+        `lock_timeout`, the second pass still falls back to an unlocked read, which won't
+        yet contain the unregistered child.
+      * Same-thread: if `_run_streamed` runs synchronously on the SAME thread that will
+        handle the signal (e.g. `--pool 1`), the RLock's same-thread re-entry acquires
+        INSTANTLY regardless of `lock_timeout` and reads a consistent but still-incomplete
+        `_LIVE_CHILDREN` — the mid-spawn child is missed every time this shape occurs, not
+        just past a timeout.
+    Both are narrowed relative to pre-#163 (which missed the child for the entire
+    Popen() duration, unconditionally), not eliminated."""
+    try:
+        immediate_snapshot = list(_LIVE_CHILDREN)
+    except RuntimeError:
+        immediate_snapshot = []
+    _kill_handles(immediate_snapshot)
+    already_killed = set(immediate_snapshot)
+
+    safe_timeout = (
+        lock_timeout if math.isfinite(lock_timeout) and lock_timeout >= 0 else 0.0
+    )
+    got_lock = _LIVE_CHILDREN_LOCK.acquire(timeout=safe_timeout)
     try:
         try:
             snapshot = list(_LIVE_CHILDREN)
@@ -412,16 +497,7 @@ def kill_live_children() -> None:
     finally:
         if got_lock:
             _LIVE_CHILDREN_LOCK.release()
-    for proc, pgid in snapshot:
-        try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                proc.kill()
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        except Exception:  # noqa: BLE001 — best-effort; reaping must never block the exit
-            pass
+    _kill_handles([handle for handle in snapshot if handle not in already_killed])
 
 
 _SIGNAL_REAPER_LOCK = threading.Lock()
@@ -1453,20 +1529,12 @@ def _run_streamed(
             else None
         )
 
-        # Widen the lock to cover Popen() itself, not just the registration
-        # that follows it (review-cli#163 signal-reaper spawn race): the
-        # previous version left this window LOCK-FREE, so an external signal
-        # landing here -- main thread idle in a panel's as_completed loop,
-        # this call running on a worker thread -- let kill_live_children()
-        # snapshot read succeed instantly against an empty/stale
-        # _LIVE_CHILDREN, reaping nothing and orphaning the child before this
-        # thread ever reached _register_child. Now that same signal makes
-        # kill_live_children()'s bounded acquire(timeout=0.5) BLOCK until this
-        # thread finishes spawning and registering (Popen completes in low
-        # milliseconds, far under the 0.5s budget), then reap the
-        # now-registered child instead of missing it. Concurrent seats briefly
-        # serialize on this lock only for their own Popen() call, never for
-        # the review itself.
+        # Widen the lock to cover Popen() itself, not just the registration that
+        # follows it (review-cli#163 signal-reaper spawn race) -- see
+        # kill_live_children's docstring for the full rationale and the residual
+        # gap when a spawn outruns its caller's lock_timeout. Concurrent seats
+        # briefly serialize on this lock only for their own Popen() call, never
+        # for the review itself.
         with _LIVE_CHILDREN_LOCK:
             proc = subprocess.Popen(
                 argv,

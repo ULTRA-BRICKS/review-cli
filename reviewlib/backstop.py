@@ -70,6 +70,28 @@ def backstop_seconds() -> int:
 # the run continue.
 _DEADMAN_GRACE_SECONDS = 3
 
+# Real margin _BACKSTOP_REAP_LOCK_TIMEOUT must leave below _DEADMAN_GRACE_SECONDS for
+# the kill loop, the qa-teardown sweep, and the announce to still run before the
+# deadman's os._exit fires.
+_DEADMAN_REAP_MARGIN_SECONDS = 1.0
+
+# kill_live_children()'s lock-acquire budget when called from HERE, not its default
+# (process._REAP_LOCK_TIMEOUT, sized for install_signal_reaper's handler, which has no
+# competing deadline). That default would consume nearly this whole grace window,
+# leaving no time for the kill loop + the pending-qa-teardown sweep + the announce
+# before the deadman's os._exit fires — the two constants landing on the same value
+# (3.0 / 3) could zero out a backstop-fired reap entirely (review-cli#163 follow-up).
+# Capped well under the grace instead; the checked margin below is the actual
+# contract, not just this comment. An `assert` alone would be stripped under
+# `python -O`, silently dropping the one guard against this exact regression.
+_BACKSTOP_REAP_LOCK_TIMEOUT = 0.5
+if _BACKSTOP_REAP_LOCK_TIMEOUT > _DEADMAN_GRACE_SECONDS - _DEADMAN_REAP_MARGIN_SECONDS:
+    raise ValueError(
+        "_BACKSTOP_REAP_LOCK_TIMEOUT must leave _DEADMAN_REAP_MARGIN_SECONDS of "
+        "real margin before the deadman's os._exit for the kill loop, the "
+        "qa-teardown sweep, and the announce"
+    )
+
 
 def _fire(seconds: int, stream) -> None:
     """Watchdog body: GUARANTEE a hard 124 exit, reaping backend children on the way out.
@@ -102,11 +124,13 @@ def _fire(seconds: int, stream) -> None:
     deadman.daemon = True
     deadman.start()
     # Reap live backend subprocesses (their own session groups) so a wedged run's backends
-    # don't get orphaned. Bounded internally; the deadman covers a pathological hang.
+    # don't get orphaned. Bounded to _BACKSTOP_REAP_LOCK_TIMEOUT (see that constant,
+    # above), not kill_live_children's default -- the deadman above still covers a
+    # pathological hang.
     try:
         from .process import kill_live_children
 
-        kill_live_children()
+        kill_live_children(lock_timeout=_BACKSTOP_REAP_LOCK_TIMEOUT)
     except Exception:  # noqa: BLE001 — best-effort; the deadman + os._exit are the guarantee
         pass
     # Reap any pending qa SUT env (hook/compose) BEFORE the announce. os._exit below BYPASSES
