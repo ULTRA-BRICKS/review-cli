@@ -41,7 +41,7 @@ from .process import (
     write_sidecar_log,
 )
 from .seat_cooldown import active_cooldown, clear_cooldown, record_cooldown
-from .usage_limits import allow_spawn_for_model, spawn_refuse_reason
+from .usage_limits import allow_spawn_for_model, spawn_refuse_reason, usage_percent_for_model
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -292,7 +292,7 @@ def review_with_images(
         # Always the CLI transport (review_claude_cli_with_images), so it shares the
         # "cli" cooldown bucket with review_claude()'s own CLI branch (review-cli#187) —
         # both really are the same underlying CLI/quota.
-        cooldown = active_cooldown(model, access_method="cli")
+        cooldown = _cooldown_after_recovery_probe(model, access_method="cli")
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         if not allow_spawn_for_model(model):
@@ -1006,7 +1006,9 @@ def review_opencode(
     # instead of paying for another multi-minute stuck attempt on every invocation.
     # `canonical_model` (not `model`) for the lookup — see the module comment above
     # about internal-lookup-only uses of `canonical_model`.
-    cooldown = active_cooldown(canonical_model, access_method=_OPENCODE_ACCESS_METHOD)
+    cooldown = _cooldown_after_recovery_probe(
+        canonical_model, access_method=_OPENCODE_ACCESS_METHOD
+    )
     if cooldown is not None:
         # `backend="opencode"` (codex review finding, round 2): without this the skip
         # was hard-coded to "claude" in the sidecar log/dashboard, mislabeling every
@@ -1343,7 +1345,7 @@ def review_omp(
     # real work, not just the final dispatch. omp model ids (e.g. "omp:kimi-code/k3")
     # are already the canonical cooldown-store key -- no alias-normalization step is
     # needed here the way review_opencode's oc:/opencode: spelling pair requires.
-    cooldown = active_cooldown(model, access_method=_OMP_ACCESS_METHOD)
+    cooldown = _cooldown_after_recovery_probe(model, access_method=_OMP_ACCESS_METHOD)
     if cooldown is not None:
         return _cooldown_skip_result(model, round_no, cooldown, backend="omp")
     # CLI-only: a forced REVIEW_OMP_MODE=api is a config error — surface it as a
@@ -2825,7 +2827,7 @@ def review_claude(
         mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None
     )
     access_method = "api" if use_api else "cli"
-    cooldown = active_cooldown(model, access_method=access_method)
+    cooldown = _cooldown_after_recovery_probe(model, access_method=access_method)
     if cooldown is not None:
         return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
     # Claude Code 5h/7d cards measure the CLI subscription, not the paid API
@@ -2880,6 +2882,56 @@ _CHRONIC_QUOTA_MARKERS = ("session limit", "usage-credits", "usage credits")
 # never be cached as a chronic failure. Shared by panel.result_is_usable and
 # retry._is_rc0_sentinel too (both import this name), so all three agree on the bound.
 _UNAVAILABLE_MAX_LEN = 400
+
+
+# seat_cooldown's TTL is a blind timer -- once a quota-exhaustion failure escalates to
+# the 8h cap (seat_cooldown._ESCALATION_SCHEDULE), the seat stays excluded for the full
+# window even if the 5-hour/weekly usage window that actually caused it resets in
+# minutes. The only existing way to un-stick it sooner was the documented
+# `$REVIEW_SEAT_COOLDOWN_SECONDS<=0` hatch -- a human has to notice and manually export
+# it (in practice: re-running `review` after manually clearing/waiting). `usage_limits`
+# already collects the live signal that answers "has it actually recovered" (the same
+# harness-card/tg-ctl snapshot `allow_spawn_for_model` reads for a seat with NO
+# cooldown) -- `_cooldown_after_recovery_probe` below consults it BEFORE honoring a
+# cooldown, so a seat that recovered early is silently re-included on the very next
+# dispatch instead of waiting out the clock. No daemon, no background polling: a plain
+# check-before-use, run once per dispatch decision, at the exact point `active_cooldown`
+# was already being read.
+def _cooldown_after_recovery_probe(model: str, *, access_method: str) -> dict | None:
+    """`active_cooldown(model, access_method=access_method)`, but first gives a
+    quota-cooled-down seat a chance to prove it has ALREADY recovered instead of
+    blindly waiting out the full (possibly hours-long, escalated) cooldown window.
+
+    Narrow on purpose: only a cooldown recorded for a QUOTA reason
+    (`_CHRONIC_QUOTA_MARKERS` -- "session limit" / "usage-credits" / "usage credits")
+    is probed. A true-silence timeout, a bare "unavailable sentinel", or any other
+    chronic reason is NOT modeled by the usage-limit percent at all -- a healthy quota
+    reading says nothing about whether an unrelated hang/notice has actually cleared,
+    so probing those would be a false recovery, not a real one. Those reasons keep
+    relying purely on the existing TTL.
+
+    The probe (`usage_percent_for_model`) must return a CONCRETE percent below 100 to
+    count as recovered -- `None` ("no data": no harness-cli installed, no tg-ctl
+    sample, an unmapped provider) is explicitly NOT treated as recovered. Fail-open
+    there would silently defeat the whole cooldown feature for every user without
+    harness-cli installed (their very first re-check would always read "recovered"
+    despite having no evidence at all) -- "unknown" must stay unknown; only a real
+    reading proves recovery. A recovered seat's cooldown is cleared via
+    `clear_cooldown` (not merely ignored for this one call) so the NEXT probe/report
+    also sees it as healthy, matching `clear_cooldown`'s existing genuine-success
+    contract elsewhere in this module."""
+    cooldown = active_cooldown(model, access_method=access_method)
+    if cooldown is None:
+        return None
+    if not any(
+        marker in cooldown["reason"].lower() for marker in _CHRONIC_QUOTA_MARKERS
+    ):
+        return cooldown
+    pct = usage_percent_for_model(model)
+    if pct is not None and pct < 100.0:
+        clear_cooldown(model, access_method=access_method)
+        return None
+    return cooldown
 
 # Byte-exact match for the numeric codes retry.py's `_TRANSIENT_PATTERNS` regex
 # targets (`\b429\b`, `\b5(?:0[0234]|2[0-4]|29)\b`): 429, 500/502/503/504, 520-524,
