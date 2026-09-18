@@ -641,15 +641,19 @@ def _distinct_roles(items: list[dict]) -> list[str]:
     hurts a ``--min-roles`` count, same as a pre-v4 record and ``repo_id`` in the
     diff-identity check.
 
-    Codex review finding: a config ``board:`` entry may carry an UNKNOWN role
-    string (``config._normalize_board_reviewer`` keeps it but degrades the seat
-    to the generic prompt — no distinct lens — and logs a warning; see that
-    function's docstring). Counting an unknown/typo'd role string here would let
-    N seats that all reviewed under the SAME generic prompt satisfy a
-    ``--min-roles N`` self-merge-authority gate as if they were N genuinely
-    distinct facets — exactly the "distinct lenses" contract this gate exists to
-    enforce. Filtering to ``REVIEW_ROLES`` keeps the count honest: only a role
-    that actually carries its own lens text can ever count as covered."""
+    Codex review finding: an unrecognized/typo'd role string can still reach a
+    recorded run's ``roles`` list from a path this counter can't assume is
+    validated — a quorum/brainstorm PERSONA name (deliberately NOT a
+    ``REVIEW_ROLES`` key), or history logged before review-cli#422 made an
+    unrecognized config ``board:`` role a hard ``BoardConfigError`` at
+    composition time (``config._parse_board_entry``) instead of a degraded
+    generic-prompt seat. Counting either case here would let N seats that all
+    reviewed under the SAME generic prompt (or under N non-lens personas)
+    satisfy a ``--min-roles N`` self-merge-authority gate as if they were N
+    genuinely distinct facets — exactly the "distinct lenses" contract this
+    gate exists to enforce. Filtering to ``REVIEW_ROLES`` keeps the count
+    honest: only a role that actually carries its own lens text can ever count
+    as covered."""
     roles: list[str] = []
     for item in items:
         for role in item.get("roles") or []:

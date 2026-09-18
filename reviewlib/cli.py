@@ -4962,6 +4962,28 @@ def _seats_of(board: list) -> tuple[tuple[str, str], ...]:
     return tuple((r.model, r.display) for r in board)
 
 
+def _board_from_models_lenient(
+    models: list[str], config: dict, *, preset: str | None = None
+) -> list:
+    """`board_from_models(models, config, preset=preset)`, but a malformed config
+    `board:` entry (`BoardConfigError` -- e.g. review-cli#422's unrecognized `role:`)
+    is a WARNING, not a hard failure, when the operator named MODELS directly via
+    explicit `-m`: losing the config's role/name/effort METADATA for them is
+    recoverable, so this retries with an empty config instead of aborting an explicit
+    `-m` request over unrelated/malformed board metadata. Shared by every explicit-`-m`
+    call site (the --task panel role-pad, `validate_board`, `_show_board`) so the
+    fallback message/behavior can't drift between them."""
+    try:
+        return board_from_models(models, config, preset=preset)
+    except BoardConfigError as exc:
+        print(
+            f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
+            file=sys.stderr,
+            flush=True,
+        )
+        return board_from_models(models, {}, preset=preset)
+
+
 def _default_review_board(
     config: dict, config_models: list[str], config_has_board: bool, default_pool: int
 ):
@@ -5839,10 +5861,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # executes every required role via separate role-specific invocations
         # (review-cli#433). Copies of one response do not fill extra slots.
         pad_min = effective_pool_size if effective_pool_size > 0 else SHIP_MIN_ROLES
-        padded_board = ensure_min_distinct_roles(
-            board_from_models(explicit_models, config),
-            pad_min,
-        )
+        # review-cli#422: a typo'd config `board:` role must not crash --task panel
+        # dispatch with a raw traceback -- `_board_from_models_lenient` (shared with
+        # `validate_board`/`_show_board` below) recovers the same way every other
+        # explicit -m call site does.
+        board_source = _board_from_models_lenient(explicit_models, config)
+        padded_board = ensure_min_distinct_roles(board_source, pad_min)
         models = [r.model for r in padded_board]
         panel_task_roles = [r.role for r in padded_board]
     elif quorum_auto_roles:
@@ -5876,17 +5900,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         board_validated = True
         try:
             if explicit_models:
-                try:
-                    board = board_from_models(
-                        explicit_models, config, preset=active_preset
-                    )
-                except BoardConfigError as exc:
-                    print(
-                        f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    board = board_from_models(explicit_models, {}, preset=active_preset)
+                board = _board_from_models_lenient(
+                    explicit_models, config, preset=active_preset
+                )
             elif active_preset is not None:
                 board = load_board(config, preset=active_preset)
             elif config_models:
@@ -6552,15 +6568,7 @@ def _show_board(
     exact_models = explicit_models or []
     try:
         if exact_models:
-            try:
-                board = board_from_models(exact_models, config, preset=preset)
-            except BoardConfigError as exc:
-                print(
-                    f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                board = board_from_models(exact_models, {}, preset=preset)
+            board = _board_from_models_lenient(exact_models, config, preset=preset)
             source = f"explicit -m{f' + preset:{preset}' if preset else ''}"
         elif preset:
             board = load_board(config, preset=preset)

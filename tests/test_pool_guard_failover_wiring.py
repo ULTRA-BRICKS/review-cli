@@ -286,18 +286,20 @@ def test_pool_zero_with_one_live_seat_still_bails_end_to_end():
 
 
 def test_unknown_role_board_with_one_live_seat_still_bails_end_to_end():
-    """Full `cli._dispatch(...)`, codex review finding (round 4): a board whose `role`
-    strings are all typos/unknown `REVIEW_ROLES` keys is functionally role-less (every
-    seat's `role_lens` resolves empty — see `select_pool_with_reuse`'s matching fix).
-    Before that fix, `reuse_eligible = not explicit_models and any(r.role for r in
-    board)` treated these non-empty-but-invalid strings as real lenses: with only
-    `seat-a` live and `--pool 3`, it would have proceeded past the guard and then
-    `select_pool_with_reuse` would have dispatched `seat-a` three times with the
-    IDENTICAL generic prompt (no seat has a real `role_lens`) while mislabeling the
-    three seats as three distinct roles. This drives the REAL CLI dispatcher end to end
-    and asserts the pre-existing safety floor still bails with EXIT_UNSATISFIED — the
-    fixed board is treated exactly like a role-less one, never a false PROCEED into a
-    paid triple-dispatch of duplicate generic-prompt reviews."""
+    """Full `cli._dispatch(...)`. Originally (codex review finding, round 4) a board
+    whose `role` strings are all typos/unknown `REVIEW_ROLES` keys was functionally
+    role-less (every seat's `role_lens` resolved empty), and this test proved the
+    pool-selection safety floor still bailed with `EXIT_UNSATISFIED` instead of a false
+    PROCEED into a paid triple-dispatch of duplicate generic-prompt reviews.
+
+    review-cli#422 moved that failure earlier: `load_board` now raises `BoardConfigError`
+    on the FIRST typo'd role (`typo-a`) at board-COMPOSITION time, before the board ever
+    reaches the pool guard/`select_pool_with_reuse` at all -- so this config never gets
+    the chance to hit `EXIT_UNSATISFIED` anymore. This test now proves the fail-fast
+    path instead: the real CLI dispatcher exits 2 (the generic `BoardConfigError` config-
+    error code every sibling `except BoardConfigError` handler in cli.py returns) with a
+    stderr message naming the bad role, never a raw traceback and never a silent
+    triple-dispatch of duplicate generic-prompt reviews."""
 
     def _config() -> dict:
         return {
@@ -343,7 +345,8 @@ def test_unknown_role_board_with_one_live_seat_still_bails_end_to_end():
                         str(repo),
                     ]
                 )
-    assert rc == EXIT_UNSATISFIED, (rc, err.getvalue())
+    assert rc == 2, (rc, err.getvalue())
+    assert "typo-a" in err.getvalue(), err.getvalue()
 
 
 def test_chain_aware_available_agrees_with_the_guard_on_a_head_down_alternate_live_seat():

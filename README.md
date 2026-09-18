@@ -1679,8 +1679,12 @@ settings are normalized to the closest supported value where the provider expose
 When `models:` is present,
 `board:` supplies role/name/effort metadata for matching models; priority still comes from
 `models:`. When `models:` is absent, `board:` is the full priority-ordered board.
-An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
-warning); a single malformed entry is skipped (the valid ones are kept). With **no**
+An entry is checked model/capability FIRST: one with no usable `model:` or resolvable
+`capability:` is skipped with a warning (the valid entries are kept) and its `role:` is
+never inspected. Only an entry that DOES resolve to a real seat then has its `role:`
+validated: an unknown value (not a key in the built-in role list) is a hard error naming
+the bad value and the valid roles (review-cli#422) — fix the typo, or omit `role:` to use
+the generic prompt intentionally. With **no**
 `models:` or `board:` configured, the CLI uses the default preset (light as of
 2026-08-28); `--preset default` uses the same 13 seats at high effort, and `--preset
 heavy` uses the 14-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable

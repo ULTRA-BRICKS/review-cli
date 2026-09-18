@@ -4988,11 +4988,14 @@ def test_quorum_check_explicit_invalid_min_roles_is_named_in_message_review_cli_
 
 
 def test_quorum_check_unknown_role_strings_never_satisfy_min_roles_review_cli_221():
-    """Codex round-2 review finding: a config `board:` entry may carry an UNKNOWN
-    role string (kept by `config._normalize_board_reviewer`, but degraded to the
-    generic prompt -- no distinct lens -- with a warning logged). N seats that all
-    reviewed under that SAME generic prompt must not satisfy --min-roles N as if
-    they were N genuinely distinct facets -- only a real REVIEW_ROLES key counts."""
+    """Codex round-2 review finding: a recorded run's `roles` list can carry an UNKNOWN
+    role string from a path this gate can't assume is validated -- a quorum/brainstorm
+    PERSONA name (deliberately not a REVIEW_ROLES key), or history logged before
+    review-cli#422 made an unrecognized config `board:` role a hard `BoardConfigError` at
+    composition time (`config._parse_board_entry`) instead of a degraded generic-prompt
+    seat. N seats that all reviewed under that SAME generic prompt (or under N non-lens
+    personas) must not satisfy --min-roles N as if they were N genuinely distinct facets
+    -- only a real REVIEW_ROLES key counts."""
     with _TmpStore():
         for typo_role in ("architeckt", "Correctness", "made-up-role"):
             _stats.record_run(
