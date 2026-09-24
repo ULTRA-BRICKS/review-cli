@@ -11,12 +11,16 @@ touched.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -1305,9 +1309,7 @@ def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_13
             # `min_models` stays run-level/passed-gated -- UNCHANGED by this fix: a
             # combined check still fails because the record's own `passed` is False,
             # so no iteration satisfies `min_iter`/`min_models` at all.
-            combined = _stats.quorum_check(
-                TASK, min_iter=1, min_models=1, min_roles=1
-            )
+            combined = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=1)
             assert combined["passed"] is False, combined
         finally:
             restore()
@@ -5581,6 +5583,151 @@ def test_cli_check_invalid_task_code_text_mode_does_not_crash_review_cli_221():
         assert rc != 0, rc
         assert "review bar NOT met" in err.getvalue()
         assert "invalid task code" in err.getvalue()
+
+
+# Baseline lower bound for `_quorum_check_result_field_names`'s sanity floor below --
+# NOT itself the drift guard (the AST walk is), just a named, self-documenting "this
+# helper must find at least these" check instead of an unexplained magic number.
+_KNOWN_QUORUM_CHECK_FIELDS = frozenset(
+    {
+        "task_code",
+        "passed_iterations",
+        "total_iterations",
+        "distinct_models_passed",
+        "models",
+        "min_iter",
+        "passed",
+        "identity_verification",
+        "min_models",
+        "min_models_source",
+        "min_models_advisory",
+        "distinct_roles_passed",
+        "roles",
+        "min_roles",
+        "quorum_mode_fallback",
+        "role_tracking_gap",
+        "min_roles_suggestion",
+        "stalled_models",
+        "verified_iterations",
+        "unverifiable_iterations",
+        "excluded_mismatched_iterations",
+        "mismatch_details",
+        "mismatch_details_truncated",
+        "searched_key",
+        "near_miss_keys",
+        "near_miss_counted",
+        "near_miss_ever_passed",
+        "error",
+    }
+)
+
+
+def _quorum_check_result_field_names() -> set[str]:
+    """Every top-level key `--check`'s JSON payload can ever carry, discovered
+    MECHANICALLY from the source that actually builds it (not hand-maintained) --
+    review-cli#552-PR3: the `--check`/`--json` contract was found under-documented
+    (help text never named a single result field), inviting a caller like `gh ship`
+    to guess the shape. Parses (via `ast`, not regex -- immune to reformatting/line-
+    wrapping and correctly ignores keys of unrelated NESTED dict literals, e.g. the
+    per-seat dicts appended to `stalled`) the source of `quorum_check`/
+    `_finalize_quorum_result` (reviewlib/stats.py, the payload's actual builder) plus
+    `_quorum_check_subcommand` (reviewlib/cli.py, which adds the one CLI-only key,
+    `identity_verification`) for every `result["key"] = ...` assignment and every
+    string key of a `result = {...}` literal -- ONLY assignments to a variable
+    literally named `result` count, so a future rename needs a matching update here
+    (documented limitation, not silently wrong: the `_KNOWN_QUORUM_CHECK_FIELDS`
+    floor below would catch the resulting collapse). Deliberately does NOT reach into
+    nested per-item shapes (`stalled_models`/`mismatch_details` list entries) --
+    those aren't top-level contract keys a caller gates on with `"key" in payload`;
+    they're asserted separately, by literal presence, in the test below."""
+    keys: set[str] = set()
+    for source in (
+        inspect.getsource(_stats.quorum_check),
+        inspect.getsource(_stats._finalize_quorum_result),
+        inspect.getsource(_cli._quorum_check_subcommand),
+    ):
+        tree = ast.parse(textwrap.dedent(source))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "result"
+                    and isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                ):
+                    keys.add(target.slice.value)
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "result"
+                and isinstance(node.value, ast.Dict)
+            ):
+                for k in node.value.keys:
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                        keys.add(k.value)
+    return keys
+
+
+def test_check_help_text_names_every_json_contract_field_review_cli_552():
+    """review-cli#552-PR3: `review help task-check` (the dedicated deep-help topic
+    for `--check --json`'s contract -- see help-docs-sync) must name every field
+    `--check --json` can actually emit, so a caller like `gh ship` never has to guess
+    the shape and the docs can't silently drift from reviewlib.stats.quorum_check's
+    real behavior the next time a field is added there. Mechanical, not hand-listed:
+    see `_quorum_check_result_field_names`'s docstring for exactly what it walks."""
+    out = io.StringIO()
+    with redirect_stderr(io.StringIO()), redirect_stdout(out):
+        rc = _cli.main(["help", "task-check"])
+    assert rc == 0, out.getvalue()
+    topic_text = out.getvalue()
+
+    # The flag's own (short) help must point a reader at the topic, or the full
+    # contract is undiscoverable from `review task --help` alone.
+    check_help = io.StringIO()
+    with redirect_stderr(io.StringIO()), redirect_stdout(check_help):
+        try:
+            _cli.main(["task", "--help"])
+        except SystemExit:
+            pass
+    assert "help task-check" in check_help.getvalue(), check_help.getvalue()
+
+    # Scope the field-name search to the FIELDS section specifically (not the WHAT
+    # section above it, which reuses some of the same short words -- "roles",
+    # "passed" -- in ordinary prose): a Sonnet review-round finding on this PR's own
+    # first draft was that a loose whole-text `\b` search can't distinguish "the
+    # field is genuinely documented" from "the bare word happens to occur somewhere
+    # else too" -- narrowing the search window is a cheap, real mitigation for that.
+    assert "--JSON FIELDS" in topic_text, topic_text
+    fields_section = topic_text.split("--JSON FIELDS", 1)[1]
+
+    field_names = _quorum_check_result_field_names()
+    # Sanity floor: catches `_quorum_check_result_field_names` silently regressing
+    # to empty/near-empty (e.g. an `ast`-incompatible source change) and passing
+    # vacuously -- named against the known baseline, not an arbitrary count.
+    assert field_names >= _KNOWN_QUORUM_CHECK_FIELDS, field_names
+    missing = sorted(
+        name
+        for name in field_names
+        if not re.search(r"\b" + re.escape(name) + r"\b", fields_section)
+    )
+    assert not missing, (
+        "`review help task-check`'s FIELDS section is missing these --json contract "
+        f"field names: {missing} -- see _help_topic_task_check in reviewlib/cli.py"
+    )
+
+    # The per-item shapes of the two list-valued fields aren't top-level contract
+    # keys (see the helper's docstring) so they're asserted explicitly here rather
+    # than mechanically -- still keeps the topic text honest about them.
+    for word in (
+        "remaining_seconds",
+        "consecutive_failures",
+        "recorded_repo_id",
+        "recorded_diff_files",
+    ):
+        assert word in fields_section, (word, fields_section)
 
 
 def test_cli_check_json_shape():
