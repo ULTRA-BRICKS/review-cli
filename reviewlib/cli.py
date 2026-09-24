@@ -4279,12 +4279,21 @@ def _add_global_options(
 
 
 def _add_visual_options(
-    parser: argparse.ArgumentParser, *, include_visual_flag: bool = True
+    parser: argparse.ArgumentParser,
+    *,
+    include_visual_flag: bool = True,
+    json_help: str = "emit the structured visual verdict as JSON",
 ) -> None:
     """Add the composable `--visual` feature flags as their own argument GROUP. These are
     SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
     on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
-    makes `review <mode> --help` render them under a clear "visual verification" heading."""
+    makes `review <mode> --help` render them under a clear "visual verification" heading.
+
+    `json_help` (ticket #546) lets a caller override `--json`'s help text WITHOUT adding a
+    second, colliding `--json` flag: this group already sits on EVERY mode parser (diff
+    review included), so `review diff`'s own `--json` (structured findings, wired in
+    `modes/review.py`) reuses this SAME argparse flag rather than defining its own — see
+    `_add_mode_options` below, the only caller that passes a non-default value."""
     group_title = (
         "visual verification"
         if not include_visual_flag
@@ -4319,9 +4328,7 @@ def _add_visual_options(
         metavar="NAME",
         help="force-activate a visual module by name (repeatable)",
     )
-    group.add_argument(
-        "--json", action="store_true", help="emit the structured visual verdict as JSON"
-    )
+    group.add_argument("--json", action="store_true", help=json_help)
     group.add_argument(
         "--strict",
         action="store_true",
@@ -4393,7 +4400,32 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
     # parser (but never the top-level overview). --rounds / --max-rounds are brainstorm-only
     # and added by the brainstorm mode's own add_arguments; they stay in _VALUE_TAKING_OPTS
     # so the mode-agnostic `-o` pre-scan treats them as value-taking.
-    _add_visual_options(parser, include_visual_flag=(mode.name != "visual"))
+    # `--json`'s help text is mode-aware (ticket #546): `review diff` (and a `review
+    # visual IMAGE --diff/--staged` companion run, which reaches the SAME handler via
+    # visual.py's own `_handler = review._handler`) gives the flag a SECOND meaning —
+    # a structured findings envelope, wired entirely in modes/review.py — since the
+    # pre-existing "visual verdict JSON" behaviour never fires there anyway (it is
+    # gated on there being NO diff at all; diff review always has one). Every other
+    # mode (quorum/brainstorm/just-ask) keeps the original, unrelated help text.
+    json_help = (
+        "with a diff in play (review diff, or review visual IMAGE --diff/--staged): "
+        "emit a structured findings JSON envelope on stdout instead of the prose "
+        "panel -- additive, the prose output is unaffected when this flag is absent. "
+        "Each backend is additionally asked to emit one fenced JSON block on top of "
+        "its normal prose; findings[] items carry file/line/severity(P0-P3)/"
+        "confidence(high|medium|low)/verdict(FINDING|CLEAR)/source (the seat that "
+        "raised it), plus summary.expected/reported/degraded (which seats ran / "
+        "parsed / failed to parse). Exit 0 = no findings, 1 = findings present, 2 = "
+        "no seat's structured response was usable at all -- --commit's own checkpoint "
+        "exit codes (11/12/13) still take priority over this 0/1/2 contract when both "
+        "flags are given. For a STANDALONE `review visual IMAGE` (no diff), this "
+        "instead emits the structured VISUAL verdict, unchanged from before."
+        if mode.name in ("review", "visual")
+        else "emit the structured visual verdict as JSON"
+    )
+    _add_visual_options(
+        parser, include_visual_flag=(mode.name != "visual"), json_help=json_help
+    )
 
     if mode.add_arguments is not None:
         mode.add_arguments(parser)

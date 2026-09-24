@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import re
 import subprocess
 import sys
@@ -90,6 +91,355 @@ EXIT_COMMIT_FAILED = 12
 # it already skips silently on `ok=False`) — the gate exists specifically to certify
 # "the full diff was reviewed", and a partial review must never certify as one.
 EXIT_COMMIT_DIFF_TRUNCATED = 13
+
+
+# ---------------------------------------------------------------------------
+# `review diff --json` (review-cli#546): additive structured findings output.
+# ---------------------------------------------------------------------------
+#
+# review-cli's panel is PROSE by design (config.DEFAULT_PROMPT above) -- every
+# backend returns free text, never a structured findings list. Scraping file/
+# line/severity/confidence back OUT of that prose after the fact is unreliable:
+# DEFAULT_PROMPT's own "FINDING must cite file:line" / "checked: ..." contract is
+# a convention for a HUMAN reader, not a machine grammar a parser can trust (see
+# docs/compare-revmux.md, ticket #546's motivation -- revmux gets a trustworthy
+# JSON contract because it tells its finders to emit one, not by re-parsing their
+# prose). So --json does not attempt prose extraction at all (design option (a)
+# rejected): it asks every backend to ALSO emit one fenced JSON block, ON TOP of
+# its normal prose review, then parses each seat's block independently after
+# dispatch. A seat that fails to emit a parseable block is reported as a
+# DEGRADED source in the merged summary rather than aborting the run -- one
+# malformed seat must never take five working ones down with it. The prose
+# review itself is completely untouched either way: `format_result` never runs
+# when --json is set (see mode_review's flat path / _mode_review_board below),
+# but the PROMPT each backend receives is the only thing --json changes, and only
+# by APPENDING this instruction -- DEFAULT_PROMPT's existing contract is never
+# replaced, so a --json run still gets the same adversarial prose review; it is
+# just not what gets printed to stdout for that invocation.
+_JSON_FINDINGS_FENCE_TAG = "review-json"
+
+_JSON_FINDINGS_PROMPT_SUFFIX = (
+    "\n\nAdditionally, once the review above is complete, emit ONE fenced code "
+    f"block tagged ```{_JSON_FINDINGS_FENCE_TAG} containing a single JSON object "
+    'with exactly this shape: {"findings": [{"file": "<path relative to the repo '
+    'root, or null for a CLEAR entry with no single file>", "line": <int or '
+    'null>, "severity": "P0"|"P1"|"P2"|"P3" (P0 = blocking, P3 = nit), '
+    '"confidence": "high"|"medium"|"low", "verdict": "FINDING"|"CLEAR"}]}. Use '
+    '"FINDING" for a real issue -- cite the SAME file:line you already gave '
+    'above -- and "CLEAR" for one of the specific failure modes you checked and '
+    'ruled out (the "checked: ..." statements above), so the array is never '
+    "suspiciously empty on a genuinely clean pass. Emit the block even when "
+    "findings is an empty list. The fenced block must contain ONLY that JSON "
+    "object -- no other text inside it."
+)
+
+
+def _with_json_findings_request(prompt: str) -> str:
+    """Append the structured-findings instruction to `prompt` for a `--json` run.
+
+    Purely additive (ticket #546's acceptance criteria: existing prose callers
+    unaffected): DEFAULT_PROMPT's own contract is untouched, so a backend that
+    ignores this suffix entirely still returns the SAME prose a non---json caller
+    would get -- `format_result`'s render never changes shape. Only `_handler`
+    calls this (gated on `ctx.args.json`), building the prompt actually sent to
+    backends -- never the `--prompt` OVERRIDE text `--help` shows the user."""
+    return prompt + _JSON_FINDINGS_PROMPT_SUFFIX
+
+
+# Matches the exact tag `--json` asks for (`review-json`). Kept separate from the
+# generic ```json fallback below (GLM/Grok review findings, review-cli#546): the
+# reviewed diff is UNTRUSTED and routinely quoted back by the model (a file's own
+# example config, a docs snippet) inside its normal prose -- an EARLIER, incidental
+# ```json fence with no relation to the requested schema must never outrank the
+# backend's OWN structured answer just because it happens to parse as a dict first.
+_JSON_FINDINGS_TAGGED_FENCE_RE = re.compile(
+    r"```" + re.escape(_JSON_FINDINGS_FENCE_TAG) + r"\s*\n(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+# Fallback ONLY when no `review-json`-tagged fence exists at all: some backends
+# ignore a custom fence tag and use the generic Markdown convention instead.
+_JSON_GENERIC_FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _best_json_object_candidate(matches: list[re.Match]) -> dict | None:
+    """Among fenced-block regex MATCHES (in document order), the best JSON object
+    candidate: the LAST match that parses to a dict carrying a `findings` LIST, or
+    -- only when nothing does -- the last match that merely parses to a dict.
+
+    Preferring the LAST match (not the first) matches
+    `_JSON_FINDINGS_PROMPT_SUFFIX`'s own instruction ("once the review above is
+    complete, emit ONE fenced block") -- the genuine structured answer is always
+    the backend's FINAL fenced block of the matched tag, never an earlier one.
+    This is a deliberate hardening (GLM/Grok review findings, review-cli#546): a
+    diff (or an indirectly-prompt-injected reply) that plants an EARLIER fenced
+    block shaped like `{"findings": []}` must never shadow the backend's real,
+    later answer -- neither by silently forcing a false-clean gate pass (an
+    earlier empty `findings` list winning) nor by silently discarding a real
+    finding (an earlier findings-less dict winning and marking the seat DEGRADED
+    before the real block is ever inspected). Preferring findings-bearing
+    candidates over bare dicts, and the LAST of either group, closes both
+    directions at once: a later REAL block always wins over an earlier PLANTED
+    or merely-quoted one of the same tag."""
+    best_plain: dict | None = None
+    best_with_findings: dict | None = None
+    for match in matches:
+        try:
+            parsed = json.loads(match.group(1))
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        best_plain = parsed
+        if isinstance(parsed.get("findings"), list):
+            best_with_findings = parsed
+    return best_with_findings if best_with_findings is not None else best_plain
+
+
+def _extract_json_findings_block(stdout: str) -> dict | None:
+    """Best-effort extraction of the structured findings object `--json` asked
+    every backend to emit (see `_JSON_FINDINGS_PROMPT_SUFFIX`). Tries, in order:
+    (1) every ```review-json-tagged fence (the exact tag requested) -- see
+    `_best_json_object_candidate` for how the best one among several is picked;
+    (2) only when NO review-json-tagged fence exists at all, every plain ```json
+    fence (some backends ignore a custom tag); (3) the WHOLE response as JSON (a
+    `--prompt` override, or a model that skipped prose entirely, may return just
+    the object with no fence at all).
+
+    Returns None -- NEVER raises -- on any parse failure; the caller counts that
+    seat as DEGRADED rather than crashing the run (ticket #546: "a backend whose
+    response fails to parse as valid JSON should be reported as a degraded/
+    unparseable source ... not crash the whole command"). Deliberately does NOT
+    fall back to `features/visual/vision_client._extract_first_json_object`'s
+    scan-for-the-first-balanced-`{...}`-anywhere-in-the-text heuristic: that
+    scanner suits the vision pipeline, whose whole response is typically ONLY the
+    structured answer with little surrounding prose, but every --json backend
+    here ALSO returns a FULL adversarial prose diff review first -- one that
+    routinely quotes braces of its own (a diff snippet, a JS/JSON example from
+    the code under review) BEFORE the requested fenced block. Scanning that much
+    free prose for the first balanced object would parse VALID but WRONG JSON far
+    more often than in the vision case, silently fabricating a findings list the
+    model never reported as structured at all. A clean miss (None) is safer than
+    a false-positive parse."""
+    candidate = _best_json_object_candidate(
+        list(_JSON_FINDINGS_TAGGED_FENCE_RE.finditer(stdout))
+    )
+    if candidate is not None:
+        return candidate
+    candidate = _best_json_object_candidate(
+        list(_JSON_GENERIC_FENCE_RE.finditer(stdout))
+    )
+    if candidate is not None:
+        return candidate
+    try:
+        parsed = json.loads(stdout.strip())
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+# The enums `--json` requests (see `_JSON_FINDINGS_PROMPT_SUFFIX`). Severity
+# reuses `qa`'s existing P0..P3 convention (reviewlib/qa/executor.py's
+# `_FINDING_RE`/`max_severity`) rather than inventing a second severity
+# vocabulary in the same codebase; confidence/verdict have no existing
+# review-cli precedent to match, so they are new, minimal enums.
+_FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
+_FINDING_CONFIDENCES = ("high", "medium", "low")
+_FINDING_VERDICTS = ("FINDING", "CLEAR")
+
+
+def _coerce_finding(raw: object) -> dict | None:
+    """Normalize one raw findings-array item into the stable `--json` shape, or
+    None to DROP it -- never raise; one malformed item must not crash a whole
+    seat's otherwise-usable response.
+
+    `severity`/`confidence` fall back to a documented middle value ("P2"/
+    "medium") when missing or spelled outside the requested enum, rather than
+    being dropped: a wrong/missing severity TAG does not change whether the item
+    IS a finding, only how it should be triaged, so silently discarding a real
+    finding over a formatting slip would lose strictly more information than a
+    mislabeled severity costs (the same fail-toward-surfacing trade-off
+    `features/visual/vision_client._safe_confidence` documents for an analogous
+    untrusted-model-output coercion). `verdict` gets the same treatment for the
+    same reason, defaulting to "FINDING" rather than being dropped or silently
+    downgraded to "CLEAR": an item the model bothered to emit at all is far more
+    likely a genuine finding it mislabeled than a ruled-out check it correctly
+    labeled wrong -- the more dangerous direction here is a LOST finding, not an
+    extra one a caller has to triage."""
+    if not isinstance(raw, dict):
+        return None
+    severity = str(raw.get("severity", "")).strip().upper()
+    if severity not in _FINDING_SEVERITIES:
+        severity = "P2"
+    confidence = str(raw.get("confidence", "")).strip().lower()
+    if confidence not in _FINDING_CONFIDENCES:
+        confidence = "medium"
+    verdict = str(raw.get("verdict", "")).strip().upper()
+    if verdict not in _FINDING_VERDICTS:
+        verdict = "FINDING"
+    file = raw.get("file")
+    file = str(file) if isinstance(file, str) and file.strip() else None
+    line = raw.get("line")
+    try:
+        line = int(line) if line is not None else None
+    except (TypeError, ValueError, OverflowError):
+        line = None
+    return {
+        "file": file,
+        "line": line,
+        "severity": severity,
+        "confidence": confidence,
+        "verdict": verdict,
+    }
+
+
+def _seat_json_findings(result: ReviewResult) -> tuple[list[dict], bool]:
+    """`(findings, reported)` for one seat's `--json` response.
+
+    `reported` is False (the seat is DEGRADED) when: the seat produced no usable
+    output at ALL (`result_is_usable` -- the SAME predicate the prose path's `ok`
+    gate and the board's own mid-run failover already use, so a seat --json marks
+    degraded here is exactly a seat the prose path would already call unusable);
+    its structured block failed to parse/extract at all
+    (`_extract_json_findings_block` returned None); the parsed object has no
+    `findings` KEY at all (a genuine shape violation); `findings` is present but
+    neither a list nor `null`; or `findings` is a NON-EMPTY list whose every item
+    failed `_coerce_finding` (Opus/GLM review findings, review-cli#546: an
+    all-unusable-items array reads as "the model was clearly trying to report
+    something and every item was garbage", not a genuine clean pass -- silently
+    reporting `reported=True, findings=[]` there would be a false clean, the exact
+    class of failure this module elsewhere fails TOWARD surfacing rather than
+    away from).
+
+    A `findings: null` (a plausible "nothing to report" rendering a model might
+    emit despite the prompt asking for `[]`) is normalized to an empty list
+    rather than degrading the seat -- unlike an ABSENT `findings` key entirely,
+    which stays a genuine shape violation. A seat that parsed fine and reported a
+    genuinely EMPTY `findings` list (explicit `[]` or `null`) is `reported=True`
+    with `findings=[]` -- a clean, structured pass is not a parse failure."""
+    if not result_is_usable(result):
+        return [], False
+    parsed = _extract_json_findings_block(result.stdout)
+    if parsed is None or "findings" not in parsed:
+        return [], False
+    raw_findings = parsed["findings"]
+    if raw_findings is None:
+        raw_findings = []
+    if not isinstance(raw_findings, list):
+        return [], False
+    findings: list[dict] = []
+    for raw in raw_findings:
+        coerced = _coerce_finding(raw)
+        if coerced is not None:
+            findings.append(coerced)
+    if raw_findings and not findings:
+        return [], False
+    return findings, True
+
+
+def _build_json_report(results: list[ReviewResult]) -> dict:
+    """The `--json` payload for already-dispatched `results` (run order) -- the
+    ONLY --json rendering path for both the flat and board dispatch paths below.
+    Pure post-processing over the SAME ReviewResults the prose path already
+    formats: --json costs no extra backend calls of its own, and never runs
+    during dispatch.
+
+    Top-level shape (ticket #546 -- deliberately review-cli's OWN schema, not a
+    copy of revmux's `sources`/`open_questions`/`stats` fields; see
+    docs/compare-revmux.md, which this mirrors only in SPIRIT: a stable
+    machine-parseable contract, not a byte-for-byte one):
+      findings -- flat array of every FINDING/CLEAR item every REPORTED seat
+        returned, each additionally tagged `source` = that seat's label. Board
+        mode: "<display> [<role>]" (e.g. "Opus [correctness]"); flat `-m` mode:
+        the bare model string. Both ALREADY are `result.model` by the time this
+        runs -- see `panel.build_board_job` (the board's label) and this
+        module's flat dispatch path (which re-tags each result with its
+        originally-REQUESTED model string via `replace(final, model=model)` in
+        `_flat_seat_with_provider_failover`) -- so no extra bookkeeping is
+        threaded through dispatch just to build this field.
+      summary.expected -- every seat that actually ran, in run order (mirrors
+        the prose path's own "every seat that ran, successes and failed seats
+        that triggered a backfill", see `_mode_review_board`'s docstring).
+      summary.reported -- the subset whose structured block parsed
+        (`_seat_json_findings`'s `reported=True`).
+      summary.degraded -- the subset that did not (backend failure OR an
+        unparseable/missing findings block) -- ticket #546: "reported as a
+        degraded/unparseable source ... not crash the whole command"."""
+    findings: list[dict] = []
+    expected: list[str] = []
+    reported: list[str] = []
+    degraded: list[str] = []
+    for result in results:
+        expected.append(result.model)
+        seat_findings, ok = _seat_json_findings(result)
+        (reported if ok else degraded).append(result.model)
+        for item in seat_findings:
+            findings.append({**item, "source": result.model})
+    return {
+        "findings": findings,
+        "summary": {
+            "expected": expected,
+            "reported": reported,
+            "degraded": degraded,
+        },
+    }
+
+
+def _json_exit_code(report: dict) -> int:
+    """The `--json`-path exit contract (ticket #546), DISTINCT from the prose
+    path's `0 if ok else 1` (seat-HEALTH only -- see the bottom of `mode_review`
+    and `_mode_review_board`):
+      0 -- the run produced at least one REPORTED seat, and zero FINDING-verdict
+           entries among them. The acceptance criterion's "above the existing
+           severity/confidence floor" is the FINDING/CLEAR line itself, not a
+           NEW numeric severity/confidence cutoff -- review-cli has no
+           pre-existing severity/confidence bar anywhere else to inherit one
+           from (checked: quorum's --min-iter/--min-models/--min-roles gate
+           iteration/model/ROLE counts, not per-finding severity; the visual
+           pipeline's confidence float gates a SCREENSHOT verdict, not a diff
+           finding) -- so introducing a specific numeric cutoff here would be a
+           new, undocumented design choice with no existing convention to match,
+           not a mirror of one. severity/confidence are still reported on every
+           finding for a caller that wants to filter further itself.
+      1 -- at least one FINDING-verdict entry among the reported seats.
+      2 -- tool error: not ONE seat reported (every dispatched seat either
+           failed outright or returned an unparseable block) -- the run
+           produced NO structured signal at all, which is a materially
+           different claim than "reviewed and clean" and must not silently
+           collapse into exit 0.
+    This 2 is scoped to `--json`'s own contract (only ever returned from
+    mode_review's/`_mode_review_board`'s --json branch) and does not reuse
+    argparse's pre-existing "2 == usage error" meaning (cli.py's own comment on
+    its exit-code block) -- by the time this runs, argparse has already finished
+    parsing successfully; the two can never collide on the same invocation."""
+    if not report["summary"]["reported"]:
+        return 2
+    if any(finding["verdict"] == "FINDING" for finding in report["findings"]):
+        return 1
+    return 0
+
+
+def _print_json_report(results: list[ReviewResult]) -> dict:
+    """Build + print the `--json` payload for `results` in ONE place -- both
+    `mode_review`'s flat path and `_mode_review_board` call this instead of
+    repeating the build/print pair (review-cli#546, code-quality review finding),
+    and both reuse the RETURNED report for `_json_exit_code` rather than
+    rebuilding/re-parsing it a second time."""
+    report = _build_json_report(results)
+    print(json.dumps(report, indent=2))
+    return report
+
+
+def _predispatch_error_exit(json_output: bool) -> int:
+    """The exit code for a PRE-DISPATCH usage/availability failure (no diff to
+    review / no reviewers available) -- shared by `mode_review`'s flat path and
+    `_mode_review_board` so the 1-vs-2 mapping can't drift between the two
+    (review-cli#546, code-quality review finding: it was duplicated verbatim).
+    The prose path keeps its pre-existing 1 (unchanged from every prior
+    release); `--json` gets its own tool-error code (2) per `_json_exit_code`'s
+    contract -- a caller parsing --json needs to tell "nothing ran" apart from
+    "ran and found nothing"."""
+    return 2 if json_output else 1
+
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
@@ -204,6 +554,7 @@ def mode_review(
     commit: bool = False,
     usage_percent: Callable[[str], float | None] | None = None,
     stamp_diff_hash: str | None = None,
+    json_output: bool = False,
 ) -> int:
     # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
     # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
@@ -220,7 +571,7 @@ def mode_review(
 
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
-        return 1
+        return _predispatch_error_exit(json_output)
 
     if board:
         # Resolve the run-scoped effort onto the seats HERE, so a direct lib/MCP caller that
@@ -237,12 +588,13 @@ def mode_review(
             staged,
             pool_size,
             outcome_sink,
-            diff_from_stdin,
-            visual_images,
-            exact_board,
-            commit,
-            usage_percent,
-            stamp_diff_hash,
+            diff_from_stdin=diff_from_stdin,
+            visual_images=visual_images,
+            exact_board=exact_board,
+            commit=commit,
+            usage_percent=usage_percent,
+            stamp_diff_hash=stamp_diff_hash,
+            json_output=json_output,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
@@ -337,35 +689,45 @@ def mode_review(
             # would double-count that one attempt.
 
     by_model = {result.model: result for result in results}
-    # check_evidence=prompt.startswith(DEFAULT_PROMPT) (k3 review finding, round 6;
-    # `.startswith` not `==`, k3 finding round 7 — see below): only the diff-review
-    # render paths (here and the board path below) apply the missing-evidence
-    # WARNING at all — DEFAULT_PROMPT's "checked: ..." contract is a diff-review-only
-    # ask, so quorum/just-ask/brainstorm's own format_result calls stay at the
-    # default False (glm-cc review finding, round 1). But even within diff-review,
-    # `--prompt` lets a caller REPLACE DEFAULT_PROMPT entirely (e.g. `--prompt
-    # 'Answer APPROVED if safe; otherwise list blockers.'`) — a custom prompt never
-    # asked for the "checked: ..." phrasing, so a compliant one-word "APPROVED"
-    # response must not get a warning claiming it omitted evidence it was never
-    # asked to provide. An exact `==` check (round 6's first cut) silently broke on
-    # `--visual`: `_with_visual` APPENDS the image's context note to whatever prompt
-    # is in effect (`text + visual_ctx.context_note`, cli.py's `_with_visual`), so
-    # `review diff --visual shot.png` with no `--prompt` dispatches
-    # `DEFAULT_PROMPT + context_note` — a DIFFERENT string from `DEFAULT_PROMPT`,
-    # even though the model still received DEFAULT_PROMPT's full "checked: ..."
-    # contract verbatim. `==` silently disabled the WARNING on every visual diff
-    # review, exactly the composable path this feature needs to keep covering.
-    # `.startswith` recognizes DEFAULT_PROMPT as an unmodified PREFIX (true whether
-    # visual appended nothing, or appended a context note) while still resolving to
-    # False for a genuinely custom `--prompt` (with or without `--visual`), which by
-    # construction never starts with DEFAULT_PROMPT's text.
-    check_evidence = prompt.startswith(DEFAULT_PROMPT)
-    print(
-        "\n\n---\n\n".join(
-            format_result(by_model[model], check_evidence=check_evidence)
-            for model in models
+    # `report` stays None on the prose path (never read there); the --json path
+    # builds+prints it here via `_print_json_report` so the SAME merged payload
+    # backs both stdout and the exit-code decision below (`_json_exit_code`) --
+    # never rebuilt/re-parsed a second time for the return value.
+    report: dict | None = None
+    if json_output:
+        report = _print_json_report([by_model[model] for model in models])
+    else:
+        # check_evidence=prompt.startswith(DEFAULT_PROMPT) (k3 review finding, round 6;
+        # `.startswith` not `==`, k3 finding round 7 — see below): only the diff-review
+        # render paths (here and the board path below) apply the missing-evidence
+        # WARNING at all — DEFAULT_PROMPT's "checked: ..." contract is a diff-review-only
+        # ask, so quorum/just-ask/brainstorm's own format_result calls stay at the
+        # default False (glm-cc review finding, round 1). But even within diff-review,
+        # `--prompt` lets a caller REPLACE DEFAULT_PROMPT entirely (e.g. `--prompt
+        # 'Answer APPROVED if safe; otherwise list blockers.'`) — a custom prompt never
+        # asked for the "checked: ..." phrasing, so a compliant one-word "APPROVED"
+        # response must not get a warning claiming it omitted evidence it was never
+        # asked to provide. An exact `==` check (round 6's first cut) silently broke on
+        # `--visual`: `_with_visual` APPENDS the image's context note to whatever prompt
+        # is in effect (`text + visual_ctx.context_note`, cli.py's `_with_visual`), so
+        # `review diff --visual shot.png` with no `--prompt` dispatches
+        # `DEFAULT_PROMPT + context_note` — a DIFFERENT string from `DEFAULT_PROMPT`,
+        # even though the model still received DEFAULT_PROMPT's full "checked: ..."
+        # contract verbatim. `==` silently disabled the WARNING on every visual diff
+        # review, exactly the composable path this feature needs to keep covering.
+        # `.startswith` recognizes DEFAULT_PROMPT as an unmodified PREFIX (true whether
+        # visual appended nothing, or appended a context note) while still resolving to
+        # False for a genuinely custom `--prompt` (with or without `--visual`), which by
+        # construction never starts with DEFAULT_PROMPT's text. Computed HERE, inside
+        # the prose branch only (code-quality review finding, review-cli#546): the
+        # --json branch above never calls format_result, so this was dead weight there.
+        check_evidence = prompt.startswith(DEFAULT_PROMPT)
+        print(
+            "\n\n---\n\n".join(
+                format_result(by_model[model], check_evidence=check_evidence)
+                for model in models
+            )
         )
-    )
     # Opus review finding: this used to check ONLY `returncode == 0`, not
     # `result_is_usable`. A live rc=0 "is currently unavailable" sentinel (the same
     # shape `_cooldown_skip_result` deliberately mirrors, and the board path already
@@ -408,6 +770,8 @@ def mode_review(
     )
     if override is not None:
         return override
+    if json_output:
+        return _json_exit_code(report)
     return 0 if ok else 1
 
 
@@ -521,6 +885,7 @@ def _report_pool_shortfall(
     *,
     reserve: list[BoardReviewer],
     pool_size: int,
+    json_output: bool = False,
 ) -> None:
     """`pool`/`reserve` are keyword-only past `pool` on purpose (GLM review finding,
     round 5): both are same-typed `list[BoardReviewer]` sitting side by side, and a
@@ -647,7 +1012,11 @@ def _report_pool_shortfall(
     # notice) -- without it, a piped/teed run (`review diff | tee report.md`) block-
     # buffers this print, and a run killed mid-dispatch loses it entirely, silently
     # reproducing the exact "zero signal" incident this notice exists to fix.
-    print("\n".join(lines), flush=True)
+    # Under --json this notice would print BEFORE the JSON envelope and break
+    # `json.loads(stdout)` for the exact degraded-pool case a machine consumer most
+    # needs reliable signal for (P1 review finding, review-cli#546) -- route it to
+    # stderr there instead, matching every OTHER operator notice in this module.
+    print("\n".join(lines), file=sys.stderr if json_output else sys.stdout, flush=True)
 
 
 # The one pre-commit invocation every gate remediation points at. Spelled ONCE: every
@@ -1286,12 +1655,14 @@ def _mode_review_board(
     staged: bool,
     pool_size: int,
     outcome_sink: list[FailoverOutcome] | None,
+    *,
     diff_from_stdin: bool = False,
     visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
     commit: bool = False,
     usage_percent: Callable[[str], float | None] | None = None,
     stamp_diff_hash: str | None = None,
+    json_output: bool = False,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -1355,7 +1726,9 @@ def _mode_review_board(
             usage_percent=usage_percent,
         )
         _warn_if_board_reused(board, pool)
-        _report_pool_shortfall(board, pool, reserve=reserve, pool_size=pool_size)
+        _report_pool_shortfall(
+            board, pool, reserve=reserve, pool_size=pool_size, json_output=json_output
+        )
     if not pool:
         print(
             "[review-cli] board: no reviewers are available — configure at least one "
@@ -1364,7 +1737,7 @@ def _mode_review_board(
             file=sys.stderr,
             flush=True,
         )
-        return 1
+        return _predispatch_error_exit(json_output)
 
     # Capped copy for backend dispatch ONLY — `diff` itself (used below for the
     # stamp/checkpoint) stays uncapped (see cap_diff_for_dispatch's docstring). Same
@@ -1379,14 +1752,24 @@ def _mode_review_board(
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
-    # check_evidence=prompt.startswith(DEFAULT_PROMPT) — see the flat path's
-    # identical note above (k3 review finding, rounds 6-7).
-    check_evidence = prompt.startswith(DEFAULT_PROMPT)
-    print(
-        "\n\n---\n\n".join(
-            format_result(r, check_evidence=check_evidence) for r in outcome.results
+    # `report` stays None on the prose path (never read there); the --json path
+    # builds+prints it here via `_print_json_report` so the SAME merged payload
+    # backs both stdout and the exit-code decision below (`_json_exit_code`) --
+    # never rebuilt/re-parsed a second time for the return value.
+    report: dict | None = None
+    if json_output:
+        report = _print_json_report(outcome.results)
+    else:
+        # check_evidence=prompt.startswith(DEFAULT_PROMPT) — see the flat path's
+        # identical note above (k3 review finding, rounds 6-7). Computed HERE,
+        # inside the prose branch only (code-quality review finding,
+        # review-cli#546): the --json branch above never calls format_result.
+        check_evidence = prompt.startswith(DEFAULT_PROMPT)
+        print(
+            "\n\n---\n\n".join(
+                format_result(r, check_evidence=check_evidence) for r in outcome.results
+            )
         )
-    )
 
     if outcome.degraded:
         print(
@@ -1414,6 +1797,8 @@ def _mode_review_board(
     )
     if override is not None:
         return override
+    if json_output:
+        return _json_exit_code(report)
     return 0 if ok else 1
 
 
@@ -1469,15 +1854,28 @@ def _handler(ctx: ModeContext) -> int:
     # commit gate even under --staged — see _stamp_if_staged_commit_review.
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     commit = bool(getattr(ctx.args, "commit", False))
+    # `--json` (ticket #546): reuses the SAME flag every mode parser already carries
+    # (added by cli._add_visual_options for the composable --visual verdict JSON) —
+    # for `review diff` (and a `review visual IMAGE --diff/--staged` companion run,
+    # which reaches this SAME handler via visual.py's own `_handler = review._handler`)
+    # that flag was previously a pure no-op: the standalone visual-verdict JSON branch
+    # in cli.py only fires when there is NO diff at all, and diff review always has
+    # one. Giving it a second, diff-review-scoped meaning here does not collide with
+    # that standalone path (mutually exclusive by construction) or with quorum/
+    # brainstorm/just-ask (which never reach this handler).
+    json_output = bool(getattr(ctx.args, "json", False))
     # Captured by the CLI immediately adjacent to `ctx.diff`'s own capture (a
     # millisecond gap, not the multi-minute panel-run gap re-deriving it at
     # stamp-WRITE time would have) — see `install._write_review_stamp`'s
     # docstring. None for any non-CLI caller of `mode_review` (falls back to
     # that function's own independent re-derive).
     stamp_diff_hash = ctx.extra.get("stamp_diff_hash")
+    prompt = ctx.with_visual(ctx.args.prompt)
+    if json_output:
+        prompt = _with_json_findings_request(prompt)
     base = (
         ctx.models,
-        ctx.with_visual(ctx.args.prompt),
+        prompt,
         ctx.diff,
         ctx.cwd,
         ctx.timeout,
@@ -1492,6 +1890,7 @@ def _handler(ctx: ModeContext) -> int:
             effort_override=ctx.effort_override,
             commit=commit,
             stamp_diff_hash=stamp_diff_hash,
+            json_output=json_output,
         )
     return mode_review(
         *base,
@@ -1504,6 +1903,7 @@ def _handler(ctx: ModeContext) -> int:
         commit=commit,
         stamp_diff_hash=stamp_diff_hash,
         usage_percent=ctx.extra.get("usage_percent"),
+        json_output=json_output,
     )
 
 

@@ -3,6 +3,23 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.13 — 2026-09-24
+
+- **Feat(review diff): additive `--json` structured findings output (review-cli#546).**
+  `review diff --json` (and a `review visual IMAGE --diff/--staged` companion run, which
+  shares the same handler) emits a machine-parseable envelope on stdout instead of the
+  prose panel — a flat `findings` array (`file`/`line`/`severity`/`confidence`/`verdict`/
+  `source`) plus `summary.expected`/`reported`/`degraded`. Each backend is additionally
+  asked to emit one fenced JSON block on top of its normal prose review; a seat whose
+  block can't be parsed (or that failed outright) is reported `degraded` rather than
+  crashing the run. Exit `0` = no findings, `1` = findings present, `2` = no seat's
+  structured response was usable at all — a contract scoped entirely to `--json`, distinct
+  from the prose path's existing seat-health-only `0`/`1` exit. Reuses the `--json` flag
+  already present on every mode parser (added for the standalone `review visual` verdict)
+  rather than a second, colliding flag — that flag was a pure no-op for diff review before
+  (its old branch only fires with no diff at all). Purely additive: the prose default is
+  byte-identical when the flag is absent.
+
 ## 0.37.12 — 2026-09-24
 
 - **Feat(board): checked-in per-project lens overrides via `.review/lenses/<role>.md`
