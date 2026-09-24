@@ -1887,15 +1887,19 @@ mode, so it rides any subcommand.
 
 ## How review compares
 
-AI code review tools cluster into three camps. **PR-bots** (Qodo PR-Agent, CodeRabbit,
+AI code review tools cluster into four camps. **PR-bots** (Qodo PR-Agent, CodeRabbit,
 GitHub Copilot code review) run a single model against a *pull request* — they live on
 the platform, comment inline, and are great once a PR exists. **In-agent review** (Claude
 Code `/review`, Codex review) runs one model on the local diff inside the harness you are
 already in. **Autonomous-loop tools** ([ralphex](https://github.com/umputun/ralphex)) fold
 review *into* a full code-gen loop — they drive a coding agent through a plan and review its
 output as one fused, opinionated pipeline (see [review vs ralphex](#review-vs-ralphex--the-whole-loop-vs-the-review-primitive) below).
+**Supervised multi-agent review CLIs** ([revmux](https://github.com/umputun/revmux)) spawn
+`claude`/`codex` as subprocesses they own and watch in a TUI, returning one stable JSON
+findings contract — a narrower, more auditable shape than a panel (see
+[review vs revmux](#review-vs-revmux--panel--decision-tool-vs-supervised-multi-agent-process) below).
 
-`review` is neither: it runs **several models in parallel on the local working-tree diff**
+`review` sits outside all four camps above: it runs **several models in parallel on the local working-tree diff**
 before you ever push, then goes further — a cited **quorum** (consensus with evidence) and
 a multi-round **brainstorm** panel for open design questions. It adds **visual review**
 (attach a render with `--visual` for a keep / rollback / repair verdict) and **interactive
@@ -1913,6 +1917,7 @@ Codex, opencode, or a plain shell).
 | Claude Code `/review` | — (1 model) | ✓ | — | — | ~ | — (in-harness) | — |
 | Codex review | — (1 model) | ✓ | — | — | ~ | — (in-harness) | — |
 | ralphex | ✓ (5 review agents + opt. codex) | ✓ | — | — | — (drives an agent that edits) | ✓ (local Go binary) | ✓ (drives the coding agent) |
+| revmux | ✓ (claude + codex, supervised subprocesses) | ~ (caller-written round; any subject) | — | — (`triage` rates relevance, not open ideation) | ✓ | ✓ (your own claude/codex CLIs) | — (review only, by design) |
 
 `~` = partial. PR-bots shine *after* a PR exists and can apply fixes; `review` is the
 pre-commit, multi-perspective second opinion that runs from any shell and decides nothing
@@ -1949,6 +1954,27 @@ controllable** — a read-only, multi-model review primitive the agent composes 
 Ralph loop, so the agent keeps full control of code-gen and of every fix/ship/re-loop
 decision instead of handing the loop to a black box.
 
+### review vs revmux — panel + decision tool vs supervised multi-agent process
+
+[**revmux**](https://github.com/umputun/revmux) spawns `claude --print` and `codex exec` as
+subprocesses it owns, watches them in a terminal TUI, and returns one structured JSON report
+with a stable schema — findings, severity, confidence, verdict, fixed exit codes. It is
+absolutely read-only, reviews *any* subject (a branch, a PR, a design doc, a filed issue, not
+only a diff) through a caller-written **task round**, and checks its review standard
+(`.revmux/` profiles and lenses) into the target repo as versioned files.
+
+`review` overlaps on intent — stop one model grading its own homework, stay out of code-gen,
+leave a durable log behind — but is architecturally wider: a **15-seat priority board** across
+many providers (not just claude+codex) with three layers of failover and per-seat reliability
+tracking, plus modes revmux has no equivalent for — cited **quorum**, multi-round
+**brainstorm**, **visual** screenshot review, and the one narrow un-caged **`qa`** write/exec
+tester. Its core interface is a human-readable panel, not a stable findings-JSON contract; the
+JSON side of `review` lives in separate management commands (`task`, `stat`, `entities`, `jobs`, `visual`).
+
+Neither replaces the other — they don't share config and don't conflict. See
+**[docs/compare-revmux.md](docs/compare-revmux.md)** for the full, detailed, feature-by-feature
+comparison, and for where the rest of the field fits.
+
 ---
 
 ## Ecosystem
@@ -1963,3 +1989,13 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
+
+---
+
+## Comparisons
+
+See [How review compares](#how-review-compares) for the field at a glance, and
+**[docs/compare-revmux.md](docs/compare-revmux.md)** for the deepest one-on-one —
+`review` vs [revmux](https://github.com/umputun/revmux), feature by feature, plus where the
+rest of the field (2ndOpinion, Open Code Review, Calimero ai-code-reviewer, ralphex, and more)
+fits.
