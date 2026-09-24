@@ -1,6 +1,12 @@
 # AGENTS.md — review-cli
 
-Agent-facing notes for working IN this repo. (User-facing docs live in `README.md`.)
+Docs live across three surfaces, each with a distinct job: `README.md` is onboarding
+/ quickstart / why-this-tool; `review help <topic>` is the live CLI contract (exact
+flags, env vars, behavior — checked by `tests/test_topic_help.py`, so it can't drift
+the way prose can); `docs/*.md` is long-form reference/history extracted out of
+README as README shrinks (so far just `docs/compare-revmux.md` — more
+README-extraction pages land as ticket #552's later PRs merge; other `docs/*.md`
+files may exist for unrelated purposes, e.g. design specs).
 
 ## What this is
 

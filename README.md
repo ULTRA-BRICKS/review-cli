@@ -272,34 +272,12 @@ bounded, non-seat subprocess calls elsewhere — e.g. `git worktree add` during 
 isolation setup — that use the plain, non-streamed runner.)
 
 **Run stats & a startup ETA — never short-timeout `review`.** `review` is
-multi-model and (for the panel modes) multi-round, so it takes **minutes**, and a
-short shell `timeout` around it kills the run before its synthesis — a `brainstorm`
-only emits its final answer at the very end, so a short cap yields *nothing* usable.
-To make the expected duration visible up front, every run that actually dispatches a
-backend appends a structured stat record — task code, mode, pool size (backends actually
-dispatched; for a small-panel brainstorm that is the per-round persona slot count),
-model **names** (never keys or prompts), the real monotonic wall-clock, and ok/fail
-counts — to an append-only
-JSONL store at `~/.config/review-cli/run-stats.jsonl` (mode 0600; override with
-`$REVIEW_STATS_FILE`). At dispatch it then prints a one-line ETA to **stderr** keyed
-on `(mode, pool_size)`:
-
-```
-[review] pool=4 (brainstorm) — typically ~6m12s based on 12 past runs of this size; do NOT timeout.
-```
-
-With no exact history it falls back to pool-size-only across modes, then to a
-`no history yet … expect MINUTES` line. Read that line and wait at least that long.
-(This store is separate from the dashboard's per-call log reader, whose mode is
-*inferred* and whose duration is an mtime proxy — this one records the run's ground
-truth.) Task-coded records power `review task CODE` and the dashboard's task history.
-The run-stats JSONL schema is versioned (currently `v: 3`); task-coded records add the
-optional `task_code` field, and `v: 3` adds an optional `passed: bool` verdict field (the
-mode's own success/failure signal, used by `review task CODE --check` — the self-merge-
-authority gate). A record with no `passed` key has verdict UNKNOWN — either it predates
-`v: 3`, or it is a current record from a mode with no verdict to thread (`qa` is
-report-only by design; see `reviewlib/qa/executor.py`) — never crashes a reader, but the
-quorum gate treats unknown as not-passed either way.
+multi-model and (for the panel modes) multi-round, so a run takes **minutes**, and a
+short shell `timeout` around it kills the run before its synthesis. Every dispatch
+appends a run-stats record and prints a one-line ETA to stderr keyed on
+`(mode, pool_size)`, so you know up front roughly how long to wait instead of
+guessing. See `review help runtime` for the run-stats JSONL schema, the exact ETA
+line format, and the full read-that-line guidance.
 
 **No external timeout — `review` carries its own internal ≤4h backstop.** Do not
 put *any* external `timeout` on `review`: it is designed to run unbounded from the

@@ -84,6 +84,7 @@ from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import (
+    STATS_VERSION,
     announce_eta,
     diff_content_hash,
     extract_diff_files,
@@ -4706,6 +4707,61 @@ See also: `review --help` (overview), `review --show-board`, `review <mode> --he
 """
 
 
+def _help_topic_runtime() -> str:
+    """The `review help runtime` deep reference (help-docs-sync): run stats and the
+    startup ETA line printed before a dispatch, plus why `review` must never be
+    wrapped in a short external timeout. Content moved here from the README's
+    "Quorum" section (review-cli#552 PR1); body prose em dashes were normalized to
+    `--` for plain-text help — the title and the literal ETA example line keep the
+    real `—` they use on-screen/in `eta_line()`'s actual output, so this stays a
+    live, test-checked contract (tests/test_topic_help.py), not just relocated
+    prose. The schema-version line below reads `STATS_VERSION` directly so it
+    cannot silently go stale the way the README prose once did. Kept in sync with
+    `reviewlib/stats.py`'s `record_run` / `announce_eta` / `eta_line` behavior — a
+    flag/behavior change there updates this topic in the same commit."""
+    return f"""\
+review — runtime, run stats & the startup ETA
+===============================================
+
+NEVER SHORT-TIMEOUT `review`
+  `review` is multi-model and (for the panel modes) multi-round, so it takes MINUTES
+  per run. A short shell `timeout` wrapped around it kills the run before its
+  synthesis -- a `brainstorm` only emits its final answer at the very end, so a
+  short cap yields *nothing* usable.
+
+RUN STATS & THE STARTUP ETA
+  To make the expected duration visible up front, every run that actually dispatches
+  a backend appends a structured stat record -- task code, mode, pool size (backends
+  actually dispatched; for a small-panel brainstorm that is the per-round persona
+  slot count), model NAMES (never keys or prompts), the real monotonic wall-clock,
+  and ok/fail counts -- to an append-only JSONL store at
+  ~/.config/review-cli/run-stats.jsonl (mode 0600; override with $REVIEW_STATS_FILE).
+
+  At dispatch it then prints a one-line ETA to stderr keyed on (mode, pool_size):
+
+    [review] pool=4 (brainstorm) — typically ~6m12s based on 12 past runs of this size; do NOT timeout.
+
+  With no exact history it falls back to pool-size-only across modes, then to a
+  "no history yet ... expect MINUTES" line. Read that line and wait at least that
+  long. (This store is separate from the dashboard's per-call log reader, whose mode
+  is INFERRED and whose duration is an mtime proxy -- this one records the run's
+  ground truth.) Task-coded records power `review task CODE` and the dashboard's
+  task history.
+
+  The run-stats JSONL schema is versioned (currently v: {STATS_VERSION}). v: 3 added
+  an optional passed: bool verdict field (the mode's own success/failure signal, used
+  by `review task CODE --check` -- the self-merge-authority gate); v: 4 added
+  repo_id/diff_files/diff_sha256 (diff-identity binding); v: 5 added
+  prompt_tokens/output_tokens (aggregate REST token usage). Task-coded records also
+  add an optional task_code field. A record with no `passed` key has verdict UNKNOWN
+  -- either it predates v: 3, or it is a current record from a mode with no verdict
+  to thread (`qa` is report-only by design; see `reviewlib/qa/executor.py`) -- never
+  crashes a reader, but the quorum gate treats unknown as not-passed either way.
+
+See also: `review --help` (overview), README's "Quorum" section, `review task CODE`.
+"""
+
+
 # Deep help TOPICS advertised from the main `review --help` and served by `review help
 # <topic>` / `review --help <topic>` (ROADMAP "Topic-based help across the ecosystem").
 # topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
@@ -4714,6 +4770,10 @@ HELP_TOPICS: dict[str, tuple[str, "object"]] = {
     "config": (
         "config file, the model/board selection cascade, keys/auth",
         _help_topic_config,
+    ),
+    "runtime": (
+        "run stats, the startup ETA line, why never to short-timeout `review`",
+        _help_topic_runtime,
     ),
 }
 
