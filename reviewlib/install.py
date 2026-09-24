@@ -29,7 +29,7 @@ description: >-
   brainstorm across personas (`review brainstorm "TOPIC"`).
 metadata:
   author: alex-mextner
-  repo: https://github.com/alex-mextner/review-cli
+  repo: https://git.hyperide.ai/ultrabricks/review-cli
 ---
 
 # review — multi-model read-only code review + panels

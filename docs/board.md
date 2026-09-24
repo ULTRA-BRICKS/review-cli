@@ -64,7 +64,7 @@ the board already uses, and GLM was re-lensed off its now-redundant `quality` ro
 paid live seat in MiMo, review-cli#450); Astra's pre-existing `consistency` duplicate of
 Sol's lens was deliberately left as is rather than reintroduce a different
 single-point-of-failure. See
-[review-cli#382](https://github.com/alex-mextner/review-cli/issues/382).
+[review-cli#382](https://git.hyperide.ai/ultrabricks/review-cli/issues/382).
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
@@ -131,7 +131,7 @@ board/failover dispatch path only ever contains the SEATS THAT SURVIVED — a ch
 cooling seat that a reserve successfully backfilled never appears there, so the
 diagnostic stays silent in exactly the case (a stuck seat masked by working failover)
 it exists to surface. Tracked as
-[review-cli#227](https://github.com/alex-mextner/review-cli/issues/227).
+[review-cli#227](https://git.hyperide.ai/ultrabricks/review-cli/issues/227).
 
 **Scope gap (known, tracked):** the FULL check/record/clear trio — including the
 administrative-sentinel/quota-marker body detection that decides a call is
@@ -157,7 +157,7 @@ this feature introduces. `review_codex` and the `commandcode:`/`zai:` HTTP backe
 have no cooldown consult/record/clear at all. Extending the full trio (including
 genuinely opencode-specific body detection, so an unrecognised wording is correctly
 classified as chronic rather than defaulting to "success") to the non-claude backends
-is tracked as [review-cli#226](https://github.com/alex-mextner/review-cli/issues/226),
+is tracked as [review-cli#226](https://git.hyperide.ai/ultrabricks/review-cli/issues/226),
 not done here.
 
 **Pool/spawn consults live `harness limits` 5-hour and 7-day windows.** Board composition and Claude dispatch skip a family whose more-restrictive 5-hour or 7-day window is already at 100% (`harness limits --all --json`, falling back to tg-ctl samples when harness has no card for that family). This is not a concurrent-agent cap; `$REVIEW_MAX_CONCURRENCY` remains the memory semaphore below.

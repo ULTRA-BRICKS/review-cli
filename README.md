@@ -28,13 +28,13 @@ review with the composable `--visual` flag for a keep / rollback / repair verdic
 **One-liner** (installs deps, links `review` into PATH, registers the skill):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alex-mextner/review-cli/main/install.sh | bash
+curl -fsSL https://git.hyperide.ai/ultrabricks/review-cli/raw/branch/main/install.sh | bash
 ```
 
 **pipx alternative:**
 
 ```bash
-pipx install git+https://github.com/alex-mextner/review-cli
+pipx install git+https://git.hyperide.ai/ultrabricks/review-cli
 ```
 
 After install, run `review install-skill` to register the tool into agent harnesses
@@ -858,7 +858,7 @@ rendering, persistence paths, and the seed/import JSON shape.
    expert roles, looping across several rounds — to surface candidate approaches a
    single model wouldn't reach.
 2. It picks the top one or two and posts them to Telegram via
-   [`tg`](https://github.com/alex-mextner/tg-cli) as simplified options with pros/cons,
+   [`tg`](https://git.hyperide.ai/ultrabricks/tg-cli) as simplified options with pros/cons,
    so you decide from your phone.
 3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
    and compares them for real before committing.
@@ -1408,11 +1408,11 @@ comparison, and for where the rest of the field fits.
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
-- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
-- **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[tg-cli](https://git.hyperide.ai/ultrabricks/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
+- **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
+- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
