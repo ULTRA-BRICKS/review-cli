@@ -185,6 +185,17 @@ committing and refuses (same distinct exit code) if it drifted from what was act
 reviewed — it never commits changes another process/session staged in the meantime. This
 is the recommended default for any review loop that might need multiple rounds.
 
+**Structured findings (`--json`).** `review diff --json` emits a machine-parseable
+findings envelope on stdout instead of the prose panel — a flat `findings` array
+(`file`, `line`, `severity`, `confidence`, `verdict`, `source`) plus a
+`summary.expected`/`reported`/`degraded` seat breakdown — additive and opt-in: the
+default prose output above is completely unaffected when the flag is absent. Each
+backend is additionally asked for a structured block on top of its normal prose
+review; a seat whose response can't be parsed is reported as `degraded` rather than
+failing the whole run. Exit `0` = no findings, `1` = findings present, `2` = no
+seat's structured response was usable at all. See `review diff --help` for the full
+field/exit-code contract.
+
 ---
 
 ### Just Ask
