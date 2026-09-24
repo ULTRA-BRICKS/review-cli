@@ -85,7 +85,7 @@ flowchart LR
 | Non-code / design work | `triage`: a four-way relevance panel over a filed issue/discussion | `brainstorm` (multi-round ideation) and `quorum` (cited decision) — distinct modes, not one review verb |
 | Visual / screenshot review | none | dedicated `review visual` mode + composable `--visual` flag, vision-model fan-out |
 | Cost model | each roster entry names its own model + effort; no cross-provider escalation beyond one retry | presets (`light`/`default`/`heavy`) trade pool size/effort for cost; `review stat` telemetry demotes seats with measured chronic failure rates |
-| License / maturity | MIT, single maintainer (umputun), young (tens of stars as of writing) | part of a broader open toolchain (`rig`, `tg-cli`, `agent-tools`), long-iterated changelog with tracked reliability fixes |
+| License / maturity | MIT, single maintainer (umputun), young ([current star/fork count](https://github.com/umputun/revmux)) | part of a broader open toolchain (`rig`, `tg-cli`, `agent-tools`), long-iterated changelog with tracked reliability fixes |
 
 **Consensus mechanism, in full.** revmux's confidence boost counts distinct **processes** (never
 lenses) that independently raised the same `(file, line ±2)`; a dedicated verify stage runs
