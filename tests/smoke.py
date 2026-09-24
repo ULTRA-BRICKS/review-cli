@@ -781,6 +781,11 @@ _UNIT_FILES = [
     # (ok/staged/not-piped), the real `git commit` it makes, and the distinct
     # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
     ("test_review_commit_checkpoint.py", {}),
+    # `review diff --json` (review-cli#546): the additive structured findings envelope --
+    # extraction/coercion/report/exit-code units plus flat+board mode_review dispatch and
+    # _handler wiring, all offline (resolve_backend/panel.resolve_backend swapped for an
+    # in-process fake, mirroring test_reviewer_board.py / test_review_commit_checkpoint.py).
+    ("test_json_findings.py", {}),
     # The pre-commit gate's trivial-follow-up delta tolerance (review-cli#208): a small
     # restage on top of an already-reviewed baseline is accepted without a fresh full
     # review, a substantive one is still blocked, and a pre-#208 stamp (no companion

@@ -48,6 +48,8 @@ from .config import (
     board_from_models,
     ensure_min_distinct_roles,
     expand_flat_models_with_reuse,
+    lens_override_path,
+    lens_override_text,
     load_board,
     load_config,
     parse_effort_flag,
@@ -4277,12 +4279,21 @@ def _add_global_options(
 
 
 def _add_visual_options(
-    parser: argparse.ArgumentParser, *, include_visual_flag: bool = True
+    parser: argparse.ArgumentParser,
+    *,
+    include_visual_flag: bool = True,
+    json_help: str = "emit the structured visual verdict as JSON",
 ) -> None:
     """Add the composable `--visual` feature flags as their own argument GROUP. These are
     SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
     on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
-    makes `review <mode> --help` render them under a clear "visual verification" heading."""
+    makes `review <mode> --help` render them under a clear "visual verification" heading.
+
+    `json_help` (ticket #546) lets a caller override `--json`'s help text WITHOUT adding a
+    second, colliding `--json` flag: this group already sits on EVERY mode parser (diff
+    review included), so `review diff`'s own `--json` (structured findings, wired in
+    `modes/review.py`) reuses this SAME argparse flag rather than defining its own — see
+    `_add_mode_options` below, the only caller that passes a non-default value."""
     group_title = (
         "visual verification"
         if not include_visual_flag
@@ -4317,9 +4328,7 @@ def _add_visual_options(
         metavar="NAME",
         help="force-activate a visual module by name (repeatable)",
     )
-    group.add_argument(
-        "--json", action="store_true", help="emit the structured visual verdict as JSON"
-    )
+    group.add_argument("--json", action="store_true", help=json_help)
     group.add_argument(
         "--strict",
         action="store_true",
@@ -4391,7 +4400,32 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
     # parser (but never the top-level overview). --rounds / --max-rounds are brainstorm-only
     # and added by the brainstorm mode's own add_arguments; they stay in _VALUE_TAKING_OPTS
     # so the mode-agnostic `-o` pre-scan treats them as value-taking.
-    _add_visual_options(parser, include_visual_flag=(mode.name != "visual"))
+    # `--json`'s help text is mode-aware (ticket #546): `review diff` (and a `review
+    # visual IMAGE --diff/--staged` companion run, which reaches the SAME handler via
+    # visual.py's own `_handler = review._handler`) gives the flag a SECOND meaning —
+    # a structured findings envelope, wired entirely in modes/review.py — since the
+    # pre-existing "visual verdict JSON" behaviour never fires there anyway (it is
+    # gated on there being NO diff at all; diff review always has one). Every other
+    # mode (quorum/brainstorm/just-ask) keeps the original, unrelated help text.
+    json_help = (
+        "with a diff in play (review diff, or review visual IMAGE --diff/--staged): "
+        "emit a structured findings JSON envelope on stdout instead of the prose "
+        "panel -- additive, the prose output is unaffected when this flag is absent. "
+        "Each backend is additionally asked to emit one fenced JSON block on top of "
+        "its normal prose; findings[] items carry file/line/severity(P0-P3)/"
+        "confidence(high|medium|low)/verdict(FINDING|CLEAR)/source (the seat that "
+        "raised it), plus summary.expected/reported/degraded (which seats ran / "
+        "parsed / failed to parse). Exit 0 = no findings, 1 = findings present, 2 = "
+        "no seat's structured response was usable at all -- --commit's own checkpoint "
+        "exit codes (11/12/13) still take priority over this 0/1/2 contract when both "
+        "flags are given. For a STANDALONE `review visual IMAGE` (no diff), this "
+        "instead emits the structured VISUAL verdict, unchanged from before."
+        if mode.name in ("review", "visual")
+        else "emit the structured visual verdict as JSON"
+    )
+    _add_visual_options(
+        parser, include_visual_flag=(mode.name != "visual"), json_help=json_help
+    )
 
     if mode.add_arguments is not None:
         mode.add_arguments(parser)
@@ -6746,6 +6780,10 @@ def _show_board(
                     mid-run (mid-run failover);
       * `unavail` — backend not reachable right now; it can't sit in the pool, but a
                     run-time "unavailable" reply still triggers a reserve backfill.
+    A seat whose role has an active checked-in `.review/lenses/<role>.md` override
+    (review-cli#547) is suffixed `(lens overridden: <path>)`; the resolved cwd (this
+    function's `cwd`, defaulting to `Path.cwd()`) is the repo root the override path is
+    read relative to.
     Read-only — no model is called, no key is printed."""
     config_models = _split_models(config.get("models") or [])
     exact_models = explicit_models or []
@@ -6831,7 +6869,22 @@ def _show_board(
     effort_w = max((len(r.effort or "-") for r in board), default=1)
     # Resolve the repo bit ONCE (a single git rev-parse) for the opencode scope label,
     # rather than per seat in the loop.
-    cwd_is_repo = backends._opencode_runs_in_repo(cwd or Path.cwd())
+    effective_cwd = cwd or Path.cwd()
+    cwd_is_repo = backends._opencode_runs_in_repo(effective_cwd)
+    # Per-project lens overrides (review-cli#547): resolve ONCE per DISTINCT role (not
+    # per seat -- DEFAULT_BOARD alone carries "consistency" and "quality" twice each) so
+    # a 15-seat board costs at most 8 file reads (len(REVIEW_ROLES)), not 15. Maps role ->
+    # the override file's path RELATIVE to the reviewed repo root, for a short, readable
+    # label; a role absent from this dict has no active override (missing/unreadable/
+    # blank file, or a role that isn't a real REVIEW_ROLES key -- see
+    # `lens_override_text`'s docstring for why each of those counts as "no override").
+    overridden_roles: dict[str, Path] = {}
+    for r in dict.fromkeys(seat.role for seat in board if seat.role):
+        override_text = lens_override_text(r, effective_cwd)
+        if override_text:
+            overridden_roles[r] = lens_override_path(r, effective_cwd).relative_to(
+                effective_cwd
+            )
     seen_available = 0  # how many AVAILABLE seats walked so far (priority order)
     for index, reviewer in enumerate(board):
         available = avail[index]
@@ -6860,9 +6913,14 @@ def _show_board(
         scope = (
             "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
         )
+        lens_note = (
+            f"  (lens overridden: {overridden_roles[reviewer.role]})"
+            if reviewer.role in overridden_roles
+            else ""
+        )
         print(
             f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
-            f"{reviewer.model}  [{status}]  ({scope})  effort={effort}"
+            f"{reviewer.model}  [{status}]  ({scope})  effort={effort}{lens_note}"
         )
     print(
         "\nScope: `agentic` seats (codex / opencode / omp / claude-CLI) run read-only in the "
@@ -6898,6 +6956,16 @@ def _show_board(
             "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
             "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
             "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)"
+        )
+    if overridden_roles:
+        overridden_list = ", ".join(
+            f"{role} ({path})" for role, path in overridden_roles.items()
+        )
+        print(
+            "\nProject lens overrides active (review-cli#547): "
+            f"{overridden_list}. Each file's text is APPENDED to that role's built-in "
+            "lens, never replacing it; delete/empty the file to fall back to the "
+            "built-in lens alone."
         )
     from .role_models import format_role_fallback_section
 

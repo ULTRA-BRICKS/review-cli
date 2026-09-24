@@ -165,7 +165,7 @@ stays accurate.
 ### `install-commit-hook` delegates to `rig apply` when rig is present
 
 `install_commit_hook` writes a GLOBAL git pre-commit hook (`core.hooksPath`). When
-[rig](https://github.com/alex-mextner/rig-cli) is also on the machine, its
+[rig](https://git.hyperide.ai/ultrabricks/rig-cli) is also on the machine, its
 `git_hooks.dispatcher` provisions the SAME mechanism as one stage of its composed pre-commit
 (`agent-tools/git-hooks/global-dispatcher/hooks/review-gate` — ported verbatim from this
 command) — two tools writing `core.hooksPath` is the exact double-write the shared

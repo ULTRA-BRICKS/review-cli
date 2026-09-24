@@ -28,13 +28,13 @@ review with the composable `--visual` flag for a keep / rollback / repair verdic
 **One-liner** (installs deps, links `review` into PATH, registers the skill):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alex-mextner/review-cli/main/install.sh | bash
+curl -fsSL https://git.hyperide.ai/ultrabricks/review-cli/raw/branch/main/install.sh | bash
 ```
 
 **pipx alternative:**
 
 ```bash
-pipx install git+https://github.com/alex-mextner/review-cli
+pipx install git+https://git.hyperide.ai/ultrabricks/review-cli
 ```
 
 After install, run `review install-skill` to register the tool into agent harnesses
@@ -181,6 +181,17 @@ A review is multi-minute, so `--commit` also re-checks the staged index right be
 committing and refuses (same distinct exit code) if it drifted from what was actually
 reviewed — it never commits changes another process/session staged in the meantime. This
 is the recommended default for any review loop that might need multiple rounds.
+
+**Structured findings (`--json`).** `review diff --json` emits a machine-parseable
+findings envelope on stdout instead of the prose panel — a flat `findings` array
+(`file`, `line`, `severity`, `confidence`, `verdict`, `source`) plus a
+`summary.expected`/`reported`/`degraded` seat breakdown — additive and opt-in: the
+default prose output above is completely unaffected when the flag is absent. Each
+backend is additionally asked for a structured block on top of its normal prose
+review; a seat whose response can't be parsed is reported as `degraded` rather than
+failing the whole run. Exit `0` = no findings, `1` = findings present, `2` = no
+seat's structured response was usable at all. See `review diff --help` for the full
+field/exit-code contract.
 
 ---
 
@@ -851,7 +862,7 @@ rendering, persistence paths, and the seed/import JSON shape.
 
 `review` earns its keep on a hard call: `review brainstorm "<the decision>" --task
 CODE` runs multi-model, multi-round ideation; the agent posts the top options to
-Telegram via [`tg`](https://github.com/alex-mextner/tg-cli) for a phone decision, and
+Telegram via [`tg`](https://git.hyperide.ai/ultrabricks/tg-cli) for a phone decision, and
 for the closest calls builds rival approaches in parallel **git worktrees** to compare
 for real before committing.
 
@@ -1121,6 +1132,24 @@ reserve-replace, the cross-invocation cooldown's escalating window, Claude accou
 across multiple accounts, the memory-aware concurrency cap, and how `board:`/`models:` config
 precedence resolves.
 
+**Per-project lens overrides (review-cli#547):** drop `.review/lenses/<role>.md` at
+your repo's root (`<role>` is one of the known roles above) to teach a board role
+something specific to your codebase — a payments invariant, a house style rule —
+without forking or patching review-cli. The file's text is **appended** to that
+role's built-in lens (never replaces it), so the seat keeps the built-in coverage
+plus your addition; an absent, unreadable, or blank/whitespace-only file is treated
+as no override, and a symlink at the override path or an intermediate `.review`/
+`.review/lenses` directory that escapes the repo root is never followed (also treated
+as absent). An **oversized** file is not rejected the same way: it is silently
+truncated to the first 8 KiB (`LENS_OVERRIDE_MAX_BYTES`) and the truncated text still
+becomes the seat's active override — so a repo that never adds this directory behaves
+exactly as before, but a project author who exceeds 8 KiB gets a quietly truncated
+lens, not a rejected one.
+`review --show-board` marks any seat whose role has an active override with a
+`(lens overridden: .review/lenses/<role>.md)` suffix. (A bigger docs reorg is
+tracked separately in review-cli#552 and will eventually move this into
+`docs/board.md`.)
+
 ---
 
 ## Auth
@@ -1289,11 +1318,11 @@ comparison, and for where the rest of the field fits.
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
-- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
-- **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[tg-cli](https://git.hyperide.ai/ultrabricks/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
+- **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
+- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
