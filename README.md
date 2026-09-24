@@ -1419,62 +1419,23 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 
 ## Reviewer board
 
-The plain `review diff` runs a **reviewer board**: a panel where
-each model is given its OWN review role/lens, so the panel covers the diff broadly
-instead of every model doing the same generic pass. The board is the default panel
-out of the box — no config file required.
+The plain `review diff` runs a **reviewer board**: a panel where each model is given its OWN
+review role/lens, so the panel covers the diff broadly instead of every model doing the same
+generic pass. The board is the default panel out of the box — no config file required.
 
-### Priority-ordered failover pool
+The raw built-in board is a **priority-ordered** list of 15 models, strongest WORKING model
+first, chosen by **priority + availability**. A bare `review diff` runs the `light` preset (a
+pool of 2 at medium effort) for cheap routine checks; `--preset default` steps up to a pool of
+4 at high effort; `--preset heavy` runs Sol/Opus/GLM-cc/Kimi at `xhigh`, with the rest of the
+board as `max`-effort reserve. Fable is excluded from every preset — chronic dispatch failures
+demoted it to the board's final, last-resort seat. Two layers of failover keep the pool full:
+**startup failover** skips an unreachable higher-priority seat and pulls up the next one, and
+**mid-run failover** promotes the next-priority reserve if an active seat fails mid-review.
+`--pool N` sizes the pool (`--pool 0` runs every available seat in the selected preset/board);
+the board itself is never disabled.
 
-The raw built-in board is a **priority-ordered** list of 15 models — strongest WORKING
-model first — and a plain `review diff` runs the `light` preset (Alex, 2026-08-28): a
-**pool of 2** without Fable/Sol, at medium effort — cheap by default for routine
-pre-commit checks. Use `--preset default` for a routine change review at a pool of 4,
-high effort, and `--preset heavy` for release/risky changes: Sol, Opus, GLM-cc, and Kimi at
-`xhigh` effort, with the remaining board seats as `max`-effort reserve. Fable is excluded
-from every preset — `review stat` telemetry showed a confirmed ~97.9-100% dispatch failure
-rate (chronic session/usage-limit exhaustion on the account it runs through), so it is
-demoted to the raw board's LAST seat instead (see the table below) — a last-resort reserve,
-not a routinely-dispatched pool seat, in any preset. The pool is chosen by **priority +
-availability**, with two layers of failover so the run keeps the requested number of
-working reviewers even when models drop:
-
-- **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority.
-  A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
-  **skipped** and the next-priority seat is pulled up, so you still start with the
-  requested number of working models. (E.g. if Sol is unavailable in the heavy preset,
-  the pool starts at Opus.)
-- **Mid-run failover** — if an active seat **fails during the review** (backend error,
-  timeout, empty output, or an "unavailable" reply such as a paywalled model returning
-  *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
-  run in its place, repeating until the requested number of working verdicts is produced or the reserve is
-  exhausted (then the run degrades gracefully and says so on stderr, exiting non-zero).
-- **Account rotation (review-cli#168)** — every `claude:*` seat and the omp-hosted
-  Claude seat authenticate as ONE Claude account, so an account-wide outage or paywall
-  (or a 100% harness 5-hour/7-day window) used to take out all of them at once. On a
-  multi-account host (`~/.claude-accounts/account-*/`, the same registry `claude-rotate`
-  already uses; `$CLAUDE_ROTATE_ROOT` overrides the root) the direct `claude:*` dispatch
-  now tries each registered account in rotation order — the persisted `current` account
-  first, then wrapping through the rest — via a per-call `CLAUDE_CONFIG_DIR`, skipping
-  any account whose own harness window is exhausted and falling through to the next on a
-  chronic-unavailable result. The omp-hosted Claude seat rotates the same way across
-  `$REVIEW_OMP_CLAUDE_PROFILES` (comma-separated, already-logged-in omp profiles). Only
-  when EVERY configured account is exhausted does the run emit the synthetic usage-limit
-  skip, now naming every account it tried; a host with no registry behaves exactly as
-  before.
-
-The role/lens **travels with the seat**: priority decides *who* sits in the pool, the
-role decides *with what lens* they review. A promoted reserve brings its own lens, so
-the panel still covers a broad set of facets.
-
-`--pool N` overrides the preset default (the top-N available, with the same failover);
-`--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 14 heavy-preset built-in seats (the raw 15-seat board,
-including last-resort Fable, needs an explicit `board:`/`models:` config). The board is **never
-disabled** — `--pool` only sizes the pool.
-
-The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
-on a fully-keyed environment):
+The built-in board, in **priority order** (the `Tier` column shows the `heavy` preset split on
+a fully-keyed environment):
 
 | # | Tier | Reviewer | Backend | Role | Lens focus |
 |---|---|---|---|---|---|
@@ -1482,7 +1443,7 @@ on a fully-keyed environment):
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
 | 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382 below) |
+| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382) |
 | 6 | reserve | Terra | `codex:gpt-5.6-terra` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (a distinct, already-paid codex model — live `performance` fallback for GLM-cc, review-cli#382) |
 | 7 | reserve | Sonnet | `claude:claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (a distinct, already-paid Anthropic model — live `quality` fallback for Kimi, review-cli#382) |
 | 8 | reserve | Sonnet-omp | `omp:anthropic/claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (the SAME claude-sonnet-5 model through the omp harness — a different auth path than the direct `claude:` seat right above, so it survives a Claude-account-wide outage that takes out every `claude:*` seat sharing one account, review-cli#168) |
@@ -1494,237 +1455,10 @@ on a fully-keyed environment):
 | 14 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
 | 15 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
 
-**review-cli#382 (2026-09-05):** `unpaid_providers: [commandcode, gemini]` disables every
-commandcode-routed seat (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That
-used to leave `performance`/`quality`/`security`/`tests`/`contracts` with zero or exactly one
-live seat each — `quality`'s one live seat (GLM, the z.ai route above) hit a real weekly quota
-exhaustion with nothing left to promote, hard-blocking a real PR's review-quorum gate. Terra
-and Sonnet are genuinely distinct, already-paid fallbacks on the same OpenAI/Codex and
-Anthropic accounts Sol/Astra and Opus/Fable already use (no new provider), giving
-`performance`/`quality` a real live seat each. GLM was re-lensed off its now-redundant
-`quality` role (Sonnet covers it more reliably) onto `security`, which had none. `tests`
-(DeepSeek-only), `contracts` (Gemini-only), and `architect` (Fable-only, and Fable is ~100%
-failing) remain thin — there was no third distinct already-paid model to give every starved
-role its own seat without doubling up one account's quota pressure on a single review run,
-the exact failure class this same change fixes for Fable. Astra's pre-existing `consistency`
-role (a duplicate of Sol's) is deliberately left unchanged — an earlier draft flipped it to
-`security` to close that duplicate, but doing so left `consistency` with zero live fallback
-anywhere on the board, the exact single-point-of-failure class this change exists to fix,
-just relocated.
-
-**Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
-the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
-Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra via the codex
-CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) — all run
-read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
-always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
-**GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
-register this GLM id, so the agentic form errors; the keyed-HTTP route is the one that
-reaches it). Both are read-only by construction (they POST only the diff).
-`review --show-board` shows each seat's live
-`agentic`/`diff-only` scope for the current host. The board has
-a reserve, so an `oc:` seat that opencode can't reach is backfilled rather than blocking:
-a missing opencode **binary** is detected at startup (the seat probes unavailable and the
-pool fills from the next reserve); missing opencode **provider auth** for known providers is
-also a startup skip. If a provider key exists but the account is not entitled/billed, list the
-provider in `unpaid_providers:` (or set `REVIEW_UNPAID_PROVIDERS`) and every direct or `oc:`
-seat under it is skipped before any model process/API call. (The diff-only
-`commandcode:`/`zai:` keyed-HTTP backends are still there for explicit `-m cc`/`-m glm` and
-config boards on hosts without opencode.)
-
-**In-seat retry before reserve-replace.** A seat that fails is first re-tried *on the same
-model* when the failure looks **transient** — a `429` rate-limit, a `529`/5xx overload, a
-provider timeout, an "overloaded"/"service unavailable" notice — with exponential backoff +
-jitter, before any reserve is promoted. The same model usually answers on the next try a
-moment later, so a brief throttle spike no longer burns a reserve seat. A **seat-fatal**
-failure (auth / bad model / `501` not-implemented / a refusal) is **never** retried — no
-retry can fix it — so it falls straight to the reserve. The retry budget is configurable via
-`--retry N` (or `$REVIEW_RETRY_COUNT`; default 2, `0` disables it). Every retry and every
-reserve promotion is recorded **durably** in the run-log dir (not just stderr), so a
-post-mortem or the dashboard can reconstruct exactly how a seat recovered or fell over.
-
-**Cross-invocation cooldown for a chronically-unavailable claude seat.** In-seat retry only
-sees one process's worth of history, so a Fable seat that is out of session quota still
-paid for one full `claude-p` dispatch on *every* review invocation before falling to the
-reserve — real evidence: 4,322 of 6,383 recorded runs dispatched Fable and it failed, most
-with an explicit session-limit notice. Once a dispatch comes back with that notice or the
-administrative "... is currently unavailable" sentinel, `reviewlib.seat_cooldown` records a
-cooldown (`$REVIEW_SEAT_COOLDOWN_SECONDS` pins a fixed window for FUTURE writes and
-disables escalation going forward — it does not retroactively shorten an already-
-escalated entry's `until`, only `<= 0` (the documented un-stick hatch, disabling
-cooldowns entirely) does that; store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`)
-so the *next* invocation within that window skips the real
-dispatch and returns the same sentinel shape immediately — every downstream consumer
-(failover, the dashboard's paywall classification) sees it exactly as it would a live
-paywall response. **Escalating window (review-cli#221):** left unset, the window starts at
-10 minutes and climbs per CONSECUTIVE failure (30min, 2h, then an 8-hour cap) — a seat that
-keeps getting re-dispatched and re-failing across many separate `review` invocations
-(minutes apart, so a flat 10-minute window kept lapsing before the next check) gets pushed
-out of the active pool long enough for `run_board_with_failover`'s reserve-promotion to
-substitute a different model instead. A genuine SUCCESSFUL dispatch clears the escalation
-immediately; absent that, a 24-hour gap since the last failure also resets it to 10 minutes.
-`review task CODE --check` (both text and `--json`) names any currently-stalled attempted
-model plus why, instead of leaving an operator to guess from a bare pass/fail count.
-Deliberately narrow: only these two chronic signals start a cooldown, never a bare
-auth/bad-model seat-fatal (which can be a transient misconfiguration a human just fixed).
-An explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` override always resets `fail_count` to 1 on
-its next write, the same as a genuine success — it's a human asking for a specific window,
-which takes priority over the escalation history the way any explicit request does.
-
-**Diagnostic gap (known, tracked):** `stalled_models` is scoped to the models a task's
-recorded runs actually attempted (`record_run`'s `models=`), which on the normal
-board/failover dispatch path only ever contains the SEATS THAT SURVIVED — a chronically-
-cooling seat that a reserve successfully backfilled never appears there, so the
-diagnostic stays silent in exactly the case (a stuck seat masked by working failover)
-it exists to surface. Tracked as
-[review-cli#227](https://github.com/alex-mextner/review-cli/issues/227).
-
-**Scope gap (known, tracked):** the FULL check/record/clear trio — including the
-administrative-sentinel/quota-marker body detection that decides a call is
-chronically-unavailable in the first place — is wired into only the two claude
-dispatch paths (`review_with_images`, `review_claude` in `backends.py`).
-`review_opencode` (review-cli#235) additionally consults + records + clears this same
-store, but ONLY for its own narrower TRUE-SILENCE failure mode (see the next section):
-a seat that never produces a single byte of output within `REVIEW_TRUE_SILENCE_SECONDS`
-is reaped and cooled down the same way a chronically-unavailable claude seat is.
-`review_opencode`'s success path now ALSO reuses the SAME shared chronic-unavailable/
-quota-marker body detector `review_claude`'s clear-gate uses (`_chronic_unavailable_reason`
-— not actually claude-specific in implementation, it just wasn't wired into any other
-call site before this) — a rc=0 body matching one of those known marker phrases is
-recorded as a chronic failure rather than wrongly clearing true-silence escalation
-history. This narrows, but does not fully close, the gap: an opencode-specific quota
-wording that matches NONE of the shared marker phrases is treated as a genuine success
-and DOES clear the cooldown (any non-empty rc=0 body defaults to "recovered" unless it
-matches a known chronic sentinel) — the same behavior `review_claude`'s identical
-sibling pattern has always had for an unrecognised claude quota wording, not a new gap
-this feature introduces. `review_codex` and the `commandcode:`/`zai:` HTTP backends
-have no cooldown consult/record/clear at all. Extending the full trio (including
-genuinely opencode-specific body detection, so an unrecognised wording is correctly
-classified as chronic rather than defaulting to "success") to the non-claude backends
-is tracked as [review-cli#226](https://github.com/alex-mextner/review-cli/issues/226),
-not done here.
-
-**Pool/spawn consults live `harness limits` 5-hour and 7-day windows.** Board composition and Claude dispatch skip a family whose more-restrictive 5-hour or 7-day window is already at 100% (`harness limits --all --json`, falling back to tg-ctl samples when harness has no card for that family). This is not a concurrent-agent cap; `$REVIEW_MAX_CONCURRENCY` remains the memory semaphore below.
-
-**Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
-model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
-or a cascade of reserve backfills can fan out into enough concurrent agent subprocesses to
-**OOM-kill** a seat mid-review under load. A process-wide cap bounds how many heavy backend
-subprocesses run at once (default **4**, overridable via `$REVIEW_MAX_CONCURRENCY`; `<= 0`
-disables it, and a value above **64** is clamped to that ceiling so a typo can't pin an
-absurd number of children). A seat over the cap simply **waits** for a slot — it is never dropped, and its
-per-call timeout starts only once it actually spawns, so queueing on the cap can't falsely
-time it out. The common single-seat gate (`--pool 1`) and the default (light) pool of 2 are
-unaffected (both `<=` the cap). This is a *per-process* cap; a swarm of separate `review`
-processes also leans on the per-seat timeout (a stalled seat frees its slot fast) and on the
-slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort reserve** (review-cli#65).
-
-**To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
-`reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
-highest priority. The role lens you attach to each model is independent of its priority.
-
-The GLM seat uses **his z.ai subscription** (`glm-5.2`, the newest GLM) through opencode's
-`zai` provider, so it reviews agentically — not the diff-only z.ai REST call. It needs that
-provider configured in opencode (see Auth); the other `oc:commandcode/…` seats reach the
-commandcode gateway the same way. opencode must be installed for the agentic seats; without
-it they fall back to the reserve.
-
-```bash
-review --show-board        # active default preset board (light); add --preset heavy to show Sol (Fable excluded)
-export REVIEW_TASK_CODE=HYP-742
-review diff                # recorded `--task` (via REVIEW_TASK_CODE): light floored to 3 roles
-review diff --pool 0       # run all available light-preset seats
-review diff --preset default --pool 0  # run all 11 default-preset built-in seats (Fable/Sol excluded)
-review diff --preset heavy --pool 0  # run all 12 heavy-preset built-in seats (Fable excluded)
-review diff --pool 2       # explicit --pool 2 still wins (warns under --task: below ship floor 3)
-review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
-review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
-review diff -m grok        # with --task: pad grok across 3 roles; without --task / multi -m: exact
-```
-
-### Board vs. models precedence
-
-The diff-review board is always the failover mechanism unless you pass exact CLI models
-without any configured `models:`/`board:` metadata.
-Precedence:
-
-```
-explicit -m requested models   >   explicit --preset   >   `models:` priority roster   >
-configured `board:`   >   default preset (light)
-```
-
-- A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
-  the first available models fill the live pool, and lower-priority models are reserve
-  backfill. It does not disable board/failover.
-- Explicit `-m` on the CLI never lets config add extra seats. With no configured
-  `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
-  the configured board metadata to only the requested models. The board can otherwise
-  never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 2 for a bare unrecorded `review diff` — the light preset, Alex 2026-08-28 —
-  or 4 if you pass `--preset default`; a recorded `--task` run floors light to 3 distinct
-  roles so `review task CODE --check` / gh ship can pass from one run; `--pool 0` runs all
-  available seats in the selected preset/board (recorded `--task --pool 0` still pads a
-  same-role config roster to the ship floor); `--preset heavy --pool 0` currently covers
-  all 12 heavy-preset built-ins — Fable is excluded from every preset, see "Reviewer board"
-  above). `--pool` does not reduce an explicit multi-model `-m` list: every requested `-m`
-  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles (review, just-ask, quorum, and brainstorm).
-- An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
-  roster — the configured/default board applies.
-
-Override the board itself in `config.yaml` with a `board:` list — each entry is a
-`{model, role}` mapping (optional `name:` for the label, optional `effort:` for the
-seat's reasoning-effort hint). Supported effort values are `minimal`, `low`, `medium`,
-`high`, `xhigh`, and `max`; `xhigh` and `max` mean "highest" in prompts. Native backend
-settings are normalized to the closest supported value where the provider exposes one.
-When `models:` is present,
-`board:` supplies role/name/effort metadata for matching models; priority still comes from
-`models:`. When `models:` is absent, `board:` is the full priority-ordered board.
-An entry is checked model/capability FIRST: one with no usable `model:` or resolvable
-`capability:` is skipped with a warning (the valid entries are kept) and its `role:` is
-never inspected. Only an entry that DOES resolve to a real seat then has its `role:`
-validated: an unknown value (not a key in the built-in role list) is a hard error naming
-the bad value and the valid roles (review-cli#422) — fix the typo, or omit `role:` to use
-the generic prompt intentionally. With **no**
-`models:` or `board:` configured, the CLI uses the default preset (light as of
-2026-08-28); `--preset default` uses the same 13 seats at high effort, and `--preset
-heavy` uses the 14-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
-excluded, see "Reviewer board" above) — the raw 15-seat board (including last-resort
-Fable) is only reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the
-seats you want; an absent or empty `board:`/`models:` falls back to the same 13-seat
-`LIGHT_PRESET_BOARD` (no Fable, no Sol; same model order as `DEFAULT_PRESET_BOARD`, at
-medium instead of high effort) that the default preset now resolves to. A
-`board:` that is **present but has no usable entry at all** is a hard error (non-zero
-exit) — it never silently falls back to the paid default board.
-
-```yaml
-# Priority order: the first 4 reachable models are the live pool; the rest are the
-# reserve that backfills a skipped/failed seat.
-board:
-  - { model: "claude:claude-fable-5",  role: architect, effort: xhigh }
-  - { model: "claude:claude-opus-4-8", role: correctness, effort: high }
-  - { model: "codex:gpt-6-astra",      role: consistency, name: Astra, effort: high }
-  # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
-  # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
-  # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
-  - { model: "oc:commandcode/moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
-  - { model: "oc:zai/glm-5.2",         role: quality }
-  - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
-```
-
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 13). Add
-either to your `board:` list for an extra 1M-context resilience / holistic-senior
-pass; both run agentically through opencode's commandcode provider (needs opencode +
-`opencode auth login`, like the default `oc:` seats):
-
-```yaml
-board:
-  # ... the 13 built-in seats ...
-  - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
-  - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
-```
-
-Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
-`security`, `tests`, `contracts`.
+See **[docs/board.md](docs/board.md)** for the full mechanics: in-seat retry vs.
+reserve-replace, the cross-invocation cooldown's escalating window, Claude account rotation
+across multiple accounts, the memory-aware concurrency cap, and how `board:`/`models:` config
+precedence resolves.
 
 ---
 
@@ -1768,7 +1502,8 @@ tightened `REVIEW_IDLE_TIMEOUT_SECONDS` below 5 minutes will see the OPPOSITE �
 seat now waits the full true-silence timeout instead of the operator's shorter idle
 window (review-cli#254). Tune `REVIEW_TRUE_SILENCE_SECONDS` directly if this matters for
 your setup. This only applies pre-first-byte and only to opencode seats today; see the
-seat-cooldown section above. Either reap lets reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
+cross-invocation cooldown section in [docs/board.md](docs/board.md). Either reap lets
+reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
 `board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
 
 **Grok board reviewer (agentic, via opencode's native `xai` provider):** `oc:xai/grok-4.6`
@@ -1807,8 +1542,8 @@ subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
 `--timeout` instead (and also disables the true-silence check below, since it runs inside
 the same idle-mode wait path). It does not change REST HTTP timeouts, QA wall-clock caps,
 or vision wall-clock caps. `REVIEW_TRUE_SILENCE_SECONDS=N` overrides how long an opencode
-seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See the
-seat-cooldown section above for the full contract.
+seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See
+[docs/board.md](docs/board.md) for the full seat-cooldown contract.
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or
