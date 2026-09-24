@@ -4627,8 +4627,8 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           positive value below the 0.5s poll
                                           granularity clamps up to it).
     REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
-                                          <= 0 disables it. See `review stat`'s section
-                                          in README.md.
+                                          <= 0 disables it. See the bold "Diff size cap"
+                                          paragraph in README.md's "Diff review" section.
     REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
                                           chronically-unavailable claude seat (Fable).
                                           opencode also consults + records + clears

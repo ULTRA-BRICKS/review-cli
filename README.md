@@ -107,7 +107,7 @@ review task HYP-742 --detail 2
 > `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
 > and the command dies silently — no review, no error. `-o` writes the result with
 > Python (`open(...,"w")`), bypassing the shell redirect entirely: it creates parent
-> dirs, always overwrites, and still prints to stdout. See [Flags](#flags).
+> dirs, always overwrites, and still prints to stdout. See [Subcommands & flags](#subcommands--flags).
 
 > **Deep help: `review help <topic>`.** Beyond `review --help` / `review <mode> --help`,
 > `review help config` (alias `review --help config`) prints the configuration reference —
@@ -1879,9 +1879,9 @@ declaring the subcommand it registers, its default diff policy, the CLI argument
 adds, and its thin handler — exactly how a visual module exposes a top-level `MODULE`.
 The CLI looks the subcommand up in the registry and dispatches; **adding a mode = drop a
 `modes/<name>.py` and list it in `registry.MODES` — no `cli.py` surgery.** A bare
-`review …` (no recognized subcommand) routes to the default `review` mode, so the common
-diff-review ergonomics are preserved; `--visual` is a composable flag orthogonal to the
-mode, so it rides any subcommand.
+`review` with no recognized subcommand prints help rather than running any mode (see
+[Quick start](#quick-start)); `--visual` is a composable flag orthogonal to the mode, so it
+rides any subcommand.
 
 ---
 
