@@ -375,6 +375,8 @@ def run_seat_with_retry(
     sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     on_retry: Callable[[SeatAttempt], None] | None = None,
+    announce: bool = True,
+    on_recovered: Callable[[int, int], None] | None = None,
 ) -> ReviewResult:
     """Run ONE seat, retrying the SAME seat on a TRANSIENT failure before giving up.
 
@@ -401,7 +403,17 @@ def run_seat_with_retry(
     (fail-loud-on-empty is preserved: an unusable result is handed back unchanged for the
     caller's reserve/degrade path — this layer never fabricates a verdict). `max_retries` /
     `max_seconds` default to the env-configured values; `rng`/`sleeper`/`clock` are injectable
-    for deterministic tests."""
+    for deterministic tests.
+
+    `announce=False` suppresses the DEFAULT stderr notices (the transient-failure line AND
+    the recovery line) WITHOUT touching the durable `write_retry_log` record either way — for
+    a caller (a live TUI, review-cli#548) that renders its own equivalent via `on_retry` /
+    `on_recovered` instead of a raw stderr write that would corrupt an interactive curses
+    screen (stdout/stderr share the same real tty during an interactive run). `on_retry` stays
+    unconditional (called whenever a retry fires, `announce` or not — unchanged from before
+    this parameter existed); `on_recovered(attempt, budget)` is the equivalent hook for the
+    one-line "recovered on retry N/M" notice, which has no `SeatAttempt` of its own to hand a
+    callback."""
     budget = retry_count() if max_retries is None else max(0, max_retries)
     cap_seconds = retry_max_seconds() if max_seconds is None else max_seconds
     jitter_rng = rng if rng is not None else random.Random()
@@ -442,7 +454,8 @@ def run_seat_with_retry(
         delay = compute_backoff(attempt, jitter_rng)
         event = SeatAttempt(model=model, attempt=attempt, max_attempts=max_attempts,
                             delay=delay, prior=result)
-        _announce_retry(event)
+        if announce:
+            _announce_retry(event)
         write_retry_log(model, kind="retry", attempt=attempt, max_attempts=max_attempts,
                         delay=delay, result=result)
         if on_retry is not None:
@@ -451,17 +464,28 @@ def run_seat_with_retry(
         result = runner()
         if result_is_usable(result):
             # We only reach here from inside the retry loop, so this IS a recovery.
-            print(f"[review-cli] seat {model} recovered on retry {attempt}/{budget}",
-                  file=sys.stderr, flush=True)
+            if announce:
+                print(f"[review-cli] seat {model} recovered on retry {attempt}/{budget}",
+                      file=sys.stderr, flush=True)
+            if on_recovered is not None:
+                on_recovered(attempt, budget)
             return result
     return result
+
+
+def retry_reason(event: SeatAttempt) -> str:
+    """Short, single-line reason for a retry event — trimmed so a long error channel can't
+    flood a log line. Shared (not duplicated) between the default stderr announcement below
+    AND any external observer (e.g. a live TUI's event log, review-cli#548) that wants the
+    SAME trimmed text."""
+    reason = (event.prior.stderr or event.prior.stdout or "").strip().splitlines()
+    return reason[0][:120] if reason else f"exit {event.prior.returncode}"
 
 
 def _announce_retry(event: SeatAttempt) -> None:
     """Print a one-line retry notice to stderr (the human channel; the durable record is the
     run log). Trimmed so a long error channel doesn't flood stderr."""
-    reason = (event.prior.stderr or event.prior.stdout or "").strip().splitlines()
-    head = reason[0][:120] if reason else f"exit {event.prior.returncode}"
     print(f"[review-cli] seat {event.model} transient failure "
-          f"(retry {event.attempt}/{event.max_attempts - 1} in {event.delay:.1f}s): {head}",
+          f"(retry {event.attempt}/{event.max_attempts - 1} in {event.delay:.1f}s): "
+          f"{retry_reason(event)}",
           file=sys.stderr, flush=True)

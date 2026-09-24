@@ -46,6 +46,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
+        "test_tui_pty.py",
     }
 )
 
@@ -993,6 +994,22 @@ _UNIT_FILES = [
     # the codex/claude path (input_text provided) keeps stdin=PIPE. Verified via
     # a spied subprocess.Popen, no real opencode/omp/codex/claude process.
     ("test_process.py", {}),
+    # The live per-seat TUI observer (review-cli#548): the auto-enable gate (--no-tui /
+    # $REVIEW_NO_TUI / both-streams-isatty), BoardReporter's state machine + rendering
+    # against a fake stdscr, and the reporter's wiring into run_board_with_failover /
+    # run_panel_with_retry (reserve promotion, in-seat retry, provider failover) via the
+    # SAME _FakeBackends harness test_failover_pool.py uses. Each wiring test asserts the
+    # corresponding raw stderr print is suppressed with a reporter and BYTE-IDENTICAL to
+    # before this feature with reporter=None. No real curses/terminal needed here (see
+    # test_tui_pty.py for that).
+    ("test_tui.py", {}),
+    # The REAL-pty half of review-cli#548: spawns the actual `bin/review diff` CLI attached
+    # to a real pty (REVIEW_FAKE_BACKEND=1, no network/keys) and asserts the TUI actually
+    # activates and paints role/model/status/elapsed, that a broken terminal (TERM=unknown)
+    # falls back to the plain non-TUI output within a bounded time instead of hanging, and
+    # that --no-tui / $REVIEW_NO_TUI disable it even under a fully-capable real pty. Needs
+    # a real git binary (own throwaway repo per test) -- see _GIT_REQUIRED_UNIT_FILES.
+    ("test_tui_pty.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in
