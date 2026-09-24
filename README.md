@@ -771,386 +771,82 @@ reboot — before it could record its own terminal status). `--detach` is reject
 
 ## `review dashboard` — local web dashboard (managed service)
 
-The dashboard is a **managed service**: it gets the same lifecycle subcommands every
-long-running agent-tools server shares (run / start / status / stop / enable / disable),
-from the reusable `agenttools_service` lib — review-cli does not hand-roll pidfiles or
-autostart units.
+A **managed service** (`run` / `start` / `status` / `stop` / `enable` / `disable`, via the
+shared `agenttools_service` lib) that serves a single-page web app over every review-cli run —
+chat logs, per-task/mode/model stats, and an overseer's free-text feedback/PR-ticket
+annotations, all read from the existing per-call logs (no new run-record format).
 
 ```bash
-review dashboard            # bare = HELP (prints the actions, launches NOTHING)
-review dashboard run        # run in the FOREGROUND (this shell), blocking — ad-hoc / when disabled
-review dashboard start      # start in the BACKGROUND (detached daemon); returns immediately
-review dashboard status     # is it running? pid / port / url / autostart-enabled
-review dashboard stop       # stop the background instance
-review dashboard enable     # install OS autostart (launchd / systemd --user / fallback) AND start now
-review dashboard disable    # remove OS autostart AND stop
-review dashboard --port 8765 run   # global --host/--port apply to any action
+review dashboard start      # background daemon; review dashboard status / stop
+review dashboard enable     # OS autostart at login (launchd / systemd --user)
 ```
 
-A bare `review dashboard` (no action) prints HELP and launches nothing. On `run`/`start`
-it hints how to `enable` autostart at login. `run` binds an ephemeral port; the managed
-`start`/`enable` bind a stable default port (so `status`'s url and a later restart land on
-the same address).
-
-A single-page web app over every review-cli run, built on the Python **stdlib** HTTP
-server (no extra deps) and a **vanilla-JS SPA** (no npm/build step — assets ship in the
-package). It binds **127.0.0.1 only** by default — the logs persist prompts/diffs that may
+It binds **127.0.0.1 only** by default — the logs persist prompts/diffs that may
 carry secrets — so it is not exposed on the network unless you pass `--host 0.0.0.0` (e.g.
 to reach it over Tailscale).
 
-**Dependency:** the lifecycle subcommands need the shared `agenttools_service` lib (an
-in-ecosystem dependency, the `[dashboard]` extra). It is not yet on PyPI; until then install
-it editable from the agent-tools checkout (`pip install -e <agent-tools>/lib/agenttools_daemon
--e <agent-tools>/lib/agenttools_service`). Without it, `run` still works for an ad-hoc
-foreground server and a bare `review dashboard` still prints help; only the managed
-start/status/stop/enable/disable actions emit an actionable error (exit 4).
-
-**Supported autostart matrix:** macOS → launchd LaunchAgent; Linux → systemd `--user`
-unit (with a no-systemd fallback); other OSes → no autostart (`enable` still starts the
-service now and warns it will not survive reboot). See `agent-tools/lib/agenttools_service`
-for the full matrix.
-
-**Data sources (read-only):** review-cli does not emit a structured run record, so the
-dashboard reads the real on-disk artifacts in `log_dir()` — the per-call streamed logs
-(`{stamp}-{backend}-r{n}.log`) and the brainstorm discussion logs (`{stamp}-brainstorm.md`).
-Subprocess backends (codex/claude/opencode) write these live; REST backends (gemini, z.ai,
-commandcode) emit an equivalent sidecar log on every call — each under its OWN backend name,
-so every backend is counted and attributed correctly. Calls are time-clustered into
-**sessions** (review-cli emits no run id; a session = a burst of calls separated by a gap),
-and the mode (review / panel / brainstorm) is inferred from the call/round shape. Task
-metadata from `--task CODE` is parsed from those logs, so a dashboard session carries the
-same task code as the CLI stat record.
-
-**Panels:** Chat logs (per-run transcripts), Stats (runs over time, by task/mode/model/role),
-Models & roles, Metrics (durations, success/fail rates), Overseer feedback, Modes, Errors,
-Tasks (task-coded review history plus the **conscious** session marker), Prompts, and PR +
-ticket links. A task badge filters runs by code and the task view shows iterations, models,
-modes, related sessions, and drill-down links to the full conversations.
-
-**The overseer's annotations** — free-text feedback, the per-session **conscious** flag,
-and PR/ticket associations — are the only NEW persistence: a small atomic JSON store at
-`~/.config/review-cli/dashboard.json` (override with `$REVIEW_DASHBOARD_STORE`), keyed by
-the deterministic session id so annotations stay pinned as logs age out. The server exposes
-small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feedback|conscious|links`).
-
-> Token/cost and an explicit run id are **not recorded** by review-core today; those panels
-> show a graceful empty-state noting what review-core would need to log, rather than faking data.
+See **[docs/dashboard.md](docs/dashboard.md)** for the full command/flag reference, the
+autostart matrix, data sources, panels, and the annotation store format.
 
 ---
 
 ## `review visual` — visual verification
 
 **Give it a screenshot; it judges keep / rollback / repair.** `--visual` is image-only
-visual verification: pixels in → verdict out. There is **no DOM, no page, no capture** —
-the image arrives as a CLI argument (or on a hook's stdin) already rendered. Every check,
-including "is this render unstyled or broken", is performed from the **image** — pixel-level
-CV heuristics plus an AI-vision model looking at the picture — never by reading a stylesheet.
-
-The pipeline is:
-
-```
-cvGate → local cache pre-classifier → AI-vision → policy engine
-```
-
-The **model is the witness**; the **deterministic policy engine is the judge**. cvGate is a
-fast pixel pre-filter that auto-rejects the unambiguously-broken set (blank/FOUC canvas,
-unstyled no-CSS render, error overlay) before any paid call. The local pre-classifier is an
-on-device, no-VLM cost-saver that clears the confident-clear cases for free; AI-vision is the
-primary judge for everything ambiguous; the policy engine decides the final verdict **outside**
-the model (schema validation, CV/model contradiction checks, module vetoes). AI-vision never
-self-decides and the local model never overrides it.
-
-![review --visual cases — REPORTS-unstyled (top) vs no-report-styled (bottom)](docs/assets/visual-cases.png)
-
-*What `review visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
-error-overlay renders the detector flags (each one would block a `tg --photo` send). Bottom row:
-properly-styled renders it stays quiet on. (The grid's title art is the tool's old standalone
-name "styleprobe" in older copies — it is the `--visual` detector.)*
-
-### Standalone and Composable
-
-`review visual <image>` is the canonical standalone verdict pipeline. Add `--diff` or
-`--staged` plus `--task CODE` when you want the screenshot judged together with the current
-diff. `--visual`
-remains a composable flag on text modes (`brainstorm` / `quorum` / `just-ask` / `diff`),
-so personas / voters / reviewers literally **see** the image as multimodal context:
+visual verification: pixels in → verdict out — no DOM, no page, no capture, ever; every
+check runs on the **image** (pixel heuristics plus an AI-vision model), never a stylesheet.
+The pipeline (`cvGate → local pre-classifier → AI-vision → policy engine`) treats the vision
+model as a **witness**, not the judge — a deterministic policy engine outside the model makes
+the final call.
 
 ```bash
-# Standalone — pure verdict pipeline on one render (no diff present)
-review visual after.png
-
-# Standalone visual plus the working-tree diff as context
-review visual after.png --task HYP-742 --diff
-
-# The brainstorm personas see the screenshot and reason about it
-review brainstorm "is this layout good?" --task HYP-742 --visual after.png
-
-# Every quorum voter gets the image as shared context
-review quorum "ship this UI?" --task HYP-742 --visual after.png
-
-# Diff review with the rendered result attached as evidence
-review diff --task HYP-742 --visual after.png
+review visual after.png                                                   # standalone verdict
+review brainstorm "is this layout good?" --task CODE --visual after.png   # composable context
 ```
 
-When a companion mode is present, Claude CLI seats can receive the raw screenshot
-attachment, and every seat receives the grounded visual observation from a companion vision
-fan-out. The standalone verdict pipeline (and its exit codes below) fires only in the
-mode-less case. If that companion visual fan-out cannot produce a usable grounded
-observation, review blocks the companion text mode instead of returning a normal answer that
-merely describes cvGate signals. Use `--no-ai` only when you explicitly want the offline
-CV-only path.
+`--visual` is also composable on `brainstorm` / `quorum` / `just-ask` / `diff`, so those
+modes' models see the screenshot as multimodal context instead of running this standalone
+pipeline.
 
-### Vision backends
-
-Vision runs **through the agent CLIs** — `codex` / `claude` / `opencode` — mirroring exactly
-how review's text backends shell out, but with the image attached and the structured verdict
-parsed from the CLI output. No provider REST keys for those three. **Gemini is the one
-exception**: its CLI is broken, so the Gemini vision call stays on the REST API key
-(`GEMINI_API_KEY`), same as review's text Gemini backend. Vision requires a vision-capable
-model on whatever backend you pick — review never silently uses a text-only model to "verify"
-an image. (For router backends like opencode, that means selecting a vision model explicitly,
-e.g. `oc:<provider>/<vision-model>`.) Visual defaults are separate from the text reviewer
-board: Opus is tried first, then GROK_SEAT (`oc:xai/grok-4.6`), then vision-capable
-fallbacks including GLM vision (`oc:zai/glm-4.5v`). If Opus is unavailable at runtime,
-review skips to the next visual backend instead of failing while a fallback exists.
-Override with `visual_models:` in
-config or `-m` on the command. `--no-local-model` disables the local cache pre-classifier (the
-cost-saver) and forces every cvGate pass-through to the paid AI-vision call.
-
-### Modules
-
-Each visual check is an independent, self-selecting **module** that declares *when it
-activates*. Built-ins: `style-presence`, `blank-frame`, `error-overlay`, `error-text`. A module contributes a
-cheap `cv_check` pre-filter and/or `vision_questions` folded into the multimodal call, plus a
-`judge` that can veto a keep. Force-activate one with `--check <name>`; otherwise modules
-self-select from `--intent` / `--expect`.
-
-**Per-project modules.** A project ships its own modules via a manifest at
-`<project>/.review/visual-modules.json` declaring `{name, entry, activates_on}`. review
-discovers, loads, and folds them into the same pipeline. The model is **trust-by-default** —
-reviewing your *own* repo, a contributed module loads and runs with zero ceremony. For the rare
-untrusted-repo case (an external PR, a cloned stranger's repo) set `REVIEW_UNTRUSTED_MODULES=1`
-to re-engage a TOFU quarantine + sha-pin (`review trust-module <name>` to pin). Every load is
-recorded to an append-only audit log either way.
-
-The worked example is **`selection-highlight`** (shipped by HyperIDE / hyper-canvas-draft):
-`activates_on: ["selection"]`. A HyperCanvas selection frame is a 2px `rgb(59,130,246)` outline
-so thin a vision model routinely can't tell whether it's there — so "selection works" proofs
-slip through with no frame drawn. The module reuses `bin/frames-check`'s deterministic
-colour+shape detector to turn "selection expected but no outline present" into a **hard veto**,
-short-circuiting before any vision call.
-
-### `tg --photo` hook
-
-`tg` can run `review visual` as a **pre-send hook** to block an unstyled / broken screenshot
-before it reaches Telegram — turning the often-violated "review screenshots before sending" rule
-into an enforced mechanism. The hook runs `review visual <png> --json --strict`; a `rollback`
-verdict (exit 10) drops the photo, a `keep` lets it through, and no-vision
-`human_review` / `unverified` also fail closed under `--strict` so an unverified screenshot
-does not silently pass the send gate. See the
-`feat-tg-photo-visual-hook` branch and `docs/architecture-visual-verification.md` §7.
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | `keep` — the render is acceptable |
-| `10` | blocking verdict (`rollback`, or `human_review`/`unverified` when treated as a block) under `--strict` |
-| `1` | usage error — no image / unreadable image |
-| `124` | vision-call timeout |
-
-Add `--no-ai` to run cvGate only (fast CI smoke / offline), `--json` for the machine verdict
-(used by the tg hook), and `--before <img>` for diff-aware judgement.
+See **[docs/visual-review.md](docs/visual-review.md)** for the full standalone/composable
+matrix, vision-backend selection, the module system (built-ins, per-project modules, and the
+untrusted-module quarantine), the `tg --photo` pre-send hook, and the exit-code reference.
 
 ---
 
 ## `review spec-web` — multi-spec web reviewer (a persistent daemon)
 
-**Render any markdown spec server-side and review it like a GitHub PR — as a bidirectional
-channel between a human reviewer and the agent that launched it.** Select any text in the
-rendered spec → leave a **question** (expects an answer from the spec author) or a **remark**
-(feedback that doesn't), anchored to that selection; notes accumulate in a **pending batch**;
-one **Submit review** finalizes them **and delivers the structured review back to the
-launching agent** (no copy-paste export step). The agent answers a question with
-`review spec-web reply <id> <answer>` — the reply shows **in the UI** (distinct agent
-styling) and is pushed to **Telegram**. In-progress note text **autosaves to disk** so a page
-reload never loses a half-typed comment. Single implicit reviewer (no author field). Reusable
-for *any* spec markdown file. Serve it over Tailscale to review from your phone.
+**Render any markdown spec server-side and review it like a GitHub PR** — a bidirectional
+channel between a human reviewer and the agent that launched it. Select text in the rendered
+spec to leave a **question** or **remark** anchored to it; **Submit review** finalizes the
+batch and delivers the structured review straight back to the launching agent (no copy-paste
+export step). One persistent daemon (`review spec-web start`) serves every registered spec by
+name at `/spec/<name>`, live-reloading a page in place when the `.md` changes on disk.
 
-**One daemon, every spec.** `review spec-web start` runs ONE persistent daemon (managed by the
-shared `agenttools_service` lib, exactly like `review dashboard`) that serves EVERY registered
-spec by NAME at `/spec/<name>` — a navigator at `/` lists them all — so a single port /
-Tailscale mapping covers all your specs instead of one ad-hoc server per spec. `add` registers
-a spec (idempotent by path; the name is a slug of the filename) and the daemon serves it
-immediately, no restart. The daemon **live-reloads** an open spec page when the `.md` changes
-on disk (SSE): the content swaps in place with **no scroll jump** — even when text above your
-viewport changed height — and the changed blocks flash briefly (above or below the fold, never
-scrolling to them). `start` is idempotent (an already-running daemon reports itself + what it
-serves, exit 0); only an explicit `stop` stops it.
-
-```sh
-# daemon lifecycle (shared agenttools_service lib, like `review dashboard`)
-review spec-web start --agent ext   # start the daemon in the background (idempotent)
-review spec-web status              # running? + registered specs + their /spec/<name> URLs
-review spec-web stop                # stop it (the ONLY thing that stops it)
-review spec-web run --agent ext     # foreground (this shell), for ad-hoc use
-review spec-web enable --agent ext  # OS autostart at login (disable removes it)
-
-# specs
-review spec-web add docs/specs/my-spec.md      # register + print its /spec/<name> URL
-review spec-web serve docs/specs/my-spec.md --agent ext   # add + BLOCK until the review is submitted
-review spec-web docs/specs/my-spec.md --agent ext         # same as `serve` (backward-compatible form)
-review spec-web list                           # every registered spec + open-note counts (+ stalled-thread reminders)
-review spec-web remove <name>                  # unregister (comments stay on disk)
-review spec-web watch <name|path>              # wait for a submit on a registered spec
-
-# pre-load an existing Q&A thread
-review spec-web serve docs/specs/my-spec.md --agent ext --seed thread.json
-
-# return to the agent as soon as the reviewer submits (one-shot review handoff)
-review spec-web serve docs/specs/my-spec.md --agent ext --exit-on-submit
-
-# the agent answers a reviewer's question (shown in the UI + sent to Telegram)
-review spec-web reply <comment-id> "the answer" --spec docs/specs/my-spec.md
+```bash
+review spec-web add docs/specs/my-spec.md --agent ext    # register + print its /spec/<name> URL
+review spec-web serve docs/specs/my-spec.md --agent ext --exit-on-submit   # add + block for one review
 ```
 
-| Flag | Meaning |
-|------|---------|
-| `--agent <name>` | the tmux window/session that OWNS the served specs — submitted review batches are injected INTO it (see below). **Required** by the daemon-launching actions (`start`/`run`/`enable`, `serve` and the positional form); also required by `add` when the daemon is DOWN, since `add` auto-starts it. A per-spec `--agent` (on `add`/`serve`) overrides the daemon-wide default for that spec. |
-| `--host` | daemon bind host (default `0.0.0.0` — reachable over Tailscale; `127.0.0.1` for loopback-only) |
-| `--port` | daemon port (default `7920`, stable across restarts so URLs/Tailscale mappings survive) |
-| `--seed FILE` | import an initial review thread from a JSON file before serving |
-| `--exit-on-submit` | return after the first Submit (the daemon keeps running; only the watch returns) |
-| `--emit-current` | `watch`: re-emit the batch ALREADY in the store before watching — the recovery path when a submit's live delivery failed (a bare `watch` only fires on a *later* submit) |
-| `--no-watch` | `serve` / the positional form: register + print the URL but don't block |
-| `--open` | open the URL in a browser on startup |
-
-On a host **without** the shared `agenttools_service` lib, the positional form falls back to
-the classic single-spec foreground server (ephemeral port, Ctrl-C to stop), so nothing breaks.
-
-**The submit → agent handoff.** `review spec-web` is started by an agent and blocks. When the
-reviewer clicks **Submit review**, the server marks the batch submitted in the store and the
-launching process prints the **structured review** to stdout framed by a line that is exactly
-`<<<REVIEW-SPEC-WEB-SUBMITTED`, then **one line** of compact JSON, then a line that is exactly
-`REVIEW-SPEC-WEB-SUBMITTED>>>`. **Parse by taking the single line immediately after the begin
-marker** (not by splitting on the end marker) — the JSON is one line and a reviewer's free
-text is JSON-escaped on it, so a body that happens to contain the marker substring can never
-break the framing. The payload carries every comment's **id** (so the agent can answer a
-specific one), `kind`, `status`, `quote`, `section_title`, `body`, and its reply thread, plus
-`counts` (questions/remarks/total). By default the server keeps serving after a submit (the
-reviewer can keep going and the agent can `reply`), re-emitting a fresh framed payload on each
-submit; `--exit-on-submit` returns after the first submit instead. (Like the other persistent
-server paths, `--exit-on-submit` ignores `-o FILE` — read the framed payload from stdout.) The
-store on disk stays the single source of truth.
-
-**Submit → agent delivery (`--agent`).** The stdout handoff above only reaches an agent that is
-actively watching the process's stdout — but the daemon is long-lived and the agents that
-launch specs come and go, so a submitted batch used to sit in the store with nobody reading it.
-The required `--agent <name>` fixes that: on every Submit, the batch is **injected into that
-agent's live tmux session** as a prompt — the same mechanism `tg-ctl` uses to inject inbound
-Telegram messages (`[TG from …]`) into a running session. `<name>` matches a tmux **window**
-name first, then a **session** name (e.g. `--agent ext` reaches the pane of the `ext` session).
-Each comment arrives on one line (`[SPEC-WEB comment on <spec> §<section>] "<quote>" — <body>
-(question, id <id>)`) with a trailing pointer to `review spec-web reply <id> "<answer>" --spec
-<path>`. Delivery is **best-effort**: the batch is already durably in the store, so a missing
-tmux session never fails the Submit — the failure is logged and reported to the reviewer in the
-UI, and the agent can still pull it with `review spec-web watch`. A daemon-wide `--agent` (on
-`start`/`run`) is the default; a per-spec `--agent` (on `add`/`serve`) overrides it for that spec.
-
-**The agent reply → UI + Telegram.** `review spec-web reply <comment-id> <answer> --spec <spec>`
-threads the agent's answer under that comment in the store (stamped with the `agent` author so
-the UI styles it distinctly), and **also** delivers it to Telegram via the `tg` CLI on `PATH`
-(best-effort — a missing/failing `tg` never fails the reply; it logs and continues; `--no-tg`
-skips it). An open spec-web page **polls** the comments API, so the agent's reply appears under
-the question without a manual refresh.
-
-**Stalled review-cycle reminders.** A comment stuck in `submitted` (awaiting an agent reply) or
-`answered` (awaiting reviewer resolution) for more than 24h (override via
-`$REVIEW_SPECWEB_STALE_HOURS`) is flagged with a `⚠ stalled ...` line — lazily, whenever an
-already-running command reads the store, never via a background poller. `review spec-web list`
-and `review spec-web status`/`start` print one line per stalled comment for every spec; `review
-spec-web reply` prints the same for every OTHER stalled comment on that spec to stderr, and
-appends a short summary to its Telegram delivery (e.g. "2 other stalled review threads on this
-spec (oldest 36.2h, waiting on an agent reply)."), skipped when nothing else is stale.
-
-**Drafts (reload-safe).** While you type a note, the composer **autosaves** the in-progress
-text to the server (debounced, persisted to disk) under a per-slot key (the new-note composer
-and each edit-in-progress have their own slot). On page load the most recent draft is **restored
-into the composer**, so an accidental reload mid-typing continues exactly where you left off.
-Saving the note (or clearing the box) drops its draft.
-
-**Layout.** Desktop (≥900px) = two panes side-by-side (spec left, comments right, a
-draggable divider). Mobile (<900px) = comments as a bottom sheet under the spec. The
-comments panel collapses to just its header bar (which carries a **count badge** so added
-notes are visible while collapsed) and re-expands from that same bar. Following an internal
-cross-reference link shows a **← Back** control that returns to the prior scroll position.
-
-**Rendering.** Markdown → HTML is rendered server-side with the GitHub heading-slug scheme,
-so the spec's own internal links (`[§9.4](#94-…)`) resolve. Figures referenced as
-`./assets/fig-*.svg|png` are served as real HTTP resources at `/asset/<name>` (never
-inlined). Tables size columns to their content and scroll horizontally on narrow screens
-rather than crushing columns.
-
-**Comments.** A note stores the selected quote, the containing section id, char offsets, its
-**kind** (`question` | `remark`, default `remark`), the body, created-at, a status
-(`pending`/`submitted`/`answered`/`resolved`), and a thread of replies. (An `author` field
-is still persisted for import/export round-tripping but is not shown in the UI.) The kind is
-surfaced with a coloured chip + icon; each note can be edited (`/api/comments/<id>/edit`). On
-reload, each note re-anchors by locating its quote within its section and highlighting it; a
-quote that can't be re-found shows in the sidebar as **unanchored** (never a crash).
-
-**Persistence.** One JSON file per spec at `~/.config/review-cli/spec-web/<sha1-of-abspath>.json`
-(mode `0600`), surviving restarts. It holds the comments, the in-progress composer **drafts**
-(per slot), and the `last_submit` batch the launching agent reads back. The daemon's spec
-**registry** (`registry.json`, name → path) lives in the same directory — and the comment
-stores are keyed by spec PATH, not by name, so specs reviewed under the old one-server-per-spec
-mode keep their full history when the daemon takes over. Override the directory with
-`$REVIEW_SPECWEB_DIR`. Override the stalled-review-cycle reminder threshold (default 24h) with
-`$REVIEW_SPECWEB_STALE_HOURS`.
-
-**Security.** Reads (spec, assets, comments, **drafts**) are open — same model as comments
-(the in-progress composer text is readable by anyone who can reach the port; there are no
-secrets in a spec review); only figures the markdown *references* are served (an unrelated
-file in the assets dir 404s), SVGs are served with a `sandbox` CSP so a directly-opened one
-can't run script, and symlinked assets that escape the assets dir are refused. Writes (post
-comment / reply / submit / import / draft autosave)
-are origin-guarded against both CSRF and DNS rebinding: a write requires (1) the request's
-**Host** to be in the allowlist — **loopback + this machine's Tailscale identity
-(discovered at runtime via `tailscale status`, never hardcoded) + `$REVIEW_SPECWEB_ALLOWED_HOSTS`**
-(comma-separated) — and (2) the **Origin/Referer** to match that Host (classic CSRF check),
-plus `Content-Type: application/json` and a body-size cap. The Host allowlist is what stops
-a rebound attacker hostname from posting same-origin. So to accept writes from a phone over
+**Security.** Reads (spec, assets, comments, **drafts**) are open to anyone who can reach the
+port — there are no secrets in a spec review; only figures the markdown *references* are
+served (an unrelated file in the assets dir 404s), SVGs are served with a `sandbox` CSP so a
+directly-opened one can't run script, and symlinked assets that escape the assets dir are
+refused. Writes (post comment / reply / submit / import / draft autosave) are origin-guarded
+against both CSRF and DNS rebinding: a write requires (1) the request's **Host** to be in the
+allowlist — **loopback + this machine's Tailscale identity (discovered at runtime via
+`tailscale status`, never hardcoded) + `$REVIEW_SPECWEB_ALLOWED_HOSTS`** (comma-separated) —
+and (2) the **Origin/Referer** to match that Host (classic CSRF check), plus
+`Content-Type: application/json` and a body-size cap. The Host allowlist is what stops a
+rebound attacker hostname from posting same-origin. So to accept writes from a phone over
 Tailscale, the Tailscale name/IP must be discovered or listed in
 `$REVIEW_SPECWEB_ALLOWED_HOSTS` (e.g. `REVIEW_SPECWEB_ALLOWED_HOSTS=ultras-mbp.tailbfe8ea.ts.net,100.123.113.82`).
+Note the daemon binds `0.0.0.0` (not loopback-only) by default — the Host allowlist above is
+what makes that safe; see `--host` in the full reference to restrict it to `127.0.0.1`.
 
-**Seed / import JSON shape** (`comments` is the only required key):
-
-```json
-{
-  "comments": [
-    {
-      "quote": "the selected text",
-      "body": "the question or comment",
-      "section_id": "94-...",
-      "section_title": "§9.4 ...",
-      "kind": "question",
-      "author": "alex",
-      "status": "submitted",
-      "batch": "2026-06-14T10:00:00+00:00",
-      "replies": [ { "author": "claude", "body": "the answer" } ]
-    }
-  ]
-}
-```
-
-Missing `id`/`created` are generated; unknown keys are ignored. Add `"replace": true` at the
-top level to discard existing comments before importing.
-
-Routes: `GET /` (SPA shell), `GET /static/<app.css|app.js>`, `GET /asset/<name>`,
-`GET /api/spec`, `GET /api/comments`, `GET /api/drafts`, `POST /api/comments`,
-`POST /api/comments/<id>/{reply,edit,status,delete}`, `POST /api/drafts/<slot>`,
-`POST /api/submit`, `POST /api/import`. (The old `GET /api/export` is removed — Submit now
-delivers the structured review to the launching agent.)
+See **[docs/spec-web.md](docs/spec-web.md)** for the full command/flag reference, the
+submit → agent stdout handoff framing, the tmux `--agent` delivery mechanism, drafts, layout,
+rendering, persistence paths, and the seed/import JSON shape.
 
 ---
 
