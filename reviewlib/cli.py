@@ -4597,6 +4597,7 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     GEMINI_API_KEY (or GOOGLE_API_KEY)  — gemini seat.
     ZAI_API_KEY    (or ZHIPU_API_KEY)   — z.ai / GLM seat.
     COMMANDCODE_API_KEY                 — commandcode seats (a `user_...` token ONLY).
+    OPENROUTER_API_KEY                  — diff-only OpenRouter aggregator seat (`-m openrouter:<model>`).
     ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (+ optional ANTHROPIC_BASE_URL) — claude API.
     REVIEW_CLAUDE_MODE=api|cli, REVIEW_<BACKEND>_MODE=api|cli — transport selection.
     REVIEW_UNPAID_PROVIDERS=provider[,provider...] — skip disabled/unpaid providers early.
@@ -4651,6 +4652,12 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           against the last reviewed baseline before a
                                           restage forces a fresh full review (default 10);
                                           0 disables the tolerance (exact-hash match only).
+                                          Fails CLOSED regardless of line count whenever
+                                          either diff contains a `Binary files ... differ`
+                                          or `Subproject commit <sha>` line — binary /
+                                          submodule-gitlink content is unmeasurable by a
+                                          line-count ruler, so it always forces a fresh
+                                          full review.
     REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
                                           seat gets before it is reaped as stuck rather
                                           than silently thinking (default 5min, per-model
@@ -4693,6 +4700,30 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     review-cli reads the local auth files to PROBE non-empty-ness at startup (deciding
     seat availability) but never logs or transmits the credential value anywhere —
     opencode is what actually sends it, at call time.
+  AGENTIC board seats authenticate via the AGENT's own config, not a review-cli env var:
+    Kimi/Qwen/DeepSeek/GLM (oc:commandcode/... / oc:zai/glm-5.2) and Grok (oc:xai/...)
+    all go through opencode's OWN provider config (`opencode auth login` /
+    `opencode providers login`; ~/.config/opencode/opencode.json) — COMMANDCODE_API_KEY
+    and ZAI_API_KEY above do NOT cover them; those two env vars only gate the separate
+    diff-only `-m cc` / `-m glm` keyed-HTTP path. omp seats (omp:<provider>/<model>,
+    incl. MIMO_SEAT omp:opencode-go/mimo-v2.5) authenticate via `omp setup`
+    (`omp token <provider>` shows the stored credential); the startup probe reads omp's
+    auth db read-only. Either way a missing binary or missing provider auth is caught at
+    startup and the seat is skipped gracefully (pool backfills from reserve) rather than
+    failing the run.
+  z.ai / GLM Coding-Plan endpoint: `glm-5.2` (the flagship) is served only from the
+    Coding-Plan base URL https://api.z.ai/api/coding/paas/v4 (review's default); the
+    standard https://api.z.ai/api/paas/v4 endpoint tops out at `glm-5.1`. Override with
+    ZAI_BASE_URL for a standard-plan key; an explicit `zai:<model>` suffix wins over
+    ZAI_MODEL, which alone only affects a bare `-m zai` invocation.
+  OPENROUTER_API_KEY (an sk-or-v1-... token): diff-only `-m openrouter:<model>`
+    aggregator backend (400+ models behind one key, api-only, no CLI mode). A bare
+    `-m openrouter` uses OpenRouter's own auto-router, overridable with
+    OPENROUTER_MODEL; base URL override is OPENROUTER_BASE_URL (default
+    https://openrouter.ai/api/v1). The OPTIONAL OPENROUTER_HTTP_REFERER /
+    OPENROUTER_X_TITLE env vars set OpenRouter's leaderboard-attribution headers
+    (HTTP-Referer / X-Title) and never affect the review; a value containing a
+    control character is silently dropped rather than sent.
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
 """
