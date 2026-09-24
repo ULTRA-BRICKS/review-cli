@@ -997,20 +997,11 @@ def _task_subcommand(rest: list[str]) -> int:
         action="store_true",
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
         "distinct board roles (self-merge-authority gate, default) or distinct "
-        "models (when --min-models is explicitly given); see --min-iter/"
-        "--min-models/--min-roles. If the task has ZERO recorded role data at "
-        "all AND every in-scope (non-mismatched) iteration predates "
-        "role-tracking (PR #246), the default falls back to the old "
-        "distinct-model count instead of a guaranteed fail — the result's "
-        "quorum_mode_fallback field/note explains when this happened. A task "
-        "with at least one iteration recorded AFTER role-tracking became "
-        "possible but reviewed only via quorum/just-ask/brainstorm/qa does NOT "
-        "get that fallback (review-cli#252) — it stays role-based and fails, "
-        "with a role_tracking_gap field/hint naming the fix (run `review diff "
-        "--task CODE` through a role-tracking board). Counts only iterations "
-        "whose run came back clean — a review that ran but failed/degraded "
-        "does not count toward the bar, and pre-verdict-field history never "
-        "satisfies it either (fail-closed)",
+        "models (when --min-models is explicitly given); fail-closed on "
+        "missing/unreadable history or pre-verdict-field records; see "
+        "--min-iter/--min-models/--min-roles and `review help task-check` for "
+        "the full pass/fail logic (incl. the role-tracking fallback) and the "
+        "complete --json field-by-field contract",
     )
     parser.add_argument(
         "--min-iter",
@@ -2433,7 +2424,7 @@ def _stale_reminder_line(stale: dict) -> str:
     clipped = _clip_text(str(raw_quote), 60, collapse_whitespace=True)
     return (
         f"    ⚠ stalled {kind} #{stale.get('id') or '?'} — {age:.1f}h waiting on "
-        f"{waiting_on}: \"{clipped}\""
+        f'{waiting_on}: "{clipped}"'
     )
 
 
@@ -4706,6 +4697,91 @@ See also: `review --help` (overview), `review --show-board`, `review <mode> --he
 """
 
 
+def _help_topic_task_check() -> str:
+    """The `review help task-check` deep reference (review-cli#552-PR3): the FULL
+    `review task CODE --check [--json]` contract, field by field. Extracted out of the
+    `--check` flag's own `help=` string (which stayed a summary + pointer here, matching
+    the config/board topics' pattern) because the field-by-field breakdown alone is ~2KB
+    -- inline it and `review task --help` buries `--detail`/`--min-iter` under it. Kept
+    in sync with reviewlib.stats.quorum_check / `_finalize_quorum_result` (the actual
+    payload builder) and `_quorum_check_subcommand` (the CLI wrapper that adds
+    `identity_verification`) — a flag/behavior change there updates this topic in the
+    same commit (help-docs-sync); `tests/test_run_stats.py`'s
+    `test_check_help_text_names_every_json_contract_field_review_cli_552` asserts every
+    field name `quorum_check` can actually emit is named somewhere below, so the two
+    can't silently drift apart again."""
+    return """\
+review — `task CODE --check [--json]` contract reference
+==========================================================
+
+WHAT --check DECIDES
+  Exit 0 iff CODE has enough PASSED recorded iterations across enough distinct board
+  roles (self-merge-authority gate, default) or distinct models (when --min-models is
+  explicitly given); see --min-iter/--min-models/--min-roles on `review task --help`.
+  If the task has ZERO recorded role data at all AND every in-scope (non-mismatched)
+  iteration predates role-tracking (PR #246), the default falls back to the old
+  distinct-model count instead of a guaranteed fail (see quorum_mode_fallback below). A
+  task with at least one iteration recorded AFTER role-tracking became possible but
+  reviewed only via quorum/just-ask/brainstorm/qa does NOT get that fallback
+  (review-cli#252) — it stays role-based and fails (see role_tracking_gap below). Counts
+  only iterations whose run came back clean — a review that ran but failed/degraded does
+  not count toward the bar, and pre-verdict-field history never satisfies it either
+  (fail-closed).
+
+--JSON FIELDS  (quorum_check()'s full result plus identity_verification — not just the
+  printed ratio; a caller like `gh ship` should parse this, not the text-mode ratio line)
+
+  ALWAYS present:
+    task_code, passed_iterations, total_iterations, distinct_models_passed, models,
+    min_iter, passed, identity_verification (ran / disabled / skipped_unresolvable —
+    see -C/--no-verify-identity on `review task --help`).
+
+  MODEL FLOOR — present whenever a model floor governs, explicitly OR via the
+  zero-role-data fallback:
+    min_models, min_models_source (explicit / fallback).
+    min_models_advisory — ONLY when --min-models was given EXPLICITLY (never on the
+    fallback path — the advisory text would be actively wrong there, since role-based
+    coverage is exactly what's unavailable when the fallback fires).
+    min_roles_suggestion — ONLY on an explicit, unmet --min-models run (--min-roles NOT
+    given) whose PASSED iterations actually carry enough role data to have cleared the
+    same floor via --min-roles instead — a non-blocking models->roles nudge, not a
+    fallback/gap diagnostic (it never co-occurs with quorum_mode_fallback/
+    role_tracking_gap below, since both of those require the bare role-based default,
+    not an explicit --min-models run).
+
+  ROLE MODE — present whenever role mode governs (the default):
+    distinct_roles_passed, roles, min_roles.
+
+  FALLBACK / GAP DIAGNOSTICS — mutually exclusive, present only when the matching case
+  above fired (both require the bare role-based default -- neither can co-occur with an
+  explicit --min-models run):
+    quorum_mode_fallback — the role-based default fell back to model-counting.
+    role_tracking_gap — it did NOT fall back and stays role-based, failing on its own
+    merits (empty/short `roles`).
+
+  STALLED SEATS — present only when the bar is NOT met:
+    stalled_models — list of {model, reason, remaining_seconds,
+    consecutive_failures} naming any attempted model currently cooling down.
+
+  IDENTITY VERIFICATION — present only when identity_verification == "ran" (a repo_id
+  resolved; see -C/--no-verify-identity):
+    verified_iterations, unverifiable_iterations, excluded_mismatched_iterations,
+    mismatch_details — list of {iteration, reason, recorded_repo_id,
+    recorded_diff_files, ts}, capped (mismatch_details_truncated when capped).
+
+  NEAR-MISS TWIN KEY — present only when the bar is NOT met AND a same-digits
+  different-'#' twin task code exists in the store (review-cli#389):
+    searched_key, near_miss_keys, near_miss_counted, near_miss_ever_passed.
+
+  error — present on every fail-closed shape: an invalid task code, an
+  unreadable/missing store, zero recorded iterations, an explicit --min-iter /
+  --min-models / --min-roles floor below 1, or a bar-not-met denial where some history
+  was excluded as mismatched.
+
+See also: `review task --help` (the flag surface), `review help config`.
+"""
+
+
 # Deep help TOPICS advertised from the main `review --help` and served by `review help
 # <topic>` / `review --help <topic>` (ROADMAP "Topic-based help across the ecosystem").
 # topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
@@ -4714,6 +4790,10 @@ HELP_TOPICS: dict[str, tuple[str, "object"]] = {
     "config": (
         "config file, the model/board selection cascade, keys/auth",
         _help_topic_config,
+    ),
+    "task-check": (
+        "the `task CODE --check --json` self-merge-gate contract, field by field",
+        _help_topic_task_check,
     ),
 }
 
