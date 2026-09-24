@@ -951,6 +951,7 @@ _UNIT_FILES = [
     ("test_install_hook_text.py", {}),
     ("test_install_state.py", {}),
     ("test_topic_help.py", {}),
+    ("test_readme_anchors.py", {}),
     # intent_mentions_tag: multilingual (English + Russian) synonym matching for
     # intent-based module activation (tg#6188). Pure string/regex logic, no
     # ImageMagick/Pillow dependency, so it runs as a plain unit file rather than

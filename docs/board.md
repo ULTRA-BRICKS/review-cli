@@ -69,7 +69,10 @@ single-point-of-failure. See
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
 Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra via the codex
-CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) — all run
+CLI (Astra — GPT-6-Astra, pinned via `codex:gpt-6-astra` — is the #5 board seat as of
+review-cli#286, was #6 before Fable's demotion moved every subsequent seat up one slot; it
+replaced a bare `"codex"` seat that silently tracked the CLI's own default model),
+and Kimi/z.ai-GLM/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) — all run
 read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
 always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
 **GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
@@ -139,8 +142,9 @@ chronically-unavailable in the first place — is wired into only the two claude
 dispatch paths (`review_with_images`, `review_claude` in `backends.py`).
 `review_opencode` (review-cli#235) additionally consults + records + clears this same
 store, but ONLY for its own narrower TRUE-SILENCE failure mode (see the
-`REVIEW_TRUE_SILENCE_SECONDS` paragraph under the README's
-[Auth section](../README.md#auth), in the "Kimi / Qwen / DeepSeek / GLM board reviewers" entry):
+`REVIEW_TRUE_SILENCE_SECONDS` entry in `review help config`'s KEYS/AUTH section,
+which also documents that the agentic Kimi/Qwen/DeepSeek/GLM/Grok board reviewers'
+own auth is opencode's, not review-cli's, env vars):
 a seat that never produces a single byte of output within `REVIEW_TRUE_SILENCE_SECONDS`
 is reaped and cooled down the same way a chronically-unavailable claude seat is.
 `review_opencode`'s success path now ALSO reuses the SAME shared chronic-unavailable/

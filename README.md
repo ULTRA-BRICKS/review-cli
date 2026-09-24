@@ -40,13 +40,10 @@ pipx install git+https://git.hyperide.ai/ultrabricks/review-cli
 After install, run `review install-skill` to register the tool into agent harnesses
 (`~/.agents/skills/review/`) so that Claude Code, Codex, opencode, and Gemini agents
 know `review` exists and can call it. The one-liner above runs this automatically.
-The `install-*` commands (`install-skill` / `install-commit-hook` / `install-hook tg` / `register-module`)
-are idempotent and report their INSTALLED state: each target shows a green ✓ "already
-configured" when nothing changed, or "+ wrote/updated" when it (re)wrote — so a re-run on
-a fully-set-up machine prints "already configured — nothing to do". A target that can't be
-configured (a foreign pre-commit hook, a wrong/occupied skill symlink, an unwriteable
-settings.json) is reported as `! conflict`, left untouched, and the command exits non-zero —
-resolve the conflict and re-run.
+The `install-*` commands (`install-skill` / `install-commit-hook` / `install-hook tg` /
+`register-module`) are idempotent — a re-run reports `already configured` (nothing
+changed), `+ wrote/updated`, or `! conflict` (a foreign hook/symlink left untouched,
+non-zero exit) so you know exactly what happened and can resolve a conflict and re-run.
 
 ---
 
@@ -874,27 +871,17 @@ rendering, persistence paths, and the seed/import JSON shape.
 
 ## Agent workflows
 
-`review` earns its keep when an agent hits a hard call:
+`review` earns its keep on a hard call: `review brainstorm "<the decision>" --task
+CODE` runs multi-model, multi-round ideation; the agent posts the top options to
+Telegram via [`tg`](https://git.hyperide.ai/ultrabricks/tg-cli) for a phone decision, and
+for the closest calls builds rival approaches in parallel **git worktrees** to compare
+for real before committing.
 
-1. The agent runs `review brainstorm "<the decision>" --task HYP-742` — many models in rotating
-   expert roles, looping across several rounds — to surface candidate approaches a
-   single model wouldn't reach.
-2. It picks the top one or two and posts them to Telegram via
-   [`tg`](https://git.hyperide.ai/ultrabricks/tg-cli) as simplified options with pros/cons,
-   so you decide from your phone.
-3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
-   and compares them for real before committing.
-
-And before every commit, `review diff --staged --task HYP-742` is a multi-model gate —
-optionally *enforced* with `review install-commit-hook` (a global pre-commit hook that
-blocks unreviewed staged changes; bypass with `REVIEW_SKIP=1 git commit` or
-`git commit --no-verify`). The gate tolerates a small trailing follow-up on top of an
-already-reviewed baseline — up to `$REVIEW_TRIVIAL_DELTA_LINES` changed lines (default
-10) since the last real review — without forcing a brand-new full multi-model round on
-every restage during an iterative fix loop; a genuinely larger change, or any binary /
-submodule-gitlink content (unmeasurable by a line count), still requires a fresh review.
-Set `REVIEW_TRIVIAL_DELTA_LINES=0` to disable the tolerance and require an exact-hash
-match on every commit, as before.
+Before every commit, `review diff --staged --task CODE` is a multi-model gate,
+optionally *enforced* with `review install-commit-hook` (bypass with `REVIEW_SKIP=1
+git commit` or `--no-verify`); small trailing follow-ups on an already-reviewed
+baseline are tolerated (`$REVIEW_TRIVIAL_DELTA_LINES`, default 10 lines) without a
+full re-review — see `review help config` for the exact tolerance rules.
 
 ---
 
@@ -1178,120 +1165,32 @@ tracked separately in review-cli#552 and will eventually move this into
 
 ## Auth
 
-**Gemini:** set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the environment, or put
-`GEMINI_API_KEY=...` in `~/.config/review-cli/.env`. The env var
-`GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
+Each backend authenticates independently; review-cli never writes a credential to disk,
+only reads one. **Gemini** and the diff-only keyed-HTTP backends (`-m cc` / `-m glm` /
+`-m openrouter:<model>`) read their own review-cli env var — `GEMINI_API_KEY`
+(or `GOOGLE_API_KEY`), `COMMANDCODE_API_KEY`, `ZAI_API_KEY` (or `ZHIPU_API_KEY`),
+`OPENROUTER_API_KEY` — from the environment or `~/.config/review-cli/.env`
+(override the search path with `$GEMINI_ENV_FILE`). **Codex / opencode / omp** must be
+on PATH and authenticated through their OWN CLI setup (`codex` login, `opencode auth
+login` / `opencode providers login`, `omp setup`) — no review-cli key covers them.
+**Claude** normally runs through its own agentic CLI too, but falls back to a
+diff-only Anthropic API call on a host with no `claude` CLI but a set
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (+ optional `ANTHROPIC_BASE_URL`).
 
-**Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
-Astra (GPT-6-Astra, pinned via `codex:gpt-6-astra`) is the #5 board seat (review-cli#286:
-was #6 before Fable's demotion moved every subsequent seat up one slot; it replaced a bare
-`"codex"` seat that silently tracked the CLI's own default model — see "Reviewer board"
-above). It runs through the same agentic codex CLI route as the bare `codex` seat / Sol.
+**The most surprising precedence fact:** the default AGENTIC board seats that run
+*through* opencode (Kimi, Qwen, DeepSeek, GLM, Grok) and through omp (MiMo) authenticate
+via **opencode's / omp's own provider config**, NOT via `COMMANDCODE_API_KEY` /
+`ZAI_API_KEY` / a review-cli env var — those keys only gate the separate diff-only
+`-m cc` / `-m glm` keyed-HTTP path. A missing binary or missing provider auth is caught
+by the startup probe and the seat is skipped gracefully (pool backfills from reserve);
+`unpaid_providers:` / `REVIEW_UNPAID_PROVIDERS` skips a provider that's authenticated but
+not currently billed/entitled.
 
-**omp (Oh My Pi) seats (`omp:<provider>/<model>`):** must be on PATH and authenticated
-via omp's own setup (`omp setup`; `omp token <provider>` shows the stored credential).
-The startup probe reads omp's auth db read-only and skips the seat (filling from the
-next reserve) when the binary or a usable credential for the seat's provider is missing.
-
-**Kimi / Qwen / DeepSeek / GLM board reviewers (agentic, via opencode):** since
-review-cli#24 these default board seats are `oc:commandcode/…` / `oc:zai/glm-5.2` —
-they run **agentically through opencode**, so they authenticate via **opencode's own
-provider config** (`opencode auth login`, the `commandcode`/`zai` providers in
-`~/.config/opencode/opencode.json`), NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
-opencode must be installed for these seats. A missing opencode **binary** makes the seat
-probe unavailable at startup (the board fills the pool from the next reserve); missing
-**provider auth** for known opencode providers is also caught by the startup probe. If auth
-exists but the provider is not currently paid/entitled, configure `unpaid_providers:` or
-`REVIEW_UNPAID_PROVIDERS` so the seat is skipped before launch. Either way the board
-degrades gracefully rather than blocking. The default GLM
-seat pins `oc:zai/glm-5.2` (the flagship). Agentic opencode seats use the same per-seat
-idle timeout as every other subprocess backend: progress output keeps the call alive.
-A call that produces at least one byte of output but then goes quiet is reaped after the
-ordinary idle window, same as any other backend. A call that NEVER produces a single byte
-is instead governed SOLELY by a separate TRUE-SILENCE check (review-cli#235,
-`REVIEW_TRUE_SILENCE_SECONDS`, default 5 minutes) — the ordinary idle window does not
-apply at all pre-first-byte, only after. With the default 20-minute idle window this
-means a silent seat is normally reaped sooner (5 min vs 20 min); but an operator who has
-tightened `REVIEW_IDLE_TIMEOUT_SECONDS` below 5 minutes will see the OPPOSITE — a silent
-seat now waits the full true-silence timeout instead of the operator's shorter idle
-window (review-cli#254). Tune `REVIEW_TRUE_SILENCE_SECONDS` directly if this matters for
-your setup. This only applies pre-first-byte and only to opencode seats today; see the
-cross-invocation cooldown section in [docs/board.md](docs/board.md). Either reap lets
-reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
-`board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
-
-**Grok board reviewer (agentic, via opencode's native `xai` provider):** `oc:xai/grok-4.6`
-(`GROK_SEAT`; aliases `grok` / `grok46` / `grok-4.6`; `grok45` pins `oc:xai/grok-4.5`)
-authenticates through opencode's own xai provider config, same as the
-commandcode/zai seats above — any of: `opencode providers login` (OAuth, the flow verified
-live on this host — `opencode providers list` shows "xAI | oauth"), an inline
-`options.apiKey` in `~/.config/opencode/opencode.json`'s `xai` provider block, or a plain
-`XAI_API_KEY` env var (opencode's own convention, not review-cli's — no
-review-cli-specific xai env var exists). Unlike the commandcode/zai seats, xai has no
-diff-only REST fallback in review-cli and no bare/colon-form default model -- `-m xai`
-(bare, no model) and `-m xai:grok-4.5` (colon-form; opencode wants `provider/model`, not
-`provider:model`) are NOT valid. A bare `-m xai/grok-4.5` (no `oc:` prefix) DOES also reach
-opencode correctly at runtime via the generic catch-all (any unrecognized id still routes
-to opencode for back-compat) -- but only `oc:xai/grok-4.6` is the documented, DEFAULT-safe
-seat spelling that `default_routes_live`'s #25 anti-rot guard accepts; the bare form is
-not protected by that guard and isn't what `GROK_SEAT` uses. Same startup-probe/
-graceful-degradation and idle-timeout behavior as the other agentic seats.
-`--moderator grok` expands to GROK_SEAT. The seat is also on the flat `DEFAULT_MODELS`
-panel (just-ask / quorum / brainstorm) and on `VISUAL_MODELS`.
-
-**MiMo board reviewer (agentic, via omp OpenCode Go):** `omp:opencode-go/mimo-v2.5`
-(`MIMO_SEAT`; aliases `mimo` / `mimo25` / `mimo-2.5`) authenticates through omp's
-opencode-go provider — the live OpenCode Go subscription (`omp models find mimo-v2.5`).
-Role `tests`: DeepSeek is the only other tests seat and is commandcode (often unpaid);
-MIMO is the live paid tests fallback, same rationale as GROK filling `security`. The
-opencode CLI catalog spelling `oc:opencode/mimo-v2.5-free` resolves to `review_opencode`
-and is LIVE in `opencode models`, but `default_routes_live` is False (provider
-`opencode` under `oc:` is not a named backend token and is not in
-`_AGENTIC_ONLY_PROVIDERS`). Do not ship that spelling as a DEFAULT; explicit
-`-m oc:opencode/mimo-v2.5-free` still works at runtime. MIMO_SEAT is on the flat
-`DEFAULT_MODELS` panel (just-ask / quorum / brainstorm). It is not on `VISUAL_MODELS`.
-
-**Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
-subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
-`--timeout` instead (and also disables the true-silence check below, since it runs inside
-the same idle-mode wait path). It does not change REST HTTP timeouts, QA wall-clock caps,
-or vision wall-clock caps. `REVIEW_TRUE_SILENCE_SECONDS=N` overrides how long an opencode
-seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See
-[docs/board.md](docs/board.md) for the full seat-cooldown contract.
-
-**`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
-set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or
-`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env` to use the **diff-only**
-keyed-HTTP backends directly — `-m cc`, `-m glm`, or an explicit `commandcode:`/`zai:` seat
-in a `config.yaml` `board:` list. These keys are NOT consulted for the agentic `oc:` board
-seats above (opencode carries its own auth). No key is ever written to disk by review — it
-is only read. Command Code and Fireworks run a cheap `/models` payment/entitlement
-preflight when a key is present; explicit unpaid/auth-disabled responses are skipped before
-chat dispatch or opencode launch. For z.ai the default base URL is the **GLM Coding-Plan endpoint**
-`https://api.z.ai/api/coding/paas/v4` — only that endpoint serves the flagship `glm-5.2`;
-the standard `https://api.z.ai/api/paas/v4` endpoint tops out at `glm-5.1`. A Coding-Plan
-key gets `glm-5.2` out of the box; a standard-plan user overrides with
-`ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. An explicit `zai:<model>` suffix wins over
-`ZAI_MODEL`; `ZAI_MODEL` alone only affects a bare `-m zai` invocation. `glm-5.2` is a reasoning model: it returns a final
-answer plus a `reasoning_content` field; review reads the answer and falls back to the
-reasoning text when the answer is empty (e.g. a low output-token budget). This key gates
-only the **diff-only** `zai:` path (`-m glm` / an explicit `zai:` config seat) — the
-**default** GLM board seat is the agentic `oc:zai/glm-5.2` (role `quality`) and
-authenticates via opencode, not `ZAI_API_KEY`. The key is only read, never written.
-
-**`OPENROUTER_API_KEY` (diff-only `-m openrouter:<model>` + config boards):** set
-`OPENROUTER_API_KEY` (an `sk-or-v1-...` token) in the environment or
-`~/.config/review-cli/.env` to use the **diff-only** OpenRouter backend — an
-OpenAI-compatible aggregator that fronts 400+ models behind one key. Select the model with a
-seat suffix, `-m openrouter:anthropic/claude-3.5-sonnet` / `-m openrouter:openai/gpt-4o`
-(slugs keep their `/` and any `:free`/`:beta`/`:nitro` variant); a bare `-m openrouter`
-defaults to OpenRouter's own auto-router (`openrouter/auto`), overridable with
-`OPENROUTER_MODEL`. Point at a proxy with `OPENROUTER_BASE_URL` (default
-`https://openrouter.ai/api/v1`). The OPTIONAL `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE`
-env vars set OpenRouter's leaderboard-attribution headers (`HTTP-Referer` / `X-Title`) and
-never affect the review. Like the other keyed-HTTP backends it is **api-only** (no OpenRouter
-CLI; a forced `REVIEW_OPENROUTER_MODE=cli` is a hard error) and the key is only read, never
-written.
+Full per-backend reference — every env var, the shared `.env` file, z.ai's Coding-Plan
+endpoint requirement for `glm-5.2`, OpenRouter model-slug selection, and the
+opencode/omp startup-probe details — lives in **`review help config`**. Seat-level board
+history and the per-seat cooldown/retry mechanics live in
+[docs/board.md](docs/board.md).
 
 ---
 
