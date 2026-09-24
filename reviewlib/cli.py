@@ -48,6 +48,8 @@ from .config import (
     board_from_models,
     ensure_min_distinct_roles,
     expand_flat_models_with_reuse,
+    lens_override_path,
+    lens_override_text,
     load_board,
     load_config,
     parse_effort_flag,
@@ -84,6 +86,7 @@ from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import (
+    STATS_VERSION,
     announce_eta,
     diff_content_hash,
     extract_diff_files,
@@ -997,20 +1000,11 @@ def _task_subcommand(rest: list[str]) -> int:
         action="store_true",
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
         "distinct board roles (self-merge-authority gate, default) or distinct "
-        "models (when --min-models is explicitly given); see --min-iter/"
-        "--min-models/--min-roles. If the task has ZERO recorded role data at "
-        "all AND every in-scope (non-mismatched) iteration predates "
-        "role-tracking (PR #246), the default falls back to the old "
-        "distinct-model count instead of a guaranteed fail — the result's "
-        "quorum_mode_fallback field/note explains when this happened. A task "
-        "with at least one iteration recorded AFTER role-tracking became "
-        "possible but reviewed only via quorum/just-ask/brainstorm/qa does NOT "
-        "get that fallback (review-cli#252) — it stays role-based and fails, "
-        "with a role_tracking_gap field/hint naming the fix (run `review diff "
-        "--task CODE` through a role-tracking board). Counts only iterations "
-        "whose run came back clean — a review that ran but failed/degraded "
-        "does not count toward the bar, and pre-verdict-field history never "
-        "satisfies it either (fail-closed)",
+        "models (when --min-models is explicitly given); fail-closed on "
+        "missing/unreadable history or pre-verdict-field records; see "
+        "--min-iter/--min-models/--min-roles and `review help task-check` for "
+        "the full pass/fail logic (incl. the role-tracking fallback) and the "
+        "complete --json field-by-field contract",
     )
     parser.add_argument(
         "--min-iter",
@@ -4738,6 +4732,146 @@ See also: `review --help` (overview), `review --show-board`, `review <mode> --he
 """
 
 
+def _help_topic_task_check() -> str:
+    """The `review help task-check` deep reference (review-cli#552-PR3): the FULL
+    `review task CODE --check [--json]` contract, field by field. Extracted out of the
+    `--check` flag's own `help=` string (which stayed a summary + pointer here, matching
+    the config/board topics' pattern) because the field-by-field breakdown alone is ~2KB
+    -- inline it and `review task --help` buries `--detail`/`--min-iter` under it. Kept
+    in sync with reviewlib.stats.quorum_check / `_finalize_quorum_result` (the actual
+    payload builder) and `_quorum_check_subcommand` (the CLI wrapper that adds
+    `identity_verification`) — a flag/behavior change there updates this topic in the
+    same commit (help-docs-sync); `tests/test_run_stats.py`'s
+    `test_check_help_text_names_every_json_contract_field_review_cli_552` asserts every
+    field name `quorum_check` can actually emit is named somewhere below, so the two
+    can't silently drift apart again."""
+    return """\
+review — `task CODE --check [--json]` contract reference
+==========================================================
+
+WHAT --check DECIDES
+  Exit 0 iff CODE has enough PASSED recorded iterations across enough distinct board
+  roles (self-merge-authority gate, default) or distinct models (when --min-models is
+  explicitly given); see --min-iter/--min-models/--min-roles on `review task --help`.
+  If the task has ZERO recorded role data at all AND every in-scope (non-mismatched)
+  iteration predates role-tracking (PR #246), the default falls back to the old
+  distinct-model count instead of a guaranteed fail (see quorum_mode_fallback below). A
+  task with at least one iteration recorded AFTER role-tracking became possible but
+  reviewed only via quorum/just-ask/brainstorm/qa does NOT get that fallback
+  (review-cli#252) — it stays role-based and fails (see role_tracking_gap below). Counts
+  only iterations whose run came back clean — a review that ran but failed/degraded does
+  not count toward the bar, and pre-verdict-field history never satisfies it either
+  (fail-closed).
+
+--JSON FIELDS  (quorum_check()'s full result plus identity_verification — not just the
+  printed ratio; a caller like `gh ship` should parse this, not the text-mode ratio line)
+
+  ALWAYS present:
+    task_code, passed_iterations, total_iterations, distinct_models_passed, models,
+    min_iter, passed, identity_verification (ran / disabled / skipped_unresolvable —
+    see -C/--no-verify-identity on `review task --help`).
+
+  MODEL FLOOR — present whenever a model floor governs, explicitly OR via the
+  zero-role-data fallback:
+    min_models, min_models_source (explicit / fallback).
+    min_models_advisory — ONLY when --min-models was given EXPLICITLY (never on the
+    fallback path — the advisory text would be actively wrong there, since role-based
+    coverage is exactly what's unavailable when the fallback fires).
+    min_roles_suggestion — ONLY on an explicit, unmet --min-models run (--min-roles NOT
+    given) whose PASSED iterations actually carry enough role data to have cleared the
+    same floor via --min-roles instead — a non-blocking models->roles nudge, not a
+    fallback/gap diagnostic (it never co-occurs with quorum_mode_fallback/
+    role_tracking_gap below, since both of those require the bare role-based default,
+    not an explicit --min-models run).
+
+  ROLE MODE — present whenever role mode governs (the default):
+    distinct_roles_passed, roles, min_roles.
+
+  FALLBACK / GAP DIAGNOSTICS — mutually exclusive, present only when the matching case
+  above fired (both require the bare role-based default -- neither can co-occur with an
+  explicit --min-models run):
+    quorum_mode_fallback — the role-based default fell back to model-counting.
+    role_tracking_gap — it did NOT fall back and stays role-based, failing on its own
+    merits (empty/short `roles`).
+
+  STALLED SEATS — present only when the bar is NOT met:
+    stalled_models — list of {model, reason, remaining_seconds,
+    consecutive_failures} naming any attempted model currently cooling down.
+
+  IDENTITY VERIFICATION — present only when identity_verification == "ran" (a repo_id
+  resolved; see -C/--no-verify-identity):
+    verified_iterations, unverifiable_iterations, excluded_mismatched_iterations,
+    mismatch_details — list of {iteration, reason, recorded_repo_id,
+    recorded_diff_files, ts}, capped (mismatch_details_truncated when capped).
+
+  NEAR-MISS TWIN KEY — present only when the bar is NOT met AND a same-digits
+  different-'#' twin task code exists in the store (review-cli#389):
+    searched_key, near_miss_keys, near_miss_counted, near_miss_ever_passed.
+
+  error — present on every fail-closed shape: an invalid task code, an
+  unreadable/missing store, zero recorded iterations, an explicit --min-iter /
+  --min-models / --min-roles floor below 1, or a bar-not-met denial where some history
+  was excluded as mismatched.
+
+See also: `review task --help` (the flag surface), `review help config`.
+"""
+
+
+def _help_topic_runtime() -> str:
+    """The `review help runtime` deep reference (help-docs-sync): run stats and the
+    startup ETA line printed before a dispatch, plus why `review` must never be
+    wrapped in a short external timeout. Content moved here from the README's
+    "Quorum" section (review-cli#552 PR1); body prose em dashes were normalized to
+    `--` for plain-text help — the title and the literal ETA example line keep the
+    real `—` they use on-screen/in `eta_line()`'s actual output, so this stays a
+    live, test-checked contract (tests/test_topic_help.py), not just relocated
+    prose. The schema-version line below reads `STATS_VERSION` directly so it
+    cannot silently go stale the way the README prose once did. Kept in sync with
+    `reviewlib/stats.py`'s `record_run` / `announce_eta` / `eta_line` behavior — a
+    flag/behavior change there updates this topic in the same commit."""
+    return f"""\
+review — runtime, run stats & the startup ETA
+===============================================
+
+NEVER SHORT-TIMEOUT `review`
+  `review` is multi-model and (for the panel modes) multi-round, so it takes MINUTES
+  per run. A short shell `timeout` wrapped around it kills the run before its
+  synthesis -- a `brainstorm` only emits its final answer at the very end, so a
+  short cap yields *nothing* usable.
+
+RUN STATS & THE STARTUP ETA
+  To make the expected duration visible up front, every run that actually dispatches
+  a backend appends a structured stat record -- task code, mode, pool size (backends
+  actually dispatched; for a small-panel brainstorm that is the per-round persona
+  slot count), model NAMES (never keys or prompts), the real monotonic wall-clock,
+  and ok/fail counts -- to an append-only JSONL store at
+  ~/.config/review-cli/run-stats.jsonl (mode 0600; override with $REVIEW_STATS_FILE).
+
+  At dispatch it then prints a one-line ETA to stderr keyed on (mode, pool_size):
+
+    [review] pool=4 (brainstorm) — typically ~6m12s based on 12 past runs of this size; do NOT timeout.
+
+  With no exact history it falls back to pool-size-only across modes, then to a
+  "no history yet ... expect MINUTES" line. Read that line and wait at least that
+  long. (This store is separate from the dashboard's per-call log reader, whose mode
+  is INFERRED and whose duration is an mtime proxy -- this one records the run's
+  ground truth.) Task-coded records power `review task CODE` and the dashboard's
+  task history.
+
+  The run-stats JSONL schema is versioned (currently v: {STATS_VERSION}). v: 3 added
+  an optional passed: bool verdict field (the mode's own success/failure signal, used
+  by `review task CODE --check` -- the self-merge-authority gate); v: 4 added
+  repo_id/diff_files/diff_sha256 (diff-identity binding); v: 5 added
+  prompt_tokens/output_tokens (aggregate REST token usage). Task-coded records also
+  add an optional task_code field. A record with no `passed` key has verdict UNKNOWN
+  -- either it predates v: 3, or it is a current record from a mode with no verdict
+  to thread (`qa` is report-only by design; see `reviewlib/qa/executor.py`) -- never
+  crashes a reader, but the quorum gate treats unknown as not-passed either way.
+
+See also: `review --help` (overview), README's "Quorum" section, `review task CODE`.
+"""
+
+
 # Deep help TOPICS advertised from the main `review --help` and served by `review help
 # <topic>` / `review --help <topic>` (ROADMAP "Topic-based help across the ecosystem").
 # topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
@@ -4746,6 +4880,14 @@ HELP_TOPICS: dict[str, tuple[str, "object"]] = {
     "config": (
         "config file, the model/board selection cascade, keys/auth",
         _help_topic_config,
+    ),
+    "task-check": (
+        "the `task CODE --check --json` self-merge-gate contract, field by field",
+        _help_topic_task_check,
+    ),
+    "runtime": (
+        "run stats, the startup ETA line, why never to short-timeout `review`",
+        _help_topic_runtime,
     ),
 }
 
@@ -6607,6 +6749,10 @@ def _show_board(
                     mid-run (mid-run failover);
       * `unavail` — backend not reachable right now; it can't sit in the pool, but a
                     run-time "unavailable" reply still triggers a reserve backfill.
+    A seat whose role has an active checked-in `.review/lenses/<role>.md` override
+    (review-cli#547) is suffixed `(lens overridden: <path>)`; the resolved cwd (this
+    function's `cwd`, defaulting to `Path.cwd()`) is the repo root the override path is
+    read relative to.
     Read-only — no model is called, no key is printed."""
     config_models = _split_models(config.get("models") or [])
     exact_models = explicit_models or []
@@ -6692,7 +6838,22 @@ def _show_board(
     effort_w = max((len(r.effort or "-") for r in board), default=1)
     # Resolve the repo bit ONCE (a single git rev-parse) for the opencode scope label,
     # rather than per seat in the loop.
-    cwd_is_repo = backends._opencode_runs_in_repo(cwd or Path.cwd())
+    effective_cwd = cwd or Path.cwd()
+    cwd_is_repo = backends._opencode_runs_in_repo(effective_cwd)
+    # Per-project lens overrides (review-cli#547): resolve ONCE per DISTINCT role (not
+    # per seat -- DEFAULT_BOARD alone carries "consistency" and "quality" twice each) so
+    # a 15-seat board costs at most 8 file reads (len(REVIEW_ROLES)), not 15. Maps role ->
+    # the override file's path RELATIVE to the reviewed repo root, for a short, readable
+    # label; a role absent from this dict has no active override (missing/unreadable/
+    # blank file, or a role that isn't a real REVIEW_ROLES key -- see
+    # `lens_override_text`'s docstring for why each of those counts as "no override").
+    overridden_roles: dict[str, Path] = {}
+    for r in dict.fromkeys(seat.role for seat in board if seat.role):
+        override_text = lens_override_text(r, effective_cwd)
+        if override_text:
+            overridden_roles[r] = lens_override_path(r, effective_cwd).relative_to(
+                effective_cwd
+            )
     seen_available = 0  # how many AVAILABLE seats walked so far (priority order)
     for index, reviewer in enumerate(board):
         available = avail[index]
@@ -6721,9 +6882,14 @@ def _show_board(
         scope = (
             "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
         )
+        lens_note = (
+            f"  (lens overridden: {overridden_roles[reviewer.role]})"
+            if reviewer.role in overridden_roles
+            else ""
+        )
         print(
             f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
-            f"{reviewer.model}  [{status}]  ({scope})  effort={effort}"
+            f"{reviewer.model}  [{status}]  ({scope})  effort={effort}{lens_note}"
         )
     print(
         "\nScope: `agentic` seats (codex / opencode / omp / claude-CLI) run read-only in the "
@@ -6759,6 +6925,16 @@ def _show_board(
             "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
             "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
             "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)"
+        )
+    if overridden_roles:
+        overridden_list = ", ".join(
+            f"{role} ({path})" for role, path in overridden_roles.items()
+        )
+        print(
+            "\nProject lens overrides active (review-cli#547): "
+            f"{overridden_list}. Each file's text is APPENDED to that role's built-in "
+            "lens, never replacing it; delete/empty the file to fall back to the "
+            "built-in lens alone."
         )
     from .role_models import format_role_fallback_section
 

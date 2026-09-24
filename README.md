@@ -28,13 +28,13 @@ review with the composable `--visual` flag for a keep / rollback / repair verdic
 **One-liner** (installs deps, links `review` into PATH, registers the skill):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alex-mextner/review-cli/main/install.sh | bash
+curl -fsSL https://git.hyperide.ai/ultrabricks/review-cli/raw/branch/main/install.sh | bash
 ```
 
 **pipx alternative:**
 
 ```bash
-pipx install git+https://github.com/alex-mextner/review-cli
+pipx install git+https://git.hyperide.ai/ultrabricks/review-cli
 ```
 
 After install, run `review install-skill` to register the tool into agent harnesses
@@ -283,34 +283,12 @@ bounded, non-seat subprocess calls elsewhere — e.g. `git worktree add` during 
 isolation setup — that use the plain, non-streamed runner.)
 
 **Run stats & a startup ETA — never short-timeout `review`.** `review` is
-multi-model and (for the panel modes) multi-round, so it takes **minutes**, and a
-short shell `timeout` around it kills the run before its synthesis — a `brainstorm`
-only emits its final answer at the very end, so a short cap yields *nothing* usable.
-To make the expected duration visible up front, every run that actually dispatches a
-backend appends a structured stat record — task code, mode, pool size (backends actually
-dispatched; for a small-panel brainstorm that is the per-round persona slot count),
-model **names** (never keys or prompts), the real monotonic wall-clock, and ok/fail
-counts — to an append-only
-JSONL store at `~/.config/review-cli/run-stats.jsonl` (mode 0600; override with
-`$REVIEW_STATS_FILE`). At dispatch it then prints a one-line ETA to **stderr** keyed
-on `(mode, pool_size)`:
-
-```
-[review] pool=4 (brainstorm) — typically ~6m12s based on 12 past runs of this size; do NOT timeout.
-```
-
-With no exact history it falls back to pool-size-only across modes, then to a
-`no history yet … expect MINUTES` line. Read that line and wait at least that long.
-(This store is separate from the dashboard's per-call log reader, whose mode is
-*inferred* and whose duration is an mtime proxy — this one records the run's ground
-truth.) Task-coded records power `review task CODE` and the dashboard's task history.
-The run-stats JSONL schema is versioned (currently `v: 3`); task-coded records add the
-optional `task_code` field, and `v: 3` adds an optional `passed: bool` verdict field (the
-mode's own success/failure signal, used by `review task CODE --check` — the self-merge-
-authority gate). A record with no `passed` key has verdict UNKNOWN — either it predates
-`v: 3`, or it is a current record from a mode with no verdict to thread (`qa` is
-report-only by design; see `reviewlib/qa/executor.py`) — never crashes a reader, but the
-quorum gate treats unknown as not-passed either way.
+multi-model and (for the panel modes) multi-round, so a run takes **minutes**, and a
+short shell `timeout` around it kills the run before its synthesis. Every dispatch
+appends a run-stats record and prints a one-line ETA to stderr keyed on
+`(mode, pool_size)`, so you know up front roughly how long to wait instead of
+guessing. See `review help runtime` for the run-stats JSONL schema, the exact ETA
+line format, and the full read-that-line guidance.
 
 **No external timeout — `review` carries its own internal ≤4h backstop.** Do not
 put *any* external `timeout` on `review`: it is designed to run unbounded from the
@@ -804,386 +782,82 @@ reboot — before it could record its own terminal status). `--detach` is reject
 
 ## `review dashboard` — local web dashboard (managed service)
 
-The dashboard is a **managed service**: it gets the same lifecycle subcommands every
-long-running agent-tools server shares (run / start / status / stop / enable / disable),
-from the reusable `agenttools_service` lib — review-cli does not hand-roll pidfiles or
-autostart units.
+A **managed service** (`run` / `start` / `status` / `stop` / `enable` / `disable`, via the
+shared `agenttools_service` lib) that serves a single-page web app over every review-cli run —
+chat logs, per-task/mode/model stats, and an overseer's free-text feedback/PR-ticket
+annotations, all read from the existing per-call logs (no new run-record format).
 
 ```bash
-review dashboard            # bare = HELP (prints the actions, launches NOTHING)
-review dashboard run        # run in the FOREGROUND (this shell), blocking — ad-hoc / when disabled
-review dashboard start      # start in the BACKGROUND (detached daemon); returns immediately
-review dashboard status     # is it running? pid / port / url / autostart-enabled
-review dashboard stop       # stop the background instance
-review dashboard enable     # install OS autostart (launchd / systemd --user / fallback) AND start now
-review dashboard disable    # remove OS autostart AND stop
-review dashboard --port 8765 run   # global --host/--port apply to any action
+review dashboard start      # background daemon; review dashboard status / stop
+review dashboard enable     # OS autostart at login (launchd / systemd --user)
 ```
 
-A bare `review dashboard` (no action) prints HELP and launches nothing. On `run`/`start`
-it hints how to `enable` autostart at login. `run` binds an ephemeral port; the managed
-`start`/`enable` bind a stable default port (so `status`'s url and a later restart land on
-the same address).
-
-A single-page web app over every review-cli run, built on the Python **stdlib** HTTP
-server (no extra deps) and a **vanilla-JS SPA** (no npm/build step — assets ship in the
-package). It binds **127.0.0.1 only** by default — the logs persist prompts/diffs that may
+It binds **127.0.0.1 only** by default — the logs persist prompts/diffs that may
 carry secrets — so it is not exposed on the network unless you pass `--host 0.0.0.0` (e.g.
 to reach it over Tailscale).
 
-**Dependency:** the lifecycle subcommands need the shared `agenttools_service` lib (an
-in-ecosystem dependency, the `[dashboard]` extra). It is not yet on PyPI; until then install
-it editable from the agent-tools checkout (`pip install -e <agent-tools>/lib/agenttools_daemon
--e <agent-tools>/lib/agenttools_service`). Without it, `run` still works for an ad-hoc
-foreground server and a bare `review dashboard` still prints help; only the managed
-start/status/stop/enable/disable actions emit an actionable error (exit 4).
-
-**Supported autostart matrix:** macOS → launchd LaunchAgent; Linux → systemd `--user`
-unit (with a no-systemd fallback); other OSes → no autostart (`enable` still starts the
-service now and warns it will not survive reboot). See `agent-tools/lib/agenttools_service`
-for the full matrix.
-
-**Data sources (read-only):** review-cli does not emit a structured run record, so the
-dashboard reads the real on-disk artifacts in `log_dir()` — the per-call streamed logs
-(`{stamp}-{backend}-r{n}.log`) and the brainstorm discussion logs (`{stamp}-brainstorm.md`).
-Subprocess backends (codex/claude/opencode) write these live; REST backends (gemini, z.ai,
-commandcode) emit an equivalent sidecar log on every call — each under its OWN backend name,
-so every backend is counted and attributed correctly. Calls are time-clustered into
-**sessions** (review-cli emits no run id; a session = a burst of calls separated by a gap),
-and the mode (review / panel / brainstorm) is inferred from the call/round shape. Task
-metadata from `--task CODE` is parsed from those logs, so a dashboard session carries the
-same task code as the CLI stat record.
-
-**Panels:** Chat logs (per-run transcripts), Stats (runs over time, by task/mode/model/role),
-Models & roles, Metrics (durations, success/fail rates), Overseer feedback, Modes, Errors,
-Tasks (task-coded review history plus the **conscious** session marker), Prompts, and PR +
-ticket links. A task badge filters runs by code and the task view shows iterations, models,
-modes, related sessions, and drill-down links to the full conversations.
-
-**The overseer's annotations** — free-text feedback, the per-session **conscious** flag,
-and PR/ticket associations — are the only NEW persistence: a small atomic JSON store at
-`~/.config/review-cli/dashboard.json` (override with `$REVIEW_DASHBOARD_STORE`), keyed by
-the deterministic session id so annotations stay pinned as logs age out. The server exposes
-small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feedback|conscious|links`).
-
-> Token/cost and an explicit run id are **not recorded** by review-core today; those panels
-> show a graceful empty-state noting what review-core would need to log, rather than faking data.
+See **[docs/dashboard.md](docs/dashboard.md)** for the full command/flag reference, the
+autostart matrix, data sources, panels, and the annotation store format.
 
 ---
 
 ## `review visual` — visual verification
 
 **Give it a screenshot; it judges keep / rollback / repair.** `--visual` is image-only
-visual verification: pixels in → verdict out. There is **no DOM, no page, no capture** —
-the image arrives as a CLI argument (or on a hook's stdin) already rendered. Every check,
-including "is this render unstyled or broken", is performed from the **image** — pixel-level
-CV heuristics plus an AI-vision model looking at the picture — never by reading a stylesheet.
-
-The pipeline is:
-
-```
-cvGate → local cache pre-classifier → AI-vision → policy engine
-```
-
-The **model is the witness**; the **deterministic policy engine is the judge**. cvGate is a
-fast pixel pre-filter that auto-rejects the unambiguously-broken set (blank/FOUC canvas,
-unstyled no-CSS render, error overlay) before any paid call. The local pre-classifier is an
-on-device, no-VLM cost-saver that clears the confident-clear cases for free; AI-vision is the
-primary judge for everything ambiguous; the policy engine decides the final verdict **outside**
-the model (schema validation, CV/model contradiction checks, module vetoes). AI-vision never
-self-decides and the local model never overrides it.
-
-![review --visual cases — REPORTS-unstyled (top) vs no-report-styled (bottom)](docs/assets/visual-cases.png)
-
-*What `review visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
-error-overlay renders the detector flags (each one would block a `tg --photo` send). Bottom row:
-properly-styled renders it stays quiet on. (The grid's title art is the tool's old standalone
-name "styleprobe" in older copies — it is the `--visual` detector.)*
-
-### Standalone and Composable
-
-`review visual <image>` is the canonical standalone verdict pipeline. Add `--diff` or
-`--staged` plus `--task CODE` when you want the screenshot judged together with the current
-diff. `--visual`
-remains a composable flag on text modes (`brainstorm` / `quorum` / `just-ask` / `diff`),
-so personas / voters / reviewers literally **see** the image as multimodal context:
+visual verification: pixels in → verdict out — no DOM, no page, no capture, ever; every
+check runs on the **image** (pixel heuristics plus an AI-vision model), never a stylesheet.
+The pipeline (`cvGate → local pre-classifier → AI-vision → policy engine`) treats the vision
+model as a **witness**, not the judge — a deterministic policy engine outside the model makes
+the final call.
 
 ```bash
-# Standalone — pure verdict pipeline on one render (no diff present)
-review visual after.png
-
-# Standalone visual plus the working-tree diff as context
-review visual after.png --task HYP-742 --diff
-
-# The brainstorm personas see the screenshot and reason about it
-review brainstorm "is this layout good?" --task HYP-742 --visual after.png
-
-# Every quorum voter gets the image as shared context
-review quorum "ship this UI?" --task HYP-742 --visual after.png
-
-# Diff review with the rendered result attached as evidence
-review diff --task HYP-742 --visual after.png
+review visual after.png                                                   # standalone verdict
+review brainstorm "is this layout good?" --task CODE --visual after.png   # composable context
 ```
 
-When a companion mode is present, Claude CLI seats can receive the raw screenshot
-attachment, and every seat receives the grounded visual observation from a companion vision
-fan-out. The standalone verdict pipeline (and its exit codes below) fires only in the
-mode-less case. If that companion visual fan-out cannot produce a usable grounded
-observation, review blocks the companion text mode instead of returning a normal answer that
-merely describes cvGate signals. Use `--no-ai` only when you explicitly want the offline
-CV-only path.
+`--visual` is also composable on `brainstorm` / `quorum` / `just-ask` / `diff`, so those
+modes' models see the screenshot as multimodal context instead of running this standalone
+pipeline.
 
-### Vision backends
-
-Vision runs **through the agent CLIs** — `codex` / `claude` / `opencode` — mirroring exactly
-how review's text backends shell out, but with the image attached and the structured verdict
-parsed from the CLI output. No provider REST keys for those three. **Gemini is the one
-exception**: its CLI is broken, so the Gemini vision call stays on the REST API key
-(`GEMINI_API_KEY`), same as review's text Gemini backend. Vision requires a vision-capable
-model on whatever backend you pick — review never silently uses a text-only model to "verify"
-an image. (For router backends like opencode, that means selecting a vision model explicitly,
-e.g. `oc:<provider>/<vision-model>`.) Visual defaults are separate from the text reviewer
-board: Opus is tried first, then GROK_SEAT (`oc:xai/grok-4.6`), then vision-capable
-fallbacks including GLM vision (`oc:zai/glm-4.5v`). If Opus is unavailable at runtime,
-review skips to the next visual backend instead of failing while a fallback exists.
-Override with `visual_models:` in
-config or `-m` on the command. `--no-local-model` disables the local cache pre-classifier (the
-cost-saver) and forces every cvGate pass-through to the paid AI-vision call.
-
-### Modules
-
-Each visual check is an independent, self-selecting **module** that declares *when it
-activates*. Built-ins: `style-presence`, `blank-frame`, `error-overlay`, `error-text`. A module contributes a
-cheap `cv_check` pre-filter and/or `vision_questions` folded into the multimodal call, plus a
-`judge` that can veto a keep. Force-activate one with `--check <name>`; otherwise modules
-self-select from `--intent` / `--expect`.
-
-**Per-project modules.** A project ships its own modules via a manifest at
-`<project>/.review/visual-modules.json` declaring `{name, entry, activates_on}`. review
-discovers, loads, and folds them into the same pipeline. The model is **trust-by-default** —
-reviewing your *own* repo, a contributed module loads and runs with zero ceremony. For the rare
-untrusted-repo case (an external PR, a cloned stranger's repo) set `REVIEW_UNTRUSTED_MODULES=1`
-to re-engage a TOFU quarantine + sha-pin (`review trust-module <name>` to pin). Every load is
-recorded to an append-only audit log either way.
-
-The worked example is **`selection-highlight`** (shipped by HyperIDE / hyper-canvas-draft):
-`activates_on: ["selection"]`. A HyperCanvas selection frame is a 2px `rgb(59,130,246)` outline
-so thin a vision model routinely can't tell whether it's there — so "selection works" proofs
-slip through with no frame drawn. The module reuses `bin/frames-check`'s deterministic
-colour+shape detector to turn "selection expected but no outline present" into a **hard veto**,
-short-circuiting before any vision call.
-
-### `tg --photo` hook
-
-`tg` can run `review visual` as a **pre-send hook** to block an unstyled / broken screenshot
-before it reaches Telegram — turning the often-violated "review screenshots before sending" rule
-into an enforced mechanism. The hook runs `review visual <png> --json --strict`; a `rollback`
-verdict (exit 10) drops the photo, a `keep` lets it through, and no-vision
-`human_review` / `unverified` also fail closed under `--strict` so an unverified screenshot
-does not silently pass the send gate. See the
-`feat-tg-photo-visual-hook` branch and `docs/architecture-visual-verification.md` §7.
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | `keep` — the render is acceptable |
-| `10` | blocking verdict (`rollback`, or `human_review`/`unverified` when treated as a block) under `--strict` |
-| `1` | usage error — no image / unreadable image |
-| `124` | vision-call timeout |
-
-Add `--no-ai` to run cvGate only (fast CI smoke / offline), `--json` for the machine verdict
-(used by the tg hook), and `--before <img>` for diff-aware judgement.
+See **[docs/visual-review.md](docs/visual-review.md)** for the full standalone/composable
+matrix, vision-backend selection, the module system (built-ins, per-project modules, and the
+untrusted-module quarantine), the `tg --photo` pre-send hook, and the exit-code reference.
 
 ---
 
 ## `review spec-web` — multi-spec web reviewer (a persistent daemon)
 
-**Render any markdown spec server-side and review it like a GitHub PR — as a bidirectional
-channel between a human reviewer and the agent that launched it.** Select any text in the
-rendered spec → leave a **question** (expects an answer from the spec author) or a **remark**
-(feedback that doesn't), anchored to that selection; notes accumulate in a **pending batch**;
-one **Submit review** finalizes them **and delivers the structured review back to the
-launching agent** (no copy-paste export step). The agent answers a question with
-`review spec-web reply <id> <answer>` — the reply shows **in the UI** (distinct agent
-styling) and is pushed to **Telegram**. In-progress note text **autosaves to disk** so a page
-reload never loses a half-typed comment. Single implicit reviewer (no author field). Reusable
-for *any* spec markdown file. Serve it over Tailscale to review from your phone.
+**Render any markdown spec server-side and review it like a GitHub PR** — a bidirectional
+channel between a human reviewer and the agent that launched it. Select text in the rendered
+spec to leave a **question** or **remark** anchored to it; **Submit review** finalizes the
+batch and delivers the structured review straight back to the launching agent (no copy-paste
+export step). One persistent daemon (`review spec-web start`) serves every registered spec by
+name at `/spec/<name>`, live-reloading a page in place when the `.md` changes on disk.
 
-**One daemon, every spec.** `review spec-web start` runs ONE persistent daemon (managed by the
-shared `agenttools_service` lib, exactly like `review dashboard`) that serves EVERY registered
-spec by NAME at `/spec/<name>` — a navigator at `/` lists them all — so a single port /
-Tailscale mapping covers all your specs instead of one ad-hoc server per spec. `add` registers
-a spec (idempotent by path; the name is a slug of the filename) and the daemon serves it
-immediately, no restart. The daemon **live-reloads** an open spec page when the `.md` changes
-on disk (SSE): the content swaps in place with **no scroll jump** — even when text above your
-viewport changed height — and the changed blocks flash briefly (above or below the fold, never
-scrolling to them). `start` is idempotent (an already-running daemon reports itself + what it
-serves, exit 0); only an explicit `stop` stops it.
-
-```sh
-# daemon lifecycle (shared agenttools_service lib, like `review dashboard`)
-review spec-web start --agent ext   # start the daemon in the background (idempotent)
-review spec-web status              # running? + registered specs + their /spec/<name> URLs
-review spec-web stop                # stop it (the ONLY thing that stops it)
-review spec-web run --agent ext     # foreground (this shell), for ad-hoc use
-review spec-web enable --agent ext  # OS autostart at login (disable removes it)
-
-# specs
-review spec-web add docs/specs/my-spec.md      # register + print its /spec/<name> URL
-review spec-web serve docs/specs/my-spec.md --agent ext   # add + BLOCK until the review is submitted
-review spec-web docs/specs/my-spec.md --agent ext         # same as `serve` (backward-compatible form)
-review spec-web list                           # every registered spec + open-note counts (+ stalled-thread reminders)
-review spec-web remove <name>                  # unregister (comments stay on disk)
-review spec-web watch <name|path>              # wait for a submit on a registered spec
-
-# pre-load an existing Q&A thread
-review spec-web serve docs/specs/my-spec.md --agent ext --seed thread.json
-
-# return to the agent as soon as the reviewer submits (one-shot review handoff)
-review spec-web serve docs/specs/my-spec.md --agent ext --exit-on-submit
-
-# the agent answers a reviewer's question (shown in the UI + sent to Telegram)
-review spec-web reply <comment-id> "the answer" --spec docs/specs/my-spec.md
+```bash
+review spec-web add docs/specs/my-spec.md --agent ext    # register + print its /spec/<name> URL
+review spec-web serve docs/specs/my-spec.md --agent ext --exit-on-submit   # add + block for one review
 ```
 
-| Flag | Meaning |
-|------|---------|
-| `--agent <name>` | the tmux window/session that OWNS the served specs — submitted review batches are injected INTO it (see below). **Required** by the daemon-launching actions (`start`/`run`/`enable`, `serve` and the positional form); also required by `add` when the daemon is DOWN, since `add` auto-starts it. A per-spec `--agent` (on `add`/`serve`) overrides the daemon-wide default for that spec. |
-| `--host` | daemon bind host (default `0.0.0.0` — reachable over Tailscale; `127.0.0.1` for loopback-only) |
-| `--port` | daemon port (default `7920`, stable across restarts so URLs/Tailscale mappings survive) |
-| `--seed FILE` | import an initial review thread from a JSON file before serving |
-| `--exit-on-submit` | return after the first Submit (the daemon keeps running; only the watch returns) |
-| `--emit-current` | `watch`: re-emit the batch ALREADY in the store before watching — the recovery path when a submit's live delivery failed (a bare `watch` only fires on a *later* submit) |
-| `--no-watch` | `serve` / the positional form: register + print the URL but don't block |
-| `--open` | open the URL in a browser on startup |
-
-On a host **without** the shared `agenttools_service` lib, the positional form falls back to
-the classic single-spec foreground server (ephemeral port, Ctrl-C to stop), so nothing breaks.
-
-**The submit → agent handoff.** `review spec-web` is started by an agent and blocks. When the
-reviewer clicks **Submit review**, the server marks the batch submitted in the store and the
-launching process prints the **structured review** to stdout framed by a line that is exactly
-`<<<REVIEW-SPEC-WEB-SUBMITTED`, then **one line** of compact JSON, then a line that is exactly
-`REVIEW-SPEC-WEB-SUBMITTED>>>`. **Parse by taking the single line immediately after the begin
-marker** (not by splitting on the end marker) — the JSON is one line and a reviewer's free
-text is JSON-escaped on it, so a body that happens to contain the marker substring can never
-break the framing. The payload carries every comment's **id** (so the agent can answer a
-specific one), `kind`, `status`, `quote`, `section_title`, `body`, and its reply thread, plus
-`counts` (questions/remarks/total). By default the server keeps serving after a submit (the
-reviewer can keep going and the agent can `reply`), re-emitting a fresh framed payload on each
-submit; `--exit-on-submit` returns after the first submit instead. (Like the other persistent
-server paths, `--exit-on-submit` ignores `-o FILE` — read the framed payload from stdout.) The
-store on disk stays the single source of truth.
-
-**Submit → agent delivery (`--agent`).** The stdout handoff above only reaches an agent that is
-actively watching the process's stdout — but the daemon is long-lived and the agents that
-launch specs come and go, so a submitted batch used to sit in the store with nobody reading it.
-The required `--agent <name>` fixes that: on every Submit, the batch is **injected into that
-agent's live tmux session** as a prompt — the same mechanism `tg-ctl` uses to inject inbound
-Telegram messages (`[TG from …]`) into a running session. `<name>` matches a tmux **window**
-name first, then a **session** name (e.g. `--agent ext` reaches the pane of the `ext` session).
-Each comment arrives on one line (`[SPEC-WEB comment on <spec> §<section>] "<quote>" — <body>
-(question, id <id>)`) with a trailing pointer to `review spec-web reply <id> "<answer>" --spec
-<path>`. Delivery is **best-effort**: the batch is already durably in the store, so a missing
-tmux session never fails the Submit — the failure is logged and reported to the reviewer in the
-UI, and the agent can still pull it with `review spec-web watch`. A daemon-wide `--agent` (on
-`start`/`run`) is the default; a per-spec `--agent` (on `add`/`serve`) overrides it for that spec.
-
-**The agent reply → UI + Telegram.** `review spec-web reply <comment-id> <answer> --spec <spec>`
-threads the agent's answer under that comment in the store (stamped with the `agent` author so
-the UI styles it distinctly), and **also** delivers it to Telegram via the `tg` CLI on `PATH`
-(best-effort — a missing/failing `tg` never fails the reply; it logs and continues; `--no-tg`
-skips it). An open spec-web page **polls** the comments API, so the agent's reply appears under
-the question without a manual refresh.
-
-**Stalled review-cycle reminders.** A comment stuck in `submitted` (awaiting an agent reply) or
-`answered` (awaiting reviewer resolution) for more than 24h (override via
-`$REVIEW_SPECWEB_STALE_HOURS`) is flagged with a `⚠ stalled ...` line — lazily, whenever an
-already-running command reads the store, never via a background poller. `review spec-web list`
-and `review spec-web status`/`start` print one line per stalled comment for every spec; `review
-spec-web reply` prints the same for every OTHER stalled comment on that spec to stderr, and
-appends a short summary to its Telegram delivery (e.g. "2 other stalled review threads on this
-spec (oldest 36.2h, waiting on an agent reply)."), skipped when nothing else is stale.
-
-**Drafts (reload-safe).** While you type a note, the composer **autosaves** the in-progress
-text to the server (debounced, persisted to disk) under a per-slot key (the new-note composer
-and each edit-in-progress have their own slot). On page load the most recent draft is **restored
-into the composer**, so an accidental reload mid-typing continues exactly where you left off.
-Saving the note (or clearing the box) drops its draft.
-
-**Layout.** Desktop (≥900px) = two panes side-by-side (spec left, comments right, a
-draggable divider). Mobile (<900px) = comments as a bottom sheet under the spec. The
-comments panel collapses to just its header bar (which carries a **count badge** so added
-notes are visible while collapsed) and re-expands from that same bar. Following an internal
-cross-reference link shows a **← Back** control that returns to the prior scroll position.
-
-**Rendering.** Markdown → HTML is rendered server-side with the GitHub heading-slug scheme,
-so the spec's own internal links (`[§9.4](#94-…)`) resolve. Figures referenced as
-`./assets/fig-*.svg|png` are served as real HTTP resources at `/asset/<name>` (never
-inlined). Tables size columns to their content and scroll horizontally on narrow screens
-rather than crushing columns.
-
-**Comments.** A note stores the selected quote, the containing section id, char offsets, its
-**kind** (`question` | `remark`, default `remark`), the body, created-at, a status
-(`pending`/`submitted`/`answered`/`resolved`), and a thread of replies. (An `author` field
-is still persisted for import/export round-tripping but is not shown in the UI.) The kind is
-surfaced with a coloured chip + icon; each note can be edited (`/api/comments/<id>/edit`). On
-reload, each note re-anchors by locating its quote within its section and highlighting it; a
-quote that can't be re-found shows in the sidebar as **unanchored** (never a crash).
-
-**Persistence.** One JSON file per spec at `~/.config/review-cli/spec-web/<sha1-of-abspath>.json`
-(mode `0600`), surviving restarts. It holds the comments, the in-progress composer **drafts**
-(per slot), and the `last_submit` batch the launching agent reads back. The daemon's spec
-**registry** (`registry.json`, name → path) lives in the same directory — and the comment
-stores are keyed by spec PATH, not by name, so specs reviewed under the old one-server-per-spec
-mode keep their full history when the daemon takes over. Override the directory with
-`$REVIEW_SPECWEB_DIR`. Override the stalled-review-cycle reminder threshold (default 24h) with
-`$REVIEW_SPECWEB_STALE_HOURS`.
-
-**Security.** Reads (spec, assets, comments, **drafts**) are open — same model as comments
-(the in-progress composer text is readable by anyone who can reach the port; there are no
-secrets in a spec review); only figures the markdown *references* are served (an unrelated
-file in the assets dir 404s), SVGs are served with a `sandbox` CSP so a directly-opened one
-can't run script, and symlinked assets that escape the assets dir are refused. Writes (post
-comment / reply / submit / import / draft autosave)
-are origin-guarded against both CSRF and DNS rebinding: a write requires (1) the request's
-**Host** to be in the allowlist — **loopback + this machine's Tailscale identity
-(discovered at runtime via `tailscale status`, never hardcoded) + `$REVIEW_SPECWEB_ALLOWED_HOSTS`**
-(comma-separated) — and (2) the **Origin/Referer** to match that Host (classic CSRF check),
-plus `Content-Type: application/json` and a body-size cap. The Host allowlist is what stops
-a rebound attacker hostname from posting same-origin. So to accept writes from a phone over
+**Security.** Reads (spec, assets, comments, **drafts**) are open to anyone who can reach the
+port — there are no secrets in a spec review; only figures the markdown *references* are
+served (an unrelated file in the assets dir 404s), SVGs are served with a `sandbox` CSP so a
+directly-opened one can't run script, and symlinked assets that escape the assets dir are
+refused. Writes (post comment / reply / submit / import / draft autosave) are origin-guarded
+against both CSRF and DNS rebinding: a write requires (1) the request's **Host** to be in the
+allowlist — **loopback + this machine's Tailscale identity (discovered at runtime via
+`tailscale status`, never hardcoded) + `$REVIEW_SPECWEB_ALLOWED_HOSTS`** (comma-separated) —
+and (2) the **Origin/Referer** to match that Host (classic CSRF check), plus
+`Content-Type: application/json` and a body-size cap. The Host allowlist is what stops a
+rebound attacker hostname from posting same-origin. So to accept writes from a phone over
 Tailscale, the Tailscale name/IP must be discovered or listed in
 `$REVIEW_SPECWEB_ALLOWED_HOSTS` (e.g. `REVIEW_SPECWEB_ALLOWED_HOSTS=ultras-mbp.tailbfe8ea.ts.net,100.123.113.82`).
+Note the daemon binds `0.0.0.0` (not loopback-only) by default — the Host allowlist above is
+what makes that safe; see `--host` in the full reference to restrict it to `127.0.0.1`.
 
-**Seed / import JSON shape** (`comments` is the only required key):
-
-```json
-{
-  "comments": [
-    {
-      "quote": "the selected text",
-      "body": "the question or comment",
-      "section_id": "94-...",
-      "section_title": "§9.4 ...",
-      "kind": "question",
-      "author": "alex",
-      "status": "submitted",
-      "batch": "2026-06-14T10:00:00+00:00",
-      "replies": [ { "author": "claude", "body": "the answer" } ]
-    }
-  ]
-}
-```
-
-Missing `id`/`created` are generated; unknown keys are ignored. Add `"replace": true` at the
-top level to discard existing comments before importing.
-
-Routes: `GET /` (SPA shell), `GET /static/<app.css|app.js>`, `GET /asset/<name>`,
-`GET /api/spec`, `GET /api/comments`, `GET /api/drafts`, `POST /api/comments`,
-`POST /api/comments/<id>/{reply,edit,status,delete}`, `POST /api/drafts/<slot>`,
-`POST /api/submit`, `POST /api/import`. (The old `GET /api/export` is removed — Submit now
-delivers the structured review to the launching agent.)
+See **[docs/spec-web.md](docs/spec-web.md)** for the full command/flag reference, the
+submit → agent stdout handoff framing, the tmux `--agent` delivery mechanism, drafts, layout,
+rendering, persistence paths, and the seed/import JSON shape.
 
 ---
 
@@ -1195,7 +869,7 @@ delivers the structured review to the launching agent.)
    expert roles, looping across several rounds — to surface candidate approaches a
    single model wouldn't reach.
 2. It picks the top one or two and posts them to Telegram via
-   [`tg`](https://github.com/alex-mextner/tg-cli) as simplified options with pros/cons,
+   [`tg`](https://git.hyperide.ai/ultrabricks/tg-cli) as simplified options with pros/cons,
    so you decide from your phone.
 3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
    and compares them for real before committing.
@@ -1430,62 +1104,23 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 
 ## Reviewer board
 
-The plain `review diff` runs a **reviewer board**: a panel where
-each model is given its OWN review role/lens, so the panel covers the diff broadly
-instead of every model doing the same generic pass. The board is the default panel
-out of the box — no config file required.
+The plain `review diff` runs a **reviewer board**: a panel where each model is given its OWN
+review role/lens, so the panel covers the diff broadly instead of every model doing the same
+generic pass. The board is the default panel out of the box — no config file required.
 
-### Priority-ordered failover pool
+The raw built-in board is a **priority-ordered** list of 15 models, strongest WORKING model
+first, chosen by **priority + availability**. A bare `review diff` runs the `light` preset (a
+pool of 2 at medium effort) for cheap routine checks; `--preset default` steps up to a pool of
+4 at high effort; `--preset heavy` runs Sol/Opus/GLM-cc/Kimi at `xhigh`, with the rest of the
+board as `max`-effort reserve. Fable is excluded from every preset — chronic dispatch failures
+demoted it to the board's final, last-resort seat. Two layers of failover keep the pool full:
+**startup failover** skips an unreachable higher-priority seat and pulls up the next one, and
+**mid-run failover** promotes the next-priority reserve if an active seat fails mid-review.
+`--pool N` sizes the pool (`--pool 0` runs every available seat in the selected preset/board);
+the board itself is never disabled.
 
-The raw built-in board is a **priority-ordered** list of 15 models — strongest WORKING
-model first — and a plain `review diff` runs the `light` preset (Alex, 2026-08-28): a
-**pool of 2** without Fable/Sol, at medium effort — cheap by default for routine
-pre-commit checks. Use `--preset default` for a routine change review at a pool of 4,
-high effort, and `--preset heavy` for release/risky changes: Sol, Opus, GLM-cc, and Kimi at
-`xhigh` effort, with the remaining board seats as `max`-effort reserve. Fable is excluded
-from every preset — `review stat` telemetry showed a confirmed ~97.9-100% dispatch failure
-rate (chronic session/usage-limit exhaustion on the account it runs through), so it is
-demoted to the raw board's LAST seat instead (see the table below) — a last-resort reserve,
-not a routinely-dispatched pool seat, in any preset. The pool is chosen by **priority +
-availability**, with two layers of failover so the run keeps the requested number of
-working reviewers even when models drop:
-
-- **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority.
-  A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
-  **skipped** and the next-priority seat is pulled up, so you still start with the
-  requested number of working models. (E.g. if Sol is unavailable in the heavy preset,
-  the pool starts at Opus.)
-- **Mid-run failover** — if an active seat **fails during the review** (backend error,
-  timeout, empty output, or an "unavailable" reply such as a paywalled model returning
-  *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
-  run in its place, repeating until the requested number of working verdicts is produced or the reserve is
-  exhausted (then the run degrades gracefully and says so on stderr, exiting non-zero).
-- **Account rotation (review-cli#168)** — every `claude:*` seat and the omp-hosted
-  Claude seat authenticate as ONE Claude account, so an account-wide outage or paywall
-  (or a 100% harness 5-hour/7-day window) used to take out all of them at once. On a
-  multi-account host (`~/.claude-accounts/account-*/`, the same registry `claude-rotate`
-  already uses; `$CLAUDE_ROTATE_ROOT` overrides the root) the direct `claude:*` dispatch
-  now tries each registered account in rotation order — the persisted `current` account
-  first, then wrapping through the rest — via a per-call `CLAUDE_CONFIG_DIR`, skipping
-  any account whose own harness window is exhausted and falling through to the next on a
-  chronic-unavailable result. The omp-hosted Claude seat rotates the same way across
-  `$REVIEW_OMP_CLAUDE_PROFILES` (comma-separated, already-logged-in omp profiles). Only
-  when EVERY configured account is exhausted does the run emit the synthetic usage-limit
-  skip, now naming every account it tried; a host with no registry behaves exactly as
-  before.
-
-The role/lens **travels with the seat**: priority decides *who* sits in the pool, the
-role decides *with what lens* they review. A promoted reserve brings its own lens, so
-the panel still covers a broad set of facets.
-
-`--pool N` overrides the preset default (the top-N available, with the same failover);
-`--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 14 heavy-preset built-in seats (the raw 15-seat board,
-including last-resort Fable, needs an explicit `board:`/`models:` config). The board is **never
-disabled** — `--pool` only sizes the pool.
-
-The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
-on a fully-keyed environment):
+The built-in board, in **priority order** (the `Tier` column shows the `heavy` preset split on
+a fully-keyed environment):
 
 | # | Tier | Reviewer | Backend | Role | Lens focus |
 |---|---|---|---|---|---|
@@ -1493,7 +1128,7 @@ on a fully-keyed environment):
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
 | 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382 below) |
+| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382) |
 | 6 | reserve | Terra | `codex:gpt-5.6-terra` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (a distinct, already-paid codex model — live `performance` fallback for GLM-cc, review-cli#382) |
 | 7 | reserve | Sonnet | `claude:claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (a distinct, already-paid Anthropic model — live `quality` fallback for Kimi, review-cli#382) |
 | 8 | reserve | Sonnet-omp | `omp:anthropic/claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (the SAME claude-sonnet-5 model through the omp harness — a different auth path than the direct `claude:` seat right above, so it survives a Claude-account-wide outage that takes out every `claude:*` seat sharing one account, review-cli#168) |
@@ -1505,237 +1140,28 @@ on a fully-keyed environment):
 | 14 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
 | 15 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
 
-**review-cli#382 (2026-09-05):** `unpaid_providers: [commandcode, gemini]` disables every
-commandcode-routed seat (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That
-used to leave `performance`/`quality`/`security`/`tests`/`contracts` with zero or exactly one
-live seat each — `quality`'s one live seat (GLM, the z.ai route above) hit a real weekly quota
-exhaustion with nothing left to promote, hard-blocking a real PR's review-quorum gate. Terra
-and Sonnet are genuinely distinct, already-paid fallbacks on the same OpenAI/Codex and
-Anthropic accounts Sol/Astra and Opus/Fable already use (no new provider), giving
-`performance`/`quality` a real live seat each. GLM was re-lensed off its now-redundant
-`quality` role (Sonnet covers it more reliably) onto `security`, which had none. `tests`
-(DeepSeek-only), `contracts` (Gemini-only), and `architect` (Fable-only, and Fable is ~100%
-failing) remain thin — there was no third distinct already-paid model to give every starved
-role its own seat without doubling up one account's quota pressure on a single review run,
-the exact failure class this same change fixes for Fable. Astra's pre-existing `consistency`
-role (a duplicate of Sol's) is deliberately left unchanged — an earlier draft flipped it to
-`security` to close that duplicate, but doing so left `consistency` with zero live fallback
-anywhere on the board, the exact single-point-of-failure class this change exists to fix,
-just relocated.
+See **[docs/board.md](docs/board.md)** for the full mechanics: in-seat retry vs.
+reserve-replace, the cross-invocation cooldown's escalating window, Claude account rotation
+across multiple accounts, the memory-aware concurrency cap, and how `board:`/`models:` config
+precedence resolves.
 
-**Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
-the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
-Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra via the codex
-CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) — all run
-read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
-always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
-**GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
-register this GLM id, so the agentic form errors; the keyed-HTTP route is the one that
-reaches it). Both are read-only by construction (they POST only the diff).
-`review --show-board` shows each seat's live
-`agentic`/`diff-only` scope for the current host. The board has
-a reserve, so an `oc:` seat that opencode can't reach is backfilled rather than blocking:
-a missing opencode **binary** is detected at startup (the seat probes unavailable and the
-pool fills from the next reserve); missing opencode **provider auth** for known providers is
-also a startup skip. If a provider key exists but the account is not entitled/billed, list the
-provider in `unpaid_providers:` (or set `REVIEW_UNPAID_PROVIDERS`) and every direct or `oc:`
-seat under it is skipped before any model process/API call. (The diff-only
-`commandcode:`/`zai:` keyed-HTTP backends are still there for explicit `-m cc`/`-m glm` and
-config boards on hosts without opencode.)
-
-**In-seat retry before reserve-replace.** A seat that fails is first re-tried *on the same
-model* when the failure looks **transient** — a `429` rate-limit, a `529`/5xx overload, a
-provider timeout, an "overloaded"/"service unavailable" notice — with exponential backoff +
-jitter, before any reserve is promoted. The same model usually answers on the next try a
-moment later, so a brief throttle spike no longer burns a reserve seat. A **seat-fatal**
-failure (auth / bad model / `501` not-implemented / a refusal) is **never** retried — no
-retry can fix it — so it falls straight to the reserve. The retry budget is configurable via
-`--retry N` (or `$REVIEW_RETRY_COUNT`; default 2, `0` disables it). Every retry and every
-reserve promotion is recorded **durably** in the run-log dir (not just stderr), so a
-post-mortem or the dashboard can reconstruct exactly how a seat recovered or fell over.
-
-**Cross-invocation cooldown for a chronically-unavailable claude seat.** In-seat retry only
-sees one process's worth of history, so a Fable seat that is out of session quota still
-paid for one full `claude-p` dispatch on *every* review invocation before falling to the
-reserve — real evidence: 4,322 of 6,383 recorded runs dispatched Fable and it failed, most
-with an explicit session-limit notice. Once a dispatch comes back with that notice or the
-administrative "... is currently unavailable" sentinel, `reviewlib.seat_cooldown` records a
-cooldown (`$REVIEW_SEAT_COOLDOWN_SECONDS` pins a fixed window for FUTURE writes and
-disables escalation going forward — it does not retroactively shorten an already-
-escalated entry's `until`, only `<= 0` (the documented un-stick hatch, disabling
-cooldowns entirely) does that; store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`)
-so the *next* invocation within that window skips the real
-dispatch and returns the same sentinel shape immediately — every downstream consumer
-(failover, the dashboard's paywall classification) sees it exactly as it would a live
-paywall response. **Escalating window (review-cli#221):** left unset, the window starts at
-10 minutes and climbs per CONSECUTIVE failure (30min, 2h, then an 8-hour cap) — a seat that
-keeps getting re-dispatched and re-failing across many separate `review` invocations
-(minutes apart, so a flat 10-minute window kept lapsing before the next check) gets pushed
-out of the active pool long enough for `run_board_with_failover`'s reserve-promotion to
-substitute a different model instead. A genuine SUCCESSFUL dispatch clears the escalation
-immediately; absent that, a 24-hour gap since the last failure also resets it to 10 minutes.
-`review task CODE --check` (both text and `--json`) names any currently-stalled attempted
-model plus why, instead of leaving an operator to guess from a bare pass/fail count.
-Deliberately narrow: only these two chronic signals start a cooldown, never a bare
-auth/bad-model seat-fatal (which can be a transient misconfiguration a human just fixed).
-An explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` override always resets `fail_count` to 1 on
-its next write, the same as a genuine success — it's a human asking for a specific window,
-which takes priority over the escalation history the way any explicit request does.
-
-**Diagnostic gap (known, tracked):** `stalled_models` is scoped to the models a task's
-recorded runs actually attempted (`record_run`'s `models=`), which on the normal
-board/failover dispatch path only ever contains the SEATS THAT SURVIVED — a chronically-
-cooling seat that a reserve successfully backfilled never appears there, so the
-diagnostic stays silent in exactly the case (a stuck seat masked by working failover)
-it exists to surface. Tracked as
-[review-cli#227](https://github.com/alex-mextner/review-cli/issues/227).
-
-**Scope gap (known, tracked):** the FULL check/record/clear trio — including the
-administrative-sentinel/quota-marker body detection that decides a call is
-chronically-unavailable in the first place — is wired into only the two claude
-dispatch paths (`review_with_images`, `review_claude` in `backends.py`).
-`review_opencode` (review-cli#235) additionally consults + records + clears this same
-store, but ONLY for its own narrower TRUE-SILENCE failure mode (see the next section):
-a seat that never produces a single byte of output within `REVIEW_TRUE_SILENCE_SECONDS`
-is reaped and cooled down the same way a chronically-unavailable claude seat is.
-`review_opencode`'s success path now ALSO reuses the SAME shared chronic-unavailable/
-quota-marker body detector `review_claude`'s clear-gate uses (`_chronic_unavailable_reason`
-— not actually claude-specific in implementation, it just wasn't wired into any other
-call site before this) — a rc=0 body matching one of those known marker phrases is
-recorded as a chronic failure rather than wrongly clearing true-silence escalation
-history. This narrows, but does not fully close, the gap: an opencode-specific quota
-wording that matches NONE of the shared marker phrases is treated as a genuine success
-and DOES clear the cooldown (any non-empty rc=0 body defaults to "recovered" unless it
-matches a known chronic sentinel) — the same behavior `review_claude`'s identical
-sibling pattern has always had for an unrecognised claude quota wording, not a new gap
-this feature introduces. `review_codex` and the `commandcode:`/`zai:` HTTP backends
-have no cooldown consult/record/clear at all. Extending the full trio (including
-genuinely opencode-specific body detection, so an unrecognised wording is correctly
-classified as chronic rather than defaulting to "success") to the non-claude backends
-is tracked as [review-cli#226](https://github.com/alex-mextner/review-cli/issues/226),
-not done here.
-
-**Pool/spawn consults live `harness limits` 5-hour and 7-day windows.** Board composition and Claude dispatch skip a family whose more-restrictive 5-hour or 7-day window is already at 100% (`harness limits --all --json`, falling back to tg-ctl samples when harness has no card for that family). This is not a concurrent-agent cap; `$REVIEW_MAX_CONCURRENCY` remains the memory semaphore below.
-
-**Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
-model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
-or a cascade of reserve backfills can fan out into enough concurrent agent subprocesses to
-**OOM-kill** a seat mid-review under load. A process-wide cap bounds how many heavy backend
-subprocesses run at once (default **4**, overridable via `$REVIEW_MAX_CONCURRENCY`; `<= 0`
-disables it, and a value above **64** is clamped to that ceiling so a typo can't pin an
-absurd number of children). A seat over the cap simply **waits** for a slot — it is never dropped, and its
-per-call timeout starts only once it actually spawns, so queueing on the cap can't falsely
-time it out. The common single-seat gate (`--pool 1`) and the default (light) pool of 2 are
-unaffected (both `<=` the cap). This is a *per-process* cap; a swarm of separate `review`
-processes also leans on the per-seat timeout (a stalled seat frees its slot fast) and on the
-slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort reserve** (review-cli#65).
-
-**To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
-`reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
-highest priority. The role lens you attach to each model is independent of its priority.
-
-The GLM seat uses **his z.ai subscription** (`glm-5.2`, the newest GLM) through opencode's
-`zai` provider, so it reviews agentically — not the diff-only z.ai REST call. It needs that
-provider configured in opencode (see Auth); the other `oc:commandcode/…` seats reach the
-commandcode gateway the same way. opencode must be installed for the agentic seats; without
-it they fall back to the reserve.
-
-```bash
-review --show-board        # active default preset board (light); add --preset heavy to show Sol (Fable excluded)
-export REVIEW_TASK_CODE=HYP-742
-review diff                # recorded `--task` (via REVIEW_TASK_CODE): light floored to 3 roles
-review diff --pool 0       # run all available light-preset seats
-review diff --preset default --pool 0  # run all 11 default-preset built-in seats (Fable/Sol excluded)
-review diff --preset heavy --pool 0  # run all 12 heavy-preset built-in seats (Fable excluded)
-review diff --pool 2       # explicit --pool 2 still wins (warns under --task: below ship floor 3)
-review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
-review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
-review diff -m grok        # with --task: pad grok across 3 roles; without --task / multi -m: exact
-```
-
-### Board vs. models precedence
-
-The diff-review board is always the failover mechanism unless you pass exact CLI models
-without any configured `models:`/`board:` metadata.
-Precedence:
-
-```
-explicit -m requested models   >   explicit --preset   >   `models:` priority roster   >
-configured `board:`   >   default preset (light)
-```
-
-- A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
-  the first available models fill the live pool, and lower-priority models are reserve
-  backfill. It does not disable board/failover.
-- Explicit `-m` on the CLI never lets config add extra seats. With no configured
-  `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
-  the configured board metadata to only the requested models. The board can otherwise
-  never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 2 for a bare unrecorded `review diff` — the light preset, Alex 2026-08-28 —
-  or 4 if you pass `--preset default`; a recorded `--task` run floors light to 3 distinct
-  roles so `review task CODE --check` / gh ship can pass from one run; `--pool 0` runs all
-  available seats in the selected preset/board (recorded `--task --pool 0` still pads a
-  same-role config roster to the ship floor); `--preset heavy --pool 0` currently covers
-  all 12 heavy-preset built-ins — Fable is excluded from every preset, see "Reviewer board"
-  above). `--pool` does not reduce an explicit multi-model `-m` list: every requested `-m`
-  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles (review, just-ask, quorum, and brainstorm).
-- An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
-  roster — the configured/default board applies.
-
-Override the board itself in `config.yaml` with a `board:` list — each entry is a
-`{model, role}` mapping (optional `name:` for the label, optional `effort:` for the
-seat's reasoning-effort hint). Supported effort values are `minimal`, `low`, `medium`,
-`high`, `xhigh`, and `max`; `xhigh` and `max` mean "highest" in prompts. Native backend
-settings are normalized to the closest supported value where the provider exposes one.
-When `models:` is present,
-`board:` supplies role/name/effort metadata for matching models; priority still comes from
-`models:`. When `models:` is absent, `board:` is the full priority-ordered board.
-An entry is checked model/capability FIRST: one with no usable `model:` or resolvable
-`capability:` is skipped with a warning (the valid entries are kept) and its `role:` is
-never inspected. Only an entry that DOES resolve to a real seat then has its `role:`
-validated: an unknown value (not a key in the built-in role list) is a hard error naming
-the bad value and the valid roles (review-cli#422) — fix the typo, or omit `role:` to use
-the generic prompt intentionally. With **no**
-`models:` or `board:` configured, the CLI uses the default preset (light as of
-2026-08-28); `--preset default` uses the same 13 seats at high effort, and `--preset
-heavy` uses the 14-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
-excluded, see "Reviewer board" above) — the raw 15-seat board (including last-resort
-Fable) is only reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the
-seats you want; an absent or empty `board:`/`models:` falls back to the same 13-seat
-`LIGHT_PRESET_BOARD` (no Fable, no Sol; same model order as `DEFAULT_PRESET_BOARD`, at
-medium instead of high effort) that the default preset now resolves to. A
-`board:` that is **present but has no usable entry at all** is a hard error (non-zero
-exit) — it never silently falls back to the paid default board.
-
-```yaml
-# Priority order: the first 4 reachable models are the live pool; the rest are the
-# reserve that backfills a skipped/failed seat.
-board:
-  - { model: "claude:claude-fable-5",  role: architect, effort: xhigh }
-  - { model: "claude:claude-opus-4-8", role: correctness, effort: high }
-  - { model: "codex:gpt-6-astra",      role: consistency, name: Astra, effort: high }
-  # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
-  # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
-  # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
-  - { model: "oc:commandcode/moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
-  - { model: "oc:zai/glm-5.2",         role: quality }
-  - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
-```
-
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 13). Add
-either to your `board:` list for an extra 1M-context resilience / holistic-senior
-pass; both run agentically through opencode's commandcode provider (needs opencode +
-`opencode auth login`, like the default `oc:` seats):
-
-```yaml
-board:
-  # ... the 13 built-in seats ...
-  - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
-  - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
-```
-
-Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
-`security`, `tests`, `contracts`.
+**Per-project lens overrides (review-cli#547):** drop `.review/lenses/<role>.md` at
+your repo's root (`<role>` is one of the known roles above) to teach a board role
+something specific to your codebase — a payments invariant, a house style rule —
+without forking or patching review-cli. The file's text is **appended** to that
+role's built-in lens (never replaces it), so the seat keeps the built-in coverage
+plus your addition; an absent, unreadable, or blank/whitespace-only file is treated
+as no override, and a symlink at the override path or an intermediate `.review`/
+`.review/lenses` directory that escapes the repo root is never followed (also treated
+as absent). An **oversized** file is not rejected the same way: it is silently
+truncated to the first 8 KiB (`LENS_OVERRIDE_MAX_BYTES`) and the truncated text still
+becomes the seat's active override — so a repo that never adds this directory behaves
+exactly as before, but a project author who exceeds 8 KiB gets a quietly truncated
+lens, not a rejected one.
+`review --show-board` marks any seat whose role has an active override with a
+`(lens overridden: .review/lenses/<role>.md)` suffix. (A bigger docs reorg is
+tracked separately in review-cli#552 and will eventually move this into
+`docs/board.md`.)
 
 ---
 
@@ -1779,7 +1205,8 @@ tightened `REVIEW_IDLE_TIMEOUT_SECONDS` below 5 minutes will see the OPPOSITE �
 seat now waits the full true-silence timeout instead of the operator's shorter idle
 window (review-cli#254). Tune `REVIEW_TRUE_SILENCE_SECONDS` directly if this matters for
 your setup. This only applies pre-first-byte and only to opencode seats today; see the
-seat-cooldown section above. Either reap lets reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
+cross-invocation cooldown section in [docs/board.md](docs/board.md). Either reap lets
+reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
 `board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
 
 **Grok board reviewer (agentic, via opencode's native `xai` provider):** `oc:xai/grok-4.6`
@@ -1818,8 +1245,8 @@ subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
 `--timeout` instead (and also disables the true-silence check below, since it runs inside
 the same idle-mode wait path). It does not change REST HTTP timeouts, QA wall-clock caps,
 or vision wall-clock caps. `REVIEW_TRUE_SILENCE_SECONDS=N` overrides how long an opencode
-seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See the
-seat-cooldown section above for the full contract.
+seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See
+[docs/board.md](docs/board.md) for the full seat-cooldown contract.
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or
@@ -1992,11 +1419,11 @@ comparison, and for where the rest of the field fits.
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
-- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
-- **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[tg-cli](https://git.hyperide.ai/ultrabricks/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
+- **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
+- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.

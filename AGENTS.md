@@ -1,6 +1,12 @@
 # AGENTS.md — review-cli
 
-Agent-facing notes for working IN this repo. (User-facing docs live in `README.md`.)
+Docs live across three surfaces, each with a distinct job: `README.md` is onboarding
+/ quickstart / why-this-tool; `review help <topic>` is the live CLI contract (exact
+flags, env vars, behavior — checked by `tests/test_topic_help.py`, so it can't drift
+the way prose can); `docs/*.md` is long-form reference/history extracted out of
+README as README shrinks (so far just `docs/compare-revmux.md` — more
+README-extraction pages land as ticket #552's later PRs merge; other `docs/*.md`
+files may exist for unrelated purposes, e.g. design specs).
 
 ## What this is
 
@@ -159,7 +165,7 @@ stays accurate.
 ### `install-commit-hook` delegates to `rig apply` when rig is present
 
 `install_commit_hook` writes a GLOBAL git pre-commit hook (`core.hooksPath`). When
-[rig](https://github.com/alex-mextner/rig-cli) is also on the machine, its
+[rig](https://git.hyperide.ai/ultrabricks/rig-cli) is also on the machine, its
 `git_hooks.dispatcher` provisions the SAME mechanism as one stage of its composed pre-commit
 (`agent-tools/git-hooks/global-dispatcher/hooks/review-gate` — ported verbatim from this
 command) — two tools writing `core.hooksPath` is the exact double-write the shared

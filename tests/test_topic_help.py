@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib import cli  # noqa: E402
 from reviewlib.config import CONFIG_PATH  # noqa: E402
+from reviewlib.stats import STATS_VERSION  # noqa: E402
 
 
 def _run(argv: list[str]) -> tuple[int, str, str]:
@@ -76,6 +77,33 @@ def test_help_config_prints_the_config_reference():
     assert "{model, role, name," in out and "effort} entries" in out, out
     assert "minimal/low/medium/high/xhigh/max" in out, out
     assert "{model, role, display}" not in out, out
+
+
+def test_main_help_lists_runtime_topic():
+    help_text = cli._build_top_level_parser().format_help()
+    assert "review help runtime" in help_text, help_text
+
+
+def test_help_runtime_prints_the_runtime_reference():
+    rc, out, _ = _run(["help", "runtime"])
+    assert rc == 0, rc
+    # Names the run-stats JSONL store + the danger of a short external timeout + the
+    # exact printed ETA line format (review-cli#552 PR1: moved out of README's Quorum
+    # section into this live, test-checked topic).
+    assert "run-stats.jsonl" in out, out
+    assert "short shell `timeout`" in out, out
+    assert "typically ~6m12s based on 12 past runs of this size" in out, out
+    assert "$REVIEW_STATS_FILE" in out, out
+    assert "(mode, pool_size)" in out, out
+
+
+def test_help_runtime_schema_version_matches_stats():
+    """The topic's stated run-stats schema version must track `stats.STATS_VERSION`
+    directly rather than a hand-copied literal, so a future version bump can't leave
+    stale text behind a passing test (the AGENTS.md "can't drift" claim)."""
+    rc, out, _ = _run(["help", "runtime"])
+    assert rc == 0, rc
+    assert f"currently v: {STATS_VERSION}" in out, out
 
 
 def test_help_config_alias_via_dashdash_help():

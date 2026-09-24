@@ -1818,7 +1818,7 @@ def test_log_dir_fingerprint_total_size_reflects_only_the_windowed_subset():
 
 
 # --- follow-up to review-cli#151 / review-cli#447: listing cache + 7-day parse window
-# PR https://github.com/alex-mextner/review-cli/pull/426 skipped `.stat()` for old files but
+# PR https://git.hyperide.ai/ultrabricks/review-cli/pulls/426 skipped `.stat()` for old files but
 # every fingerprint/SSE still scandirs all names, and `load_sessions` still parses every
 # artifact. These tests pin the remaining O(corpus) costs: a dir-mtime-gated name-list
 # cache (listing cache ≠ TTL debounce) and a `review stat --days`-matching parse window.
