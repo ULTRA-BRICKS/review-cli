@@ -3,6 +3,35 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.37.12 — 2026-09-24
+
+- **Feat(board): checked-in per-project lens overrides via `.review/lenses/<role>.md`
+  (review-cli#547).** The revmux `.revmux/` pattern applied to review-cli's board: a
+  project can now drop `.review/lenses/<role>.md` (role = any `REVIEW_ROLES` key) at its
+  repo root to teach a board role something specific to its own codebase (a payments
+  invariant, a house style rule) without forking/patching `reviewlib/config.py`. New
+  `BoardReviewer.resolved_lens(cwd)` (config.py) reads the file relative to the reviewed
+  repo's root and, when present and non-blank, APPENDS it after the role's built-in
+  `REVIEW_ROLES` lens — extension, never silent replacement, so an override can never
+  accidentally drop the built-in coverage the board was designed around. A
+  missing/unreadable/blank-after-strip file all resolve to "no override" (never a crash);
+  blank-means-absent is the deliberate safer default so an accidentally-emptied file falls
+  back to the full built-in lens rather than a silent no-op. `panel.build_board_job` (and
+  `build_board_jobs`) now take an optional `cwd` and call `resolved_lens` instead of the
+  bare `role_lens`; `run_board_with_failover` (the real diff-review dispatch path) and
+  `mode_just_ask`'s task-role-padded path both thread their own `cwd` through, so a repo
+  with no `.review/lenses/` at all dispatches byte-identical prompts to before this
+  change. `review --show-board` now suffixes any seat whose role has an active override
+  with `(lens overridden: .review/lenses/<role>.md)` and prints a summary footer line
+  naming every overridden role. Hardened against a self-review finding: the override read
+  refuses a symlink anywhere in `.review/lenses/<role>.md`'s path (`Path.resolve()` +
+  `is_relative_to(cwd)`, plus `O_NOFOLLOW`/`O_NONBLOCK` on the open) so a git-tracked
+  symlink pointing outside the repo can't have review-cli's own process read an arbitrary
+  host file and ship it to every matching seat — including diff-only HTTP backends that
+  otherwise have no filesystem access at all — and caps the read at
+  `LENS_OVERRIDE_MAX_BYTES` (8 KiB) so neither a FIFO nor a pathologically large file can
+  hang or `MemoryError` the process.
+
 ## 0.37.11 — 2026-09-18
 
 - **Fix(config): board composition rejects an unrecognized `role:` string instead of

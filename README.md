@@ -1134,6 +1134,24 @@ reserve-replace, the cross-invocation cooldown's escalating window, Claude accou
 across multiple accounts, the memory-aware concurrency cap, and how `board:`/`models:` config
 precedence resolves.
 
+**Per-project lens overrides (review-cli#547):** drop `.review/lenses/<role>.md` at
+your repo's root (`<role>` is one of the known roles above) to teach a board role
+something specific to your codebase — a payments invariant, a house style rule —
+without forking or patching review-cli. The file's text is **appended** to that
+role's built-in lens (never replaces it), so the seat keeps the built-in coverage
+plus your addition; an absent, unreadable, or blank/whitespace-only file is treated
+as no override, and a symlink at the override path or an intermediate `.review`/
+`.review/lenses` directory that escapes the repo root is never followed (also treated
+as absent). An **oversized** file is not rejected the same way: it is silently
+truncated to the first 8 KiB (`LENS_OVERRIDE_MAX_BYTES`) and the truncated text still
+becomes the seat's active override — so a repo that never adds this directory behaves
+exactly as before, but a project author who exceeds 8 KiB gets a quietly truncated
+lens, not a rejected one.
+`review --show-board` marks any seat whose role has an active override with a
+`(lens overridden: .review/lenses/<role>.md)` suffix. (A bigger docs reorg is
+tracked separately in review-cli#552 and will eventually move this into
+`docs/board.md`.)
+
 ---
 
 ## Auth

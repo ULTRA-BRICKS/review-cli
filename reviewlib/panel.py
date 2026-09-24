@@ -452,13 +452,21 @@ def build_board_job(
     base_prompt: str,
     diff: str,
     images: tuple[Path, ...] = (),
+    cwd: Path | None = None,
 ) -> PanelJob:
     """One role-lensed PanelJob for a reviewer (no availability check).
 
-    The prompt is `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone
+    The prompt is `base_prompt + "\\n\\n" + resolved_lens` (the generic prompt alone
     when the role is unknown / blank) and the label is
-    `"<display> [<role>]"` so the result block shows who reviewed with which lens."""
-    lens = reviewer.role_lens
+    `"<display> [<role>]"` so the result block shows who reviewed with which lens.
+
+    `cwd`, when given, is the REVIEWED repo's root, passed straight through to
+    `BoardReviewer.resolved_lens` so a checked-in `.review/lenses/<role>.md`
+    (review-cli#547) extends this seat's built-in lens text. Defaulting to None keeps
+    every existing caller (a diff-only just-ask seat, a test with no real repo) exactly
+    byte-identical to the pre-#547 `role_lens`-only prompt -- `resolved_lens(None)`
+    short-circuits to `role_lens` in `lens_override_text` (no `cwd` -> no lookup)."""
+    lens = reviewer.resolved_lens(cwd)
     parts = [base_prompt]
     if lens:
         parts.append(lens)
@@ -479,22 +487,24 @@ def build_board_jobs(
     base_prompt: str,
     diff: str,
     images: tuple[Path, ...] = (),
+    cwd: Path | None = None,
 ) -> tuple[list[PanelJob], list[BoardReviewer]]:
     """Turn a reviewer board into PanelJobs, skipping unavailable reviewers.
 
-    Each reachable reviewer becomes one PanelJob (see build_board_job). A reviewer
-    whose backend isn't available (no key / no CLI) is SKIPPED — `backend_available`
-    is the same cheap probe the moderator selection uses — and returned in the second
-    tuple element so the caller can log the degradation. The board never crashes on a
-    dead backend; it just shrinks. Returns ([], skipped) when nothing is reachable;
-    the caller decides how to surface that."""
+    Each reachable reviewer becomes one PanelJob (see build_board_job); `cwd` is
+    forwarded to each so a project's `.review/lenses/<role>.md` override (review-cli#547)
+    applies here too. A reviewer whose backend isn't available (no key / no CLI) is
+    SKIPPED — `backend_available` is the same cheap probe the moderator selection uses —
+    and returned in the second tuple element so the caller can log the degradation. The
+    board never crashes on a dead backend; it just shrinks. Returns ([], skipped) when
+    nothing is reachable; the caller decides how to surface that."""
     jobs: list[PanelJob] = []
     skipped: list[BoardReviewer] = []
     for reviewer in board:
         if not backend_available(reviewer.model):
             skipped.append(reviewer)
             continue
-        jobs.append(build_board_job(reviewer, base_prompt, diff, images))
+        jobs.append(build_board_job(reviewer, base_prompt, diff, images, cwd=cwd))
     return jobs, skipped
 
 
@@ -581,7 +591,9 @@ def run_board_with_failover(
     try:
         current = list(pool)
         while current:
-            jobs = [build_board_job(r, base_prompt, diff, images) for r in current]
+            jobs = [
+                build_board_job(r, base_prompt, diff, images, cwd=cwd) for r in current
+            ]
             # In-seat retry FIRST: each seat retries the SAME model on a TRANSIENT failure
             # (429/529/5xx/timeout/overloaded) with backoff+jitter, before we fall to the
             # reserve below. A SEAT-FATAL failure (auth/bad-model/501/refusal) skips the

@@ -55,6 +55,7 @@ from reviewlib.config import (  # noqa: E402
     _agentic,
     _split_models,
     board_from_models,
+    lens_override_text,
     load_board,
     preset_board,
     select_pool,
@@ -1741,6 +1742,194 @@ def test_roles_are_non_overlapping_focus_sentences():
     assert len(set(focuses.values())) == len(REVIEW_ROLES), focuses
 
 
+# === per-project lens overrides (review-cli#547, .review/lenses/<role>.md) =======
+def test_resolved_lens_with_no_cwd_matches_role_lens_byte_for_byte():
+    """No `cwd` (the pre-#547 call shape, e.g. a diff-only just-ask seat) must resolve
+    BYTE-IDENTICAL to the old `role_lens` -- absence of repo context is absence of
+    override, never a crash."""
+    for role in REVIEW_ROLES:
+        reviewer = BoardReviewer("codex", role, "Codex")
+        assert reviewer.resolved_lens() == reviewer.role_lens == REVIEW_ROLES[role]
+        assert reviewer.resolved_lens(None) == reviewer.role_lens
+
+
+def test_resolved_lens_with_no_override_file_matches_role_lens_byte_for_byte():
+    """A repo with NO `.review/lenses/` at all must behave exactly as before this
+    feature -- acceptance criterion 2 of review-cli#547."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        for role in REVIEW_ROLES:
+            reviewer = BoardReviewer("codex", role, "Codex")
+            assert reviewer.resolved_lens(cwd) == reviewer.role_lens
+        assert lens_override_text("security", cwd) == ""
+
+
+def test_resolved_lens_extends_not_replaces_the_builtin_lens():
+    """An override file's text is APPENDED after the built-in lens (never silently
+    replacing it) -- acceptance criterion 1 of review-cli#547, extension over
+    replacement is the deliberate, documented safer default (see
+    `lens_override_text`'s docstring)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        (lenses / "security.md").write_text(
+            "Also check: our payments ledger must never go negative.\n"
+        )
+        reviewer = BoardReviewer("codex", "security", "Codex")
+        resolved = reviewer.resolved_lens(cwd)
+        assert resolved.startswith(REVIEW_ROLES["security"])
+        assert "payments ledger must never go negative" in resolved
+        assert resolved != REVIEW_ROLES["security"]
+        # A DIFFERENT role's board seat in the SAME repo is untouched.
+        other = BoardReviewer("codex", "correctness", "Codex")
+        assert other.resolved_lens(cwd) == REVIEW_ROLES["correctness"]
+
+
+def test_lens_override_blank_file_counts_as_no_override():
+    """An empty or whitespace-only override file is treated as ABSENT (the safer
+    default, documented on `lens_override_text`) -- the seat keeps the full built-in
+    lens rather than silently reviewing with a truncated/empty one."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        for blank in ("", "   ", "\n\n  \n"):
+            (lenses / "correctness.md").write_text(blank)
+            assert lens_override_text("correctness", cwd) == ""
+            reviewer = BoardReviewer("codex", "correctness", "Codex")
+            assert reviewer.resolved_lens(cwd) == REVIEW_ROLES["correctness"]
+
+
+def test_lens_override_unknown_role_and_missing_cwd_never_crash():
+    """`lens_override_text` never raises: an unknown/typo'd role, a `cwd=None`, and a
+    path that exists but is a DIRECTORY (not a file, so `.read_text()` raises
+    `IsADirectoryError`, an `OSError` subclass) all collapse to "" rather than
+    propagating -- a malformed override must never break a review."""
+    import tempfile
+
+    assert lens_override_text("not-a-real-role", None) == ""
+    assert lens_override_text("", None) == ""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        assert lens_override_text("security", cwd) == ""  # no .review/ at all
+        # A directory sitting where the override FILE should be (a plausible mistake --
+        # `mkdir security.md` instead of writing a file) must not crash either.
+        bogus = cwd / ".review" / "lenses" / "security.md"
+        bogus.mkdir(parents=True)
+        assert lens_override_text("security", cwd) == ""
+
+
+def test_lens_override_refuses_a_leaf_symlink_escaping_the_repo():
+    """Security review finding (review-cli#547): a git-tracked symlink AT the override
+    path pointing OUTSIDE the reviewed repo (e.g. `.review/lenses/security.md ->
+    ~/.ssh/id_rsa`) must never be followed -- `Path.read_text()` follows symlinks
+    unconditionally, which would have review-cli's own process read an arbitrary host
+    file and ship its bytes to every matching seat's prompt, including diff-only HTTP
+    backends that otherwise have NO filesystem access at all."""
+    import tempfile
+
+    with (
+        tempfile.TemporaryDirectory() as outside,
+        tempfile.TemporaryDirectory() as repo,
+    ):
+        secret = Path(outside) / "secret.txt"
+        secret.write_text("SUPER_SECRET_API_KEY=xyz\n")
+        cwd = Path(repo)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        (lenses / "security.md").symlink_to(secret)
+        assert lens_override_text("security", cwd) == ""
+        reviewer = BoardReviewer("codex", "security", "Codex")
+        assert reviewer.resolved_lens(cwd) == REVIEW_ROLES["security"]
+
+
+def test_lens_override_refuses_an_intermediate_directory_symlink_escaping_the_repo():
+    """Same exfiltration class as the leaf-symlink case, one level up: `.review/lenses`
+    (or `.review` itself) checked in as a symlink to an OUTSIDE directory must not let
+    an override "inside" that directory be read either -- `os.open(..., O_NOFOLLOW)`
+    alone only refuses a symlinked LEAF, so this is covered by the separate
+    `Path.resolve() -> is_relative_to(cwd)` containment check."""
+    import tempfile
+
+    with (
+        tempfile.TemporaryDirectory() as outside,
+        tempfile.TemporaryDirectory() as repo,
+    ):
+        (Path(outside) / "security.md").write_text("Also check: leaked secret.\n")
+        cwd = Path(repo)
+        review_dir = cwd / ".review"
+        review_dir.mkdir()
+        (review_dir / "lenses").symlink_to(outside, target_is_directory=True)
+        assert lens_override_text("security", cwd) == ""
+
+
+def test_lens_override_rejects_a_fifo_without_hanging():
+    """A FIFO planted at the override path (not a symlink, so `O_NOFOLLOW` alone
+    wouldn't stop it) must be rejected via `O_NONBLOCK` + `S_ISREG` rather than hang a
+    blocking open forever -- the same class of bug `jobs.py`'s
+    `_read_fallback_pointer` already guards against for a comparable predictable
+    path. This test itself would hang were the guard missing, so its own PASS is the
+    proof."""
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        os.mkfifo(lenses / "security.md")
+        assert lens_override_text("security", cwd) == ""
+
+
+def test_lens_override_caps_read_size_instead_of_loading_the_whole_file():
+    """A pathologically large override file must never be loaded whole (`MemoryError`
+    is not an `OSError`, so an uncapped `read_text()` would violate this function's own
+    never-crash contract) -- content beyond `LENS_OVERRIDE_MAX_BYTES` is silently
+    truncated, never rejected outright (a project override is a short addendum, not a
+    payload-sized document)."""
+    import tempfile
+
+    from reviewlib.config import LENS_OVERRIDE_MAX_BYTES
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        (lenses / "security.md").write_text("A" * (LENS_OVERRIDE_MAX_BYTES * 3))
+        result = lens_override_text("security", cwd)
+        assert 0 < len(result) <= LENS_OVERRIDE_MAX_BYTES, len(result)
+
+
+def test_build_board_job_prompt_carries_project_lens_override():
+    """`panel.build_board_job` is the function `panel.py` actually calls to assemble a
+    dispatched seat's prompt (review-cli#547's real integration point) -- prove the
+    override reaches the FINAL prompt, not just the config-layer helper."""
+    import tempfile
+
+    from reviewlib.panel import build_board_job
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        (lenses / "tests.md").write_text(
+            "Also check: golden-file fixtures are updated."
+        )
+        reviewer = BoardReviewer("codex", "tests", "Codex")
+        job_with_override = build_board_job(reviewer, DEFAULT_PROMPT, "+x", cwd=cwd)
+        job_without = build_board_job(reviewer, DEFAULT_PROMPT, "+x")
+        assert "golden-file fixtures are updated" in job_with_override.prompt
+        assert "golden-file fixtures are updated" not in job_without.prompt
+        assert job_without.prompt == f"{DEFAULT_PROMPT}\n\n{REVIEW_ROLES['tests']}"
+
+
 # === config.yaml board parsing ==================================================
 def test_no_board_key_falls_back_to_default():
     assert [r.model for r in load_board({})] == [r.model for r in DEFAULT_PRESET_BOARD]
@@ -3267,11 +3456,14 @@ def _show_board_lines(
     *,
     preset: str | None = None,
     explicit_models: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> list[str]:
     """Run cli._show_board(config, pool_size) and return its stdout lines. When
     board_models is given, a config `board:` of those models is used (each role tests).
     `available` forces the availability probe to a fixed set (None = all available) so
-    the tag split is deterministic + offline."""
+    the tag split is deterministic + offline. `cwd`, when given, is the reviewed repo
+    root to resolve `.review/lenses/<role>.md` project overrides against (review-cli#547);
+    omitted, `_show_board` resolves its own `Path.cwd()`."""
     import contextlib
     import io
 
@@ -3288,7 +3480,11 @@ def _show_board_lines(
     try:
         with contextlib.redirect_stdout(buf):
             rc = cli._show_board(
-                cfg, pool_size, preset=preset, explicit_models=explicit_models
+                cfg,
+                pool_size,
+                cwd,
+                preset=preset,
+                explicit_models=explicit_models,
             )
     finally:
         backends.backend_available = old_avail
@@ -3455,6 +3651,58 @@ def test_show_board_tags_by_seat_not_model_for_duplicate_models():
     assert "[pool" in seat_lines[0]
     assert "[reserve]" in seat_lines[1], seat_lines[1]  # the duplicate codex, by seat
     assert "[reserve]" in seat_lines[2]
+
+
+def test_show_board_marks_seat_with_active_project_lens_override():
+    """review-cli#547 acceptance criterion 3: `--show-board` must show when a seat's
+    lens has been overridden by a project file. Only the seat(s) whose ROLE has an
+    active `.review/lenses/<role>.md` are annotated; every other seat is untouched."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        lenses = cwd / ".review" / "lenses"
+        lenses.mkdir(parents=True)
+        (lenses / "correctness.md").write_text("Also check: our house style rule.")
+        lines = _show_board_lines(2, board_models=["codex", "gemini"], cwd=cwd)
+    role_lines = [ln for ln in lines if "[pool" in ln or "[reserve]" in ln]
+    # board_models seats are all tagged role="tests" by the _show_board_lines helper,
+    # so with a correctness.md override present NEITHER seat here is annotated.
+    assert role_lines, lines
+    assert not any("lens overridden" in ln for ln in role_lines), lines
+    footer = "\n".join(lines)
+    assert "Project lens overrides active" not in footer, footer
+
+    with tempfile.TemporaryDirectory() as tmp2:
+        cwd2 = Path(tmp2)
+        lenses2 = cwd2 / ".review" / "lenses"
+        lenses2.mkdir(parents=True)
+        (lenses2 / "tests.md").write_text("Also check: our house style rule.")
+        lines2 = _show_board_lines(2, board_models=["codex", "gemini"], cwd=cwd2)
+    seat_lines2 = [ln for ln in lines2 if "[pool" in ln or "[reserve]" in ln]
+    assert len(seat_lines2) == 2
+    assert all(
+        "lens overridden: .review/lenses/tests.md" in ln for ln in seat_lines2
+    ), lines2
+    assert any("Project lens overrides active" in ln for ln in lines2), lines2
+
+
+def test_show_board_with_no_override_files_matches_pre_547_output():
+    """review-cli#547 acceptance criterion 2: a repo with no `.review/lenses/` at all
+    must print BYTE-IDENTICAL `--show-board` output to a repo where that directory was
+    never introduced as a concept -- proven by comparing two independent empty repos."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        lines_a = _show_board_lines(
+            2, board_models=["codex", "gemini"], cwd=Path(tmp_a)
+        )
+        lines_b = _show_board_lines(
+            2, board_models=["codex", "gemini"], cwd=Path(tmp_b)
+        )
+    assert lines_a == lines_b
+    assert not any("lens overridden" in ln for ln in lines_a)
+    assert not any("Project lens overrides active" in ln for ln in lines_a)
 
 
 def test_show_board_uses_config_models_as_priority_roster():

@@ -8,6 +8,8 @@ DEFAULT_MODELS panel is untouched.
 
 from __future__ import annotations
 
+import os
+import stat
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -309,6 +311,115 @@ REVIEW_ROLES = {
 }
 
 
+# Per-project lens overrides (review-cli#547): the revmux `.revmux/` pattern applied to
+# review-cli's board. A project can check in `.review/lenses/<role>.md` (role = one of
+# the REVIEW_ROLES keys above) to teach the board something specific to ITS codebase (a
+# payments invariant, a house style rule) without forking/patching this file. The
+# override is resolved relative to the REVIEWED repo's root -- the `cwd` a board
+# dispatch already carries (see `panel.build_board_job` / `run_board_with_failover`),
+# NOT review-cli's own installation directory.
+LENS_OVERRIDE_SUBDIR = Path(".review") / "lenses"
+# A project override is meant to be a short addendum (a house rule, an invariant
+# reminder), not a document -- capped well under the diff dispatch cap
+# (`backends.DIFF_MAX_BYTES_DEFAULT`, 300_000) so a pathologically large file at this
+# path can never balloon into a huge chunk of every matching seat's prompt.
+LENS_OVERRIDE_MAX_BYTES = 8_192
+
+
+def lens_override_path(role: str, cwd: Path) -> Path:
+    """The checked-in override file a project can drop for `role` under `cwd` (the
+    reviewed repo's root). Pure path arithmetic -- existence is NOT checked here, so a
+    caller that only wants to LABEL a path (e.g. `--show-board`) doesn't pay for a read
+    it isn't going to use."""
+    return cwd / LENS_OVERRIDE_SUBDIR / f"{role}.md"
+
+
+def lens_override_text(role: str, cwd: Path | None) -> str:
+    """Read a project's checked-in lens-override file for `role`, or "" when there is
+    none to apply.
+
+    Every failure mode below collapses to "" by design, all silent/never-crashing -- a
+    malformed or hostile override must never break a review the way a real
+    `BoardConfigError` does; this is optional per-project seasoning, not board config:
+      * `cwd` is None (no repo context to resolve a project-relative path against, e.g.
+        a diff-only seat built with no real reviewed repo) or `role` isn't a real
+        REVIEW_ROLES key (an unknown/typo'd role has no built-in lens to extend either
+        -- see `BoardReviewer.role_lens`);
+      * the file doesn't exist, isn't readable, or isn't valid UTF-8 (a typo'd override
+        file is not a review-cli crash);
+      * the resolved path escapes `cwd` -- either the leaf file itself is a SYMLINK, or
+        an intermediate component (`.review` or `.review/lenses`) is (review-cli#547
+        security review finding). `Path.read_text()` follows symlinks unconditionally;
+        a git-tracked symlink at this exact path pointing OUTSIDE the repo (e.g.
+        `.review/lenses/security.md -> ~/.ssh/id_rsa` or `../../.aws/credentials`)
+        would have THIS PROCESS (not a sandboxed agentic seat) read an arbitrary host
+        file and ship its bytes to every seat with that role -- including diff-only
+        HTTP backends (gemini/commandcode/zai) that otherwise have NO filesystem access
+        at all, a brand-new exfiltration channel a cloned repo should never get. Checked
+        with `Path.resolve()` + `is_relative_to(cwd.resolve())` up front (catches an
+        escaping symlink ANYWHERE in the path, not just the leaf), and the leaf is then
+        opened with `O_NOFOLLOW` (belt-and-suspenders against a TOCTOU swap between the
+        resolve check and the open) and `O_NONBLOCK` (a FIFO planted at this path would
+        otherwise hang a blocking open forever) -- the same pattern `jobs.py`'s
+        `_read_fallback_pointer` already uses for a locally predictable path; `S_ISREG`
+        rejects anything that slips through as a directory/device/socket;
+      * the file is LARGER than `LENS_OVERRIDE_MAX_BYTES` -- read is capped at the
+        limit (never loaded whole; `MemoryError` on a pathological file is not an
+        `OSError` and would otherwise violate this function's own never-crash
+        contract), and the content is silently truncated to that many bytes rather
+        than rejected outright (a project override is a short addendum, not a
+        payload-sized document, so truncation is the safe conservative behavior, not a
+        rejection a project author would need to debug);
+      * the file's content is EMPTY or whitespace-only after stripping. Blank-means-
+        "no override" (not "override with an empty string") is the safer default here,
+        matching how most config-override patterns treat a blank value -- this helper is
+        EXTEND-only (see `BoardReviewer.resolved_lens`), so there is no way to write an
+        override that deliberately SUPPRESSES the built-in lens; an accidentally-emptied
+        file falling back to "no override" (full built-in lens) is strictly safer than
+        treating it as "override with nothing," which would look identical to a no-op
+        and give the project author no signal that their file stopped doing anything."""
+    if cwd is None or not role or role not in REVIEW_ROLES:
+        return ""
+    path = lens_override_path(role, cwd)
+    try:
+        resolved_cwd = cwd.resolve()
+        if not path.resolve(strict=False).is_relative_to(resolved_cwd):
+            return ""
+    except OSError:
+        return ""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    try:
+        # `os.fdopen` takes ownership of `fd` immediately, so every exit from this
+        # `with` block (including the early `return` below) closes it -- no leaked
+        # descriptor on the rejection path.
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return ""
+            raw = fh.read(LENS_OVERRIDE_MAX_BYTES + 1)
+    except OSError:
+        return ""
+    truncated = len(raw) > LENS_OVERRIDE_MAX_BYTES
+    capped = raw[:LENS_OVERRIDE_MAX_BYTES]
+    try:
+        text = capped.decode("utf-8")
+    except UnicodeDecodeError:
+        if not truncated:
+            # The file fit entirely within the cap and still isn't valid UTF-8 (binary
+            # garbage, wrong encoding) -- a genuinely invalid file, not a truncation
+            # artifact. Stays "no override".
+            return ""
+        # Truncation landed mid-codepoint (any multibyte UTF-8 text, e.g. an em dash or
+        # non-ASCII name): the ONLY invalid bytes are the incomplete trailing sequence
+        # (at most 3 bytes) the cap cut off. Dropping just those (not the whole file)
+        # keeps the documented "silently truncated, never rejected" contract instead of
+        # discarding a valid override over one boundary byte (review finding).
+        text = capped.decode("utf-8", errors="ignore")
+    return text.strip()
+
+
 @dataclass(frozen=True)
 class BoardReviewer:
     """One seat on the reviewer board: a backend model + its review role.
@@ -316,8 +427,13 @@ class BoardReviewer:
     `model` is the backend string (e.g. `claude:claude-opus-4-8`,
     `commandcode:deepseek/deepseek-v4-pro`). `role` is a key into REVIEW_ROLES;
     `display` is a short human name for the --show-board listing / result label.
-    `role_lens` resolves the lens text (empty string for a role that isn't a
-    REVIEW_ROLES key, so the job falls back to the generic prompt — never a crash).
+    `role_lens` resolves the BUILT-IN lens text (empty string for a role that isn't a
+    REVIEW_ROLES key, so the job falls back to the generic prompt — never a crash);
+    `resolved_lens(cwd)` is the same text optionally EXTENDED with a checked-in
+    per-project `.review/lenses/<role>.md` override (review-cli#547) -- callers that
+    dispatch a real review (`panel.build_board_job`) use `resolved_lens`, not the bare
+    property, so a project override actually takes effect.
+
     This dataclass itself stays permissive on `role` for non-config callers (the
     `--task` role pad, `DEFAULT_BOARD`'s own literals, brainstorm/quorum personas);
     only the config.yaml `board:` parser (`_parse_board_entry`) validates `role`
@@ -331,6 +447,26 @@ class BoardReviewer:
     @property
     def role_lens(self) -> str:
         return REVIEW_ROLES.get(self.role, "")
+
+    def resolved_lens(self, cwd: Path | None = None) -> str:
+        """`role_lens`, EXTENDED with a checked-in project override for this seat's role
+        (review-cli#547), when one is present under `cwd`.
+
+        EXTENDS rather than REPLACES the built-in lens text deliberately: a project
+        override exists to add project-specific knowledge (a house rule, a payments
+        invariant) ON TOP of review-cli's own coverage for that role, not to silently
+        drop the built-in coverage the board was designed around -- a project author who
+        wants to ADD "also check X" should never accidentally lose "check CORRECTNESS:
+        logic bugs, ..." just by writing a short override file. See `lens_override_text`
+        for exactly when an override file counts as absent (missing/unreadable/blank all
+        resolve to "no override", never a crash)."""
+        base = self.role_lens
+        override = lens_override_text(self.role, cwd)
+        if not override:
+            return base
+        if not base:
+            return override
+        return f"{base}\n\n{override}"
 
 
 # DEFAULT_BOARD: the raw 14-seat board used as the source of truth for built-in presets

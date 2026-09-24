@@ -75,6 +75,7 @@ def mode_just_ask(
                 prompt,
                 "",
                 visual_images,
+                cwd=cwd,
             )
             for i, model in enumerate(models)
         ]
