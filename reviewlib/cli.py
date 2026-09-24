@@ -6602,6 +6602,47 @@ def _dispatch(argv: list[str] | None = None) -> int:
             )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []
+        # Live per-seat TUI (review-cli#548): an OPTIONAL observer bolted onto the
+        # failover board (reviewlib.tui.BoardReporter), auto-enabled only in a genuine
+        # interactive terminal and forced off by --no-tui / $REVIEW_NO_TUI. Scoped to
+        # mode.name == "review" (the `diff` subcommand) ONLY -- this same `if board:`
+        # branch is also reachable for mode.name == "visual", whose own handler never
+        # reads ctx.extra["board_reporter"], so starting curses there would be a pointless
+        # screen flash for a mode that can't use it. `diff.strip()` gates it the SAME way
+        # the pool-guard/foolproofing check above does -- an empty diff never reaches
+        # run_board_with_failover (mode_review short-circuits "No diff to review" first),
+        # so a no-op run never even flashes a screen.
+        board_reporter = None
+        if mode.name == "review" and diff.strip():
+            from . import tui as _tui
+
+            # Seeded from `planned_pool` (the SAME ETA-planning selection `eta_models`
+            # below already relies on), not a separate call -- review finding on this
+            # feature's own PR: `_mode_review_board` computes its OWN pool moments later
+            # via a second `select_pool_and_reserve_with_reuse` call, and if backend
+            # availability flips in that narrow window the two selections could, in
+            # principle, diverge. That divergence risk is pre-existing in this codebase
+            # (the ETA plan and the real dispatch are always two separate calls, by
+            # design -- see the `planned_pool` comment above), not introduced here; the
+            # TUI's only NEW consequence of inheriting it is a stale "queued" row for a
+            # seat that was planned but never actually dispatched -- cosmetic-only,
+            # never a functional/correctness issue (the review's own outcome is governed
+            # by the REAL pool `_mode_review_board` computes, never by this seed list).
+            # `args.no_tui` always exists on this path (the `diff` subcommand's own
+            # parser registers --no-tui, modes/review.py's `_add_arguments`) -- a bare
+            # attribute access, not `getattr(..., False)`, so a future rename/wiring
+            # regression here fails loudly instead of silently making the flag a no-op.
+            # `r.role or "general"` -- MUST match panel._seat_role's exact normalization
+            # (the same coalescing `run_board_with_failover`'s own reporter calls apply to
+            # a role-less seat -- review finding on this feature's own PR): seeding this
+            # initial row under the RAW (possibly falsy) role while dispatch later keys
+            # the same physical seat under the normalized one would split one seat into
+            # two table rows (a stale seed row frozen at "queued" forever, plus the real
+            # row progressing through running/done under the other key).
+            board_reporter = _tui.start_if_enabled(
+                [(r.role or "general", r.model) for r in planned_pool],
+                no_tui_flag=bool(args.no_tui),
+            )
         ctx.extra.update(
             board=board,
             pool_size=review_pool_size,
@@ -6614,6 +6655,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # A recorded `--task` one-model pad opts IN so select_pool_with_reuse
             # can fill the cloned role slots (review-cli#309).
             usage_percent=None if exact_m else _usage_percent,
+            board_reporter=board_reporter,
         )
 
         def _ran_models() -> list[str]:
@@ -6645,18 +6687,26 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # reserve-failover board, so the same expression covers both shapes.
             return outcome_sink[0].usable_roles if outcome_sink else []
 
-        return _run_mode_with_stats(
-            mode.stats_mode,
-            eta_models,
-            lambda: mode.handler(ctx),
-            models_after=_ran_models,
-            roles_after=_ran_roles,
-            usable_roles_after=_ran_usable_roles,
-            task_code=task_code,
-            repo_id=repo_id,
-            diff_files=diff_files,
-            diff_sha256=diff_sha256,
-        )
+        try:
+            return _run_mode_with_stats(
+                mode.stats_mode,
+                eta_models,
+                lambda: mode.handler(ctx),
+                models_after=_ran_models,
+                roles_after=_ran_roles,
+                usable_roles_after=_ran_usable_roles,
+                task_code=task_code,
+                repo_id=repo_id,
+                diff_files=diff_files,
+                diff_sha256=diff_sha256,
+            )
+        finally:
+            # Unconditional teardown (review-cli#548): the TUI must restore the terminal
+            # whether the board run succeeded, failed, or raised -- a caller that never
+            # started one (board_reporter is None, the overwhelming common case) pays
+            # nothing here.
+            if board_reporter is not None:
+                board_reporter.close()
     # Flat review path (no board): explicit `-m` with no configured board/models. The
     # foolproofing guard STILL applies here — an explicit selection whose live subset can't
     # converge must not silently run a degenerate flat panel either (the board path isn't the

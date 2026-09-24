@@ -196,6 +196,17 @@ failing the whole run. Exit `0` = no findings, `1` = findings present, `2` = no
 seat's structured response was usable at all. See `review diff --help` for the full
 field/exit-code contract.
 
+**Live board (interactive terminals).** Running `review diff` by hand in a real terminal
+auto-shows a live per-seat status table (role, model, status -- queued/running/retrying/
+promoted-from-reserve/done -- and elapsed time) plus a scrolling event log for retry/
+failover/reserve-promotion notices, instead of a silent wait followed by one block of
+prose findings. It activates ONLY when both stdout and stderr are a real interactive
+terminal AND curses can actually start a real screen -- a piped/redirected/agent-driven
+invocation (every CI/automation caller) is completely unaffected either way. Disable it
+explicitly with `--no-tui` or `$REVIEW_NO_TUI=1`; a broken/dumb terminal falls back to the
+existing per-call log files + `[review-cli] ... still waiting ...` heartbeat lines on its
+own, within a bounded timeout.
+
 ---
 
 ### Just Ask

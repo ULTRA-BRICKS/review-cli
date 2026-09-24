@@ -14,6 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .backends import (
     ReviewResult,
@@ -26,6 +27,14 @@ from .backends import (
 )
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 from .process import set_board_deadline, write_retry_log
+
+if TYPE_CHECKING:
+    # Type-only: review-cli#548's live TUI observer. NEVER imported at runtime here (this
+    # module stays curses-free) -- every reporter call below is duck-typed against
+    # BoardReporter's public methods (`seat_status` / `event`), guarded by `if reporter is
+    # not None`, so a caller that never passes one (every existing caller, unchanged) never
+    # even resolves this import.
+    from .tui import BoardReporter
 
 # Overall wall-clock BUDGET (seconds, from the start of a board run) that
 # run_board_with_failover clamps its reserve-promotion idle timeouts against via
@@ -445,6 +454,14 @@ class PanelJob:
     # review/just-ask/quorum (no rounds).
     round_no: int = 0
     effort: str | None = None
+    # The board ROLE this job is reviewing under (review-cli#548's live TUI needs a
+    # (role, model) pair to key a seat's table row -- `label` already carries this baked
+    # into a display string like "GLM [security]", but that's not machine-splittable back
+    # into its two parts). None for every non-board caller (brainstorm/quorum/just_ask build
+    # PanelJob directly, never set this) -- reporter calls fall back to "general" for those,
+    # though in practice no reporter is ever passed on those paths (review-cli#548 is
+    # board-dispatch-only).
+    role: str | None = None
 
 
 def build_board_job(
@@ -479,6 +496,7 @@ def build_board_job(
         label=f"{reviewer.display} [{role_tag}]",
         images=images,
         effort=reviewer.effort,
+        role=role_tag,
     )
 
 
@@ -506,6 +524,17 @@ def build_board_jobs(
             continue
         jobs.append(build_board_job(reviewer, base_prompt, diff, images, cwd=cwd))
     return jobs, skipped
+
+
+def _seat_role(role: str | None) -> str:
+    """Normalize a possibly-None `BoardReviewer.role` for reporter/table-key purposes --
+    MUST match `build_board_job`'s own `role_tag = reviewer.role or "general"` (which
+    ends up on `PanelJob.role`, the identity `run_panel_with_retry`'s retry callbacks key
+    their reporter calls on). Without this, a role-less seat's `run_board_with_failover`
+    calls (keyed on the RAW `None` role) and its in-seat-retry calls (keyed on
+    `job.role or "general"`) would split into TWO different table rows for the same
+    physical seat -- review finding on this feature's own PR (review-cli#548)."""
+    return role or "general"
 
 
 @dataclass(frozen=True)
@@ -550,6 +579,7 @@ def run_board_with_failover(
     cwd: Path,
     timeout: int,
     images: tuple[Path, ...] = (),
+    reporter: "BoardReporter | None" = None,
 ) -> FailoverOutcome:
     """Run the priority `pool` and backfill failed seats from `reserve` (mid-run failover).
 
@@ -565,13 +595,26 @@ def run_board_with_failover(
     so the per-call ok/fail counts and pool_size reflect the models that actually produced
     verdicts — not the failed attempts the failover replaced. Backfill rounds run
     sequentially (one reserve promotion per failed seat per round); the common path (the
-    whole pool succeeds) costs a single parallel round."""
+    whole pool succeeds) costs a single parallel round.
+
+    `reporter` (review-cli#548's optional live TUI observer, None by default) gets a
+    `seat_status(role, model, status)` call for every pool-seat lifecycle transition
+    (queued -> running -> done, or -> promoted-from-reserve -> running -> done for a
+    backfilled seat) and an `event(message)` call in place of the reserve-promotion
+    stderr print below -- an interactive curses screen would be corrupted by a raw stderr
+    write (stdout/stderr share the same real tty), so the human-facing notice moves into
+    the TUI's own scrolling event log instead. With `reporter=None` (every existing
+    caller, unchanged), this function's behavior -- including that stderr print -- is
+    BYTE-IDENTICAL to before this parameter existed."""
     target = len(pool)
     all_results: list[ReviewResult] = []
     usable: list[ReviewResult] = []
     usable_models: list[str] = []
     usable_roles: list[str] = []
     reserve_queue = list(reserve)
+    if reporter is not None:
+        for r in pool:
+            reporter.seat_status(_seat_role(r.role), r.model, "queued")
 
     # If REVIEW_BOARD_DEADLINE_SECONDS names an overall wall-clock budget, arm the
     # process-wide deadline for its duration so a reserve promoted late in this run gets
@@ -591,6 +634,9 @@ def run_board_with_failover(
     try:
         current = list(pool)
         while current:
+            if reporter is not None:
+                for r in current:
+                    reporter.seat_status(_seat_role(r.role), r.model, "running")
             jobs = [
                 build_board_job(r, base_prompt, diff, images, cwd=cwd) for r in current
             ]
@@ -600,7 +646,7 @@ def run_board_with_failover(
             # retries and returns at once, so the reserve backfill stays immediate for the
             # class no retry can fix. run_panel_with_retry preserves job order, so the zip
             # below still lines each result up with its reviewer.
-            round_results = run_panel_with_retry(jobs, cwd, timeout)
+            round_results = run_panel_with_retry(jobs, cwd, timeout, reporter=reporter)
             # run_panel preserves job order, so each result lines up with its reviewer —
             # zip recovers the BoardReviewer (and its bare model id) behind a labelled
             # result. `strict=True` is a real guard (NOT a stripped-under-`-O` assert): if
@@ -614,19 +660,32 @@ def run_board_with_failover(
                     usable_models.append(reviewer.model)
                     usable_roles.append(reviewer.role)
                     _tally_ok(True)
+                    if reporter is not None:
+                        reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=True)
                 else:
                     # This seat failed — count it as a fail and try to backfill it from
                     # the next-priority reserve. The replacement runs in the NEXT round.
                     _tally_ok(False)
+                    if reporter is not None:
+                        reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=False)
                     if reserve_queue:
                         promoted = reserve_queue.pop(0)
-                        print(
-                            f"[review-cli] board: {result.model} failed — promoting "
+                        note = (
+                            f"board: {result.model} failed — promoting "
                             f"reserve {promoted.display} [{promoted.role or 'general'}] "
-                            f"({promoted.model})",
-                            file=sys.stderr,
-                            flush=True,
+                            f"({promoted.model})"
                         )
+                        if reporter is not None:
+                            # An interactive TUI is up: the promotion notice goes into its
+                            # scrolling event log instead of a raw stderr print, which would
+                            # corrupt the curses screen (stdout/stderr share the same real
+                            # tty during an interactive run — review-cli#548).
+                            reporter.event(f"[promote] {note}")
+                            reporter.seat_status(
+                                _seat_role(promoted.role), promoted.model, "promoted-from-reserve"
+                            )
+                        else:
+                            print(f"[review-cli] {note}", file=sys.stderr, flush=True)
                         # Durable record of the promotion (not stderr-only): a post-mortem /
                         # the dashboard can reconstruct WHICH seat failed and WHICH reserve
                         # backfilled it, with the failing seat's exit code + error channel.
@@ -784,7 +843,7 @@ def run_role_slots(
 
 
 def run_panel_with_retry(
-    jobs: list[PanelJob], cwd: Path, timeout: int
+    jobs: list[PanelJob], cwd: Path, timeout: int, reporter: "BoardReporter | None" = None
 ) -> list[ReviewResult]:
     """Run jobs in parallel like `run_panel`, but each seat RETRIES itself on a transient
     failure before giving up — same-order results out.
@@ -806,7 +865,17 @@ def run_panel_with_retry(
     the parallel seats must never race on the `_suppress_autotally` global). The caller
     (`run_board_with_failover` / a future direct user) owns the one-per-logical-seat tally;
     when NOT already suppressed, each seat's FINAL outcome is tallied once below, matching
-    `run_panel`'s one-call-one-tally contract."""
+    `run_panel`'s one-call-one-tally contract.
+
+    `reporter` (review-cli#548's optional live TUI observer, None by default, forwarded
+    unchanged from `run_board_with_failover`) gets `seat_status(role, model, "retrying")`
+    on an in-seat retry and `event(...)` lines in place of BOTH the transient-retry stderr
+    announcement (retry.run_seat_with_retry's `announce` param is set False whenever a
+    reporter is active) and the provider-failover stderr print below -- an interactive
+    curses screen would be corrupted by a raw stderr write, so those human-facing notices
+    move into the TUI's scrolling event log instead. With `reporter=None` (every existing
+    caller, unchanged), this function's behavior is BYTE-IDENTICAL to before this
+    parameter existed."""
     # Use the SAME unpaid predicate backend_available uses (runtime_provider_marked_unpaid),
     # so the pool guard's liveness view and the failover chain's drop set never disagree.
     from .backends import (
@@ -819,6 +888,7 @@ def run_panel_with_retry(
         remember_working_provider,
     )
     from .retry import (
+        retry_reason,
         run_seat_with_retry,
     )  # lazy: breaks the panel<->retry import cycle
 
@@ -836,6 +906,7 @@ def run_panel_with_retry(
         # first next run); a total failure rotates the cache. Unpaid providers are dropped from
         # the chain up front (never dispatched) — distinct from this call-time failover.
         label = job.label or job.model
+        role = job.role or "general"
         chain = provider_chain(
             job.model,
             available=backend_available,
@@ -848,7 +919,39 @@ def run_panel_with_retry(
             def _once() -> ReviewResult:
                 return run_panel([seat_job], cwd, timeout)[0]
 
-            return run_seat_with_retry(label, _once)
+            if reporter is None:
+                return run_seat_with_retry(label, _once)
+
+            # A live TUI is up (review-cli#548): render the SAME retry/recovery notices
+            # into its event log instead of the default stderr prints (`announce=False`),
+            # which would corrupt the curses screen -- stdout/stderr share the same real
+            # tty during an interactive run. The durable write_retry_log record inside
+            # run_seat_with_retry is unaffected either way.
+            # Keyed by the OUTER `job.model` (the LOGICAL seat identity board-level
+            # queued/running/done calls also use), NOT `seat_job.model` -- after a
+            # provider failover `seat_job` is `replace(job, model=provider_model)`
+            # (below), a DIFFERENT model id than the seat's own row key. Keying on the
+            # per-attempt provider id here would split one physical seat's retry/recovery
+            # updates onto a phantom row instead of updating its real one (review finding
+            # on this feature's own PR, review-cli#548).
+            def _on_retry(event) -> None:
+                reporter.seat_status(role, job.model, "retrying")
+                reporter.event(
+                    f"[retry] seat {label}: attempt {event.attempt}/"
+                    f"{event.max_attempts - 1} in {event.delay:.1f}s: {retry_reason(event)}"
+                )
+
+            def _on_recovered(attempt: int, budget: int) -> None:
+                reporter.seat_status(role, job.model, "running")
+                reporter.event(f"[retry] seat {label} recovered on retry {attempt}/{budget}")
+
+            return run_seat_with_retry(
+                label,
+                _once,
+                on_retry=_on_retry,
+                on_recovered=_on_recovered,
+                announce=False,
+            )
 
         # The last-working cache only helps a model with ALTERNATES (so a chronically-flaky
         # first provider stops costing a failover each run). A single-provider seat (codex,
@@ -876,12 +979,16 @@ def run_panel_with_retry(
                 return result
             last = result
             if idx + 1 < len(chain):
-                print(
-                    f"[review-cli] seat {label}: provider {provider_model} failed — "
-                    f"switching to {chain[idx + 1]} (review continues)",
-                    file=sys.stderr,
-                    flush=True,
+                note = (
+                    f"seat {label}: provider {provider_model} failed — "
+                    f"switching to {chain[idx + 1]} (review continues)"
                 )
+                if reporter is not None:
+                    # Interactive TUI active: route into its event log instead of a raw
+                    # stderr write, which would corrupt the curses screen (review-cli#548).
+                    reporter.event(f"[failover] {note}")
+                else:
+                    print(f"[review-cli] {note}", file=sys.stderr, flush=True)
                 write_retry_log(
                     f"{provider_model}=>{chain[idx + 1]}",
                     kind="provider-failover",

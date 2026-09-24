@@ -443,6 +443,7 @@ def _predispatch_error_exit(json_output: bool) -> int:
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
+    from ..tui import BoardReporter
 
 
 def _flat_seat_with_provider_failover(
@@ -555,11 +556,21 @@ def mode_review(
     usage_percent: Callable[[str], float | None] | None = None,
     stamp_diff_hash: str | None = None,
     json_output: bool = False,
+    reporter: "BoardReporter | None" = None,
 ) -> int:
     # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
     # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
     # multi-model review the checkpoint could never have used anyway.
     if commit and not staged:
+        # Close the TUI (if active) before printing -- this usage-error return happens
+        # BEFORE `_mode_review_board` ever runs (which is where the reporter normally gets
+        # closed, right after dispatch), and a message printed while curses' alternate
+        # screen is still up (smcup/rmcup, toggled automatically by initscr()/endwin() on a
+        # capable terminal) is invisible the instant the screen is later restored — see
+        # `_mode_review_board`'s docstring for the full explanation. cli.py's own cleanup
+        # closes it too, defensively; close() is idempotent.
+        if reporter is not None:
+            reporter.close()
         print(
             "[review-cli] --commit requires --staged: a checkpoint commits the reviewed "
             "STAGED diff, and there is no such thing as checkpointing an unstaged/piped "
@@ -595,6 +606,7 @@ def mode_review(
             usage_percent=usage_percent,
             stamp_diff_hash=stamp_diff_hash,
             json_output=json_output,
+            reporter=reporter,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
@@ -776,7 +788,7 @@ def mode_review(
 
 
 def _warn_if_dispatch_diff_truncated(
-    diff: str, dispatch_diff: str, staged: bool
+    diff: str, dispatch_diff: str, staged: bool, reporter: "BoardReporter | None" = None
 ) -> bool:
     """Print a visible stderr warning whenever the dispatch cap actually truncated the
     diff, and return WHETHER IT DID (codex review finding, round 5, then round 6): the
@@ -808,33 +820,46 @@ def _warn_if_dispatch_diff_truncated(
     stdout. Not printing a warning here just because there's no gate to refuse left a
     real, common case (a plain `review diff` on a huge change) reviewing a partial diff
     with zero visible notice. Both branches below share the same byte-count facts; only
-    the framing (commit-gate consequence vs none) and the git command hint differ."""
+    the framing (commit-gate consequence vs none) and the git command hint differ.
+
+    `reporter` (review-cli#548's optional live TUI observer, None for the flat path,
+    which never has one) routes this warning into the TUI's event log instead of a raw
+    stderr print when active -- this is exactly the safety warning the feature's own
+    docstring says used to be silently lost, so it must survive an active curses screen
+    too (review finding on this feature's own PR: printed directly, it would vanish the
+    instant the alt-screen later restores, recreating the very incident this function
+    exists to prevent, for the one audience -- an interactive human -- most likely to be
+    reviewing a large change by hand)."""
     truncated = dispatch_diff != diff
     if not truncated:
         return False
     full_bytes = len(diff.encode("utf-8"))
     reviewed_bytes = len(dispatch_diff.encode("utf-8"))
     if staged:
-        print(
-            "[review-cli] WARNING: the staged diff exceeded $REVIEW_DIFF_MAX_BYTES and "
+        note = (
+            "WARNING: the staged diff exceeded $REVIEW_DIFF_MAX_BYTES and "
             "was TRUNCATED for every seat — this review covers only a PARTIAL view of "
             "the staged change, not the full diff, so no commit-gate stamp/checkpoint "
             f"will be created. Full diff: {full_bytes} bytes; reviewed: "
             f"{reviewed_bytes} bytes. Scope the review "
-            "(`git diff --cached -- <path>`) or raise the cap to review the full change.",
-            file=sys.stderr,
-            flush=True,
+            "(`git diff --cached -- <path>`) or raise the cap to review the full change."
         )
+        if reporter is not None:
+            reporter.event(f"[warn] {note}")
+        else:
+            print(f"[review-cli] {note}", file=sys.stderr, flush=True)
         return True
-    print(
-        "[review-cli] WARNING: the diff exceeded $REVIEW_DIFF_MAX_BYTES and was "
+    note = (
+        "WARNING: the diff exceeded $REVIEW_DIFF_MAX_BYTES and was "
         "TRUNCATED for every seat — this review covers only a PARTIAL view of the "
         f"change. Full diff: {full_bytes} bytes; reviewed: {reviewed_bytes} bytes. "
         "Scope the review (`git diff -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES to "
-        "review the full change.",
-        file=sys.stderr,
-        flush=True,
+        "review the full change."
     )
+    if reporter is not None:
+        reporter.event(f"[warn] {note}")
+    else:
+        print(f"[review-cli] {note}", file=sys.stderr, flush=True)
     return True
 
 
@@ -1663,6 +1688,7 @@ def _mode_review_board(
     usage_percent: Callable[[str], float | None] | None = None,
     stamp_diff_hash: str | None = None,
     json_output: bool = False,
+    reporter: "BoardReporter | None" = None,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -1693,7 +1719,21 @@ def _mode_review_board(
     included) hermetic by default; it never touches the real
     ~/.config/tg-cli/ file unless the caller explicitly opts in (k3/Fable
     review finding: an unconditional internal load broke test hermeticity for
-    board-path tests that assert exact dispatched model sets)."""
+    board-path tests that assert exact dispatched model sets).
+
+    `reporter` (review-cli#548's optional live TUI observer, None by default) is forwarded
+    to `run_board_with_failover` unchanged, then CLOSED the moment dispatch is done (or
+    immediately if there is no pool at all) -- BEFORE the prose findings print below, not
+    deferred to the CLI's own cleanup. This ordering matters: curses' initscr()/endwin()
+    toggle the terminal's ALTERNATE screen buffer on a capable terminal (verified
+    empirically -- TERM=xterm emits smcup/rmcup automatically), so anything printed while
+    the alt-screen is still active becomes invisible the instant endwin() restores the
+    main buffer. Every stderr notice in this function after the dispatch call is therefore
+    a plain, unconditional print -- by construction, the reporter is always already closed
+    by the time any of them can fire, so there is no "route to the reporter instead" branch
+    left to write here (unlike `run_board_with_failover`'s own promotion notice, which
+    fires WHILE the screen is still up). With `reporter=None` (every existing caller,
+    unchanged), nothing here differs from before this parameter existed."""
     if exact_board:
         pool, reserve = list(board), []
     else:
@@ -1730,6 +1770,14 @@ def _mode_review_board(
             board, pool, reserve=reserve, pool_size=pool_size, json_output=json_output
         )
     if not pool:
+        # Close the TUI (if active) BEFORE printing -- curses' initscr()/endwin() toggle
+        # the terminal's ALTERNATE screen buffer on capable terminals (verified
+        # empirically: TERM=xterm emits smcup/rmcup automatically), so anything printed
+        # while the alt-screen is still active is invisible the moment endwin() restores
+        # the main buffer, TUI or not. Every message after this point is a normal print;
+        # the reporter is never touched again in this function.
+        if reporter is not None:
+            reporter.close()
         print(
             "[review-cli] board: no reviewers are available — configure at least one "
             "backend key/CLI (e.g. COMMANDCODE_API_KEY, GEMINI_API_KEY, codex/claude on "
@@ -1744,11 +1792,24 @@ def _mode_review_board(
     # stdin exemption as the flat path above.
     dispatch_diff = diff if diff_from_stdin else cap_diff_for_dispatch(diff)
     dispatch_diff_truncated = _warn_if_dispatch_diff_truncated(
-        diff, dispatch_diff, staged
+        diff, dispatch_diff, staged, reporter
     )
     outcome = run_board_with_failover(
-        pool, reserve, prompt, dispatch_diff, cwd, timeout, visual_images
+        pool,
+        reserve,
+        prompt,
+        dispatch_diff,
+        cwd,
+        timeout,
+        visual_images,
+        reporter=reporter,
     )
+    # Close the TUI (if active) THE MOMENT dispatch is done -- see the `if not pool:`
+    # comment above for why this must happen before the prose findings print below, not
+    # deferred to the CLI's own cleanup (cli.py still closes it too, defensively, for a
+    # path that raises before reaching here -- close() is idempotent).
+    if reporter is not None:
+        reporter.close()
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
@@ -1772,6 +1833,9 @@ def _mode_review_board(
         )
 
     if outcome.degraded:
+        # The reporter is already closed by this point (see above) -- a plain print,
+        # same as every non-TUI run, always correct here regardless of how this run
+        # started.
         print(
             f"[review-cli] board: degraded — only {len(outcome.usable)} of "
             f"{outcome.target} seats produced a usable verdict (reserve exhausted).",
@@ -1836,6 +1900,18 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "checkpoint with `git reset --soft HEAD~1` (safe — leaves untracked/foreign "
             "files alone); never `git reset --hard` mid-review-cycle (wipes uncommitted "
             "work, including anyone else's, in a shared checkout)."
+        ),
+    )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help=(
+            "disable the live per-seat status TUI (review-cli#548) even in a real "
+            "interactive terminal -- same effect as $REVIEW_NO_TUI=1. The board falls "
+            "back to the existing per-call log files + heartbeat lines. The TUI "
+            "auto-enables ONLY when stdout AND stderr are both a real tty and curses can "
+            "start a real screen; a piped/redirected/agent-driven invocation is "
+            "unaffected either way, --no-tui or not."
         ),
     )
 
@@ -1904,6 +1980,7 @@ def _handler(ctx: ModeContext) -> int:
         stamp_diff_hash=stamp_diff_hash,
         usage_percent=ctx.extra.get("usage_percent"),
         json_output=json_output,
+        reporter=ctx.extra.get("board_reporter"),
     )
 
 
