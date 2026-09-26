@@ -20,3 +20,10 @@ agent_hooks:
 
 ci:
   enabled: false
+
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/review-cli
+    attachment_mode: native
