@@ -717,6 +717,8 @@ _UNIT_FILES = [
     ("test_cwd.py", {}),
     ("test_shim_bootstrap.py", {}),
     ("test_install_shadow_warning.py", {}),
+    # install.sh trusts a clone only when its origin is the real repo by host AND path.
+    ("test_install_origin.py", {}),
     # The rig-apply deploy hook (scripts/deploy.sh): safe-FF-pull refusal semantics
     # driven against throwaway origin+clone pairs in temp dirs (review-cli#105).
     ("test_deploy_sh.py", {}),
@@ -995,6 +997,10 @@ _UNIT_FILES = [
     # the codex/claude path (input_text provided) keeps stdin=PIPE. Verified via
     # a spied subprocess.Popen, no real opencode/omp/codex/claude process.
     ("test_process.py", {}),
+    # reviewlib.portable: the one POSIX/Windows advisory-lock helper (flock semantics on
+    # both: exclusive across opens/processes, LOCK_NB -> BlockingIOError, blocking waits)
+    # plus the pid-probe / uid / Windows tree-kill shims. Real subprocesses, no network.
+    ("test_portable.py", {}),
     # The live per-seat TUI observer (review-cli#548): the auto-enable gate (--no-tui /
     # $REVIEW_NO_TUI / both-streams-isatty), BoardReporter's state machine + rendering
     # against a fake stdscr, and the reporter's wiring into run_board_with_failover /

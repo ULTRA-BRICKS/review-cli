@@ -1840,6 +1840,8 @@ def test_scan_log_dir_entries_reuses_name_list_when_dir_mtime_unchanged():
         ld = Path(d)
         stamp = "20260601T100000_000000"
         path = _write_call_log(ld, stamp, "codex", 0, "partial output so far\n")
+        quiet = os.stat(ld).st_mtime - 60  # a directory nobody created/deleted in for a while
+        os.utime(ld, (quiet, quiet))
         p.os.scandir = _counting_scandir
         try:
             first = p._scan_log_dir_entries(ld)
@@ -6015,3 +6017,21 @@ if __name__ == "__main__":
                 if mp is not None:
                     mp.restore()
     sys.exit(1 if failures else 0)
+
+
+def test_scan_log_dir_entries_does_not_cache_a_listing_taken_in_the_dir_mtime_tick():
+    """A delete in the same filesystem-clock tick as the listing leaves the dir mtime unchanged
+    (coarse on Linux runners), so a listing of a directory changed within the last
+    `_NAME_LIST_RACY_SECONDS` is never reused — the next scan sees the delete."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        keep = _write_call_log(ld, "20260601T100000_000000", "codex", 0, "a\n", exit_code=0)
+        gone = _write_call_log(ld, "20260601T100001_000000", "codex", 0, "b\n", exit_code=0)
+        tick = os.stat(ld).st_mtime
+        assert p._scan_log_dir_entries(ld).total_count == 2
+        gone.unlink()
+        os.utime(ld, (tick, tick))  # the delete landed in the same mtime tick
+        assert p._scan_log_dir_entries(ld).total_count == 1
+        assert keep.exists()

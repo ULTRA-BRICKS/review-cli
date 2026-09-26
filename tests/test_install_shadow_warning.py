@@ -311,7 +311,7 @@ def test_healthy_shadow_is_explained_not_uninstalled():
     # ...and must NOT advise uninstalling a valid install, nor invoke the stale-script
     # diagnosis. Match the SPECIFIC remediation phrases, not a bare "stale" substring (a
     # future generic note mentioning the word would false-trip that).
-    assert "uninstall -y review-cli" not in out, (
+    assert "uninstall -y hyper-review review-cli" not in out, (
         "healthy pipx/pip shadow was told to UNINSTALL — the exact bug this guards\n" + out
     )
     assert "stale pip/uv console-script" not in out, out
@@ -326,7 +326,7 @@ def test_broken_stale_console_script_gets_uninstall_remediation():
     # and give the copy-paste uninstall + rm remediation.
     assert "stale pip/uv console-script" in out, out
     assert "cannot `import reviewlib`" in out, out
-    assert "uninstall -y review-cli" in out, out
+    assert "uninstall -y hyper-review review-cli" in out, out
     # It must NOT misclassify the broken script as a healthy shadow.
     assert "imports reviewlib fine" not in out, out
 
@@ -336,7 +336,7 @@ def _assert_conservative_fallthrough(out: str):
     # install.sh must NOT call it stale nor advise uninstall — advising removal on a guess is
     # the exact harm. It must NOT claim the shadow imports reviewlib fine either (no probe ran
     # successfully). It DOES still emit the generic PATH-ordering remediation.
-    assert "uninstall -y review-cli" not in out, (
+    assert "uninstall -y hyper-review review-cli" not in out, (
         "unprovable shadow was told to UNINSTALL on a guess — the conservative path failed\n"
         + out
     )

@@ -29,18 +29,28 @@ from reviewlib.backends import _ensure_workspace_trusted, _remove_workspace_trus
 
 @contextlib.contextmanager
 def _home(tmp: Path):
-    """Point ~ at a throwaway home for the duration of the block."""
+    """Point ~ at a throwaway home for the duration of the block. USERPROFILE too:
+    `Path.home()` reads it (not $HOME) on Windows, and without it these tests would
+    edit the developer's REAL ~/.claude.json there."""
     home = tmp / "home"
     home.mkdir()
-    saved = os.environ.get("HOME")
+    saved = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
     os.environ["HOME"] = str(home)
+    os.environ["USERPROFILE"] = str(home)
     try:
         yield home
     finally:
-        if saved is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = saved
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _realpath_key(path) -> str:
+    """claude's project key: the resolved real path (forward slashes on Windows)."""
+    key = os.path.realpath(str(path))
+    return key.replace("\\", "/") if os.name == "nt" else key
 
 
 def test_seeds_trust_for_absent_project():
@@ -53,7 +63,7 @@ def test_seeds_trust_for_absent_project():
             proj.mkdir()
             _ensure_workspace_trusted(proj)
             data = json.loads(cfg.read_text())
-            key = os.path.realpath(str(proj))
+            key = _realpath_key(proj)
             assert data["projects"][key]["hasTrustDialogAccepted"] is True
             assert data["projects"][key]["hasCompletedProjectOnboarding"] is True
 
@@ -64,7 +74,7 @@ def test_idempotent_when_already_trusted():
         with _home(tmp) as home:
             proj = tmp / "repo"
             proj.mkdir()
-            key = os.path.realpath(str(proj))
+            key = _realpath_key(proj)
             cfg = home / ".claude.json"
             cfg.write_text(json.dumps({"projects": {key: {"hasTrustDialogAccepted": True, "sentinel": 1}}}))
             before = cfg.read_text()
@@ -83,12 +93,19 @@ def test_key_is_the_resolved_real_path():
             real = tmp / "real"
             real.mkdir()
             link = tmp / "link"
-            os.symlink(real, link)
+            try:
+                os.symlink(real, link)
+            except OSError as exc:
+                # Windows without Developer Mode refuses symlinks (WinError 1314): nothing to test.
+                if getattr(exc, "winerror", None) == 1314:
+                    print("skip: symlinks need Developer Mode / admin on this Windows host")
+                    return
+                raise
             _ensure_workspace_trusted(link)
             data = json.loads(cfg.read_text())
             # claude canonicalises cwd, so the entry must be keyed by the real
             # path, not the symlink we passed (else the seed silently misses).
-            assert data["projects"][os.path.realpath(str(real))]["hasTrustDialogAccepted"] is True
+            assert data["projects"][_realpath_key(real)]["hasTrustDialogAccepted"] is True
             assert str(link) not in data["projects"]
 
 
@@ -120,7 +137,7 @@ def test_preserves_other_projects_and_top_level_keys():
         tmp = Path(d)
         with _home(tmp) as home:
             cfg = home / ".claude.json"
-            other = os.path.realpath(str(tmp / "other"))
+            other = _realpath_key(tmp / "other")
             cfg.write_text(json.dumps({
                 "numStartups": 42,
                 "projects": {other: {"hasTrustDialogAccepted": True, "lastCost": 0.5}},
@@ -131,7 +148,7 @@ def test_preserves_other_projects_and_top_level_keys():
             data = json.loads(cfg.read_text())
             assert data["numStartups"] == 42  # top-level state untouched
             assert data["projects"][other] == {"hasTrustDialogAccepted": True, "lastCost": 0.5}
-            assert data["projects"][os.path.realpath(str(proj))]["hasTrustDialogAccepted"] is True
+            assert data["projects"][_realpath_key(proj)]["hasTrustDialogAccepted"] is True
 
 
 def test_forces_onboarding_true_on_partial_untrusted_entry():
@@ -141,7 +158,7 @@ def test_forces_onboarding_true_on_partial_untrusted_entry():
             cfg = home / ".claude.json"
             proj = tmp / "repo"
             proj.mkdir()
-            key = os.path.realpath(str(proj))
+            key = _realpath_key(proj)
             # A prior blocked/headless attempt can leave a partial entry that is
             # NOT trusted and has onboarding=false; seeding must force BOTH true,
             # else claude still blocks on the onboarding gate.
@@ -197,7 +214,7 @@ def test_remove_trust_reaps_a_review_seeded_entry():
             cfg.write_text(json.dumps({"projects": {}}))
             proj = tmp / "wt"
             proj.mkdir()
-            key = os.path.realpath(str(proj))
+            key = _realpath_key(proj)
             _ensure_workspace_trusted(proj)
             assert key in json.loads(cfg.read_text())["projects"]
             _remove_workspace_trust(proj)
@@ -212,7 +229,7 @@ def test_remove_trust_leaves_an_enriched_entry_intact():
         with _home(tmp) as home:
             proj = tmp / "wt"
             proj.mkdir()
-            key = os.path.realpath(str(proj))
+            key = _realpath_key(proj)
             cfg = home / ".claude.json"
             enriched = {"hasTrustDialogAccepted": True, "history": ["x"], "mcpServers": {}}
             cfg.write_text(json.dumps({"projects": {key: enriched}}))
@@ -231,7 +248,7 @@ def test_remove_trust_is_noop_when_absent_or_no_config():
             _remove_workspace_trust(proj)
             # Config with an UNRELATED entry -> the unrelated entry is untouched.
             cfg = home / ".claude.json"
-            other = os.path.realpath(str(tmp / "other"))
+            other = _realpath_key(tmp / "other")
             cfg.write_text(json.dumps({"projects": {other: {"hasTrustDialogAccepted": True}}}))
             _remove_workspace_trust(proj)
             assert other in json.loads(cfg.read_text())["projects"]

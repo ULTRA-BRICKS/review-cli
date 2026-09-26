@@ -26,14 +26,12 @@ Plain-script harness (mirrors tests/test_e2e_resume.py): each test_* is run by _
 """
 from __future__ import annotations
 
-import fcntl
 import os
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 from pathlib import Path
@@ -43,9 +41,11 @@ REVIEW_BIN = REPO_ROOT / "bin" / "review"
 sys.path.insert(0, str(REPO_ROOT))
 
 try:
+    import fcntl
     import pty as _pty
-except ImportError:  # pragma: no cover - POSIX-only stdlib module
-    _pty = None
+    import termios
+except ImportError:  # pragma: no cover - POSIX-only stdlib modules (stock Windows CPython)
+    fcntl = termios = _pty = None  # _preflight_skip() then skips every test
 
 try:
     import curses as _curses  # noqa: F401 - presence check only, never used directly here

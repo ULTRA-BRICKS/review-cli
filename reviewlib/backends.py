@@ -31,6 +31,7 @@ from typing import Callable
 from .config import _agentic
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
+from .portable import lock_file, unlock_file
 from .process import (
     TIMEOUT_KIND_STALL,
     _run,
@@ -3476,6 +3477,45 @@ def _cooldown_skip_result(
     )
 
 
+def _claude_project_key(cwd: Path) -> str:
+    """The ``~/.claude.json`` ``projects`` key claude uses for ``cwd``: the RESOLVED real
+    path (claude canonicalises cwd — e.g. /tmp -> /private/tmp, symlinked worktrees). On
+    Windows claude writes it with forward slashes (``C:/Users/...``), so a native
+    backslash path would never match its entry."""
+    key = os.path.realpath(str(cwd))
+    if os.name == "nt":
+        key = key.replace("\\", "/")
+    return key
+
+
+def _open_trust_lock(cfg: Path):
+    """Open + exclusively lock the sidecar ``.claude.json.review-trust.lock`` that
+    serialises review's own read-modify-writes of ``~/.claude.json`` (the data file itself
+    is swapped by ``os.replace``, so a lock held on it wouldn't survive the swap). Returns
+    the locked file object, or None when the lock is unavailable → the caller proceeds
+    unsynchronised, best-effort."""
+    lock = None
+    try:
+        lock = open(cfg.with_name(".claude.json.review-trust.lock"), "w")
+        lock_file(lock.fileno())
+    except OSError:
+        if lock is not None:
+            lock.close()
+        return None
+    return lock
+
+
+def _release_trust_lock(lock) -> None:
+    if lock is None:
+        return
+    try:
+        unlock_file(lock.fileno())
+    except OSError:
+        pass
+    finally:
+        lock.close()
+
+
 def _ensure_workspace_trusted(cwd: Path) -> None:
     """Pre-accept Claude Code's workspace trust for ``cwd`` in ~/.claude.json.
 
@@ -3506,28 +3546,15 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
     # claude keys workspace trust by the RESOLVED real path (it canonicalises
     # cwd — e.g. /tmp -> /private/tmp, symlinked worktrees), so a raw-path key
     # would silently miss and the prompt would still fire.
-    key = os.path.realpath(str(cwd))
+    key = _claude_project_key(cwd)
     # Serialise the read-modify-write against other review processes with an
     # advisory flock on a sidecar lock file (the data file itself is swapped by
     # os.replace, so a lock held on it wouldn't survive the swap). This can't
     # synchronise against `claude` — it doesn't lock — but the skip-when-already-
     # trusted guard means we only ever write on the FIRST review in a fresh dir,
     # keeping that residual window tiny.
-    lock = None
-    flock_mod = None
+    lock = _open_trust_lock(cfg)
     try:
-        try:
-            import fcntl as flock_mod
-        except ImportError:
-            flock_mod = None  # non-POSIX (e.g. Windows) → unsynchronised, best-effort
-        if flock_mod is not None:
-            try:
-                lock = open(cfg.with_name(".claude.json.review-trust.lock"), "w")
-                flock_mod.flock(lock.fileno(), flock_mod.LOCK_EX)
-            except OSError:
-                if lock is not None:
-                    lock.close()
-                lock = None  # lock unavailable → proceed unsynchronised, best-effort
         data = json.loads(cfg.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return
@@ -3562,12 +3589,7 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
     except Exception:
         return  # malformed / unreadable config → degrade to the old behaviour
     finally:
-        if lock is not None:
-            try:
-                if flock_mod is not None:
-                    flock_mod.flock(lock.fileno(), flock_mod.LOCK_UN)
-            finally:
-                lock.close()
+        _release_trust_lock(lock)
 
 
 # The exact flag set `_ensure_workspace_trusted` seeds. An entry holding ONLY these (a subset is
@@ -3602,22 +3624,9 @@ def _remove_workspace_trust(cwd: Path) -> None:
     cfg = Path.home() / ".claude.json"
     if not cfg.exists():
         return
-    key = os.path.realpath(str(cwd))
-    lock = None
-    flock_mod = None
+    key = _claude_project_key(cwd)
+    lock = _open_trust_lock(cfg)
     try:
-        try:
-            import fcntl as flock_mod
-        except ImportError:
-            flock_mod = None
-        if flock_mod is not None:
-            try:
-                lock = open(cfg.with_name(".claude.json.review-trust.lock"), "w")
-                flock_mod.flock(lock.fileno(), flock_mod.LOCK_EX)
-            except OSError:
-                if lock is not None:
-                    lock.close()
-                lock = None
         data = json.loads(cfg.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return
@@ -3644,12 +3653,7 @@ def _remove_workspace_trust(cwd: Path) -> None:
     except Exception:
         return
     finally:
-        if lock is not None:
-            try:
-                if flock_mod is not None:
-                    flock_mod.flock(lock.fileno(), flock_mod.LOCK_UN)
-            finally:
-                lock.close()
+        _release_trust_lock(lock)
 
 
 # Tools the read-only review seat must never invoke. Shared by the direct `claude`

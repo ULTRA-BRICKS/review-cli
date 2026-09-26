@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
@@ -1326,6 +1327,12 @@ _STAMP_PREFIX_RE = re.compile(r"^\d{8}T\d{6}$")
 # reuse; an unchanged mtime is the only hit condition.
 _NAME_LIST_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
 _NAME_LIST_CACHE_LOCK = threading.Lock()
+# ...and only once the directory's mtime is older than this. Filesystems stamp mtimes from a
+# coarse clock (a few ms on Linux ext4/overlayfs, up to 2 s elsewhere), so a create or delete in
+# the same tick as the listing leaves the mtime unchanged and a cached listing would hide it —
+# git's "racily clean" index entry, handled the same way: a directory still changing is rescanned,
+# a quiet one is cached.
+_NAME_LIST_RACY_SECONDS = 2.0
 
 
 class LogEntry(NamedTuple):
@@ -1484,7 +1491,11 @@ def _scan_log_dir_entries(
             # Only publish when pre-scan and post-scan mtimes match. A create racing
             # the listing bumps mtime and the captured names are incomplete relative
             # to that new mtime — caching them under it would hide the new file.
-            if post_mtime is not None and post_mtime == dir_mtime:
+            if (
+                post_mtime is not None
+                and post_mtime == dir_mtime
+                and time.time() - post_mtime > _NAME_LIST_RACY_SECONDS
+            ):
                 with _NAME_LIST_CACHE_LOCK:
                     _NAME_LIST_CACHE[key] = (post_mtime, names)
     else:

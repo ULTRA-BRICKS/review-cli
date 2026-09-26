@@ -1052,7 +1052,7 @@ def test_board_diff_review_render_opts_into_the_evidence_warning():
     )
 
     def _fake_run_board_with_failover(
-        pool, reserve, prompt, diff, cwd, timeout, images
+        pool, reserve, prompt, diff, cwd, timeout, images, reporter=None
     ):
         return outcome
 
@@ -1102,7 +1102,7 @@ def test_board_diff_review_render_skips_the_warning_under_a_custom_prompt():
     )
 
     def _fake_run_board_with_failover(
-        pool, reserve, prompt, diff, cwd, timeout, images
+        pool, reserve, prompt, diff, cwd, timeout, images, reporter=None
     ):
         return outcome
 

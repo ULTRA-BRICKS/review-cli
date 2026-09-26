@@ -34,7 +34,6 @@ overwriting an arbitrary file the process can reach (codex review, review-cli#16
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -45,6 +44,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .portable import (
+    O_NOFOLLOW,
+    O_NONBLOCK,
+    current_uid,
+    lock_file,
+    pid_alive,
+    unlock_file,
+)
 from .process import probe_writable_dir
 
 # The exact shape `new_job_id()` produces: an 8-digit UTC date, "T", a 6-digit time, "-",
@@ -83,7 +90,7 @@ def _temp_root_path(suffix: str) -> Path:
     multi-user box doesn't cross-report between users)."""
     import tempfile
 
-    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{os.getuid()}{suffix}"
+    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{current_uid()}{suffix}"
 
 
 def _fallback_pointer_path() -> Path:
@@ -105,7 +112,7 @@ def _fallback_pointer_lock_path() -> Path:
 def _open_pointer_lock() -> int:
     """Open (creating if needed) and take an exclusive `flock` on the pointer's own
     lock file, returning the fd for the caller to release via
-    `fcntl.flock(fd, fcntl.LOCK_UN)` + `os.close(fd)`. Serializes the WHOLE
+    `unlock_file(fd)` + `os.close(fd)`. Serializes the WHOLE
     read-pointer-or-mint-a-new-directory-and-record-it sequence across processes
     (codex review, review-cli#162 follow-up): without this, two `--detach` calls
     entering this tier at the same moment could each mint a DIFFERENT `mkdtemp()`
@@ -124,14 +131,14 @@ def _open_pointer_lock() -> int:
     foreign-owned file so the caller's existing except-clause falls back to an
     uncoordinated `mkdtemp()` instead of ever calling `flock` on it."""
     path = _fallback_pointer_lock_path()
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | O_NOFOLLOW, 0o600)
     try:
         st = os.fstat(fd)
-        if st.st_uid != os.getuid():
+        if st.st_uid != current_uid():
             raise OSError(
                 f"{path} is owned by uid {st.st_uid}, not us — refusing to lock it"
             )
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_file(fd)
     except BaseException:
         os.close(fd)
         raise
@@ -161,14 +168,14 @@ def _read_fallback_pointer() -> Path | None:
         # best-effort lookup into a hang for every future `review status`/`review
         # jobs` call (codex review, review-cli#162 follow-up round 4). O_NONBLOCK
         # makes that open return immediately instead.
-        fd = os.open(str(pointer), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(str(pointer), os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
         # Reject anything that isn't a plain regular file (a FIFO/socket/device
         # planted at this path, even one O_NONBLOCK let us open) OR isn't ours.
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != current_uid():
             return None
         with os.fdopen(fd, "r", encoding="utf-8") as fh:
             recorded = fh.read().strip()
@@ -195,7 +202,7 @@ def _read_fallback_pointer() -> Path | None:
         cst = candidate.stat()
     except OSError:
         return None
-    if cst.st_uid != os.getuid():
+    if cst.st_uid != current_uid():
         return None
     if candidate.is_dir() and probe_writable_dir(candidate):
         return candidate
@@ -226,13 +233,13 @@ def _write_fallback_pointer(path: Path) -> None:
     except OSError:
         existing_st = None
     if existing_st is not None and (
-        stat.S_ISLNK(existing_st.st_mode) or existing_st.st_uid != os.getuid()
+        stat.S_ISLNK(existing_st.st_mode) or existing_st.st_uid != current_uid()
     ):
         return
     tmp = pointer.with_name(pointer.name + f".tmp{os.getpid()}")
     try:
         fd = os.open(
-            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW, 0o600
         )
     except OSError:
         return
@@ -315,7 +322,7 @@ def jobs_dir() -> Path:
             file=sys.stderr,
             flush=True,
         )
-        base = Path(tempfile.gettempdir()) / f"review-cli-jobs-{os.getuid()}"
+        base = Path(tempfile.gettempdir()) / f"review-cli-jobs-{current_uid()}"
         try:
             base.mkdir(parents=True, exist_ok=True)
             if not probe_writable_dir(base):
@@ -350,7 +357,7 @@ def jobs_dir() -> Path:
                         _write_fallback_pointer(base)
                 finally:
                     try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        unlock_file(lock_fd)
                     finally:
                         os.close(lock_fd)
                 _jobs_dir_fallback_cache = base
@@ -427,7 +434,7 @@ def _job_lock_path(job_id: str) -> Path:
 
 def _job_lock(job_id: str) -> int:
     """Open (creating if needed) and take an exclusive `flock` on this job's lock file,
-    returning the fd for the caller to release via `fcntl.flock(fd, fcntl.LOCK_UN)` +
+    returning the fd for the caller to release via `unlock_file(fd)` +
     `os.close(fd)`. Serializes `write_job` across PROCESSES for the same job-id — the
     spawning parent's initial + pid-only writes, and the spawned child's own terminal-
     status write (or `backstop._fire`'s, on an internal-backstop kill), are genuinely
@@ -437,7 +444,7 @@ def _job_lock(job_id: str) -> int:
     no need for byte-range granularity here."""
     path = _job_lock_path(job_id)
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    lock_file(fd)
     return fd
 
 
@@ -460,7 +467,7 @@ def _update_job_locked(job_id: str, mutate: Callable[[dict[str, Any]], bool]) ->
         return True
     finally:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            unlock_file(lock_fd)
         finally:
             os.close(lock_fd)
 
@@ -589,16 +596,10 @@ def _is_well_formed_record(rec: Any, job_id: str) -> bool:
 
 def is_pid_alive(pid: int) -> bool:
     """True iff `pid` names a live process THIS user can at least signal-probe.
-    `kill(pid, 0)` sends no signal — it only checks existence/permission."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    `kill(pid, 0)` on POSIX (sends no signal — only checks existence/permission); a
+    process query on Windows, where `os.kill(pid, 0)` would TERMINATE the process
+    (`portable.pid_alive`)."""
+    return pid_alive(pid)
 
 
 # How long a "running" record may legitimately have NO pid yet: the spawning parent

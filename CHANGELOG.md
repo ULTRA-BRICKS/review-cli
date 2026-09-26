@@ -3,6 +3,43 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.38.0 — 2026-09-26
+
+- **Build: published on PyPI as `hyper-review`** (the command stays `review`; `review-cli` on
+  PyPI is an unrelated project). The README installs with uv or pipx from PyPI, the
+  git.hyperide.ai one-liner or a clone, and tells people with the pre-rename install to remove
+  it first. `install.sh` recognises the repo origin by host and path (a lookalike host no longer
+  passes for the canonical repo), pulls from the origin it validated, and installs the clone
+  editable, so `git pull` updates the tool.
+- **Fix(dashboard): a create/delete in the same directory-mtime tick is no longer hidden.** The
+  log-dir name-list cache is used only once the directory has been quiet for 2 s — Linux's
+  coarse mtime clock let a deleted old log keep a stale session alive.
+- **Fix(windows):** `review qa --report` no longer crashes on Python < 3.13 (the third
+  `os.fchmod` site now goes through `portable.fchmod`), and the repo's `.git` dir is resolved
+  with UTF-8 decoding like every other git read (a non-ASCII path crashed the diff review, or
+  mis-matched and stripped the repo's own `GIT_*` env).
+- Correction to 0.37.14's "POSIX behaviour is unchanged": stdout/stderr that are not UTF-8 are
+  re-encoded as UTF-8 (`errors="replace"`) on POSIX too — a latin-1 terminal now receives UTF-8
+  instead of a crash on a character it cannot encode.
+
+## 0.37.14 — 2026-09-25
+
+- **Fix: `review` runs natively on Windows.** `import fcntl` (POSIX-only) made the package
+  unimportable there. All cross-process advisory locks (job records, seat cooldowns, spec-web
+  store/registry, the `~/.claude.json` trust lock) now go through ONE helper,
+  `reviewlib.portable.lock_file`/`unlock_file`: exactly `fcntl.flock` on POSIX, and
+  `msvcrt.locking` on a lock byte far past any data on Windows with the same semantics
+  (exclusive between opens/processes, non-blocking -> `BlockingIOError`, blocking waits
+  indefinitely). Other POSIX-only spots on the `diff`/`task --check`/`just-ask` path are
+  guarded in the same module: backend children start in their own process group
+  (`CREATE_NEW_PROCESS_GROUP`) and are tree-killed with `taskkill /T /F`; `os.getuid`,
+  `O_NOFOLLOW`/`O_NONBLOCK`, `os.getpgid`/`killpg`/`SIGKILL` and `os.fchmod` (Python < 3.13)
+  have fallbacks; job liveness no longer uses `os.kill(pid, 0)`, which TERMINATES the process
+  on Windows. stdout/stderr (and stdin on Windows) are re-encoded as UTF-8 with
+  `errors="replace"` (a model's `→` crashed printing on a cp1251 pipe), `git diff` output is
+  decoded as UTF-8 on Windows (a Cyrillic "И" silently produced an EMPTY diff), and the
+  workspace-trust key uses claude's forward-slash form there. POSIX behaviour is unchanged.
+
 ## 0.37.13 — 2026-09-24
 
 - **Feat(review diff): additive `--json` structured findings output (review-cli#546).**

@@ -27,7 +27,7 @@ Concurrency
 The daemon reads the registry per request while a separate ``review spec-web add`` process
 writes it — same cross-process hazard the comment store solves. Every mutator holds an
 exclusive advisory flock on a sibling ``registry.lock`` across its load->modify->write (atomic
-``os.replace``), degrading to the in-process lock where ``fcntl`` is absent (Windows).
+``os.replace``) -- ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows (``reviewlib.portable``).
 """
 from __future__ import annotations
 
@@ -42,10 +42,7 @@ from pathlib import Path
 from .render import slug
 from .store import store_dir
 
-try:
-    import fcntl  # POSIX advisory file locking (cross-process)
-except ImportError:  # pragma: no cover - Windows has no fcntl
-    fcntl = None  # type: ignore[assignment]
+from ..portable import lock_file, unlock_file  # cross-process advisory lock
 
 _LOCK = threading.RLock()
 
@@ -71,13 +68,10 @@ def _now() -> str:
 def _guard():
     """Serialise a load-modify-write across threads AND processes (see module docstring)."""
     with _LOCK:
-        if fcntl is None:
-            yield
-            return
         fd = None
         try:
             fd = os.open(str(_lock_path()), os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            lock_file(fd)
         except OSError:
             if fd is not None:
                 os.close(fd)
@@ -87,7 +81,7 @@ def _guard():
         finally:
             if fd is not None:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    unlock_file(fd)
                 except OSError:
                     pass
                 os.close(fd)

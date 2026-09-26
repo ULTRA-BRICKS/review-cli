@@ -38,6 +38,7 @@ import argparse
 import re
 from pathlib import Path
 
+from .. import portable
 from .contract import ModeContext, ModeSpec
 
 # The recommended, canonical suite location (relative to the SUT path). A ``*.md`` file
@@ -601,7 +602,7 @@ def _write_bot_report(
         report_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            portable.fchmod(fd, 0o600)
         except OSError:
             pass
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

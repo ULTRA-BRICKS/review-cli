@@ -803,6 +803,10 @@ def test_every_rerun_remediation_carries_a_task_code():
     # instruction, and containing no backticks) is deliberately not one of them.
     src = re.sub(r"(?m)^\s*#.*$", "", inspect.getsource(review_mode))
     src = re.sub(r'"""(?:[^"]|"(?!""))*"""', "", src)
+    # A ``` Markdown fence (the --json prompt's "block tagged ```json") is not an inline code
+    # span; left in, its odd backtick shifted every later pair, so the scan paired prose
+    # across string literals instead of reading the rerun commands.
+    src = src.replace("```", "")
     assert "_RERUN_STAGED =" in src, "the comment/docstring strip ate real code"
     constants = ("{_RERUN_STAGED}", "{_RERUN_STAGED_COMMIT}")
     rerun_spans = [

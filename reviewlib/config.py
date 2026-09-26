@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from pathlib import Path
 
+from .portable import O_NOFOLLOW, O_NONBLOCK
 from .usage_limits import DEFAULT_LIMIT_THRESHOLD
 
 DEFAULT_PROMPT = (
@@ -388,7 +389,7 @@ def lens_override_text(role: str, cwd: Path | None) -> str:
     except OSError:
         return ""
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(str(path), os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     except OSError:
         return ""
     try:

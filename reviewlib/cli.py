@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, TextIO
 
 from . import backends
 from . import jobs
+from . import portable
 from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
@@ -3690,6 +3691,9 @@ def main(argv: list[str] | None = None) -> int:
     # from a live interpreter; an external signal's default disposition kills the
     # process before any `finally` runs, orphaning session-isolated backend children.
     install_signal_reaper()
+    # A model's review text (→, ✓, CJK) must never crash printing on a cp1251/cp1252 pipe
+    # (Windows mintty/Git Bash/redirects); see `portable.ensure_utf8_stdio`.
+    portable.ensure_utf8_stdio()
 
     raw = sys.argv[1:] if argv is None else argv
     # The reentrancy guard runs BEFORE the --detach split (review-cli#180 x #160): a
@@ -3998,6 +4002,7 @@ def _spawn_detached_job(raw: list[str]) -> int:
             stderr=subprocess.STDOUT,
             env=_detached_child_env(job_id, this_jobs_dir),
             start_new_session=True,
+            **portable.new_process_group_kwargs(),  # Windows: CREATE_NEW_PROCESS_GROUP
         )
     finally:
         os.close(log_fd)
@@ -4457,6 +4462,8 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset(
         "--project",
         "--retry",
         "--commit",
+        # review diff's live per-seat status TUI off-switch (modes/review.py).
+        "--no-tui",
         # quorum's opt-in adversarial refutation pass (modes/quorum.py).
         "--adversarial-check",
         # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`

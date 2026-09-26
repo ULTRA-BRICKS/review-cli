@@ -21,6 +21,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .portable import (
+    IS_WINDOWS,
+    TEXT_SUBPROCESS_KWARGS,
+    current_uid,
+    kill_process_tree,
+    new_process_group_kwargs,
+)
 from .stats import normalize_task_code
 
 _LOG_HEADER_CONTROL_TRANSLATION = {
@@ -395,7 +402,13 @@ def _kill_handles(handles: list[tuple[subprocess.Popen, int | None]]) -> None:
     passes (see there)."""
     for proc, pgid in handles:
         try:
-            if pgid is not None:
+            if IS_WINDOWS:
+                # No process groups/signals: taskkill /T /F the tree (it can only find
+                # descendants through a still-running direct child), then the child.
+                if proc.poll() is None:
+                    kill_process_tree(proc.pid)
+                proc.kill()
+            elif pgid is not None:
                 os.killpg(pgid, signal.SIGKILL)
             else:
                 proc.kill()
@@ -599,6 +612,7 @@ def _run(
         stderr=subprocess.PIPE,
         env=env,
         timeout=timeout,
+        **TEXT_SUBPROCESS_KWARGS,  # Windows: UTF-8, not the ANSI codepage
     )
 
 
@@ -630,6 +644,7 @@ def _resolve_git_dir(cwd: Path) -> Path | None:
             cwd=str(cwd),
             env=stripped,
             text=True,
+            **TEXT_SUBPROCESS_KWARGS,  # Windows: UTF-8, not the ANSI codepage
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=10,
@@ -745,7 +760,7 @@ def _fallback_log_dir() -> Path:
 
     import tempfile
 
-    base = Path(tempfile.gettempdir()) / f"review-cli-logs-{os.getuid()}"
+    base = Path(tempfile.gettempdir()) / f"review-cli-logs-{current_uid()}"
     try:
         base.mkdir(parents=True, exist_ok=True)
         if not probe_writable_dir(base):
@@ -1020,6 +1035,15 @@ def _write_stderr_best_effort(text: str) -> None:
         fd = stream.fileno()
     except (AttributeError, OSError, ValueError):
         fd = None
+    if fd is not None and IS_WINDOWS:
+        # Windows consoles/pipes mostly reject os.get_blocking (WinError 87). A raw
+        # os.write still never takes the stream lock; at worst it parks this daemon
+        # heartbeat thread on a full pipe.
+        try:
+            os.write(fd, text.encode("utf-8", "replace"))
+        except OSError:
+            pass
+        return
     if fd is not None:
         data = text.encode("utf-8", "replace")
         restore_blocking = False
@@ -1343,7 +1367,25 @@ def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     we must do even after the direct child has exited, because a grandchild in the
     same group can still be alive and holding the pipe. `pgid` is captured at Popen
     time precisely so it stays valid after the parent is reaped.
+
+    Windows has neither sessions nor SIGTERM for console programs: the child runs in its
+    own process group (CREATE_NEW_PROCESS_GROUP) and, while it is still running, the whole
+    tree is force-killed at once (`taskkill /T /F`), then the direct child, then a bounded
+    wait. Known gap: Windows finds descendants only through a LIVE parent, so a grandchild
+    that outlives an already-exited direct child is not reached here.
     """
+    if IS_WINDOWS:
+        if proc.poll() is None:
+            kill_process_tree(proc.pid)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        return
 
     def _signal_group(sig: int) -> None:
         try:
@@ -1556,6 +1598,7 @@ def _run_streamed(
                 # flushed-but-newline-less output is captured immediately and is never lost
                 # if a descendant keeps the pipe open past the deadline.
                 start_new_session=True,  # own process group, so we can kill the whole tree
+                **new_process_group_kwargs(),  # Windows: CREATE_NEW_PROCESS_GROUP
             )
             running = proc  # non-None alias for the nested closures
             # Register IMMEDIATELY — before resolving the pgid — so a backstop fire can never
@@ -1566,8 +1609,9 @@ def _run_streamed(
         # Capture the group id NOW, while the child is alive. We need it later even
         # after the direct child is reaped, because a grandchild in the same group
         # may still be holding the stdout pipe open.
+        # (Windows has no process groups to capture: `_kill_tree` walks the pid tree.)
         try:
-            pgid = os.getpgid(proc.pid)
+            pgid = None if IS_WINDOWS else os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
             pgid = None
         # Once the pgid is known, swap to a group-bearing handle so a later reap kills the

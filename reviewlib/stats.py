@@ -86,6 +86,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import portable
 from . import seat_cooldown as _seat_cooldown
 from .config import REVIEW_ROLES
 
@@ -442,7 +443,7 @@ def record_run(
             # already exists (or a $REVIEW_STATS_FILE the user pre-created) could carry
             # broader perms and keep them forever. fchmod on every write so the 0600
             # privacy guarantee holds for pre-existing files too.
-            os.fchmod(fd, 0o600)
+            portable.fchmod(fd, 0o600)
             os.write(
                 fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
             )

@@ -634,10 +634,6 @@ def test_record_and_clear_interleave_without_losing_either_side():
     _with_store(_run)
 
 
-@pytest.mark.skipif(
-    sc.fcntl is None,
-    reason="flock-specific; no-fcntl platforms use the in-process-only degrade path exercised elsewhere",
-)
 def test_locked_serialises_record_cooldown_across_real_processes():
     """review-cli#188, k3 review finding: `_locked`'s claim of a CROSS-PROCESS guarantee
     (not just in-process, which a plain `threading.Lock` would already give) is
@@ -661,10 +657,6 @@ def test_locked_serialises_record_cooldown_across_real_processes():
     lost-update failure mode only needs >=2 writers overlapping, and this keeps the wall
     clock this inherently-unparallelizable test costs the suite down without weakening
     what it proves."""
-    if sc.fcntl is None:
-        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
-        # pytest markers (it calls every test_* directly), so this early-return is
-        # what actually skips the test outside real pytest collection.
     import subprocess
     import sys as _sys
 
@@ -705,10 +697,6 @@ def test_locked_serialises_record_cooldown_across_real_processes():
     _with_store(_run)
 
 
-@pytest.mark.skipif(
-    sc.fcntl is None,
-    reason="flock-specific; no-fcntl platforms use the in-process-only degrade path exercised elsewhere",
-)
 def test_locked_serialises_clear_cooldown_across_real_processes():
     """review-cli#188, Opus review finding, round 2: only `record_cooldown` had a
     cross-process test — `clear_cooldown` has the identical read-modify-write shape and no
@@ -716,10 +704,6 @@ def test_locked_serialises_clear_cooldown_across_real_processes():
     lost clear resurrects a cooldown, keeping a healthy seat wrongly skipped). Records N
     models, then races clearing all of them across real subprocesses; every clear must
     land."""
-    if sc.fcntl is None:
-        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
-        # pytest markers (it calls every test_* directly), so this early-return is
-        # what actually skips the test outside real pytest collection.
     import subprocess
     import sys as _sys
 
@@ -760,63 +744,56 @@ def test_locked_serialises_clear_cooldown_across_real_processes():
     _with_store(_run)
 
 
-def test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable():
-    """review-cli#188, Opus/GLM review findings, round 1: the module docstring promises
-    that on platforms without `fcntl` (Windows), locking degrades to the in-process `_LOCK`
-    alone rather than skipping the write — nothing pinned that a write still lands in this
-    branch. Simulates the Windows case by patching the module's `fcntl` reference to
-    `None`, mirroring how the module itself detects it at import time."""
+def test_locked_degrades_to_in_process_lock_when_file_locking_is_unavailable():
+    """review-cli#188, Opus/GLM review findings, round 1: a platform/filesystem with no
+    advisory file locking at all (`portable.lock_file` raises ENOSYS) must degrade to the
+    in-process `_LOCK` alone rather than skipping the write — nothing pinned that a write
+    still lands in this branch. Swaps the module's `portable` reference for a stub (never
+    the shared real module)."""
+    import errno
+    import types
+
+    def _no_locking(*_a, **_k):
+        raise OSError(errno.ENOSYS, "simulated: no advisory file locking")
 
     def _run():
-        saved_fcntl = sc.fcntl
-        sc.fcntl = None
+        saved_portable = sc.portable
+        sc.portable = types.SimpleNamespace(lock_file=_no_locking, unlock_file=_no_locking)
         try:
-            sc.record_cooldown("claude:no-fcntl", "session limit", access_method="test")
+            sc.record_cooldown("claude:no-file-lock", "session limit", access_method="test")
             assert (
-                sc.active_cooldown("claude:no-fcntl", access_method="test") is not None
+                sc.active_cooldown("claude:no-file-lock", access_method="test") is not None
             )
-            sc.clear_cooldown("claude:no-fcntl", access_method="test")
-            assert sc.active_cooldown("claude:no-fcntl", access_method="test") is None
+            sc.clear_cooldown("claude:no-file-lock", access_method="test")
+            assert sc.active_cooldown("claude:no-file-lock", access_method="test") is None
         finally:
-            sc.fcntl = saved_fcntl
+            sc.portable = saved_portable
 
     _with_store(_run)
 
 
-@pytest.mark.skipif(
-    sc.fcntl is None,
-    reason="flock-specific; the no-fcntl degrade path is covered directly by test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable",
-)
 def test_locked_degrades_to_in_process_lock_when_flock_raises_oserror():
     """review-cli#188, Opus/GLM review findings, round 1: the module docstring promises
     that a flock-acquisition `OSError` (an odd filesystem without working advisory locks)
     degrades to the in-process `_LOCK` alone rather than aborting the write — nothing
-    pinned that a write still lands in this branch. Patches `fcntl.flock` to always raise,
+    pinned that a write still lands in this branch. Makes the lock call always raise,
     which is exactly the `except OSError` path in `_locked`.
 
-    k3 review finding, round 2: `sc.fcntl` IS the stdlib `fcntl` module object, so
-    patching `sc.fcntl.flock` directly mutates a module every other consumer in the
-    process shares (e.g. `reviewlib.specweb.store.SpecStore._guard`) for the duration of
+    k3 review finding, round 2: `sc.portable` is the shared `reviewlib.portable` module,
+    so patching its `lock_file` directly would mutate what every other consumer in the
+    process (e.g. `reviewlib.specweb.store.SpecStore._guard`) sees for the duration of
     this test. Swap the module REFERENCE instead — a lightweight stand-in exposing only
     what `_locked` touches — so nothing outside this test's own `finally` can observe the
     raising stub."""
-    if sc.fcntl is None:
-        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
-        # pytest markers (it calls every test_* directly), so this early-return is
-        # what actually skips the test outside real pytest collection.
     import types
 
     def _run():
-        real_fcntl = sc.fcntl
-        fake_fcntl = types.SimpleNamespace(
-            LOCK_EX=real_fcntl.LOCK_EX,
-            LOCK_NB=real_fcntl.LOCK_NB,
-            LOCK_UN=real_fcntl.LOCK_UN,
-            flock=lambda *_a, **_k: (_ for _ in ()).throw(
-                OSError("simulated: no advisory locks on this filesystem")
-            ),
-        )
-        sc.fcntl = fake_fcntl
+        real_portable = sc.portable
+
+        def _raising(*_a, **_k):
+            raise OSError("simulated: no advisory locks on this filesystem")
+
+        sc.portable = types.SimpleNamespace(lock_file=_raising, unlock_file=_raising)
         try:
             sc.record_cooldown(
                 "claude:flock-oserror", "session limit", access_method="test"
@@ -830,23 +807,19 @@ def test_locked_degrades_to_in_process_lock_when_flock_raises_oserror():
                 sc.active_cooldown("claude:flock-oserror", access_method="test") is None
             )
         finally:
-            sc.fcntl = real_fcntl
+            sc.portable = real_portable
 
     _with_store(_run)
 
 
-@pytest.mark.skipif(
-    sc.fcntl is None,
-    reason="flock-specific; the no-fcntl degrade path is covered directly by test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable",
-)
 def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
     """review-cli#188, Opus/GLM review findings, round 1 [High]: the original `_locked`
-    used a BLOCKING `fcntl.flock(fd, LOCK_EX)` acquire — a peer holding the lock past any
+    used a BLOCKING `flock(fd, LOCK_EX)` acquire — a peer holding the lock past any
     point (a stalled/paused process, a hung network filesystem) would hang this call
     forever, violating the module's own "never blocks the caller" contract that every
     other code path here honors. The fix bounds the retry to
     `_LOCK_TOTAL_DEADLINE_SECONDS` and then degrades to the in-process `_LOCK` alone —
-    same as the OSError/no-fcntl degrade paths — instead of blocking indefinitely.
+    same as the OSError/no-file-lock degrade paths — instead of blocking indefinitely.
 
     Holds the real flock open in THIS process (on the actual lock file `_locked` would
     use) for longer than the retry deadline, then confirms `record_cooldown` still
@@ -871,10 +844,6 @@ def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
     (`_FLOCK_SUB_BUDGET_SECONDS`), separate from `_LOCK_TOTAL_DEADLINE_SECONDS` — that
     is the constant actually bounding this scenario (a held FLOCK, not a held `_LOCK`),
     so it's the one patched to make this test's timing assertions meaningful again."""
-    if sc.fcntl is None:
-        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
-        # pytest markers (it calls every test_* directly), so this early-return is
-        # what actually skips the test outside real pytest collection.
     import threading
     import time as _time
 
@@ -891,7 +860,7 @@ def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
             path.parent.mkdir(parents=True, exist_ok=True)
             lock_path = path.parent / f".{path.name}.lock"
             held_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            sc.fcntl.flock(held_fd, sc.fcntl.LOCK_EX)
+            sc.portable.lock_file(held_fd)
 
             t = threading.Thread(
                 target=sc.record_cooldown,
@@ -922,7 +891,7 @@ def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
             )
         finally:
             if held_fd is not None:
-                sc.fcntl.flock(held_fd, sc.fcntl.LOCK_UN)
+                sc.portable.unlock_file(held_fd)
                 os.close(held_fd)
             sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
             sc._FLOCK_SUB_BUDGET_SECONDS = saved_sub_budget
@@ -954,10 +923,6 @@ def test_flock_sub_budget_lets_inprocess_threads_serialize_despite_held_flock():
     normally on `_LOCK` — every entry must land. Under the regression, all threads
     queue on `_LOCK` for the full deadline and degrade to fully unlocked together,
     losing entries."""
-    if sc.fcntl is None:
-        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
-        # pytest markers (it calls every test_* directly), so this early-return is
-        # what actually skips the test outside real pytest collection.
     import threading
 
     def _run():
@@ -976,7 +941,7 @@ def test_flock_sub_budget_lets_inprocess_threads_serialize_despite_held_flock():
             path.parent.mkdir(parents=True, exist_ok=True)
             lock_path = path.parent / f".{path.name}.lock"
             held_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            sc.fcntl.flock(held_fd, sc.fcntl.LOCK_EX)  # external peer holds it for good
+            sc.portable.lock_file(held_fd)  # external peer holds it for good
 
             threads = [
                 threading.Thread(
@@ -993,7 +958,7 @@ def test_flock_sub_budget_lets_inprocess_threads_serialize_despite_held_flock():
             assert not any(t.is_alive() for t in threads), "a thread wedged/deadlocked"
         finally:
             if held_fd is not None:
-                sc.fcntl.flock(held_fd, sc.fcntl.LOCK_UN)
+                sc.portable.unlock_file(held_fd)
                 os.close(held_fd)
             sc._write = saved_write
             sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
@@ -1132,20 +1097,19 @@ def test_locked_releases_the_lock_when_the_body_raises():
             sc._LOCK.release()
         assert freed, "_LOCK was leaked by the raising body, not released"
 
-        if sc.fcntl is not None:
-            path = sc.cooldown_path()
-            lock_path = path.parent / f".{path.name}.lock"
-            probe = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                sc.fcntl.flock(probe, sc.fcntl.LOCK_EX | sc.fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise AssertionError(
-                    "the sidecar flock was leaked by the raising body, not released"
-                )
-            else:
-                sc.fcntl.flock(probe, sc.fcntl.LOCK_UN)
-            finally:
-                os.close(probe)
+        path = sc.cooldown_path()
+        lock_path = path.parent / f".{path.name}.lock"
+        probe = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            sc.portable.lock_file(probe, blocking=False)
+        except BlockingIOError:
+            raise AssertionError(
+                "the sidecar flock was leaked by the raising body, not released"
+            )
+        else:
+            sc.portable.unlock_file(probe)
+        finally:
+            os.close(probe)
 
         sc.record_cooldown("claude:after-boom", "session limit", access_method="test")
         assert (

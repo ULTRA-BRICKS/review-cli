@@ -342,7 +342,7 @@ def test_board_review_path_applies_effort_override_for_direct_callers(monkeypatc
 
     seen: list = []
 
-    def fake_run_board(pool, reserve, prompt, diff, cwd, timeout, images=()):
+    def fake_run_board(pool, reserve, prompt, diff, cwd, timeout, images=(), reporter=None):
         seen.append(list(pool))
         return FailoverOutcome(
             results=[_ok(s.model) for s in pool],
@@ -377,7 +377,7 @@ def test_board_review_path_effort_override_is_idempotent_after_cli_apply(monkeyp
 
     seen: list = []
 
-    def fake_run_board(pool, reserve, prompt, diff, cwd, timeout, images=()):
+    def fake_run_board(pool, reserve, prompt, diff, cwd, timeout, images=(), reporter=None):
         seen.append(list(pool))
         return FailoverOutcome(
             results=[_ok(s.model) for s in pool],

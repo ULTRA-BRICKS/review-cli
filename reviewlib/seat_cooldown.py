@@ -65,7 +65,7 @@ first thread's new entry, silently losing it ("last-writer-wins", not corruption
 ``_write``'s ``tempfile.mkstemp`` fix above already closes the SEPARATE same-tmp-path
 collision that could corrupt the file or raise). ``_locked()`` now wraps the whole
 read-modify-write in an in-process ``threading.Lock`` PLUS (where available) an
-``fcntl.flock`` exclusive lock: same-process threads are serialized by the
+exclusive file lock (``reviewlib.portable.lock_file``): same-process threads are serialized by the
 ``threading.Lock`` alone (the flock is only ever attempted while already holding it, so
 same-process threads never actually contend the flock against each other — see the
 ``_locked()`` docstring below); the flock is what extends that serialization ACROSS
@@ -81,9 +81,9 @@ filesystem — the module's own motivating scenario), the caller degrades to pro
 weaker locking and, in the worst case, proceeds FULLY UNLOCKED — the original lost-update
 race returns for that one call. This is a deliberate trade (never block the caller
 indefinitely; see the ``_locked()`` docstring below) inherited from, and mirroring,
-``reviewlib.specweb.store.SpecStore._guard``'s established pattern: fcntl import is guarded
-(Windows has none — degrades to the in-process lock only), and any lock-acquisition
-``OSError`` (an odd filesystem without working advisory locks) degrades the SAME way rather
+``reviewlib.specweb.store.SpecStore._guard``'s established pattern: the lock goes through
+``reviewlib.portable`` (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows), and any
+lock-acquisition ``OSError`` (an odd filesystem without working advisory locks) degrades the SAME way rather
 than aborting the write entirely — this cache must never regress from "best-effort,
 occasionally racy" to "silently stops recording cooldowns", and "occasionally racy under
 sustained contention or a stuck filesystem" is exactly the residual risk this trade keeps.
@@ -100,10 +100,9 @@ import threading
 import time
 from pathlib import Path
 
-try:
-    import fcntl  # POSIX advisory file locking (cross-process)
-except ImportError:  # pragma: no cover - Windows has no fcntl
-    fcntl = None  # type: ignore[assignment]
+# Cross-process advisory lock (fcntl.flock on POSIX, msvcrt.locking on Windows). A module
+# reference (not bare functions) so tests can swap in a stub without touching other users.
+from . import portable
 
 # Default cooldown window once a chronic-unavailable signal is seen. Conservative: long
 # enough to skip several would-be-wasted dispatches in a normal burst of review runs, short
@@ -179,8 +178,8 @@ def _ttl_seconds() -> float:
     return override if override is not None else DEFAULT_COOLDOWN_SECONDS
 
 
-# Serializes same-process threads unconditionally (works even where fcntl is unavailable,
-# e.g. Windows) — the flock below adds the cross-process guarantee on top where possible.
+# Serializes same-process threads unconditionally — the file lock below adds the
+# cross-process guarantee on top where possible.
 _LOCK = threading.Lock()
 
 # Total bounded budget for acquiring the in-process `_LOCK` (and, via the flock's own
@@ -240,8 +239,8 @@ def _locked(path: Path):
 
     Mirrors `reviewlib.specweb.store.SpecStore._guard`, with a stronger bound: the WHOLE
     operation (in-process `_LOCK` + cross-process flock, combined) is capped at
-    `_LOCK_TOTAL_DEADLINE_SECONDS`. On platforms without `fcntl` (Windows), when the file
-    lock fails for any `OSError` reason (an odd filesystem without working advisory locks),
+    `_LOCK_TOTAL_DEADLINE_SECONDS`. When the file lock fails for any `OSError` reason (an
+    odd filesystem without working advisory locks),
     when a peer holds the FLOCK past the shared deadline, or when a peer holds `_LOCK`
     ITSELF past the shared deadline (a same-process thread stalled inside its own critical
     section — Opus/GLM review finding, round 2: this case was still an unbounded wait after
@@ -273,7 +272,7 @@ def _locked(path: Path):
     deadline = time.monotonic() + _LOCK_TOTAL_DEADLINE_SECONDS
     got_lock = _LOCK.acquire(timeout=max(0.0, deadline - time.monotonic()))
     try:
-        if not got_lock or fcntl is None:
+        if not got_lock:
             yield
             return
         lock_path = path.parent / f".{path.name}.lock"
@@ -287,7 +286,7 @@ def _locked(path: Path):
             flock_deadline = min(deadline, time.monotonic() + _FLOCK_SUB_BUDGET_SECONDS)
             while True:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    portable.lock_file(fd, blocking=False)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= flock_deadline:
@@ -326,7 +325,7 @@ def _locked(path: Path):
         finally:
             if fd is not None:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    portable.unlock_file(fd)
                 except OSError:
                     pass
                 try:

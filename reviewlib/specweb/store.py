@@ -49,10 +49,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    import fcntl  # POSIX advisory file locking (cross-process)
-except ImportError:  # pragma: no cover - Windows has no fcntl
-    fcntl = None  # type: ignore[assignment]
+from ..portable import lock_file, unlock_file  # cross-process advisory lock
 
 # In-process lock: serialises threads within ONE process (the server's request threads).
 # Cross-process correctness (the server process AND a separate `review spec-web reply`
@@ -331,19 +328,16 @@ class SpecStore:
         ``review spec-web reply`` runs in a SEPARATE process from the server, so the RLock
         alone can't stop its read-modify-write from clobbering a concurrent reviewer
         edit/submit/draft-save (last-writer-wins on os.replace). The flock closes that
-        window: every mutator holds it across its whole load→modify→_write. Best-effort on
-        platforms without fcntl (Windows): falls back to the in-process lock only."""
+        window: every mutator holds it across its whole load→modify→_write (``fcntl.flock`` on
+        POSIX, ``msvcrt.locking`` on Windows -- ``reviewlib.portable``)."""
         with _LOCK:
-            if fcntl is None:
-                yield
-                return
             # Open (creating) the lock file and hold an EXCLUSIVE lock for the critical
             # section. A failure to lock (e.g. an odd filesystem) must not deadlock the
             # store — degrade to the in-process lock rather than raise.
             fd = None
             try:
                 fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                lock_file(fd)
             except OSError:
                 if fd is not None:
                     os.close(fd)
@@ -353,7 +347,7 @@ class SpecStore:
             finally:
                 if fd is not None:
                     try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        unlock_file(fd)
                     except OSError:
                         pass
                     os.close(fd)

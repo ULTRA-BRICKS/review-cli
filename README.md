@@ -25,21 +25,32 @@ review with the composable `--visual` flag for a keep / rollback / repair verdic
 
 ## Install
 
-**One-liner** (installs deps, links `review` into PATH, registers the skill):
+Pick one — each ends with `review` on your PATH:
 
 ```bash
+# 1. uv — recommended; macOS, Linux and Windows (incl. Cygwin / Git Bash)
+uv tool install hyper-review
+
+# 2. pipx
+pipx install hyper-review
+
+# 3. one-liner — clones to ~/.local/share/review-cli, links review into ~/.local/bin, registers the agent skill
 curl -fsSL https://git.hyperide.ai/ultrabricks/review-cli/raw/branch/main/install.sh | bash
+
+# 4. from a clone — to hack on it; `git pull` updates the installed tool
+git clone https://git.hyperide.ai/ultrabricks/review-cli && cd review-cli && ./install.sh
 ```
 
-**pipx alternative:**
+- After **1** or **2**, run `review install-skill` once so coding agents discover `review` (3 and 4 do it for you).
+- **Unreleased `main`:** `uv tool install git+https://git.hyperide.ai/ultrabricks/review-cli` (or the same with `pipx install`).
+- **Update:** `uv tool upgrade hyper-review` · `pipx upgrade hyper-review` · re-run the one-liner · `git pull`.
+- **Installed before the rename** (as `review-cli`, from git)? Remove that first — `uv tool uninstall review-cli` or `pipx uninstall review-cli` — or two installs both claim `review`.
+- **Via rig:** clone into `~/xp/review-cli` and list `review` under `tools.items` in `~/.config/rig/config.yaml` — `rig apply commit` runs its `install.sh` and keeps the clone fresh.
+- **Windows:** use uv (option 1) — review runs natively under Cygwin / Git Bash (file locks via `msvcrt`, UTF-8 output on mintty). `./install.sh` and the one-liner do exactly that there. More: [rig-cli → Windows](https://git.hyperide.ai/ultrabricks/rig-cli#windows-cygwin-git-bash-powershell).
 
-```bash
-pipx install git+https://git.hyperide.ai/ultrabricks/review-cli
-```
+> **On PyPI as `hyper-review`** (the command is still `review`). The canonical repo is
+> **git.hyperide.ai/ultrabricks/review-cli**; `github.com/alex-mextner/review-cli` is a frozen, archived mirror.
 
-After install, run `review install-skill` to register the tool into agent harnesses
-(`~/.agents/skills/review/`) so that Claude Code, Codex, opencode, and Gemini agents
-know `review` exists and can call it. The one-liner above runs this automatically.
 The `install-*` commands (`install-skill` / `install-commit-hook` / `install-hook tg` /
 `register-module`) are idempotent — a re-run reports `already configured` (nothing
 changed), `+ wrote/updated`, or `! conflict` (a foreign hook/symlink left untouched,
@@ -1332,8 +1343,8 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 - **[tg-cli](https://git.hyperide.ai/ultrabricks/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
 - **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
 - **[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
-- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.

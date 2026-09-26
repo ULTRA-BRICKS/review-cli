@@ -43,6 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import portable
 from ..backends import _which
 from ..process import _run, _run_streamed
 
@@ -1334,7 +1335,7 @@ def _write_report(
         # pre-existing (review security finding).
         fd = os.open(str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            portable.fchmod(fd, 0o600)  # a no-op where fchmod doesn't exist
         except OSError:
             pass  # some filesystems don't support fchmod; the create-mode 0600 still applies
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
