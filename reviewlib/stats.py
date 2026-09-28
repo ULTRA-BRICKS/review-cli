@@ -146,6 +146,14 @@ _GITHUB_ISSUE_TASK_RE = re.compile(r"^#?([0-9]+)$")
 _DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
 # `git@host:org/repo(.git)` SCP-style SSH remote syntax.
 _SCP_STYLE_REMOTE_RE = re.compile(r"^[^@/]+@([^:/]+):(.+)$")
+
+
+# Repositories whose canonical home moved from the old alex-mextner GitHub mirror to
+# ultrabricks Forgejo. Normalize both URLs to one identity so historical review/quorum
+# records survive the migration instead of splitting into two logical repositories.
+_FORGEJO_MIGRATED_REPOS = frozenset({
+    "agent-tools", "dev-cli", "review-cli", "rig-cli", "task-cli", "tg-cli"
+})
 # Cap on `quorum_check`'s `mismatch_details` list (the COUNT in
 # `excluded_mismatched_iterations` is always the true total, uncapped) -- a
 # task with thousands of polluted iterations (the HYP-858 shape this feature
@@ -217,6 +225,14 @@ def normalize_repo_remote(url: str) -> str | None:
         path = path[: -len(".git")]
     if not host or not path:
         return None
+    parts = path.split("/", 1)
+    if (
+        host == "github.com"
+        and len(parts) == 2
+        and parts[0].lower() == "alex-mextner"
+        and parts[1].lower() in _FORGEJO_MIGRATED_REPOS
+    ):
+        return f"git.hyperide.ai/ultrabricks/{parts[1].lower()}"
     return f"{host}/{path}"
 
 
@@ -562,7 +578,11 @@ def _classify_iteration_identity(
     item_repo = item.get("repo_id")
     if not isinstance(item_repo, str) or not item_repo:
         return "unverifiable", None
-    if item_repo != repo_id:
+    # Normalize both persisted historical identities and the current repository.
+    # Keep opaque local identities distinct when remote normalization is unavailable.
+    stored_id = normalize_repo_remote(item_repo) or item_repo
+    current_id = normalize_repo_remote(repo_id) or repo_id
+    if stored_id != current_id:
         return "mismatched", "repo_mismatch"
     item_files = item.get("diff_files")
     if current_files and isinstance(item_files, list) and item_files:

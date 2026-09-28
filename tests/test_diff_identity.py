@@ -163,6 +163,48 @@ def test_normalize_repo_remote_nondefault_ssh_port_kept_distinct():
     assert custom_port != portless
 
 
+_FORGEJO = "git.hyperide.ai/ultrabricks/review-cli"
+
+
+def test_normalize_forgejo_canonical_across_forms():
+    for url in (
+        "https://git.hyperide.ai/ultrabricks/review-cli.git",
+        "https://user:tok@git.hyperide.ai/ultrabricks/review-cli",
+        "git@git.hyperide.ai:ultrabricks/review-cli.git",
+        "ssh://git@git.hyperide.ai:22/ultrabricks/review-cli.git",
+    ):
+        assert _stats.normalize_repo_remote(url) == _FORGEJO, url
+
+
+def test_normalize_github_mirror_aliased_to_forgejo():
+    for url in (
+        "https://github.com/alex-mextner/review-cli.git",
+        "https://x-access-token:ghp_abc@github.com/alex-mextner/review-cli.git",
+        "git@github.com:alex-mextner/review-cli.git",
+        "ssh://git@github.com:22/alex-mextner/review-cli.git",
+        "https://GitHub.com/Alex-Mextner/Review-CLI.git",
+        "https://github.com/alex-mextner/review-cli/",
+    ):
+        assert _stats.normalize_repo_remote(url) == _FORGEJO, url
+
+
+def test_normalize_all_migrated_repos_aliased():
+    for repo in ("agent-tools", "dev-cli", "review-cli", "rig-cli", "task-cli", "tg-cli"):
+        got = _stats.normalize_repo_remote(f"git@github.com:alex-mextner/{repo}.git")
+        assert got == f"git.hyperide.ai/ultrabricks/{repo}", repo
+
+
+def test_normalize_unmigrated_repos_not_aliased():
+    for repo in ("draw-cli", "3d-cli"):
+        got = _stats.normalize_repo_remote(f"https://github.com/alex-mextner/{repo}.git")
+        assert got == f"github.com/alex-mextner/{repo}", repo
+
+
+def test_normalize_other_owner_not_aliased():
+    got = _stats.normalize_repo_remote("https://github.com/someone-else/review-cli.git")
+    assert got == "github.com/someone-else/review-cli"
+
+
 def test_diff_content_hash_deterministic_and_content_sensitive():
     h1 = _stats.diff_content_hash(_TWO_FILE_DIFF)
     h2 = _stats.diff_content_hash(_TWO_FILE_DIFF)

@@ -918,6 +918,7 @@ _UNIT_FILES = [
     # Diff-identity binding (review-cli#213): repo/diff mismatch detection for
     # `review task CODE --check`'s self-merge-authority gate.
     ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    ("test_forgejo_history.py", {}),
     ("test_backstop.py", {}),
     # External SIGTERM/SIGINT child reaper (review-cli#160) and its `--detach`/`jobs`/
     # `status`/`wait` companion feature. Both spawn real subprocesses (a throwaway
