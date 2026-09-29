@@ -2,20 +2,23 @@
 """Unit tests for the PRIORITY-ORDERED FAILOVER reviewer pool.
 
 The board is a priority-ordered list (strongest model first). A plain `review` runs the
-top-N AVAILABLE seats; a higher-priority seat that is unavailable at startup is skipped
-and the next-priority one pulled up (startup failover), and a seat that FAILS during the
-run (backend error, timeout, empty/unusable output, "unavailable" body) is replaced by
-the next-priority reserve (mid-run failover) so the run still yields N working verdicts.
+top-N AVAILABLE seats, distinct roles first; a higher-priority seat that is unavailable at
+startup is skipped and the next one pulled up (startup failover), and a seat that FAILS
+during the run (backend error, timeout, empty/unusable output, "unavailable" body) is
+replaced by a seat that keeps its role (mid-run failover, review-cli#588) so the run still
+yields N working verdicts on distinct roles.
 
 These tests, all OFFLINE (no model call, no network — `resolve_backend` is stubbed to a
 fake keyed on model id), prove:
-  (a) startup failover skips an unavailable higher-priority seat and pulls the next up;
-  (b) mid-run failover backfills a FAILED pool seat from the reserve to keep the count;
+  (a) startup failover skips an unavailable higher-priority seat and pulls the next up,
+      preferring a seat with a new role over one repeating a covered role;
+  (b) mid-run failover backfills a FAILED pool seat to keep the count AND its role
+      (same-role reserve, re-lensed reserve, or a reused healthy model);
   (c) the "unavailable" sentinel body (rc=0, e.g. paywalled Fable) counts as a FAILURE
       and triggers a backfill — the cheap probe can't see it, the run-time body can;
   (d) `--pool N` sizes the pool with the same failover;
-  (e) priority order is respected (pool fills from the top, reserve in priority order);
-  (f) graceful degradation when the reserve is exhausted (degraded=True, fewer verdicts);
+  (e) priority order is respected within each role;
+  (f) degradation (degraded=True, missing roles named) only when no healthy model is left;
   (g) run-stats: only the FINAL outcome of each logical seat is tallied (a failed-then-
       replaced seat is one fail + the replacement's outcome, not double-counted), and the
       recorded pool = the models that actually produced verdicts.
@@ -232,89 +235,64 @@ def test_fable_unavailability_is_noop_for_default_pool_roles():
     assert "architect" not in roles, roles  # Fable's lens is the one lost, as expected.
 
 
-def test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens():
-    """When GLM-cc itself is unavailable, Kimi and then Astra backfill. Before
-    review-cli#fable-seat-reliability, Fable's UNIQUE `architect` lens sat right behind
-    GLM-cc in priority, so this exact combo still kept four distinct lenses. Now that
-    Fable is demoted to the very last reserve seat (a confirmed ~100% dispatch failure
-    rate made that trade worth it — see DEFAULT_BOARD's Fable comment), the next
-    backfill is Astra, whose `consistency` lens duplicates Sol's — a real, accepted,
-    narrow trade-off: this combo (GLM-cc down AND a 4th seat needed) is far rarer than
-    Fable's near-certain failure on literally every default review. review-cli#382 (round
-    2): an earlier draft of that change re-lensed Astra to `security` specifically to
-    close this duplicate, but a codex re-review caught that doing so left `consistency`
-    with ZERO live fallback anywhere on the whole board — worse than this narrow,
-    pre-existing trade-off. Astra's role is deliberately left unchanged; see its own
-    DEFAULT_BOARD comment."""
+def test_glm_cc_unavailable_backfills_a_new_lens_not_astras_duplicate():
+    """review-cli#588: with GLM-cc unavailable, the next seat by priority is Astra, whose
+    `consistency` lens duplicates Sol's. The pool used to take it anyway (a 4-seat pool
+    with only 3 lenses — the pre-#588 "accepted trade-off"). Distinct roles now come
+    first: Terra brings `performance` (the very lens GLM-cc carried) and Astra stays at the
+    head of the reserve, still the first `consistency` backfill if Sol fails."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != GLM_COMMANDCODE_SEAT}
-    pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
+    pool, reserve = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
     models = [r.model for r in pool]
-    assert GLM_COMMANDCODE_SEAT not in models, models
     assert models == [
         SOL_SEAT,
         "claude:claude-opus-4-8",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        ASTRA_SEAT,
+        TERRA_SEAT,
     ], models
     roles = [r.role for r in pool]
-    assert roles.count("consistency") == 2, roles  # Sol + Astra, the accepted trade-off
-    assert set(roles) == {"consistency", "correctness", "quality"}, roles
+    assert sorted(roles) == ["consistency", "correctness", "performance", "quality"], roles
+    assert reserve[0].model == ASTRA_SEAT, [r.model for r in reserve]
 
 
 def test_heavy_preset_double_failure_still_beats_pre_382_board():
     """codex review finding (review-cli#382): `--preset heavy` (which keeps Sol, unlike
-    `DEFAULT_PRESET_BOARD`) can only fit 4 distinct roles in its pool once commandcode is
-    ALSO disabled -- its top-4-available becomes Sol/Opus/Astra/Terra, i.e. `consistency`
-    (Sol AND Astra -- Astra's pre-existing role, deliberately left unchanged, see its
-    DEFAULT_BOARD comment) / `correctness` / `performance`, with `quality` (Sonnet) AND
-    `security` (the z.ai-GLM seat) both pushed to reserve. No re-ordering fixes this for
-    every board at once (see the KNOWN LIMIT comment above DEFAULT_BOARD) -- pool=4 cannot
-    hold every distinct role Sol+Opus+Astra+performance+quality+security would need. This
-    test proves the change is still a genuine improvement for heavy in the ACTUAL incident
-    shape: not just commandcode disabled, but the z.ai GLM seat (the SAME seat that hit a
-    real quota exhaustion in the 2026-09-05 incident) also down. Before review-cli#382,
-    that left heavy with only 3 available seats (Sol, Opus, Astra) and ZERO reserve. After
-    #382, heavy still gets a full 4-seat pool, with Sonnet as the immediate first-reserve
-    `quality` backfill on any pool-seat failure."""
+    `DEFAULT_PRESET_BOARD`) with commandcode ALSO disabled used to dispatch its raw
+    top-4-available, Sol/Opus/Astra/Terra — `consistency` twice, `quality` and `security`
+    pushed to reserve. review-cli#588 picks distinct roles first, so the pool is
+    Sol/Opus/Terra/Sonnet: four lenses. This stays true in the ACTUAL incident shape (the
+    z.ai GLM seat — the one that hit the real 2026-09-05 quota exhaustion — also down),
+    and Astra heads the reserve as the `consistency` backfill. Before review-cli#382 that
+    double failure left heavy with only 3 available seats (Sol, Opus, Astra) and ZERO
+    reserve."""
     board = list(HEAVY_PRESET_BOARD)
     pool_size = preset_pool_size("heavy")
     available = {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS
 
-    expected_pool_models = [SOL_SEAT, "claude:claude-opus-4-8", ASTRA_SEAT, TERRA_SEAT]
+    expected_pool_models = [SOL_SEAT, "claude:claude-opus-4-8", TERRA_SEAT, SONNET_SEAT]
+    expected_roles = ["consistency", "correctness", "performance", "quality"]
 
-    # Post-#382: commandcode/gemini disabled only -- the routine incident precursor.
+    # commandcode/gemini disabled only -- the routine incident precursor.
     pool, reserve = split_pool_reserve(board, pool_size, _avail(available))
     assert [r.model for r in pool] == expected_pool_models
-    assert [r.role for r in pool] == [
-        "consistency",
-        "correctness",
-        "consistency",
-        "performance",
-    ]
-    reserve_models = {r.model for r in reserve}
-    assert SONNET_SEAT in reserve_models and "oc:zai/glm-5.2" in reserve_models
+    assert [r.role for r in pool] == expected_roles
+    reserve_models = [r.model for r in reserve]
+    assert reserve_models[0] == ASTRA_SEAT and "oc:zai/glm-5.2" in reserve_models
 
-    # Post-#382: the z.ai GLM seat -- the seat that hit the REAL 2026-09-05 quota
-    # exhaustion -- ALSO down, mirroring the real incident shape exactly.
+    # The z.ai GLM seat ALSO down, mirroring the real incident shape exactly.
     available_double_failure = available - {"oc:zai/glm-5.2"}
     pool_double_failure, reserve_double_failure = split_pool_reserve(
         board, pool_size, _avail(available_double_failure)
     )
-    assert len(pool_double_failure) == 4, (
-        pool_double_failure
-    )  # still FULL, not degraded
-    assert {r.model for r in pool_double_failure} == set(expected_pool_models)
-    # quality is the FIRST backfill
-    assert reserve_double_failure and reserve_double_failure[0].model == SONNET_SEAT
+    assert [r.model for r in pool_double_failure] == expected_pool_models
+    assert reserve_double_failure and reserve_double_failure[0].model == ASTRA_SEAT
 
     # Pre-#382 comparison (drop TERRA_SEAT/SONNET_SEAT -- the two seats #382 added -- and
     # GROK_SEAT/MIMO_SEAT/OMP_CLAUDE_SEAT, which review-cli#165/#450/#168 added on top of
-    # #382 and which are likewise available reserves here): since Astra's role is
-    # UNCHANGED by #382, this accurately reconstructs the board as it existed before this
-    # change. The equivalent double failure left only Sol/Opus/Astra available (3, one
-    # seat short of the pool, with `consistency` ALREADY duplicated) and NO reserve
-    # whatsoever.
+    # #382 and which are likewise available reserves here): the equivalent double failure
+    # left only Sol/Opus/Astra available (3, one seat short of the pool, with
+    # `consistency` duplicated) and NO reserve whatsoever.
     pre_382_board = [
         r
         for r in board
@@ -428,23 +406,29 @@ def test_midrun_all_pool_succeeds_no_backfill():
     assert set(fb.dispatched) == {r.model for r in pool}
 
 
-def test_midrun_failed_seat_is_backfilled_keeps_count():
-    """A pool seat that FAILS mid-run is replaced by the next-priority reserve, so the
-    run still ends with `pool_size` (4) usable verdicts — it does NOT degrade to 3."""
+def test_midrun_failed_seat_is_backfilled_keeps_count_and_role():
+    """A pool seat that FAILS mid-run is replaced so the run still ends with `pool_size`
+    (4) usable verdicts — and (review-cli#588) the replacement carries the failed seat's
+    ROLE: Kimi [quality] is backfilled by Sonnet [quality], not by Astra, the next seat by
+    priority, whose `consistency` lens Sol already covers."""
     board = list(DEFAULT_BOARD)
     pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
-    # The 4th pool seat (Kimi) errors out mid-run; the next reserve (Codex, priority 5
-    # post-Fable-demotion) backfills it.
-    failing = pool[3].model
-    with _FakeBackends({failing: (1, "boom")}) as fb:
+    failing = pool[3]
+    assert failing.role == "quality" and reserve[0].model == ASTRA_SEAT
+    with _FakeBackends({failing.model: (1, "boom")}) as fb:
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
     assert len(outcome.usable) == 4, outcome.usable_models
     assert not outcome.degraded
-    # The failed seat ran (and is in results but not usable); the first reserve ran too.
-    assert failing in fb.dispatched
-    assert reserve[0].model in fb.dispatched
-    assert failing not in outcome.usable_models
-    assert reserve[0].model in outcome.usable_models
+    assert failing.model in fb.dispatched
+    assert ASTRA_SEAT not in fb.dispatched, fb.dispatched
+    assert failing.model not in outcome.usable_models
+    assert SONNET_SEAT in outcome.usable_models
+    assert sorted(outcome.usable_roles) == [
+        "consistency",
+        "correctness",
+        "performance",
+        "quality",
+    ]
 
 
 def test_midrun_unavailable_body_triggers_backfill_fable_case():
@@ -501,21 +485,128 @@ def test_midrun_cascading_failures_walk_the_reserve():
     assert not outcome.degraded
 
 
-def test_midrun_reserve_exhausted_degrades_gracefully():
-    """When the reserve can't refill the pool, the run degrades: fewer usable verdicts,
-    degraded=True — it does NOT crash or hang."""
+def test_midrun_reserve_exhausted_reuses_healthy_seats_for_missing_roles():
+    """review-cli#588: when the reserve can't refill the pool, a model that already
+    returned a usable verdict is dispatched AGAIN under each missing role (a real call
+    with that role's lens), instead of degrading to fewer lenses while it sits idle."""
+    from reviewlib.config import REVIEW_ROLES
+
     board = list(DEFAULT_BOARD)
-    # Only the 4 pool seats are available; NO reserve. Two of the pool fail.
+    # Only the 4 pool seats are available; NO reserve. Sol and Opus fail.
     pool, reserve = split_pool_reserve(
         board, 4, _avail({r.model for r in DEFAULT_BOARD[:4]})
     )
     assert reserve == []
     behaviour = {pool[0].model: (1, "x"), pool[1].model: (1, "y")}
+    with _FakeBackends(behaviour) as fb:
+        outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
+    assert not outcome.degraded, outcome
+    assert len(outcome.usable) == 4
+    assert sorted(outcome.usable_roles) == [
+        "consistency",
+        "correctness",
+        "performance",
+        "quality",
+    ]
+    survivors = {pool[2].model, pool[3].model}
+    assert set(outcome.usable_models) == survivors
+    reuse_prompts = [p for m, p in fb.calls if m in survivors]
+    assert len(reuse_prompts) == 4  # 2 own-lens calls + 2 reuse calls
+    assert any(REVIEW_ROLES["consistency"] in p for p in reuse_prompts)
+    assert any(REVIEW_ROLES["correctness"] in p for p in reuse_prompts)
+
+
+def test_midrun_every_seat_failing_degrades_without_fake_coverage():
+    """Zero healthy models cannot produce coverage: nothing is reused, the run is
+    degraded, and every role the pool owed is named with the reason its seat failed."""
+    board = list(DEFAULT_BOARD)
+    pool, reserve = split_pool_reserve(
+        board, 4, _avail({r.model for r in DEFAULT_BOARD[:4]})
+    )
+    behaviour = {r.model: (1, f"Error: {r.display} is out of credits") for r in pool}
     with _FakeBackends(behaviour):
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
-    assert len(outcome.usable) == 2, [r.model for r in outcome.usable]
     assert outcome.degraded
-    assert outcome.target == 4
+    assert outcome.usable == [] and outcome.target == 4
+    assert outcome.role_target == 4
+    assert outcome.missing_roles == [r.role for r in pool]
+    assert "out of credits" in outcome.role_failures["consistency"][0]
+
+
+def test_midrun_reserve_seat_is_relensed_onto_the_missing_role():
+    """review-cli#588: when no reserve seat carries the failed role or any other uncovered
+    role, the next reserve seat reviews under the MISSING role instead of repeating a lens
+    the pool already has."""
+    from reviewlib.config import REVIEW_ROLES
+
+    pool = [
+        BoardReviewer("m-a", "correctness", "A"),
+        BoardReviewer("m-b", "security", "B"),
+    ]
+    reserve = [BoardReviewer("m-c", "correctness", "C")]
+    with _FakeBackends({"m-b": (1, "boom")}) as fb:
+        outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
+    assert not outcome.degraded
+    assert list(zip(outcome.usable_models, outcome.usable_roles)) == [
+        ("m-a", "correctness"),
+        ("m-c", "security"),
+    ]
+    prompts = dict(fb.calls)
+    assert REVIEW_ROLES["security"] in prompts["m-c"]
+    assert REVIEW_ROLES["correctness"] not in prompts["m-c"]
+
+
+# The roster from ~/.config/review-cli/config.yaml on 2026-09-29 (commandcode seats are
+# unpaid and never reachable, so they are left out here as the startup probe drops them).
+_ALEX_ROSTER = [
+    BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+    BoardReviewer("omp:openai-codex/gpt-5.6-terra", "consistency", "Codex-omp"),
+    BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+    BoardReviewer("oc:zai/glm-5.2", "quality", "GLM"),
+    BoardReviewer("claude:claude-sonnet-5", "quality", "Sonnet"),
+    BoardReviewer("oc:xai/grok-4.6", "security", "Grok"),
+    BoardReviewer("omp:anthropic/claude-opus-4-8", "correctness", "Opus-omp"),
+    BoardReviewer("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc-last"),
+    BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+]
+
+
+def test_replay_2026_09_29_sme_463_keeps_three_distinct_roles():
+    """review-cli#588 acceptance: sme-archiving-gc #463 on 2026-09-29 — claude CLI
+    OAuth expired (Opus/Sonnet/Fable), Codex-omp weekly quota, codex CLI token revoked,
+    Grok out of credits; GLM, Opus-omp and the z.ai-routed GLM-cc were healthy. Pool 3
+    must come back with 3 distinct roles and never with a repeated lens."""
+    board = list(_ALEX_ROSTER)
+    pool, reserve = split_pool_reserve(board, 3, _avail({r.model for r in board}))
+    assert [r.display for r in pool] == ["Opus", "Codex-omp", "GLM"]
+    dead = {
+        "claude:claude-opus-4-8": (1, "Failed to authenticate: OAuth session expired"),
+        "claude:claude-sonnet-5": (1, "Failed to authenticate: OAuth session expired"),
+        "claude:claude-fable-5": (1, "Failed to authenticate: OAuth session expired"),
+        "omp:openai-codex/gpt-5.6-terra": (1, "The usage limit has been reached"),
+        "codex:gpt-5.6-terra": (1, "401 Unauthorized: token_revoked"),
+        "oc:xai/grok-4.6": (1, "Error: You have run out of credits"),
+    }
+    with _FakeBackends(dead):
+        outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
+    assert not outcome.degraded, outcome
+    assert len(set(outcome.usable_roles)) == 3, outcome.usable_roles
+    assert len(outcome.usable_roles) == 3
+
+
+def test_replay_2026_09_29_stt_106_single_healthy_model_fills_three_roles():
+    """review-cli#588 acceptance: stt-cli 106 on 2026-09-29 — every seat but Opus-omp
+    failed (GLM also hit z.ai 429s) and the run degraded to ONE correctness verdict. The
+    healthy model now reviews the missing lenses too: 3 distinct roles, one model."""
+    board = list(_ALEX_ROSTER)
+    pool, reserve = split_pool_reserve(board, 3, _avail({r.model for r in board}))
+    healthy = "omp:anthropic/claude-opus-4-8"
+    dead = {r.model: (1, "Error: seat down") for r in board if r.model != healthy}
+    with _FakeBackends(dead):
+        outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
+    assert not outcome.degraded, outcome
+    assert outcome.usable_models == [healthy] * 3
+    assert len(set(outcome.usable_roles)) == 3, outcome.usable_roles
 
 
 def test_midrun_pool_n_honored_in_failover():

@@ -2135,12 +2135,13 @@ def _call_is_clean_ok(call: "CallLog") -> bool:
 
 
 def _fallback_seat_for(model_id: str) -> dict | None:
-    """The next board seat (by priority) the failover pool would promote when ``model_id`` is
-    down, or ``None`` if the model is off-board or already the lowest-priority seat.
+    """The board seat the failover pool would promote first when ``model_id`` is down, or
+    ``None`` if the model is off-board or already the lowest-priority seat.
 
-    review-cli's pool runs the top-N AVAILABLE seats and backfills a failed seat from the
-    next-priority reserve (config.select_pool / panel.run_board_with_failover). So the honest
-    'planned fallback' for a failed seat is simply the next board seat after it.
+    review-cli#588: a failed seat is backfilled by the next lower-priority seat carrying
+    the SAME role when one exists (panel._choose_backfill), else by the next seat in
+    priority order — so that is the honest 'planned fallback' hint. (The live choice also
+    depends on which roles the run already covers; this static hint cannot see that.)
 
     `model_id` is a `model_id_for_call` result, which shares the built-in board id scheme exactly
     (e.g. `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`), so the exact match below
@@ -2149,9 +2150,10 @@ def _fallback_seat_for(model_id: str) -> dict | None:
     board = _board_models_cached()
     for idx, seat in enumerate(board):
         if seat["model"] == model_id:
-            nxt = board[idx + 1] if idx + 1 < len(board) else None
-            if nxt is None:
+            later = board[idx + 1 :]
+            if not later:
                 return None
+            nxt = next((s for s in later if s["role"] == seat["role"]), later[0])
             return {
                 "model": nxt["model"],
                 "display": nxt["display"],

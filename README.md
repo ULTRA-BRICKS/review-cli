@@ -1122,9 +1122,12 @@ first, chosen by **priority + availability**. A bare `review diff` runs the `lig
 pool of 2 at medium effort) for cheap routine checks; `--preset default` steps up to a pool of
 4 at high effort; `--preset heavy` runs Sol/Opus/GLM-cc/Kimi at `xhigh`, with the rest of the
 board as `max`-effort reserve. Fable is excluded from every preset — chronic dispatch failures
-demoted it to the board's final, last-resort seat. Two layers of failover keep the pool full:
-**startup failover** skips an unreachable higher-priority seat and pulls up the next one, and
-**mid-run failover** promotes the next-priority reserve if an active seat fails mid-review.
+demoted it to the board's final, last-resort seat. Two layers of failover keep the pool full
+and its **roles** covered (review-cli#588): **startup failover** skips an unreachable seat and
+fills the pool with distinct roles first, and **mid-run failover** replaces a failed seat with
+one that keeps its role (a same-role reserve, else a reserve re-lensed onto the missing role,
+else a model that already answered in this run). A run that still ends short of roles prints
+a `ROLE SHORTFALL` notice and exits non-zero.
 `--pool N` sizes the pool (`--pool 0` runs every available seat in the selected preset/board);
 the board itself is never disabled.
 

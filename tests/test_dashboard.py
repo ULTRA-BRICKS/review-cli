@@ -2531,8 +2531,9 @@ def test_error_recovery_recovered_when_a_clean_call_follows_in_session():
         assert e["recovery"] == "recovered", (
             e
         )  # DeepSeek's clean call after it recovered the run
-        # The planned fallback is the next board seat by priority after Qwen (DeepSeek).
-        assert e["fallback"] is not None and e["fallback"]["display"] == "DeepSeek", e[
+        # The planned fallback is the next board seat carrying Qwen's `security` role
+        # (Grok), not merely the next seat by priority (review-cli#588).
+        assert e["fallback"] is not None and e["fallback"]["display"] == "Grok", e[
             "fallback"
         ]
 
@@ -2627,18 +2628,17 @@ def test_error_recovery_recovered_by_parallel_panel_sibling_same_round():
         assert kimi_err["recovery"] == "recovered", kimi_err
 
 
-def test_fallback_seat_is_next_priority_and_none_for_last_seat():
-    """`_fallback_seat_for` returns the next board seat by priority, and None for the
-    lowest-priority seat (the board has no lower reserve) or an off-board model."""
+def test_fallback_seat_prefers_same_role_and_is_none_for_last_seat():
+    """`_fallback_seat_for` returns the next lower-priority seat carrying the same role
+    (Sol `consistency` -> Astra, not Opus), and None for the lowest-priority seat (the
+    board has no lower reserve) or an off-board model."""
     from reviewlib.dashboard import parser as p
-    from reviewlib.config import DEFAULT_BOARD
+    from reviewlib.config import ASTRA_SEAT, DEFAULT_BOARD, SOL_SEAT
 
-    first = DEFAULT_BOARD[0].model
-    second = DEFAULT_BOARD[1]
-    last = DEFAULT_BOARD[-1].model
-    fb = p._fallback_seat_for(first)
-    assert fb is not None and fb["model"] == second.model and fb["priority"] == 2, fb
-    assert p._fallback_seat_for(last) is None, (
+    assert DEFAULT_BOARD[0].model == SOL_SEAT
+    fb = p._fallback_seat_for(SOL_SEAT)
+    assert fb is not None and fb["model"] == ASTRA_SEAT and fb["role"] == "consistency", fb
+    assert p._fallback_seat_for(DEFAULT_BOARD[-1].model) is None, (
         "the lowest-priority seat has no fallback"
     )
     assert p._fallback_seat_for("opencode") is None, (
@@ -2649,26 +2649,27 @@ def test_fallback_seat_is_next_priority_and_none_for_last_seat():
 def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     """(glm review finding 2/6) The id `model_id_for_call` returns for a real gateway call (e.g.
     `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`) is EXACTLY a built-in board seat id,
-    so `_fallback_seat_for` resolves a real next-priority seat — NOT None — for the in-production
+    so `_fallback_seat_for` resolves a real fallback seat — NOT None — for the in-production
     failing-seat case. Pin it so a board re-id can't silently make every fallback hint blank."""
     from reviewlib.dashboard import parser as p
     from reviewlib.config import DEFAULT_BOARD
 
-    board_ids = [b.model for b in DEFAULT_BOARD]
-    # Every NON-LAST board seat must resolve a concrete fallback whose id is the next board seat.
+    # Every NON-LAST board seat must resolve a concrete, LOWER-priority fallback seat.
     for idx, b in enumerate(DEFAULT_BOARD[:-1]):
         fb = p._fallback_seat_for(b.model)
         assert fb is not None, f"{b.model} (priority {idx + 1}) should have a fallback"
-        assert fb["model"] == board_ids[idx + 1], (b.model, fb)
+        assert fb["priority"] > idx + 1, (b.model, fb)
+    # Kimi (`quality`) falls back to Sonnet (the next `quality` seat), not Astra.
+    kimi = next(b for b in DEFAULT_BOARD if b.display == "Kimi")
+    fb = p._fallback_seat_for(kimi.model)
+    assert fb is not None and fb["display"] == "Sonnet" and fb["role"] == "quality", fb
     # The gateway-routed seat a failing Kimi call carries (the board's exact id — agentic `oc:`
     # form today) resolves a real fallback, not None — the production failing-seat case.
     kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
     assert p._fallback_seat_for(kimi_seat) is not None
     # The z.ai GLM seat is deprioritized (review-cli#65) but no longer the very last
-    # seat: Fable is (review-cli#fable-seat-reliability, a confirmed ~100% dispatch
-    # failure rate demoted it below even GLM). GLM still resolves a real fallback (to
-    # Fable); Fable itself has none — None is the correct hint for the lowest seat (the
-    # general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
+    # seat: Fable is (review-cli#fable-seat-reliability). GLM (`security`, no later
+    # security seat) still resolves a real fallback (to Fable); Fable itself has none.
     glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
     fable_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Fable")
     assert fable_seat == DEFAULT_BOARD[-1].model, fable_seat  # pin: Fable is last

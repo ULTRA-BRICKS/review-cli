@@ -608,6 +608,46 @@ def test_recorded_task_pool_size_floors_light_unless_explicit():
     assert recorded_task_pool_size(4, explicit_pool=False, recorded=True) == 4
 
 
+# Alex's roster order on 2026-09-29: two consistency seats right behind Opus.
+_ROSTER = [
+    BoardReviewer("opus", "correctness", "Opus"),
+    BoardReviewer("codex-omp", "consistency", "Codex-omp"),
+    BoardReviewer("codex", "consistency", "Codex"),
+    BoardReviewer("glm", "quality", "GLM"),
+    BoardReviewer("grok", "security", "Grok"),
+]
+
+
+def test_startup_pool_prefers_distinct_roles_review_cli_588():
+    """A pure priority slice made the pool Opus/Codex-omp/Codex — `consistency` twice.
+    Distinct roles come first; the repeat-role seat heads the reserve instead."""
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        _ROSTER, 3, usage_percent=_usage({})
+    )
+    assert [(r.model, r.role) for r in pool] == [
+        ("opus", "correctness"),
+        ("codex-omp", "consistency"),
+        ("glm", "quality"),
+    ]
+    assert [r.model for r in reserve] == ["codex", "grok"]
+
+
+def test_startup_repeat_role_seat_is_relensed_when_it_must_fill_a_slot_review_cli_588():
+    """Only Opus + both Codex seats reachable: the third slot is still worth a dispatch,
+    but under a lens the pool lacks (the board's next unused role), not `consistency`
+    again — and the re-lensed seat's ORIGINAL is consumed, not left in the reserve."""
+    reachable = {"opus", "codex-omp", "codex"}
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        _ROSTER, 3, lambda r: r.model in reachable, usage_percent=_usage({})
+    )
+    assert [(r.model, r.role) for r in pool] == [
+        ("opus", "correctness"),
+        ("codex-omp", "consistency"),
+        ("codex", "quality"),
+    ]
+    assert reserve == []
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

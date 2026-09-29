@@ -3,6 +3,33 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.39.0 — 2026-09-29
+
+- **Fix(board): a review keeps every role filled when seats fail**
+  ([review-cli#588](https://git.hyperide.ai/ultrabricks/review-cli/issues/588)). On
+  2026-09-29, 29 of 142 review runs covered fewer than 3 distinct roles, and in the week
+  before, 190 runs ended as correctness + quality + quality. Failover promoted the
+  next-priority reserve with whatever lens it carried, so consistency and security
+  disappeared whenever Codex or Grok were down. Now:
+  - the startup pool takes distinct roles first. A seat whose role an earlier pool seat
+    already covers waits in the reserve. If such a seat must still fill a slot, it reviews
+    under a board role the pool lacks (`board re-lensed` on stderr). `--show-board` marks
+    the same pool;
+  - a failed seat is backfilled by a reserve seat with the same role, else a reserve seat
+    whose own role is still uncovered, else the next reserve seat re-lensed onto the missing
+    role. Once the reserve is empty, a model that already returned a usable verdict in this
+    run is dispatched again under the missing role (a real call with that lens). A reserve
+    seat whose model already failed in this run is skipped. An exact `-m` board is not
+    padded this way: a failed explicit seat stays failed (review-cli#137);
+  - a run that still covers fewer distinct roles than it owes (min of the pool size and the
+    board's distinct lensed roles) prints a `ROLE SHORTFALL` notice on stdout. The notice
+    names each missing role and why its seats failed, and the run exits non-zero;
+  - the Claude CLI account rotation now also moves on to the next registered account when
+    a login is gone ("Failed to authenticate: OAuth session expired", "not logged in"). A
+    logged-out `current` account used to stop the rotation and take down every `claude:*`
+    seat;
+  - the dashboard's "planned fallback" hint names the next seat with the same role.
+
 ## 0.38.0 — 2026-09-26
 
 - **Build: published on PyPI as `hyper-review`** (the command stays `review`; `review-cli` on

@@ -1319,7 +1319,7 @@ def _review_omp_with_account_fallback(
         result = _review_omp_once(
             model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile
         )
-        if _chronic_unavailable_reason(result) is None:
+        if not _account_should_advance(result):
             return result
         last_result = result
     return last_result
@@ -2732,6 +2732,32 @@ def _claude_runtime_gateway_provider() -> str | None:
     return _claude_gateway_provider_from_env()
 
 
+# review-cli#588: a Claude login that is gone (logged out, OAuth expired/revoked) on ONE
+# registered account. The account loops below move on to the next account for this, the
+# same as for a chronic quota result — on 2026-09-29 the `current` account (account-2) was
+# logged out while account-0/1 were fine, and stopping at the first account killed every
+# claude:* seat. Only matched on a non-zero exit, so a real review mentioning these words
+# is never read as an auth failure.
+_ACCOUNT_AUTH_FAILURE = re.compile(
+    r"failed to authenticate|oauth (?:session|token) (?:has )?expired|not logged in"
+    r"|please run /login|invalid api key|authentication_error|log in again",
+    re.IGNORECASE,
+)
+
+
+def _account_should_advance(result: ReviewResult) -> bool:
+    """True when the next registered account should be tried after `result`: a chronic
+    quota/unavailable result (`_chronic_unavailable_reason`) or a failed login on this
+    account (`_ACCOUNT_AUTH_FAILURE`)."""
+    if _chronic_unavailable_reason(result) is not None:
+        return True
+    if result.returncode == 0:
+        return False
+    return bool(
+        _ACCOUNT_AUTH_FAILURE.search(f"{result.stdout or ''}\n{result.stderr or ''}")
+    )
+
+
 def _claude_account_candidates() -> list[tuple[str | None, str | None]]:
     """Ordered (CLAUDE_CONFIG_DIR, email) pairs review_claude's CLI transport tries,
     current account first (reviewlib.claude_accounts.rotation_order). A single
@@ -2749,7 +2775,8 @@ def _review_claude_cli_with_account_fallback(
     model, prompt, diff, cwd, timeout, round_no, *, effort
 ) -> ReviewResult:
     """Try each registered Claude account (CLAUDE_CONFIG_DIR) in rotation order, current
-    first, until one produces a non-chronic result or every account is exhausted
+    first, until one produces a result that is neither chronic nor a failed login
+    (`_account_should_advance`) or every account is exhausted
     (review-cli#168/#170: the OLD gate blocked every claude:* seat when ANY ONE
     configured account reported 100% usage, even when the account actually in use was
     fine). A host with no `~/.claude-accounts` registry gets exactly one (None, None)
@@ -2771,7 +2798,7 @@ def _review_claude_cli_with_account_fallback(
             effort=effort,
             config_dir=config_dir,
         )
-        if _chronic_unavailable_reason(result) is None:
+        if not _account_should_advance(result):
             return result
         last_result = result
         skipped.append(email or config_dir or "default")

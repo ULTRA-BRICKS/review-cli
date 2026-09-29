@@ -833,20 +833,22 @@ def test_panel_tally_one_per_seat_across_reserve_replace(tmp_log):
 
 def test_panel_seat_fatal_falls_to_reserve(tmp_log):
     """A SEAT-FATAL pool seat is NOT retried — it falls straight to the reserve, which keeps
-    the pool full."""
+    the pool full. The backfill is the reserve seat carrying the failed seat's role
+    (review-cli#588), not merely the next one by priority."""
     os.environ["REVIEW_RETRY_COUNT"] = "3"
     try:
         board = list(DEFAULT_BOARD)
         pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
         behaviour = {pool[3].model: [(1, "", "401 unauthorized")]}  # fatal, every call
+        backfill = next(r for r in reserve if r.role == pool[3].role)
         with _FakeBackends(behaviour) as fb:
             outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
         assert len(outcome.usable) == 4
         assert not outcome.degraded
         # The fatal seat was tried ONCE (no in-seat retry) and the reserve backfilled it.
         assert fb.dispatched.count(pool[3].model) == 1, fb.dispatched
-        assert reserve[0].model in fb.dispatched
-        assert reserve[0].model in outcome.usable_models
+        assert backfill.model in fb.dispatched
+        assert backfill.model in outcome.usable_models
         assert pool[3].model not in outcome.usable_models
     finally:
         os.environ.pop("REVIEW_RETRY_COUNT", None)

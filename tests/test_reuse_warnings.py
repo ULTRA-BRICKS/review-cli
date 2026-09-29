@@ -98,6 +98,68 @@ def test_board_reused_warning_silent_when_pool_equals_board():
     assert out == ""
 
 
+def test_board_relensed_notice_is_not_called_reuse_review_cli_588():
+    """A repeat-role seat moved onto another lens at startup is a fresh `replace()` copy
+    too, but its model runs ONCE — the notice must say it was re-lensed, not claim the
+    model was reused for lack of distinct models."""
+    from dataclasses import replace
+
+    board = [
+        BoardReviewer("codex-omp", "consistency", "Codex-omp"),
+        BoardReviewer("codex", "consistency", "Codex"),
+    ]
+    pool = [board[0], replace(board[1], role="quality")]
+    out = _captured_stderr(_warn_if_board_reused, board, pool)
+    assert "board re-lensed" in out and "Codex [quality]" in out, out
+    assert "board padded" not in out, out
+
+
+def test_role_shortfall_notice_names_missing_roles_and_reasons_on_stdout_review_cli_588():
+    from contextlib import redirect_stdout
+
+    from reviewlib.modes.review import _report_role_shortfall
+    from reviewlib.panel import FailoverOutcome
+
+    outcome = FailoverOutcome(
+        results=[],
+        usable=[],
+        target=3,
+        degraded=True,
+        usable_models=["omp:anthropic/claude-opus-4-8"],
+        usable_roles=["correctness"],
+        role_target=3,
+        missing_roles=["consistency", "security"],
+        role_failures={
+            "consistency": ["Codex (codex:gpt-5.6-terra): 401 token_revoked"],
+            "security": ["Grok (oc:xai/grok-4.6): run out of credits"],
+        },
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _report_role_shortfall(outcome)
+    out = buf.getvalue()
+    assert "ROLE SHORTFALL: 1 of 3 required roles covered (correctness)" in out, out
+    assert "missing: consistency, security" in out, out
+    assert "- consistency: Codex (codex:gpt-5.6-terra): 401 token_revoked" in out, out
+    assert "- security: Grok (oc:xai/grok-4.6): run out of credits" in out, out
+
+
+def test_role_shortfall_notice_silent_when_every_role_is_covered():
+    from contextlib import redirect_stdout
+
+    from reviewlib.modes.review import _report_role_shortfall
+    from reviewlib.panel import FailoverOutcome
+
+    outcome = FailoverOutcome(
+        results=[], usable=[], target=2, degraded=False, usable_models=["a", "b"],
+        usable_roles=["correctness", "security"], role_target=2,
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _report_role_shortfall(outcome)
+    assert buf.getvalue() == ""
+
+
 def test_board_reused_warning_does_not_blame_usage_limit_for_a_hard_cooldown_pad():
     # task-cli#139, codex review finding: the message used to hardcode "too few
     # distinct models were under their usage limit" as the cause, but padding also

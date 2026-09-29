@@ -25,7 +25,7 @@ from .backends import (
     resolve_backend,
     review_with_images,
 )
-from .config import MODERATOR_CANDIDATES, BoardReviewer
+from .config import MODERATOR_CANDIDATES, REVIEW_ROLES, BoardReviewer
 from .process import set_board_deadline, write_retry_log
 
 if TYPE_CHECKING:
@@ -546,7 +546,8 @@ class FailoverOutcome:
     the whole story). `usable` is the subset that produced a real verdict (see
     result_is_usable) — its length is the honest pool_size for run-stats. `degraded`
     is True when fewer than `target` usable verdicts were produced (the reserve was
-    exhausted before the pool refilled)."""
+    exhausted before the pool refilled), or when fewer than `role_target` distinct
+    lensed roles got a usable verdict (review-cli#588)."""
 
     results: list[ReviewResult]
     usable: list[ReviewResult]
@@ -569,6 +570,13 @@ class FailoverOutcome:
     # `FailoverOutcome(...)` test fakes that predate this field keep constructing
     # without passing it.
     usable_roles: list[str] = field(default_factory=list)
+    # review-cli#588: how many distinct lensed roles this run owed (min of the seat target
+    # and the distinct lensed roles on the pool+reserve), the ones it did NOT cover, and
+    # for each missing role the "<seat>: <reason>" lines of the seats that failed it — the
+    # ROLE SHORTFALL notice prints these instead of letting a lens vanish silently.
+    role_target: int = 0
+    missing_roles: list[str] = field(default_factory=list)
+    role_failures: dict[str, list[str]] = field(default_factory=dict)
 
 
 def run_board_with_failover(
@@ -580,16 +588,24 @@ def run_board_with_failover(
     timeout: int,
     images: tuple[Path, ...] = (),
     reporter: "BoardReporter | None" = None,
+    *,
+    # False for an exact `-m` board: the caller asked for exactly those seats, so a
+    # failed one stays failed (review-cli#137) instead of re-running a survivor.
+    reuse_healthy: bool = True,
 ) -> FailoverOutcome:
     """Run the priority `pool` and backfill failed seats from `reserve` (mid-run failover).
 
     The pool runs in parallel (run_panel). Any seat whose result is NOT usable
     (result_is_usable: non-zero exit, empty output, or an "unavailable" sentinel body)
-    is a failed seat; for each, the next-priority RESERVE reviewer is promoted and run,
-    repeating until `len(pool)` usable verdicts are collected or the reserve is exhausted
-    (then it degrades gracefully — `FailoverOutcome.degraded` is True). The target count
-    is the number of pool seats handed in (already sized to --pool and to availability by
-    the caller's startup failover).
+    is a failed seat; each one is backfilled by `_choose_backfill` (review-cli#588), which
+    keeps the failed seat's ROLE filled instead of blindly promoting the next-priority
+    reserve with whatever lens it carries: same-role reserve first, then a reserve whose
+    own role is still uncovered, then the next reserve re-lensed onto the missing role,
+    and — once the reserve is empty — a model that already produced a usable verdict in
+    this run, dispatched again under the missing role. Rounds repeat until `len(pool)`
+    usable verdicts are collected or nothing is left to try (then it degrades — see
+    `FailoverOutcome.degraded`). The target count is the number of pool seats handed in
+    (already sized to --pool and to availability by the caller's startup failover).
 
     Each LOGICAL seat is tallied exactly once against the run-stats (its FINAL outcome),
     so the per-call ok/fail counts and pool_size reflect the models that actually produced
@@ -612,6 +628,13 @@ def run_board_with_failover(
     usable_models: list[str] = []
     usable_roles: list[str] = []
     reserve_queue = list(reserve)
+    # Lensed roles this board can speak to, in priority order of first appearance — the
+    # order a missing role is filled in when the failed seat's own role is already covered.
+    role_order = list(dict.fromkeys(r.role for r in [*pool, *reserve] if _lensed(r.role)))
+    healthy: list[BoardReviewer] = []  # seats that produced a usable verdict (reuse pool)
+    failed_models: set[str] = set()
+    reuse_counts: dict[str, int] = {}
+    role_failures: dict[str, list[str]] = {}
     if reporter is not None:
         for r in pool:
             reporter.seat_status(_seat_role(r.role), r.model, "queued")
@@ -653,58 +676,107 @@ def run_board_with_failover(
             # run_panel ever returned a short list, this raises instead of silently
             # dropping a seat.
             next_round: list[BoardReviewer] = []
-            for reviewer, result in zip(current, round_results, strict=True):
+            round_usable = [result_is_usable(result) for result in round_results]
+            # Settle the whole round before backfilling any of it: roles covered by every
+            # usable verdict so far (THIS round included — a later seat's success must not
+            # be "backfilled" by an earlier failure), the seats proven healthy for reuse,
+            # and the models that failed. Replacement roles are added to `taken` as they
+            # are queued below.
+            round_pairs = list(zip(current, round_results, round_usable, strict=True))
+            healthy.extend(reviewer for reviewer, _result, ok in round_pairs if ok)
+            failed_models.update(reviewer.model for reviewer, _result, ok in round_pairs if not ok)
+            taken = set(usable_roles) | {
+                reviewer.role for reviewer, _result, ok in round_pairs if ok
+            }
+            for reviewer, result, ok in round_pairs:
                 all_results.append(result)
-                if result_is_usable(result):
+                if ok:
                     usable.append(result)
                     usable_models.append(reviewer.model)
                     usable_roles.append(reviewer.role)
                     _tally_ok(True)
                     if reporter is not None:
                         reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=True)
+                    continue
+                # This seat failed — count it as a fail and backfill it. The replacement
+                # runs in the NEXT round.
+                _tally_ok(False)
+                if _lensed(reviewer.role):
+                    role_failures.setdefault(reviewer.role, []).append(
+                        f"{reviewer.display} ({reviewer.model}): {_failure_reason(result)}"
+                    )
+                if reporter is not None:
+                    reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=False)
+                choice = _choose_backfill(
+                    reviewer,
+                    reserve_queue,
+                    taken,
+                    role_order,
+                    healthy if reuse_healthy else [],
+                    failed_models,
+                    reuse_counts,
+                )
+                if choice is None:
+                    continue
+                promoted, how = choice
+                if _lensed(promoted.role):
+                    taken.add(promoted.role)
+                if how == "reuse":
+                    note = (
+                        f"board: {result.model} failed — reserve exhausted; reusing "
+                        f"{promoted.display} [{promoted.role}] ({promoted.model}), which "
+                        "already returned a usable verdict, so the role stays covered"
+                    )
                 else:
-                    # This seat failed — count it as a fail and try to backfill it from
-                    # the next-priority reserve. The replacement runs in the NEXT round.
-                    _tally_ok(False)
-                    if reporter is not None:
-                        reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=False)
-                    if reserve_queue:
-                        promoted = reserve_queue.pop(0)
-                        note = (
-                            f"board: {result.model} failed — promoting "
-                            f"reserve {promoted.display} [{promoted.role or 'general'}] "
-                            f"({promoted.model})"
-                        )
-                        if reporter is not None:
-                            # An interactive TUI is up: the promotion notice goes into its
-                            # scrolling event log instead of a raw stderr print, which would
-                            # corrupt the curses screen (stdout/stderr share the same real
-                            # tty during an interactive run — review-cli#548).
-                            reporter.event(f"[promote] {note}")
-                            reporter.seat_status(
-                                _seat_role(promoted.role), promoted.model, "promoted-from-reserve"
-                            )
-                        else:
-                            print(f"[review-cli] {note}", file=sys.stderr, flush=True)
-                        # Durable record of the promotion (not stderr-only): a post-mortem /
-                        # the dashboard can reconstruct WHICH seat failed and WHICH reserve
-                        # backfilled it, with the failing seat's exit code + error channel.
-                        write_retry_log(
-                            f"{result.model}->{promoted.model}",
-                            kind="promote",
-                            attempt=0,
-                            max_attempts=1,
-                            delay=0.0,
-                            result=result,
-                        )
-                        next_round.append(promoted)
+                    note = (
+                        f"board: {result.model} failed — promoting "
+                        f"reserve {promoted.display} [{promoted.role or 'general'}] "
+                        f"({promoted.model})"
+                    )
+                    if how == "relens":
+                        note += " re-lensed so the role stays covered"
+                if reporter is not None:
+                    # An interactive TUI is up: the promotion notice goes into its
+                    # scrolling event log instead of a raw stderr print, which would
+                    # corrupt the curses screen (stdout/stderr share the same real
+                    # tty during an interactive run — review-cli#548).
+                    reporter.event(f"[promote] {note}")
+                    reporter.seat_status(
+                        _seat_role(promoted.role), promoted.model, "promoted-from-reserve"
+                    )
+                else:
+                    print(f"[review-cli] {note}", file=sys.stderr, flush=True)
+                # Durable record of the promotion (not stderr-only): a post-mortem /
+                # the dashboard can reconstruct WHICH seat failed and WHICH seat
+                # backfilled it, with the failing seat's exit code + error channel.
+                write_retry_log(
+                    f"{result.model}->{promoted.model}",
+                    kind="promote",
+                    attempt=0,
+                    max_attempts=1,
+                    delay=0.0,
+                    result=result,
+                )
+                next_round.append(promoted)
             current = next_round
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
         set_board_deadline(None)
 
-    degraded = len(usable) < target
+    covered = [role for role in dict.fromkeys(usable_roles) if _lensed(role)]
+    role_target = min(target, len(role_order))
+    missing_roles: list[str] = []
+    if len(covered) < role_target:
+        # Name the roles the run was asked for first (the pool's own lenses), then the
+        # rest of the board's order, until the shortfall is fully accounted for.
+        wanted = dict.fromkeys(
+            [r.role for r in pool if _lensed(r.role)] + role_order
+        )
+        missing_roles = [role for role in wanted if role not in covered][
+            : role_target - len(covered)
+        ]
+    degraded = len(usable) < target or bool(missing_roles)
     return FailoverOutcome(
         results=all_results,
         usable=usable,
@@ -712,7 +784,90 @@ def run_board_with_failover(
         degraded=degraded,
         usable_models=usable_models,
         usable_roles=usable_roles,
+        role_target=role_target,
+        missing_roles=missing_roles,
+        role_failures={role: role_failures.get(role, []) for role in missing_roles},
     )
+
+
+def _lensed(role: str | None) -> bool:
+    """True for a role that carries a real lens (a REVIEW_ROLES key) — the only roles
+    the failover tries to keep covered; a role-less / unknown-role seat has no lens."""
+    return bool(role) and role in REVIEW_ROLES
+
+
+_REASON_HINT = re.compile(
+    r"error|fail|limit|credit|quota|expired|unauthori|forbidden|revoked|denied|\b40[13]\b|\b429\b",
+    re.IGNORECASE,
+)
+
+
+def _failure_reason(result: ReviewResult) -> str:
+    """One short line saying why a seat failed, for the ROLE SHORTFALL notice: the last
+    error-looking line of its output (else the last non-empty line), capped at 160 chars."""
+    if result.returncode == 124:
+        return "timed out"
+    lines = [
+        line.strip()
+        for line in f"{result.stderr or ''}\n{result.stdout or ''}".splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return f"exit {result.returncode}, no output"
+    hinted = [line for line in lines if _REASON_HINT.search(line)]
+    line = (hinted or lines)[-1]
+    return line if len(line) <= 160 else line[:157] + "..."
+
+
+def _choose_backfill(
+    failed: BoardReviewer,
+    reserve_queue: list[BoardReviewer],
+    taken: set[str],
+    role_order: list[str],
+    healthy: list[BoardReviewer],
+    failed_models: set[str],
+    reuse_counts: dict[str, int],
+) -> tuple[BoardReviewer, str] | None:
+    """Pick the seat that replaces `failed` for the next round, or None when nothing can.
+
+    review-cli#588. The slot keeps a lens the run does not have yet — the failed seat's
+    own role if nobody covers it, else the first uncovered lensed role on the board:
+      1. a reserve seat whose role is that target role;
+      2. else a reserve seat whose own lensed role is still uncovered (its own lens is
+         the one it was configured for);
+      3. else the next reserve seat by priority, re-lensed onto the target role;
+      4. else (reserve empty) a seat that already returned a usable verdict in this run
+         and whose model has not failed, re-dispatched under the target role — the
+         least-reused one first. A real new call with that role's lens, never a copy.
+    When every lensed role is already covered or queued, the old priority promotion
+    applies (next reserve seat, own lens). A reserve seat whose model already failed in
+    this run is passed over — the same model behind the same broken auth/quota would
+    only burn another round. Mutates `reserve_queue` and `reuse_counts`. The second
+    tuple element names the path taken: "reserve", "relens" or "reuse"."""
+    if _lensed(failed.role) and failed.role not in taken:
+        target: str | None = failed.role
+    else:
+        target = next((role for role in role_order if role not in taken), None)
+    live = [i for i, seat in enumerate(reserve_queue) if seat.model not in failed_models]
+    if target is None:
+        if live:
+            return reserve_queue.pop(live[0]), "reserve"
+        return None
+    for index in live:
+        if reserve_queue[index].role == target:
+            return reserve_queue.pop(index), "reserve"
+    for index in live:
+        seat = reserve_queue[index]
+        if _lensed(seat.role) and seat.role not in taken:
+            return reserve_queue.pop(index), "reserve"
+    if live:
+        return replace(reserve_queue.pop(live[0]), role=target), "relens"
+    candidates = [seat for seat in healthy if seat.model not in failed_models]
+    if not candidates:
+        return None
+    seat = min(candidates, key=lambda s: reuse_counts.get(s.model, 0))
+    reuse_counts[seat.model] = reuse_counts.get(seat.model, 0) + 1
+    return replace(seat, role=target), "reuse"
 
 
 def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:

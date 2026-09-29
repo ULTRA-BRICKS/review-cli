@@ -19,16 +19,24 @@ last-resort reserve, not a routinely-dispatched pool seat, in any preset. The po
 by **priority + availability**, with three layers so the run keeps the requested
 number of working reviewers even when models drop:
 
-- **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority.
-  A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
-  **skipped** and the next-priority seat is pulled up, so you still start with the
-  requested number of working models. (E.g. if Sol is unavailable in the heavy preset,
-  the pool starts at Opus.)
+- **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority,
+  **distinct roles first** (review-cli#588): a seat whose role an earlier pool seat already
+  covers waits in the reserve while another available seat brings a new role. A
+  higher-priority seat whose backend isn't reachable (no key / not on PATH) is
+  **skipped** and the next seat is pulled up, so you still start with the requested
+  number of working models. (E.g. if Sol is unavailable in the heavy preset, the pool
+  starts at Opus.) If only repeat-role seats are left to fill a slot, the seat reviews
+  under a board role the pool lacks (`board re-lensed` on stderr).
 - **Mid-run failover** — if an active seat **fails during the review** (backend error,
   timeout, empty output, or an "unavailable" reply such as a paywalled model returning
-  *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
-  run in its place, repeating until the requested number of working verdicts is produced or the reserve is
-  exhausted (then the run degrades gracefully and says so on stderr, exiting non-zero).
+  *"… is currently unavailable"*), its **role** is kept filled (review-cli#588): a
+  reserve seat with the same role runs in its place, else a reserve seat whose own role
+  is still uncovered, else the next reserve re-lensed onto the missing role, and once the
+  reserve is empty a model that already returned a usable verdict in this run is
+  dispatched again under the missing role (a real call with that role's lens). This
+  repeats until the requested number of working verdicts is produced. If no healthy
+  model is left, the run degrades, prints a `ROLE SHORTFALL` notice on stdout naming
+  each missing role and why its seats failed, and exits non-zero.
 - **Account rotation (review-cli#168)** — every `claude:*` seat and the omp-hosted
   Claude seat authenticate as ONE Claude account, so an account-wide outage or paywall
   (or a 100% harness 5-hour/7-day window) used to take out all of them at once. On a
@@ -37,15 +45,16 @@ number of working reviewers even when models drop:
   now tries each registered account in rotation order — the persisted `current` account
   first, then wrapping through the rest — via a per-call `CLAUDE_CONFIG_DIR`, skipping
   any account whose own harness window is exhausted and falling through to the next on a
-  chronic-unavailable result. The omp-hosted Claude seat rotates the same way across
+  chronic-unavailable result or a failed login (logged out / OAuth expired,
+  review-cli#588). The omp-hosted Claude seat rotates the same way across
   `$REVIEW_OMP_CLAUDE_PROFILES` (comma-separated, already-logged-in omp profiles). Only
   when EVERY configured account is exhausted does the run emit the synthetic usage-limit
   skip, now naming every account it tried; a host with no registry behaves exactly as
   before.
 
-The role/lens **travels with the seat**: priority decides *who* sits in the pool, the
-role decides *with what lens* they review. A promoted reserve brings its own lens, so
-the panel still covers a broad set of facets.
+Each seat carries its own configured role/lens: priority decides *who* sits in the pool,
+the role decides *with what lens* they review. The run owes the pool's roles, so a
+replacement keeps a missing lens covered rather than repeating one the pool already has.
 
 `--pool N` overrides the preset default (the top-N available, with the same failover);
 `--pool 0` runs **all available** seats in the selected preset/board. Use

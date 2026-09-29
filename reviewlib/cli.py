@@ -53,6 +53,7 @@ from .config import (
     lens_override_text,
     load_board,
     load_config,
+    prefer_distinct_roles,
     parse_effort_flag,
     preset_board,
     preset_names,
@@ -6918,7 +6919,7 @@ def _show_board(
         )
         print(
             f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
-            f"live pool = {pool_target} by priority{sized}, "
+            f"live pool = {pool_target} by priority, distinct roles first{sized}, "
             f"{pool_filled} filled, the rest reserve — size with --pool N):\n"
         )
     name_w = max((len(r.display) for r in board), default=0)
@@ -6942,7 +6943,15 @@ def _show_board(
             overridden_roles[r] = lens_override_path(r, effective_cwd).relative_to(
                 effective_cwd
             )
-    seen_available = 0  # how many AVAILABLE seats walked so far (priority order)
+    # review-cli#588: the pool is the AVAILABLE seats in priority order with distinct roles
+    # first (`prefer_distinct_roles`), the same pick the dispatch makes — a seat repeating a
+    # role an earlier pool seat already covers is listed as reserve.
+    pool_ids = {
+        id(r)
+        for r in prefer_distinct_roles([r for i, r in enumerate(board) if avail[i]])[
+            :pool_filled
+        ]
+    }
     for index, reviewer in enumerate(board):
         available = avail[index]
         if available:
@@ -6964,8 +6973,7 @@ def _show_board(
         elif not available:
             tier = "unavail"
         else:
-            tier = "pool   " if seen_available < pool_filled else "reserve"
-            seen_available += 1
+            tier = "pool   " if id(reviewer) in pool_ids else "reserve"
         prio = f"#{index + 1}"
         scope = (
             "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
@@ -6999,10 +7007,11 @@ def _show_board(
     else:
         print(
             f"\nA plain `review diff` runs the top {pool_size} AVAILABLE seats by "
-            f"priority (--pool {pool_size}); a higher-priority seat that is "
-            f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
-            f"pool keeps {pool_size} working reviewers. `--pool N` sizes the pool; "
-            f"`--pool 0` runs all available seats."
+            f"priority, distinct roles first (--pool {pool_size}); a seat that is "
+            f"unavailable (or fails mid-run) is replaced by a seat that keeps its role (a "
+            f"same-role reserve, else a reserve re-lensed onto the missing role, else a "
+            f"model that already answered) so the pool keeps {pool_size} working reviewers "
+            f"on distinct roles. `--pool N` sizes the pool; `--pool 0` runs all available seats."
         )
     if not all(avail):
         print(

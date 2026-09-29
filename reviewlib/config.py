@@ -474,16 +474,18 @@ class BoardReviewer:
 # and for custom/config fallback paths. A plain `review diff` runs the default preset,
 # not this tuple directly. The board is ordered by *priority* — strongest WORKING model
 # first, weakest (or least-reliable, review-cli#fable-seat-reliability) last — NOT by
-# role. Priority drives the FAILOVER pool: the selected board runs
-# the top-N AVAILABLE seats, skipping a higher-priority seat whose backend isn't reachable
-# and promoting the next-priority reserve to keep a full pool (startup failover); a seat
-# that fails *during* the run is likewise replaced by the next reserve (mid-run failover).
-# See select_pool() / panel.run_board_with_failover().
+# role. Priority drives the FAILOVER pool: the selected board runs the top-N AVAILABLE
+# seats, skipping a higher-priority seat whose backend isn't reachable (startup failover),
+# and a seat that fails *during* the run is backfilled (mid-run failover). See
+# select_pool() / panel.run_board_with_failover().
 #
 # Each seat still carries its OWN role/lens — the lens is what makes a multi-model panel
 # cover the diff broadly instead of N duplicate passes. Priority decides WHO sits; the
-# role decides WITH WHAT LENS they review. So the lens travels with the seat: when a
-# higher-priority seat is skipped/replaced, the promoted reserve brings its own lens.
+# role decides WITH WHAT LENS they review. review-cli#588: the ROLES are what a run owes,
+# so both failover steps keep them filled — the startup pool takes distinct roles first
+# (`prefer_distinct_roles`), and a failed seat is backfilled by a reserve with the same
+# (or another uncovered) role, else a reserve re-lensed onto the missing role, else a
+# model that already answered in this run (`panel._choose_backfill`).
 #
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
@@ -503,15 +505,10 @@ class BoardReviewer:
 # "roles declare models, harness auto-resolves" redesign tracked as review-cli#364/
 # rig-cli#337.
 #
-# KNOWN LIMIT: `pool: 4` can't fit every distinct role once Sol AND commandcode disabled
-# are both in play (`--preset heavy`'s available top-4 becomes Sol/Opus/Astra/Terra —
-# `consistency` x2, `correctness`, `performance` — with `quality`/`security` in reserve),
-# and `pool: 2` (the `light` preset a bare `review diff` uses) can never show more than 2
-# roles at all. Neither is a #382 regression (both predate it) and neither is fixed by
-# reordering — only a role-aware selector (review-cli#364/rig-cli#337, out of scope) or
-# more paid seats would. See test_heavy_preset_double_failure_still_beats_pre_382_board /
-# test_light_preset_double_failure_pool_unchanged_but_reserve_deepens for the traced proof
-# that #382 still strictly improves both (deeper reserve, no fewer pool seats) even here.
+# `pool: 2` (the `light` preset a bare `review diff` uses) can never show more than 2
+# roles at all — a deliberate cost choice. (The older `--preset heavy` limit — Sol/Opus/
+# Astra/Terra with `consistency` twice — is gone since review-cli#588 picks distinct roles
+# first; see test_heavy_preset_double_failure_still_beats_pre_382_board.)
 #
 # AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
 # claude seats run via the agentic claude CLI; Sol/Astra/Terra via the codex CLI
@@ -561,9 +558,10 @@ DEFAULT_BOARD = (
     # priority 5 — Astra, the agentic codex CLI route (reads the whole repo), pinned via
     # ASTRA_SEAT rather than the bare `"codex"` seat this used to be. ROLE LEFT AS
     # `consistency` (a duplicate of Sol's) — an earlier draft of #382 flipped it to
-    # `security`, but that left `consistency` with ZERO live fallback board-wide; see the
-    # KNOWN LIMIT comment above DEFAULT_BOARD and
-    # test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens.
+    # `security`, but that left `consistency` with ZERO live fallback board-wide. Since
+    # review-cli#588 the startup pool skips it while Sol covers `consistency` (see
+    # test_glm_cc_unavailable_backfills_a_new_lens_not_astras_duplicate), so it acts as
+    # Sol's same-role backfill.
     BoardReviewer(ASTRA_SEAT, "consistency", "Astra"),
     # priority 6 — Terra (review-cli#382): live `performance` fallback, promoted whenever
     # GLM-cc is unavailable.
@@ -923,25 +921,57 @@ def _effective_pool_size(seat_count: int, pool: int) -> int:
     return pool
 
 
+def prefer_distinct_roles(seats: list[BoardReviewer]) -> list[BoardReviewer]:
+    """`seats` (priority order) with every seat that REPEATS an already-taken lensed role
+    moved behind the seats that bring a new one; each group keeps its priority order.
+
+    review-cli#588: a pure priority slice put Codex-omp AND Codex (both `consistency`)
+    into a 3-seat pool, and failover then dropped consistency AND security in the same
+    run. Priority still decides WHO sits among seats of the same role; the pool just
+    stops spending a slot on a lens it already has while another lens is available.
+    A seat without a real lens (`role_lens` empty: role-less `models:` roster, unknown
+    role) is never treated as a duplicate — there is no lens to dedupe on."""
+    first: list[BoardReviewer] = []
+    repeats: list[BoardReviewer] = []
+    taken: set[str] = set()
+    for seat in seats:
+        if seat.role_lens:
+            if seat.role in taken:
+                repeats.append(seat)
+                continue
+            taken.add(seat.role)
+        first.append(seat)
+    return first + repeats
+
+
 def select_pool(
     board: list[BoardReviewer],
     pool: int,
     available: Callable[[BoardReviewer], bool] = _always_available,
 ) -> list[BoardReviewer]:
-    """Pick the top `pool` AVAILABLE seats by priority; the rest are the reserve.
+    """Pick the top `pool` AVAILABLE seats by priority, distinct roles first; the rest
+    are the reserve.
 
     The board is EXPECTED to be priority-ordered (strongest first) — that order IS the
     priority. Startup failover: a higher-priority seat whose backend is NOT reachable
     (per `available`) is SKIPPED and the next-priority seat pulled up, so the run still
-    starts with `pool` WORKING seats when enough reachable seats exist. The default
-    `available` treats every seat as reachable, so callers that check availability
-    downstream get "the first `pool` seats in priority order".
+    starts with `pool` WORKING seats when enough reachable seats exist. A reachable seat
+    whose lensed role an earlier seat already covers yields to the next seat with a new
+    role (`prefer_distinct_roles`, review-cli#588). The default `available` treats every
+    seat as reachable.
 
     The selection is deterministic. `pool <= 0` means "all (available) seats", and a
     `pool` larger than the available count is clamped — a caller can never ask for more
     seats than exist. An empty board stays empty. Returns a NEW list, never a view."""
     seats = [r for r in board if available(r)]
-    return list(seats[: _effective_pool_size(len(seats), pool)])
+    return _pick_distinct(seats, _effective_pool_size(len(seats), pool))
+
+
+def _pick_distinct(seats: list[BoardReviewer], n: int) -> list[BoardReviewer]:
+    """The `n` seats `prefer_distinct_roles` ranks first, returned in their original
+    (priority) order — the pool's membership changes, its dispatch order does not."""
+    picked_ids = {id(r) for r in prefer_distinct_roles(seats)[:n]}
+    return [r for r in seats if id(r) in picked_ids]
 
 
 def split_pool_reserve(
@@ -949,16 +979,17 @@ def split_pool_reserve(
     pool: int,
     available: Callable[[BoardReviewer], bool] = _always_available,
 ) -> tuple[list[BoardReviewer], list[BoardReviewer]]:
-    """Split the AVAILABLE board into (pool, reserve) by priority, for failover.
+    """Split the AVAILABLE board into (pool, reserve) for failover.
 
-    `pool` = the top-N available seats (startup failover — same slice select_pool makes).
-    `reserve` = the remaining available seats, in priority order, which back-fill a pool
-    seat that fails mid-run. Unavailable seats are in NEITHER list (they can't run). The
-    two lists are disjoint and together hold every available seat, in priority order. The
+    `pool` = the seats `select_pool` picks (priority, distinct roles first).
+    `reserve` = the remaining available seats, in board priority order, which back-fill
+    a pool seat that fails mid-run. Unavailable seats are in NEITHER list (they can't
+    run). The two lists are disjoint and together hold every available seat. The
     `board` is EXPECTED to be priority-ordered (its order is the priority)."""
     seats = [r for r in board if available(r)]
-    n = _effective_pool_size(len(seats), pool)
-    return list(seats[:n]), list(seats[n:])
+    picked = _pick_distinct(seats, _effective_pool_size(len(seats), pool))
+    picked_ids = {id(r) for r in picked}
+    return picked, [r for r in seats if id(r) not in picked_ids]
 
 
 def _is_near_limit(
@@ -1024,21 +1055,74 @@ def select_pool_with_reuse(
              `len(reachable)` — "all" has no fixed target size to pad
              towards, so reuse has nothing to pad here (unaffected: this is
              the same value the near-usage-limit path already used).
-      5. The first `min(n, len(candidates))` slots each keep their OWN role, in
-         priority order — IDENTICAL to `select_pool`'s output whenever
-         `len(candidates) >= n`.
+      5. The first `min(n, len(candidates))` slots come from `candidates` in
+         priority order with distinct roles first (`prefer_distinct_roles`,
+         review-cli#588); a slot that still repeats an earlier slot's lensed role
+         is re-lensed onto a lensed board role no slot covers yet
+         (`_relens_repeated_roles`). With `usage_percent` None there is no
+         re-lensing — the pick equals `select_pool`'s.
       6. Any remaining slots (`n - len(candidates)`) are filled by cycling back
          through `candidates`' models, each one taking the NEXT board role not
          yet used by an earlier slot (in board priority order) — so a shrunk
          model pool still reviews the diff under `n` distinct lenses instead of
          fewer."""
+    return _select_pool_with_reuse(
+        board, pool, available, usage_percent, limit_threshold
+    )[0]
+
+
+def _relens_repeated_roles(
+    picked: list[BoardReviewer], board: list[BoardReviewer]
+) -> list[BoardReviewer]:
+    """`picked` with each seat that repeats an earlier seat's lensed role moved onto a
+    lensed board role nobody in `picked` covers yet (board priority order), as a fresh
+    `replace()` copy. A repeat stays as-is once the board has no unused lensed role left.
+
+    review-cli#588: `prefer_distinct_roles` already puts every new-role seat first, so a
+    repeat only lands in the pool when the reachable seats carry fewer distinct roles than
+    the pool size — e.g. Opus + Codex-omp + Codex reachable, the last two both
+    `consistency`. The slot is still worth dispatching; it should review a lens the pool
+    lacks rather than the same lens twice."""
+    seen: set[str] = set()
+    repeats: list[int] = []
+    for index, seat in enumerate(picked):
+        if not seat.role_lens:
+            continue
+        if seat.role in seen:
+            repeats.append(index)
+        else:
+            seen.add(seat.role)
+    if not repeats:
+        return list(picked)
+    free_roles = [
+        role
+        for role in dict.fromkeys(r.role for r in board if r.role_lens)
+        if role not in seen
+    ]
+    out = list(picked)
+    for index, role in zip(repeats, free_roles):
+        out[index] = replace(out[index], role=role)
+    return out
+
+
+def _select_pool_with_reuse(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool],
+    usage_percent: Callable[[str], float | None] | None,
+    limit_threshold: float,
+) -> tuple[list[BoardReviewer], list[BoardReviewer]]:
+    """`select_pool_with_reuse`'s body, also returning the ORIGINAL board seats the pool
+    consumed. Re-lensed and padded seats are fresh `replace()` copies, so the reserve
+    split can't recover their originals by identity from the pool alone."""
     reachable = [r for r in board if available(r)]
     if not reachable:
-        return []
+        return [], []
 
     if usage_percent is None:
         n = _effective_pool_size(len(reachable), pool)
-        return list(reachable[:n])
+        picked = _pick_distinct(reachable, n)
+        return picked, list(picked)
 
     # Reuse is opted into (usage_percent given): size `n` against the FULL
     # board when a concrete pool is requested, not just what's reachable —
@@ -1060,14 +1144,15 @@ def select_pool_with_reuse(
             r for r in reachable if (usage_percent(r.model) or 0.0) < 100.0
         ]
         if not not_exhausted:
-            return []
+            return [], []
         idx = _least_depleted_index([r.model for r in not_exhausted], usage_percent)
         candidates = [not_exhausted[idx]]
 
-    primary = candidates[: min(n, len(candidates))]
+    picked = _pick_distinct(candidates, min(n, len(candidates)))
+    primary = _relens_repeated_roles(picked, board)
     extra_needed = n - len(primary)
     if extra_needed <= 0:
-        return primary
+        return primary, picked
 
     if not any(r.role_lens for r in board):
         # A role-less OR every-role-unknown board (every seat's `role_lens` resolves
@@ -1079,7 +1164,7 @@ def select_pool_with_reuse(
         # raw `role` string, so a typo'd/unknown role doesn't masquerade as a real lens
         # (codex review finding, task-cli#139). Leave the pool at its (smaller) primary
         # size instead.
-        return primary
+        return primary, picked
 
     used_roles = {r.role for r in primary}
     # Every DISTINCT board role not yet used by `primary`, in board priority order,
@@ -1108,7 +1193,7 @@ def select_pool_with_reuse(
             # full-size pool with a wasted duplicate dispatch.
             break
         extra.append(replace(candidates[i % len(candidates)], role=role_pool[i]))
-    return primary + extra
+    return primary + extra, picked
 
 
 def select_pool_and_reserve_with_reuse(
@@ -1147,14 +1232,14 @@ def select_pool_and_reserve_with_reuse(
     begin with (Fable review finding, review-cli#205 round 5)."""
     reachable = [r for r in board if available(r)]
     reachable_ids = {id(r) for r in reachable}
-    pool_seats = select_pool_with_reuse(
+    pool_seats, picked = _select_pool_with_reuse(
         board,
         pool,
         lambda r: id(r) in reachable_ids,
-        usage_percent=usage_percent,
-        limit_threshold=limit_threshold,
+        usage_percent,
+        limit_threshold,
     )
-    consumed_ids = {id(r) for r in pool_seats} & reachable_ids
+    consumed_ids = {id(r) for r in picked} & reachable_ids
     unused = [r for r in reachable if id(r) not in consumed_ids]
     if usage_percent is None:
         reserve_seats = unused

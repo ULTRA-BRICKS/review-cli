@@ -175,6 +175,55 @@ def test_cli_fallback_rotates_past_chronic_account_to_next():
     assert result.stdout == "a real review verdict"
 
 
+def _run_cli_fallback_with_first_account_returning(first_result):
+    calls = []
+
+    def fake_cli(
+        model, prompt, diff, cwd, timeout, round_no, *, effort=None, config_dir=None
+    ):
+        calls.append(config_dir)
+        return first_result if config_dir == "/cfg/one" else _usable(model)
+
+    with (
+        _patched_backends(
+            _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
+            allow_spawn_for_model=lambda model, account=None: True,
+            review_claude_cli=fake_cli,
+        ),
+        _isolated_env(**_hermetic_env()),
+    ):
+        result = backends._review_claude_cli_with_account_fallback(
+            _MODEL, "prompt", "diff", Path("."), 60, 1, effort=None
+        )
+    return calls, result
+
+
+def test_cli_fallback_rotates_past_logged_out_account_to_next():
+    """review-cli#588: on 2026-09-29 the `current` account (account-2) was logged out —
+    the claude CLI printed "Failed to authenticate: OAuth session expired and could not
+    be refreshed" (exit 1) — while the other registered accounts were fine. Stopping
+    there killed every claude:* seat; the next account must be tried."""
+    logged_out = backends.ReviewResult(
+        _MODEL,
+        "claude --print",
+        1,
+        "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "",
+    )
+    calls, result = _run_cli_fallback_with_first_account_returning(logged_out)
+    assert calls == ["/cfg/one", "/cfg/two"], calls
+    assert result.stdout == "a real review verdict"
+
+
+def test_cli_fallback_stops_on_a_plain_seat_failure():
+    """A non-auth, non-quota failure (a crash, a bad model) is not the account's fault:
+    rotating would only burn the other accounts' quota on the same failure."""
+    crashed = backends.ReviewResult(_MODEL, "claude --print", 1, "", "segfault")
+    calls, result = _run_cli_fallback_with_first_account_returning(crashed)
+    assert calls == ["/cfg/one"], calls
+    assert result is crashed
+
+
 def test_cli_fallback_skips_exhausted_account_without_dispatching_it():
     calls = []
 

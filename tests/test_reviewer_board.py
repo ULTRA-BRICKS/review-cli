@@ -1515,13 +1515,17 @@ def test_select_pool_larger_than_board_is_clamped():
 
 def test_select_pool_boundary_at_and_below_full_size():
     """Exact boundary: pool == len(board) -> all (the `pool >= len` short-circuit);
-    pool == len(board) - 1 -> all but the last seat (GLM finding 11)."""
+    pool == len(board) - 1 -> all but ONE seat, kept in priority order (GLM finding 11).
+    review-cli#588: the seat left out is the lowest-priority one repeating a role an
+    earlier seat covers (the z.ai GLM `security` seat), not Fable, whose `architect`
+    lens no other seat has."""
     n = len(DEFAULT_BOARD)
     assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [
         r.model for r in DEFAULT_BOARD
     ]
+    dropped = "oc:zai/glm-5.2"
     assert [r.model for r in select_pool(list(DEFAULT_BOARD), n - 1)] == [
-        r.model for r in DEFAULT_BOARD[: n - 1]
+        r.model for r in DEFAULT_BOARD if r.model != dropped
     ]
 
 
@@ -2290,14 +2294,10 @@ def test_mode_review_board_runs_and_succeeds():
     assert REVIEW_ROLES["consistency"] in prompts["gemini"]
 
 
-def test_mode_review_board_fails_when_a_reviewer_fails():
+def test_mode_review_board_reuses_the_healthy_seat_and_fails_only_when_none_is_left():
+    """review-cli#588: on a (non-exact) board, a failed seat's role is re-run on the seat
+    that already answered, so the run succeeds; with no healthy seat at all it fails."""
     from reviewlib.modes import review as review_mod
-
-    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
-        rc = 0 if model == "codex" else 1
-        return ReviewResult(
-            model=model, command="fake", returncode=rc, stdout="x", stderr="boom"
-        )
 
     board = [
         BoardReviewer("codex", "correctness", "Codex"),
@@ -2305,16 +2305,25 @@ def test_mode_review_board_fails_when_a_reviewer_fails():
     ]
     import reviewlib.panel as panel
 
-    old_panel_resolve = panel.resolve_backend
-    panel.resolve_backend = lambda _m: _fake_backend
-    try:
-        with _AvailabilityPatch({"codex", "gemini"}):
-            rc = review_mod.mode_review(
-                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=board
+    def _run(healthy: set[str]) -> int:
+        def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+            rc = 0 if model in healthy else 1
+            return ReviewResult(
+                model=model, command="fake", returncode=rc, stdout="x", stderr="boom"
             )
-    finally:
-        panel.resolve_backend = old_panel_resolve
-    assert rc == 1, rc
+
+        old_panel_resolve = panel.resolve_backend
+        panel.resolve_backend = lambda _m: _fake_backend
+        try:
+            with _AvailabilityPatch({"codex", "gemini"}):
+                return review_mod.mode_review(
+                    [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=board
+                )
+        finally:
+            panel.resolve_backend = old_panel_resolve
+
+    assert _run({"codex"}) == 0
+    assert _run(set()) == 1
 
 
 def test_mode_review_board_backfills_preflight_skip_from_reserve():

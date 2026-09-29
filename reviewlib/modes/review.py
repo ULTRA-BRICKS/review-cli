@@ -891,7 +891,22 @@ def _warn_if_board_reused(
     case — a report saying "reused because near its usage limit" while every OTHER seat
     is actually in cooldown, not merely expensive."""
     board_ids = {id(r) for r in board}
-    reused_models = [r.model for r in pool if id(r) not in board_ids]
+    copies = [r for r in pool if id(r) not in board_ids]
+    if not copies:
+        return
+    pool_models = [r.model for r in pool]
+    # review-cli#588: a copy whose model appears only once in the pool is not model
+    # reuse — it is a repeated-role seat moved onto a lens the pool lacked.
+    relensed = [r for r in copies if pool_models.count(r.model) == 1]
+    reused_models = [r.model for r in copies if pool_models.count(r.model) > 1]
+    if relensed:
+        moved = ", ".join(f"{r.display} [{r.role}]" for r in relensed)
+        print(
+            f"[review-cli] board re-lensed — {moved} (its configured role was already "
+            "covered by a higher-priority seat, so it reviews a lens the pool lacked)",
+            file=sys.stderr,
+            flush=True,
+        )
     if not reused_models:
         return
     counts = {m: reused_models.count(m) for m in dict.fromkeys(reused_models)}
@@ -902,6 +917,33 @@ def _warn_if_board_reused(
         file=sys.stderr,
         flush=True,
     )
+
+
+def _report_role_shortfall(outcome, *, json_output: bool = False) -> None:
+    """Loud notice when a board run ends with fewer distinct lensed roles than it owed
+    (`FailoverOutcome.missing_roles`, review-cli#588): names every missing role and, for
+    each, the seats that tried it and why they failed. STDOUT like `_report_pool_shortfall`
+    (an agent piping the review into a PR/TG report keeps stdout and drops stderr — a lens
+    that silently vanished is exactly what this must not hide); stderr under --json so the
+    JSON envelope stays parseable."""
+    missing = list(getattr(outcome, "missing_roles", None) or [])
+    if not missing:
+        return
+    covered = [r for r in dict.fromkeys(outcome.usable_roles) if r]
+    failures = getattr(outcome, "role_failures", None) or {}
+    lines = [
+        f"[review-cli] ROLE SHORTFALL: {len(covered)} of {outcome.role_target} required "
+        f"roles covered ({', '.join(covered) or 'none'}); missing: {', '.join(missing)}. "
+        "No healthy seat was left to take them — this review is INCOMPLETE."
+    ]
+    for role in missing:
+        tried = failures.get(role) or []
+        if tried:
+            for line in tried:
+                lines.append(f"  - {role}: {line}")
+        else:
+            lines.append(f"  - {role}: no live seat on the board carries this lens")
+    print("\n".join(lines), file=sys.stderr if json_output else sys.stdout, flush=True)
 
 
 def _report_pool_shortfall(
@@ -1693,22 +1735,24 @@ def _mode_review_board(
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
     `board` is the FULL priority-ordered board (highest priority first). The active
-    pool is the top-`pool_size` AVAILABLE seats by priority (startup failover — a
-    higher-priority seat whose backend isn't reachable is skipped and the next-priority
-    seat pulled up); the remaining available seats are the RESERVE. The pool runs in
-    parallel, and any seat that fails DURING the run (backend error, timeout, empty or
-    "unavailable" output) is replaced by the next-priority reserve until `pool_size`
-    usable verdicts are produced or the reserve is exhausted (then it degrades, loudly).
+    pool is the top-`pool_size` AVAILABLE seats by priority, distinct roles first
+    (startup failover — an unreachable seat is skipped, a repeat-role seat waits in the
+    reserve; review-cli#588); the remaining available seats are the RESERVE. The pool
+    runs in parallel, and any seat that fails DURING the run (backend error, timeout,
+    empty or "unavailable" output) is replaced by a seat that keeps its role
+    (`panel._choose_backfill`) until `pool_size` usable verdicts are produced or nothing
+    healthy is left (then it degrades, loudly).
 
     Output lists every seat that ran (successes and the failed seats that triggered a
     backfill, so the whole story is visible). Exit 0 (and the staged stamp) iff the pool
-    refilled to `pool_size` usable verdicts — i.e. NOT degraded. A failed-then-replaced
-    seat is an expected, HANDLED failover event, not a review failure: the run still
-    delivered the target number of working verdicts, so it must succeed (otherwise the
-    paywalled-Fable case would make every `review --staged` fail despite a full, healthy
-    pool). Only a genuine shortfall (reserve exhausted before the pool refilled) is a
-    failure. `outcome_sink`, when given, receives the FailoverOutcome so the CLI can
-    report the models that actually ran.
+    refilled to `pool_size` usable verdicts on its owed distinct roles — i.e. NOT
+    degraded. A failed-then-replaced seat is an expected, HANDLED failover event, not a
+    review failure: the run still delivered the target number of working verdicts, so it
+    must succeed (otherwise the paywalled-Fable case would make every `review --staged`
+    fail despite a full, healthy pool). Only a genuine seat or role shortfall is a
+    failure, and a role shortfall is printed as a `ROLE SHORTFALL` notice
+    (`_report_role_shortfall`). `outcome_sink`, when given, receives the FailoverOutcome
+    so the CLI can report the models that actually ran.
 
     `usage_percent`, when given, enables reuse-aware pool composition (Alex,
     2026-08-18) — the CALLER (cli.py's `_dispatch`) builds ONE tg-ctl usage
@@ -1803,6 +1847,7 @@ def _mode_review_board(
         timeout,
         visual_images,
         reporter=reporter,
+        reuse_healthy=not exact_board,
     )
     # Close the TUI (if active) THE MOMENT dispatch is done -- see the `if not pool:`
     # comment above for why this must happen before the prose findings print below, not
@@ -1832,7 +1877,7 @@ def _mode_review_board(
             )
         )
 
-    if outcome.degraded:
+    if outcome.degraded and len(outcome.usable) < outcome.target:
         # The reporter is already closed by this point (see above) -- a plain print,
         # same as every non-TUI run, always correct here regardless of how this run
         # started.
@@ -1842,10 +1887,11 @@ def _mode_review_board(
             file=sys.stderr,
             flush=True,
         )
+    _report_role_shortfall(outcome, json_output=json_output)
 
-    # Success gate: the pool refilled to its target of usable verdicts (NOT degraded).
-    # A failed-then-replaced seat is handled, so it must not block — only a real
-    # shortfall (reserve exhausted) does.
+    # Success gate: the pool refilled to its target of usable verdicts AND of distinct
+    # roles (NOT degraded). A failed-then-replaced seat is handled, so it must not block
+    # — only a real seat or role shortfall does (review-cli#588).
     ok = not outcome.degraded
     _stamp_if_staged_commit_review(
         ok,

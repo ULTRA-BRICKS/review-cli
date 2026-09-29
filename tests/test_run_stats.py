@@ -1202,12 +1202,10 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     assert "promoting reserve" in r["_stderr"]  # failover actually fired
 
 
-def test_cli_failover_exhausted_reserve_degrades_exit_1():
-    """When the reserve can't refill the pool (every commandcode + everything but one
-    fail), the run degrades: exit 1, a degraded message on stderr, and the record holds
-    only the seats that produced verdicts. Bare invocation targets the light preset's
-    pool of 2 (Alex, 2026-08-28), so only ONE usable seat is needed to fall short."""
-    # Fail everything EXCEPT opus -> only 1 usable, reserve can't reach the pool of 2.
+def test_cli_failover_exhausted_reserve_reuses_the_only_healthy_seat():
+    """review-cli#588: when every seat but one fails, the reserve can't refill the pool
+    with distinct models — the one healthy model is re-run under the missing roles, so the
+    run succeeds with a full pool of DISTINCT roles, all from that model."""
     from reviewlib.config import DEFAULT_BOARD
 
     ok = {"claude:claude-opus-4-8"}
@@ -1215,10 +1213,19 @@ def test_cli_failover_exhausted_reserve_degrades_exit_1():
         {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
     )
     r = _run_board_review_with_resolver([], resolver)
+    assert r["_rc"] == 0, r
+    assert set(r["models"]) == ok, r  # only the model that produced verdicts
+    assert r["pool_size"] >= 2, r
+    assert len(set(r["roles"])) == len(r["roles"]) == r["pool_size"], r
+
+
+def test_cli_failover_every_seat_failing_degrades_exit_1():
+    """With no healthy model at all, nothing is reused: exit 1 and a ROLE SHORTFALL."""
+    from reviewlib.config import DEFAULT_BOARD
+
+    resolver = _stub_resolve_backend({r.model: 1 for r in DEFAULT_BOARD})
+    r = _run_board_review_with_resolver([], resolver)
     assert r["_rc"] == 1, r
-    assert "degraded" in r["_stderr"], r["_stderr"]
-    assert set(r["models"]) == ok, r  # only the seats that produced verdicts
-    assert r["pool_size"] == 1, r
 
 
 def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failure():
