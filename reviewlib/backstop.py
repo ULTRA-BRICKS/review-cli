@@ -1,4 +1,4 @@
-"""Internal run backstop — the ONLY time bound on a `review` run.
+"""Internal run backstop — the last-resort time bound on a `review` run.
 
 `review` is meant to have NO external timeout: agents must not wrap it in a short
 shell `timeout`, because the panel/brainstorm modes are multi-round and only emit
@@ -25,6 +25,10 @@ Design:
     blocks on a full pipe. `os._exit` is deliberate: a wedged run may be stuck inside a
     C call or a non-daemon thread that a normal `sys.exit`/raise could not unwind. See
     `_fire` for the exact ordering and why nothing on that path may block the exit.
+  * `command_deadline` (review-cli#587) reuses the same watchdog for the one user-set
+    wall-clock bound: an explicit `review just-ask --timeout N` kills every seat call at
+    N (`process.set_run_deadline`) and fires this watchdog, with a seat report instead of
+    the generic line, at N + `COMMAND_TIMEOUT_GRACE_SECONDS`.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ import time
 import sys
 import threading
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator
 
 # The hard ceiling. The internal backstop can be LOWERED below this (tests, a tighter
 # user preference) but NEVER raised above it — 4h is the advertised maximum.
@@ -93,7 +97,7 @@ if _BACKSTOP_REAP_LOCK_TIMEOUT > _DEADMAN_GRACE_SECONDS - _DEADMAN_REAP_MARGIN_S
     )
 
 
-def _fire(seconds: int, stream) -> None:
+def _fire(seconds: int, stream, announce: Callable[[], str] | None = None) -> None:
     """Watchdog body: GUARANTEE a hard 124 exit, reaping backend children on the way out.
 
     `os._exit` (not `sys.exit`/raise) is deliberate: a wedged run may be stuck inside a
@@ -123,6 +127,19 @@ def _fire(seconds: int, stream) -> None:
     )
     deadman.daemon = True
     deadman.start()
+    # A caller-supplied announcement describes the run as it stood at the fire — so it
+    # is built BEFORE the reap below changes that (command_deadline's seat report).
+    message = (
+        f"[review] INTERNAL BACKSTOP fired after {seconds}s "
+        f"(hard ceiling {MAX_BACKSTOP_SECONDS}s / 4h) — the run was force-terminated. "
+        "This is a last-resort bound, not a normal timeout; a healthy run finishes "
+        "in minutes. If you see this, a backend wedged past its per-call deadline."
+    )
+    if announce is not None:
+        try:
+            message = announce()
+        except Exception:  # noqa: BLE001 — fall back to the generic line, never block the exit
+            pass
     # Reap live backend subprocesses (their own session groups) so a wedged run's backends
     # don't get orphaned. Bounded to _BACKSTOP_REAP_LOCK_TIMEOUT (see that constant,
     # above), not kill_live_children's default -- the deadman above still covers a
@@ -178,28 +195,27 @@ def _fire(seconds: int, stream) -> None:
     # Announce LAST among the fallible steps: a full undrained stderr pipe could block this
     # print, but children + the qa env are already reaped and the deadman guarantees the exit.
     try:
-        print(
-            f"[review] INTERNAL BACKSTOP fired after {seconds}s "
-            f"(hard ceiling {MAX_BACKSTOP_SECONDS}s / 4h) — the run was force-terminated. "
-            "This is a last-resort bound, not a normal timeout; a healthy run finishes "
-            "in minutes. If you see this, a backend wedged past its per-call deadline.",
-            file=stream,
-            flush=True,
-        )
+        print(message, file=stream, flush=True)
     except Exception:  # noqa: BLE001 — never let the announcement block the exit
         pass
     os._exit(BACKSTOP_EXIT_CODE)
 
 
 @contextmanager
-def run_backstop(seconds: int | None = None, *, stream=None) -> Iterator[None]:
+def run_backstop(
+    seconds: int | None = None,
+    *,
+    stream=None,
+    announce: Callable[[], str] | None = None,
+) -> Iterator[None]:
     """Arm the internal run backstop for the duration of the `with` block.
 
     `seconds` defaults to `backstop_seconds()` (the clamped 4h-or-less ceiling). A
     daemon `threading.Timer` fires `_fire` if the block has not exited by then; on a
     normal exit the timer is cancelled so it never fires. Daemon so it can never keep
     the process alive on its own. Re-entrant-safe enough for the single top-level
-    `main()` use it is built for.
+    `main()` use it is built for, plus one nested `command_deadline`. `announce`, if
+    given, builds the line printed on fire instead of the generic backstop notice.
     """
     secs = (
         backstop_seconds()
@@ -207,10 +223,71 @@ def run_backstop(seconds: int | None = None, *, stream=None) -> Iterator[None]:
         else max(1, min(int(seconds), MAX_BACKSTOP_SECONDS))
     )
     out = stream if stream is not None else sys.stderr
-    timer = threading.Timer(secs, _fire, args=(secs, out))
+    timer = threading.Timer(secs, _fire, args=(secs, out, announce))
     timer.daemon = True
     timer.start()
     try:
         yield
     finally:
         timer.cancel()
+
+
+# review-cli#587: grace the whole command gets past an explicit `review just-ask
+# --timeout N`. Every seat call is killed at N (`process.set_run_deadline`); the grace
+# covers the kill, the report and exit, and if the command is still alive at N + grace
+# (a seat wedged where no per-call kill reaches) the watchdog force-exits it.
+COMMAND_TIMEOUT_GRACE_SECONDS = 30
+
+
+@contextmanager
+def command_deadline(seconds: int, *, command: str, stream=None) -> Iterator[None]:
+    """Make `seconds` a hard wall-clock bound on the `with` block (review-cli#587).
+
+    Arms `process.set_run_deadline(now + seconds)`, which kills every backend call
+    still running at that moment and refuses to start new ones, and a watchdog at
+    `seconds + COMMAND_TIMEOUT_GRACE_SECONDS` that — should the block still not have
+    returned — prints `command`, each seat still running with its last activity and
+    each finished seat's outcome, reaps every registered child process group and exits
+    `BACKSTOP_EXIT_CODE` (124)."""
+    from .process import set_run_deadline
+
+    grace = COMMAND_TIMEOUT_GRACE_SECONDS
+    started = time.monotonic()
+    set_run_deadline(started + seconds)
+    try:
+        with run_backstop(
+            seconds + grace,
+            stream=stream,
+            announce=lambda: _seat_report(command, seconds, grace, started),
+        ):
+            yield
+    finally:
+        set_run_deadline(None)
+
+
+def _seat_report(command: str, seconds: int, grace: int, started: float) -> str:
+    """The watchdog's announcement: what was still running at `seconds + grace`."""
+    from .process import seat_calls
+
+    now = time.monotonic()
+    lines = [
+        f"[review] {command}: still running {now - started:.0f}s after start "
+        f"(--timeout {seconds}s + {grace}s grace) — killed every seat process group "
+        f"and exited {BACKSTOP_EXIT_CODE}. Seats waited on:"
+    ]
+    for call in seat_calls():
+        ran = (call.finished if call.finished is not None else now) - call.started
+        if call.finished is None:
+            activity = (
+                f'last output {now - call.last_output:.0f}s ago: "{call.last_line}"'
+                if call.last_output is not None
+                else "no output yet"
+            )
+            lines.append(f"  - {call.seat}: still running after {ran:.0f}s; {activity}")
+        else:
+            lines.append(
+                f"  - {call.seat}: finished after {ran:.0f}s; {call.outcome or 'no answer'}"
+            )
+    if len(lines) == 1:
+        lines.append("  (no seat call had started)")
+    return "\n".join(lines)

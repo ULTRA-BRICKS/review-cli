@@ -20,6 +20,7 @@ from .backends import (
     ReviewResult,
     _UNAVAILABLE_MARKERS,
     _UNAVAILABLE_MAX_LEN,
+    _chronic_unavailable_reason,
     backend_available,
     backend_unavailable_reason,
     call_backend,
@@ -27,7 +28,13 @@ from .backends import (
     review_with_images,
 )
 from .config import MODERATOR_CANDIDATES, REVIEW_ROLES, BoardReviewer, _expand_alias
-from .process import set_board_deadline, write_retry_log
+from .process import (
+    cap_line,
+    run_deadline_expired,
+    seat_call,
+    set_board_deadline,
+    write_retry_log,
+)
 
 if TYPE_CHECKING:
     # Type-only: review-cli#548's live TUI observer. NEVER imported at runtime here (this
@@ -821,8 +828,31 @@ def _failure_reason(result: ReviewResult) -> str:
     if not lines:
         return f"exit {result.returncode}, no output"
     hinted = [line for line in lines if _REASON_HINT.search(line)]
-    line = (hinted or lines)[-1]
-    return line if len(line) <= 160 else line[:157] + "..."
+    return cap_line((hinted or lines)[-1])
+
+
+def _last_output_line(result: ReviewResult) -> str | None:
+    """The seat's own last non-blank output line (review-cli's `[review-cli] …` markers
+    skipped), capped at 160 chars; None when it printed nothing."""
+    for line in reversed(f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()):
+        line = line.strip()
+        if line and not line.startswith("[review-cli]"):
+            return cap_line(line)
+    return None
+
+
+def seat_no_answer_reason(result: ReviewResult) -> str:
+    """Why a seat gave no usable answer, as `<kind>: <detail>` with kind one of
+    timeout / quota / no output / failed — the per-seat line of just-ask's
+    no-answer report and of the command-deadline watchdog (review-cli#587)."""
+    if result.returncode in (124, 125):
+        last = _last_output_line(result)
+        return "timeout: " + (f'last output "{last}"' if last else "no output")
+    if _chronic_unavailable_reason(result) is not None:
+        return f"quota: {_failure_reason(result)}"
+    if result.returncode == 0 and not (result.stdout or "").strip():
+        return "no output: the seat exited 0 without an answer"
+    return f"failed (exit {result.returncode}): {_failure_reason(result)}"
 
 
 def mark_substitution(
@@ -927,6 +957,17 @@ def _run_panel_once(
         return []
 
     def _run_job(job: PanelJob) -> ReviewResult:
+        with seat_call(job.label or job.model) as call:
+            result = _dispatch_job(job)
+            if call is not None:
+                call.outcome = (
+                    "answered"
+                    if result_is_usable(result)
+                    else seat_no_answer_reason(result)
+                )
+            return result
+
+    def _dispatch_job(job: PanelJob) -> ReviewResult:
         if job.images:
             return review_with_images(
                 job.model,
@@ -1202,6 +1243,11 @@ def run_panel_with_retry(
             last = result
             failed.append((provider_model, result))
             if idx + 1 < len(chain):
+                if run_deadline_expired():
+                    # review-cli#587: the command's --timeout is spent, so the next
+                    # provider would only start after it; nor is running out of time
+                    # evidence against the cached last-working provider.
+                    return result
                 note = (
                     f"seat {label}: provider {provider_model} failed "
                     f"({_failure_reason(result)}) — "

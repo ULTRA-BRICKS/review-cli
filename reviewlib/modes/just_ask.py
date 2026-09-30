@@ -12,20 +12,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..backends import cap_diff_for_dispatch
-from ..config import BoardReviewer
 from ..panel import (
     PanelJob,
-    build_board_job,
     format_result,
     recount_round_by_usability,
     result_is_usable,
     run_panel,
-    run_role_slots,
+    seat_no_answer_reason,
 )
+from ..process import run_deadline_expired
 from . import _diff_context_block, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
 
 if TYPE_CHECKING:
+    from ..backends import ReviewResult
     from ..config import EffortOverride
 
 
@@ -39,7 +39,6 @@ def mode_just_ask(
     effort_override: "EffortOverride | None" = None,
     diff_from_stdin: bool = False,
     diff_already_capped: bool = False,
-    roles: list[str] | None = None,
 ) -> int:
     # codex review finding: the dispatch-time diff cap used to be applied ONLY by
     # cli.py's `_dispatch`, so a caller reaching this function directly (a library
@@ -63,35 +62,17 @@ def mode_just_ask(
         "Answer this question directly and concisely. Do not edit files or run commands.\n\n"
         f"QUESTION:\n{question}" + _diff_context_block(dispatch_diff)
     )
-    if roles:
-        jobs = [
-            build_board_job(
-                BoardReviewer(
-                    model,
-                    roles[i] if i < len(roles) else "",
-                    model,
-                    effort=_run_effort(effort_override, model),
-                ),
-                prompt,
-                "",
-                visual_images,
-                cwd=cwd,
-            )
-            for i, model in enumerate(models)
-        ]
-        results = run_role_slots(jobs, cwd, timeout, roles=roles)
-    else:
-        jobs = [
-            PanelJob(
-                model=model,
-                prompt=prompt,
-                diff="",
-                images=visual_images,
-                effort=_run_effort(effort_override, model),
-            )
-            for model in models
-        ]
-        results = run_panel(jobs, cwd, timeout)
+    jobs = [
+        PanelJob(
+            model=model,
+            prompt=prompt,
+            diff="",
+            images=visual_images,
+            effort=_run_effort(effort_override, model),
+        )
+        for model in models
+    ]
+    results = run_panel(jobs, cwd, timeout)
     # glm-5.2 review finding (2026-08 seat-cooldown feature): `run_panel`'s own
     # auto-tally counts a cached-cooldown sentinel (rc=0, non-empty "unavailable"
     # body) as `ok` in run-stats — the same distortion brainstorm's
@@ -106,7 +87,28 @@ def mode_just_ask(
     # just-ask -m fable` during a cooldown window even though no seat produced a real
     # answer. `result_is_usable` is the same predicate `mode_review`'s flat/board paths
     # already use for exactly this reason.
-    return 0 if all(result_is_usable(r) for r in results) else 1
+    if all(result_is_usable(r) for r in results):
+        return 0
+    print(_no_answer_report(results, timeout))
+    return 1
+
+
+def _no_answer_report(results: list["ReviewResult"], timeout: int) -> str:
+    """Every seat just-ask waited on, and why each one without a usable answer gave
+    none — timeout (with its last output), quota, no output, failed (review-cli#587)."""
+    missing = sum(1 for r in results if not result_is_usable(r))
+    head = (
+        "no seat answered"
+        if missing == len(results)
+        else f"{missing} of {len(results)} seats gave no answer"
+    )
+    if run_deadline_expired():
+        head += f" within --timeout {timeout}s"
+    lines = [f"\n[review-cli] just-ask: {head}. Seats waited on:"]
+    for r in results:
+        why = "answered" if result_is_usable(r) else seat_no_answer_reason(r)
+        lines.append(f"  - {r.model}: {why}")
+    return "\n".join(lines)
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -117,7 +119,6 @@ def _handler(ctx: ModeContext) -> int:
     images = _visual_images(ctx)
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     diff_already_capped = bool(ctx.extra.get("diff_already_capped", False))
-    roles = ctx.extra.get("task_roles") or None
     if images:
         return mode_just_ask(
             ctx.with_visual(ctx.args.question),
@@ -129,7 +130,6 @@ def _handler(ctx: ModeContext) -> int:
             effort_override=ctx.effort_override,
             diff_from_stdin=diff_from_stdin,
             diff_already_capped=diff_already_capped,
-            roles=roles,
         )
     return mode_just_ask(
         ctx.with_visual(ctx.args.question),
@@ -140,7 +140,6 @@ def _handler(ctx: ModeContext) -> int:
         effort_override=ctx.effort_override,
         diff_from_stdin=diff_from_stdin,
         diff_already_capped=diff_already_capped,
-        roles=roles,
     )
 
 

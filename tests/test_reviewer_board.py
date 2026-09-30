@@ -4070,7 +4070,8 @@ def test_just_ask_default_panel_drops_unavailable_grok_seat():
 
 def test_just_ask_explicit_dash_m_still_dispatches_unavailable_grok():
     """Explicit `-m grok` is honored as-is even when the probe says down —
-    the operator asked for that seat."""
+    the operator asked for that seat — and, with `--task`, it stays ONE seat:
+    just-ask never pads a single `-m` model into role slots (review-cli#587)."""
     saved_avail = backends.backend_available
     saved_unpaid = backends.runtime_provider_marked_unpaid
     try:
@@ -4081,10 +4082,7 @@ def test_just_ask_explicit_dash_m_still_dispatches_unavailable_grok():
         backends.backend_available = saved_avail
         backends.runtime_provider_marked_unpaid = saved_unpaid
     assert cap["rc"] == 0, cap
-    from reviewlib.config import SHIP_MIN_ROLES
-
-    assert set(cap["models"]) == {GROK_SEAT}, cap
-    assert len(cap["models"]) >= SHIP_MIN_ROLES, cap
+    assert cap["models"] == [GROK_SEAT], cap
 
 
 def test_just_ask_all_unreachable_defaults_still_dispatch_src():
@@ -4875,17 +4873,17 @@ def _capture_panel_task_dispatch(
 
 
 def test_cli_panel_task_one_model_pads_to_ship_min_roles():
-    """review-cli#433: just-ask / quorum / brainstorm `-m one-model --task`
-    must dispatch SHIP_MIN_ROLES distinct roles on that one engine — never
-    shrink the role list to engine count. Copies of one response do not
-    count as coverage; each role is its own slot.
+    """review-cli#433: quorum / brainstorm `-m one-model --task` must dispatch
+    SHIP_MIN_ROLES distinct roles on that one engine — never shrink the role list
+    to engine count. Copies of one response do not count as coverage; each role is
+    its own slot. (just-ask never pads — review-cli#587, see
+    tests/test_just_ask_timeout.py.)
 
     Fails if `task_role_pad` stays gated on `mode.name == "review"` (today
-    those three stay a single seat)."""
+    those modes stay a single seat)."""
     from reviewlib.config import SHIP_MIN_ROLES
 
     for sub, positional in (
-        ("just-ask", "q"),
         ("quorum", "q"),
         ("brainstorm", "topic"),
     ):

@@ -25,7 +25,7 @@ from . import jobs
 from . import portable
 from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
-from .backstop import run_backstop
+from .backstop import COMMAND_TIMEOUT_GRACE_SECONDS, command_deadline, run_backstop
 from .process import _open_log_with_fallback, install_signal_reaper
 from .config import (
     CONFIG_PATH,
@@ -4343,7 +4343,11 @@ def _add_global_options(
             "per-call timeout seconds; REST uses wall/request timeout; review/panel "
             "agent CLIs use idle/silence timeout with a 20m floor for values >=60 "
             "(set REVIEW_IDLE_TIMEOUT_SECONDS to shorten); qa/vision keep wall-clock "
-            f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT})"
+            f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT}). "
+            "An explicit `just-ask --timeout N` is instead a hard wall-clock bound: "
+            "every seat still running N s after dispatch is killed, the command lists "
+            "each seat and why it gave no answer, exits non-zero, and is force-exited "
+            f"(124) at N + {COMMAND_TIMEOUT_GRACE_SECONDS} s at the latest"
         ),
     )
     parser.add_argument(
@@ -4750,7 +4754,9 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   Fable/Sol. A recorded `review diff --task CODE` floors that pool to {SHIP_MIN_ROLES}
   distinct roles so `review task CODE --check` / gh ship can pass from one run; explicit
   `--pool N` still wins (warns if N<{SHIP_MIN_ROLES}). `-m one-model` with `--task` pads
-  that model across {SHIP_MIN_ROLES} roles for review, just-ask, quorum, and brainstorm.
+  that model across {SHIP_MIN_ROLES} roles for review, quorum, and brainstorm (quorum and
+  brainstorm announce the role slots on stderr, one call each); just-ask never pads — one
+  `-m` model is one call.
   Use `--preset default` for a routine change
   review (pool 4, high effort) or `--preset heavy` for release/risky changes
   (Sol/Opus/GLM-cc/Kimi at highest effort; Fable is excluded from every preset — a
@@ -4782,7 +4788,12 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
       stdout/stderr resets the idle timer; a fully silent seat is reaped after the idle
       window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
       applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
-      timeout caps.
+      timeout caps. An explicit `review just-ask --timeout N` is a hard wall-clock bound
+      instead: seats still running N s after dispatch are killed (whole process group), the
+      command prints each seat with why it gave no answer (timeout + last output, quota, no
+      output, failed) and exits 1; if it is somehow still alive at N + {COMMAND_TIMEOUT_GRACE_SECONDS} s,
+      a watchdog prints the seats still running with their last activity, kills them and
+      exits 124.
     REVIEW_HEARTBEAT_SECONDS=N          — interval between "still waiting" heartbeat
                                           lines printed to stderr once a backend call
                                           has SPAWNED (not while still queued on
@@ -6199,12 +6210,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # call.
     # One explicit `-m` model on a recorded run: clone that model onto unused
     # roles and reuse-pad to the ship floor (review-cli#309, extended in
-    # review-cli#433 to just-ask / quorum / brainstorm). `--pool 1` keeps exact
+    # review-cli#433 to quorum / brainstorm). `--pool 1` keeps exact
     # (effective_pool_size > 1 is false) and warns above. Review uses the board
-    # path; panel modes pad the flat `models` list below.
+    # path; panel modes pad the flat `models` list below. Never just-ask
+    # (review-cli#587): it asks every seat the same question with no role lens,
+    # so a pad only multiplied the calls — and the wait — by the role count.
     task_role_pad = (
         bool(task_code)
-        and mode.name in ("review", "just-ask", "quorum", "brainstorm")
+        and mode.name in ("review", "quorum", "brainstorm")
         and len(explicit_models) == 1
         and effective_pool_size > 1
     )
@@ -6228,6 +6241,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         padded_board = ensure_min_distinct_roles(board_source, pad_min)
         models = [r.model for r in padded_board]
         panel_task_roles = [r.role for r in padded_board]
+        # review-cli#587: the pad multiplies the calls, so say so up front.
+        print(
+            f"[review-cli] --task with one -m model: {mode.name} runs "
+            f"{explicit_models[0]} as {len(models)} role slots "
+            f"({', '.join(panel_task_roles)}) = {len(models)} calls",
+            file=sys.stderr,
+            flush=True,
+        )
     elif quorum_auto_roles:
         # Mutually exclusive with task_role_pad in practice (quorum_auto_roles
         # is only ever populated on the no-`-m` default path, task_role_pad
@@ -6673,10 +6694,21 @@ def _dispatch(argv: list[str] | None = None) -> int:
             panel_roles = list(panel_task_roles)
             panel_roles_kw["models_after"] = lambda: panel_models
             panel_roles_kw["roles_after"] = lambda: panel_roles
+
+        def _run_panel_handler() -> int:
+            # review-cli#587: an explicit `just-ask --timeout N` is a hard wall-clock
+            # bound — every seat call dies at N, the command at N + the grace.
+            if mode.name == "just-ask" and args.timeout is not None:
+                with command_deadline(
+                    timeout, command=f"review just-ask --timeout {timeout}"
+                ):
+                    return mode.handler(ctx)
+            return mode.handler(ctx)
+
         return _run_mode_with_stats(
             mode.stats_mode,
             models,
-            lambda: mode.handler(ctx),
+            _run_panel_handler,
             task_code=task_code,
             repo_id=repo_id,
             diff_files=diff_files,

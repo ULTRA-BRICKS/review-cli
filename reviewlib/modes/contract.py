@@ -103,9 +103,10 @@ class ModeContext:
     #                                    diff" — codex review finding, 2026-08 seat-
     #                                    cooldown/diff-cap feature, round 2).
     #   * "task_roles"   — list[str] : REVIEW_ROLES ids for a recorded one-model
-    #                                  `-m --task` pad (just-ask / quorum /
-    #                                  brainstorm). Absent when the panel was not
-    #                                  role-padded. Length matches `models`.
+    #                                  `-m --task` pad (quorum / brainstorm; never
+    #                                  just-ask, review-cli#587), or quorum's
+    #                                  auto-picked roles. Absent when the panel was
+    #                                  not role-padded. Length matches `models`.
     # A mode adding a new extra key should document it here.
     extra: dict = field(default_factory=dict)
 

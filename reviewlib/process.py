@@ -18,8 +18,11 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from .portable import (
     IS_WINDOWS,
@@ -177,6 +180,97 @@ def set_board_deadline(deadline: float | None) -> None:
 def _active_board_deadline() -> float | None:
     with _DEADLINE_LOCK:
         return _board_deadline
+
+
+# review-cli#587: the hard wall-clock deadline of the WHOLE command (a time.monotonic()
+# timestamp), armed by `backstop.command_deadline` for `review just-ask --timeout N`.
+# Unlike `_board_deadline` above, which only shortens idle windows and never below 90 s,
+# this one kills: `_run_streamed` reaps a call still running when it passes (whatever the
+# call's idle window) and refuses to start a call after it. None = no command deadline.
+_run_deadline: float | None = None
+
+
+def set_run_deadline(deadline: float | None) -> None:
+    """Arm (or clear, with None) the command deadline `_run_streamed` enforces. Arming
+    also starts a fresh `seat_calls()` record for the timeout report."""
+    global _run_deadline
+    with _DEADLINE_LOCK:
+        _run_deadline = deadline
+    if deadline is not None:
+        with _SEAT_CALLS_LOCK:
+            _SEAT_CALLS.clear()
+
+
+def _active_run_deadline() -> float | None:
+    with _DEADLINE_LOCK:
+        return _run_deadline
+
+
+def run_deadline_expired() -> bool:
+    """True once an armed command deadline has passed (False when none is armed)."""
+    deadline = _active_run_deadline()
+    return deadline is not None and time.monotonic() >= deadline
+
+
+@dataclass
+class SeatCall:
+    """One backend call made under a command deadline: what the timeout report says
+    about the seat — how long it ran, its last output line and when, how it ended."""
+
+    seat: str
+    started: float
+    last_output: float | None = None
+    last_line: str = ""
+    finished: float | None = None
+    outcome: str = ""
+
+
+_SEAT_CALLS_LOCK = threading.Lock()
+_SEAT_CALLS: list[SeatCall] = []
+_CURRENT_SEAT_CALL = threading.local()
+
+
+@contextmanager
+def seat_call(seat: str) -> Iterator[SeatCall | None]:
+    """Record one backend call for `seat` while a command deadline is armed; yields
+    None (records nothing) otherwise. `_run_streamed` on this thread feeds the call's
+    output into the record; the caller sets `outcome` when the backend returns."""
+    if _active_run_deadline() is None:
+        yield None
+        return
+    call = SeatCall(seat=seat, started=time.monotonic())
+    with _SEAT_CALLS_LOCK:
+        _SEAT_CALLS.append(call)
+    _CURRENT_SEAT_CALL.call = call
+    try:
+        yield call
+    finally:
+        call.finished = time.monotonic()
+        _CURRENT_SEAT_CALL.call = None
+
+
+def seat_calls() -> list[SeatCall]:
+    """Snapshot of this command's seat calls, in start order. Lock-free on purpose (a
+    list copy is atomic under the GIL): the backstop's watchdog reads it on its way to a
+    forced exit and must never wait on a lock a wedged thread might hold."""
+    return list(_SEAT_CALLS)
+
+
+def _note_seat_output(call: SeatCall, text: str) -> None:
+    """Stamp `call` with fresh output: the time, and the chunk's last non-blank line
+    (control sequences stripped, capped) as its last activity."""
+    call.last_output = time.monotonic()
+    for line in reversed(text.splitlines()):
+        line = strip_control_sequences(line).strip()
+        if line:
+            call.last_line = cap_line(line)
+            return
+
+
+def cap_line(line: str, limit: int = 160) -> str:
+    """`line` cut to `limit` chars with a trailing "..." — the one-line shape the seat
+    failure / timeout reports print."""
+    return line if len(line) <= limit else line[: limit - 3] + "..."
 
 
 # Built lazily + cached: read $REVIEW_MAX_CONCURRENCY once on first spawn so a test can set
@@ -958,6 +1052,9 @@ def _open_log(backend: str, round_no: int) -> Path:
 # compares against THIS, so rewording the human-readable marker text can never silently
 # desync detection from display.
 TIMEOUT_KIND_STALL = "waiting for first output"
+# The kind stamped when the command deadline (`set_run_deadline`, review-cli#587) killed
+# the call, or stopped it from starting at all.
+TIMEOUT_KIND_DEADLINE = "at the command's --timeout deadline"
 
 
 def _timeout_marker_text(secs: int, kind: str) -> str:
@@ -969,6 +1066,26 @@ def _timeout_marker_text(secs: int, kind: str) -> str:
     coincidentally contain the same words, and after idle/liveness clamping the exact
     embedded seconds value here may not equal what a caller originally requested)."""
     return f"[review-cli] TIMEOUT after {secs}s {kind} — partial output above]"
+
+
+def _not_started_result(argv: list[str], log_fh) -> subprocess.CompletedProcess[str]:
+    """The result of a call `_run_streamed` refused to spawn because the command
+    deadline had already passed: exit 124, a marker in place of output, no child."""
+    marker = (
+        "[review-cli] NOT STARTED: the command's --timeout deadline had already passed]"
+    )
+    try:
+        log_fh.write(f"{marker}\n{_exit_line(124)}")
+        log_fh.flush()
+    except (ValueError, OSError):
+        pass
+    result = subprocess.CompletedProcess(
+        args=argv, returncode=124, stdout=f"\n{marker}\n", stderr=""
+    )
+    result.timeout_kind = TIMEOUT_KIND_DEADLINE
+    result.stall_bound_clamped = False
+    result.true_silenced = False
+    return result
 
 
 def heartbeat_interval_seconds() -> float | None:
@@ -1495,6 +1612,10 @@ def _run_streamed(
         "without output" if timeout_mode == "idle" else "total runtime"
     )
     activity = {"last": time.monotonic(), "got_output": False}
+    # review-cli#587: the command deadline (if armed) is a hard wall-clock cap on top of
+    # whichever timeout mode applies; `seat_rec` is this thread's timeout-report record.
+    deadline = _active_run_deadline()
+    seat_rec: SeatCall | None = getattr(_CURRENT_SEAT_CALL, "call", None)
     proc: subprocess.Popen | None = None
     pgid: int | None = None
     child_handle: tuple[subprocess.Popen, int | None] | None = None
@@ -1549,6 +1670,8 @@ def _run_streamed(
             f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n"
         )
         log_fh.flush()
+        if deadline is not None and time.monotonic() >= deadline:
+            return _not_started_result(argv, log_fh)
 
         # Deadline-dependent: computed HERE (post concurrency-slot wait, pre-spawn),
         # not at entry — the true-silence clock starts at Popen, so the board-deadline
@@ -1695,6 +1818,8 @@ def _run_streamed(
                             if stopping.is_set():
                                 break
                             buf.append(text)
+                            if seat_rec is not None:
+                                _note_seat_output(seat_rec, text)
                             if tag:
                                 line_rem += text
                                 while "\n" in line_rem:
@@ -1770,6 +1895,16 @@ def _run_streamed(
                             elapsed_since_output=now - activity["last"],
                         )
                         next_heartbeat = now + heartbeat_interval
+                    if deadline is not None and now >= deadline:
+                        timed_out = True
+                        timeout_marker_secs = int(now - wall_started)
+                        timeout_marker_kind = TIMEOUT_KIND_DEADLINE
+                        _kill_tree(proc, pgid)
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
                     if now - wall_started >= timeout_secs:
                         timed_out = True
                         timeout_marker_secs = timeout_secs
@@ -1848,6 +1983,18 @@ def _run_streamed(
                             elapsed_since_output=elapsed_idle,
                         )
                         next_heartbeat = _now + heartbeat_interval
+                    # The command deadline outranks every window below: idle, liveness
+                    # and true-silence all reset or wait on output, the deadline never.
+                    if deadline is not None and _now >= deadline:
+                        timed_out = True
+                        timeout_marker_secs = int(_now - loop_started)
+                        timeout_marker_kind = TIMEOUT_KIND_DEADLINE
+                        _kill_tree(proc, pgid)
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
                     # A backend that has NEVER emitted a byte gets a separate, much
                     # shorter bound when the caller opts in via `liveness_timeout`
                     # (review-cli#153/#159/#179: opencode's zai/glm seat hangs at 0%

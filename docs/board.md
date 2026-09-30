@@ -263,7 +263,7 @@ configured `board:`   >   default preset (light)
   all 14 heavy-preset built-ins — Fable is excluded from every preset, see "Priority-ordered
   failover pool" above). `--pool`
   does not reduce an explicit multi-model `-m` list: every requested `-m`
-  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles (review, just-ask, quorum, and brainstorm).
+  seat is attempted. A recorded `--task -m one-model` run pads that model across 3 roles (review, quorum, and brainstorm); just-ask never pads — one `-m` model is one call (review-cli#587).
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   roster — the configured/default board applies.
 

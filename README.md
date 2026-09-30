@@ -1019,7 +1019,9 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     timeout with a 20m default floor on normal review runs; REST calls use it
                     as the HTTP request timeout, and QA/vision keep wall-clock caps. Values
                     under 60s stay exact for tests/probes; REVIEW_IDLE_TIMEOUT_SECONDS
-                    overrides the review/panel idle window when set.
+                    overrides the review/panel idle window when set. `just-ask --timeout N`
+                    is a hard bound: seats still running at N s are killed, each seat's
+                    reason for no answer is printed (exit 1); force-exit 124 at N + 30 s.
 --detach            Spawn this review as a session-detached BACKGROUND process and return
                     almost immediately with a job-id, instead of blocking the caller for
                     the whole run. See "review --detach / jobs / status / wait" below.
@@ -1039,8 +1041,8 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     it. N<=0 (e.g. --pool 0) runs all seats in the selected preset/board.
                     An explicit `--pool N` below 3 with `--task` still wins but warns.
                     Ignored for exact multi-model -m; `--task -m` one-model pads that model
-                    across 3 roles. Recorded `--task --pool 0` still pads a same-role
-                    config roster to the ship floor.
+                    across 3 roles (not just-ask: one -m model, one call). Recorded
+                    `--task --pool 0` still pads a same-role config roster to the ship floor.
 --effort LEVEL|PROVIDER=LEVEL
                     Run-scoped reasoning effort, overriding each seat's config effort for
                     THIS run. A bare level (minimal/low/medium/high/xhigh/max) applies to

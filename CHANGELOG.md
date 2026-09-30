@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.42.0 — 2026-09-30
+
+- **Fix(just-ask): `--timeout N` is a hard wall-clock bound, and one `-m` model is one call**
+  ([review-cli#587](https://git.hyperide.ai/ultrabricks/review-cli/issues/587)). On
+  2026-09-29 a just-ask proofread printed nothing for 25 minutes, and a retry with
+  `-m claude:claude-opus-4-8 --timeout 300` was still running after 600 s. `--timeout` was
+  an idle window with a 20-minute floor that any output reset, a single `-m` model with
+  `--task` ran as 3 role slots, and failover and retries each got the full window. Now,
+  with an explicit `review just-ask --timeout N`:
+  - every seat call still running N seconds after dispatch is killed with its whole
+    process group, and no failover call starts after that;
+  - the command prints each seat it waited on and why it gave no answer — `timeout` (with
+    the seat's last output line), `quota`, `no output` or `failed` — and exits 1;
+  - if the command is still alive at N + 30 s (a seat wedged where no per-call kill
+    reaches), a watchdog prints each seat still running with its last output and how long
+    ago it came, kills every seat process group, and exits 124.
+  just-ask no longer pads one `-m` model into role slots: it asks every seat the same
+  question with no role lens, so one `-m` model is one call. quorum and brainstorm still
+  pad (their seats answer under role lenses) and now say so on stderr: `--task with one -m
+  model: quorum runs <model> as 3 role slots (…) = 3 calls`. Without `--timeout`, just-ask
+  keeps the idle window; `review diff` and the board are unchanged.
+
 ## 0.41.0 — 2026-09-30
 
 - **Fix(board): a failed Claude CLI login is remembered, so `review status` says the seat is

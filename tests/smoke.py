@@ -810,6 +810,12 @@ _UNIT_FILES = [
     # without paying the failed call; a later success or a re-login clears it. Offline —
     # Claude CLI and omp faked; registry, cooldown store, cache and logs in temp dirs.
     ("test_claude_login_failure.py", {}),
+    # review-cli#587: an explicit `review just-ask --timeout N` is a hard wall-clock bound —
+    # a fake seat that never answers is killed with its process group at N, the command
+    # names each seat and why it gave no answer, a seat wedged inside review is cut off by
+    # the N + grace watchdog, and one -m model is one call. Fake `codex` executables on a
+    # private PATH; the real bin/review runs with HOME/logs/stats/caches in temp dirs.
+    ("test_just_ask_timeout.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # Reuse-aware board/panel composition (review-cli#205): scarce/near-limit models
     # reuse across roles instead of shrinking the panel. Pure algorithm, no I/O.
     ("test_pool_reuse.py", {}),

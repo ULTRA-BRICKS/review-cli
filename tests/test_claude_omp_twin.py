@@ -211,7 +211,7 @@ def test_a_last_working_cache_reorder_is_not_reported_as_a_substitution():
 
 
 def test_task_role_slots_each_count_once_when_every_claude_slot_is_substituted():
-    """The `--task` role-slot runner (just-ask / quorum / brainstorm padding one model
+    """The `--task` role-slot runner (quorum / brainstorm padding one model
     across the ship floor): every slot answers through omp, every role counts once."""
     roles = ["correctness", "quality", "security"]
     jobs = [
