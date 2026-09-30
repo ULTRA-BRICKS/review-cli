@@ -2752,16 +2752,71 @@ _ACCOUNT_AUTH_FAILURE = re.compile(
 )
 
 
+def _login_failure_line(result: ReviewResult) -> str | None:
+    """The output line saying this account's login failed (`_ACCOUNT_AUTH_FAILURE` on a
+    non-zero exit that is not a chronic quota result), else None."""
+    if result.returncode == 0 or _chronic_unavailable_reason(result) is not None:
+        return None
+    for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines():
+        if _ACCOUNT_AUTH_FAILURE.search(line):
+            return line.strip()
+    return None
+
+
 def _account_should_advance(result: ReviewResult) -> bool:
     """True when the next registered account should be tried after `result`: a chronic
     quota/unavailable result (`_chronic_unavailable_reason`) or a failed login on this
-    account (`_ACCOUNT_AUTH_FAILURE`)."""
+    account (`_login_failure_line`)."""
     if _chronic_unavailable_reason(result) is not None:
         return True
-    if result.returncode == 0:
-        return False
-    return bool(
-        _ACCOUNT_AUTH_FAILURE.search(f"{result.stdout or ''}\n{result.stderr or ''}")
+    return _login_failure_line(result) is not None
+
+
+def _claude_account_dir(config_dir: str | None) -> Path | None:
+    """The account a candidate's CLAUDE_CONFIG_DIR names (None = the single implicit
+    account): the key its recorded login failure lives under."""
+    return Path(config_dir) if config_dir else None
+
+
+def _remember_claude_login(config_dir: str | None, result: ReviewResult) -> None:
+    """After a real call on account `config_dir`, record its failed login or clear a
+    recorded one once the account answers (review-cli#596)."""
+    from . import claude_accounts as _accts
+
+    account = _claude_account_dir(config_dir)
+    failure = _login_failure_line(result)
+    if failure is not None:
+        _accts.record_login_failure(account, failure)
+    elif _clears_cooldown_history(result):
+        _accts.clear_login_failure(account)
+
+
+def _claude_cli_login_reason() -> str | None:
+    """Why the Claude CLI transport cannot run right now: every account it rotates
+    through has a standing recorded login failure (review-cli#596), with the command
+    that logs each back in; None while any account has none. Reads the cooldown store
+    and, for a recorded failure, when that account's login was last stored (a
+    `security` Keychain attribute read on macOS, cached briefly) -- no `claude`
+    process, no model call. Side effect: a failure whose account was logged back in is
+    dropped (`claude_accounts.login_failure`). `review status` shows a wider verdict
+    (`seat_health._claude_cli_reason` also counts accounts `claude auth status` reports
+    logged out), which this probe cannot afford on every availability check."""
+    from . import claude_accounts as _accts
+
+    accounts: list[Path | None] = [*_accts.rotation_order()] or [None]
+    names_by_reason: dict[str, list[str]] = {}
+    for account in accounts:
+        failure = _accts.login_failure(account)
+        if failure is None:
+            return None
+        name = account.name if account is not None else "the default account"
+        names_by_reason.setdefault(failure["reason"], []).append(name)
+    what = "; ".join(
+        f"{', '.join(names)}: {reason}" for reason, names in names_by_reason.items()
+    )
+    commands = ", ".join(_accts.login_command(a) for a in accounts)
+    return (
+        f"Claude CLI login failed on every account ({what}) -- log back in: {commands}"
     )
 
 
@@ -2788,10 +2843,27 @@ def _review_claude_cli_with_account_fallback(
     configured account reported 100% usage, even when the account actually in use was
     fine). A host with no `~/.claude-accounts` registry gets exactly one (None, None)
     candidate and behaves byte-identically to before this function existed."""
+    from . import claude_accounts as _accts
+
     candidates = _claude_account_candidates()
+    # review-cli#596: an account whose login already failed is not paid for again while
+    # another account may still answer. When every account's login has failed they are
+    # all tried: nothing else can answer this call (with a reachable omp twin the seat
+    # never gets here -- `backend_unavailable_reason` already handed it over), and a
+    # success is what clears the record.
+    fresh: list[tuple[str | None, str | None]] = []
+    login_failed: list[tuple[str | None, str | None]] = []
+    for candidate in candidates:
+        failure = _accts.login_failure(_claude_account_dir(candidate[0]))
+        (fresh if failure is None else login_failed).append(candidate)
+    if not fresh:
+        fresh, login_failed = login_failed, []
     last_result = None
-    skipped = []
-    for config_dir, email in candidates:
+    skipped = [
+        f"{email or config_dir or 'default'} (login failed)"
+        for config_dir, email in login_failed
+    ]
+    for config_dir, email in fresh:
         if not allow_spawn_for_model(model, account=email):
             skipped.append(email or config_dir or "default")
             continue
@@ -2805,6 +2877,7 @@ def _review_claude_cli_with_account_fallback(
             effort=effort,
             config_dir=config_dir,
         )
+        _remember_claude_login(config_dir, result)
         if not _account_should_advance(result):
             return result
         last_result = result
@@ -5117,12 +5190,15 @@ def backend_unavailable_reason(model: str) -> str | None:
                 if _claude_api_available_for_model(model):
                     return None
                 return "claude: no API key for this model (REVIEW_CLAUDE_MODE=api)"
+            # With the CLI transport, a login that failed on every account the CLI
+            # rotates through makes the seat unusable too (review-cli#596), so a board
+            # hands it to its omp twin without paying the failed call again.
             if mode == "cli":
                 if _have_claude_cli():
-                    return None
+                    return _claude_cli_login_reason()
                 return "claude: CLI not found on PATH (REVIEW_CLAUDE_MODE=cli)"
             if _have_claude_cli():
-                return None
+                return _claude_cli_login_reason()
             if _claude_api_available_for_model(model):
                 return None
             return "claude: no `claude` CLI on PATH and no API key"

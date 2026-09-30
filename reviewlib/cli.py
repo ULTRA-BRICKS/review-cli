@@ -1711,9 +1711,10 @@ def _configured_board(config: dict) -> list[BoardReviewer]:
 def _seat_status_report(*, as_json: bool) -> int:
     """Bare `review status` (review-cli#594): every board seat as usable or UNUSABLE with
     the reason (unpaid provider, missing CLI/login, an active cooldown, every Claude CLI
-    account logged out) and the executor its failover would hand the seat to, plus each
-    registered Claude CLI account's login state with the command that logs it back in.
-    Read-only: no model is called and no login is started."""
+    account logged out or failed its last login) and the executor its failover would hand
+    the seat to, plus each registered Claude CLI account's login state -- including a
+    login failure a call recorded (review-cli#596) -- with the command that logs it back
+    in. Read-only: no model is called and no login is started."""
     from .seat_health import claude_accounts_state, seat_health
 
     try:
@@ -1745,6 +1746,8 @@ def _seat_status_report(*, as_json: bool) -> int:
                     "email": a.email,
                     "current": a.current,
                     "logged_in": a.logged_in,
+                    "login_failure": a.login_failure,
+                    "login_failed_at": a.login_failed_at_utc,
                     "login_command": a.login_command,
                 }
                 for a in accounts
@@ -1777,6 +1780,11 @@ def _seat_status_report(*, as_json: bool) -> int:
         marker = "*" if a.current else " "
         if a.logged_in is False:
             state = f"LOGGED OUT -- log it back in: {a.login_command}"
+        elif a.login_failure:
+            state = (
+                f"LOGIN FAILED {a.login_failed_at_utc} ({a.login_failure}) "
+                f"-- log it back in: {a.login_command}"
+            )
         elif a.logged_in:
             state = "logged in"
         else:
@@ -1850,6 +1858,8 @@ def _entities_subcommand(rest: list[str]) -> int:
             "email": a.email,
             "current": a.current,
             "logged_in": a.logged_in,
+            "login_failure": a.login_failure,
+            "login_failed_at": a.login_failed_at_utc,
             "login_command": a.login_command,
         }
         for a in account_state
@@ -1912,6 +1922,11 @@ def _render_entities_report(payload: dict) -> str:
             marker = "*" if a["current"] else " "
             if a.get("logged_in") is False:
                 state = f"  LOGGED OUT -- log it back in: {a['login_command']}"
+            elif a.get("login_failure"):
+                state = (
+                    f"  LOGIN FAILED {a['login_failed_at']} ({a['login_failure']}) "
+                    f"-- log it back in: {a['login_command']}"
+                )
             else:
                 state = ""
             lines.append(

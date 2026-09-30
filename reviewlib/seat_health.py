@@ -6,10 +6,13 @@ called them available (the `claude` binary was on PATH) and `review status` coul
 inspect detached jobs. Bare `review status` and `review entities` render this module.
 
 Read-only, and only from what review-cli already knows: the backend availability probe
-(missing CLI/key/login, unpaid provider), the seat cooldown store (a recorded quota,
-limit or silence cooldown), and — for a seat that runs through the Claude CLI — each
-registered `~/.claude-accounts` account's login state (`claude_accounts.account_logged_in`,
-a local `claude auth status`). No model is called and no login is started.
+(missing CLI/key/login, unpaid provider, a Claude CLI login that failed on every account),
+the seat cooldown store (a recorded quota, limit or silence cooldown), and — for a seat
+that runs through the Claude CLI — each registered `~/.claude-accounts` account's login
+state (`claude_accounts.account_logged_in`, a local `claude auth status`) and its recorded
+login failure (`claude_accounts.login_failure`, review-cli#596: `claude auth status` kept
+saying logged in while every call on the account failed). No model is called and no login
+is started.
 """
 
 from __future__ import annotations
@@ -32,18 +35,32 @@ _COOLDOWN_METHODS = tuple(
 
 @dataclass(frozen=True)
 class ClaudeAccount:
-    """One registered Claude CLI account and whether the CLI considers it logged in
-    (`logged_in` None = could not tell)."""
+    """One registered Claude CLI account, whether the CLI considers it logged in
+    (`logged_in` None = could not tell), and the login failure a call on it recorded
+    (`login_failure` None = none standing; `login_failed_at` its UNIX time)."""
 
     name: str
     path: Path
     email: str | None
     current: bool
     logged_in: bool | None
+    login_failure: str | None = None
+    login_failed_at: float | None = None
 
     @property
     def login_command(self) -> str:
         return claude_accounts.login_command(self.path)
+
+    @property
+    def login_failed_at_utc(self) -> str | None:
+        """When the recorded login failure happened, or None without one; a failure
+        whose store entry lost its time reads as "at an unknown time"."""
+        if self.login_failure is None:
+            return None
+        if self.login_failed_at is None:
+            return "at an unknown time"
+        at = datetime.fromtimestamp(self.login_failed_at, tz=timezone.utc)
+        return at.strftime("%Y-%m-%d %H:%MZ")
 
 
 @dataclass(frozen=True)
@@ -57,18 +74,24 @@ class SeatHealth:
 
 
 def claude_accounts_state() -> list[ClaudeAccount]:
-    """The Claude CLI account registry in name order, each with its login state."""
+    """The Claude CLI account registry in name order, each with its login state and any
+    standing recorded login failure."""
     current = claude_accounts.current_account_name()
-    return [
-        ClaudeAccount(
-            name=path.name,
-            path=path,
-            email=claude_accounts.account_email(path),
-            current=path.name == current,
-            logged_in=claude_accounts.account_logged_in(path),
+    accounts = []
+    for path in claude_accounts.list_accounts():
+        failure = claude_accounts.login_failure(path)
+        accounts.append(
+            ClaudeAccount(
+                name=path.name,
+                path=path,
+                email=claude_accounts.account_email(path),
+                current=path.name == current,
+                logged_in=claude_accounts.account_logged_in(path),
+                login_failure=failure["reason"] if failure else None,
+                login_failed_at=failure["recorded_at"] if failure else None,
+            )
         )
-        for path in claude_accounts.list_accounts()
-    ]
+    return accounts
 
 
 def _cooldown_reason(model: str, now: float) -> str | None:
@@ -91,12 +114,26 @@ def _runs_through_claude_cli(model: str) -> bool:
 
 
 def _claude_cli_reason(accounts: list[ClaudeAccount]) -> str | None:
-    """A reason only when EVERY registered account is known to be logged out — the claude
-    seats rotate through the registry, so one live account keeps them usable."""
-    if not accounts or any(a.logged_in is not False for a in accounts):
+    """A reason only when EVERY registered account is known to be unusable — logged out,
+    or its last login failed — since the claude seats rotate through the registry and
+    one live account keeps them usable. Wider than `backends._claude_cli_login_reason`
+    (what dispatch routes on), which reads only recorded failures because it runs on
+    every availability probe and cannot afford a `claude auth status` per account; a
+    logged-out account gets its recorded failure from its first call ("Not logged in")."""
+    if not accounts or any(
+        a.logged_in is not False and a.login_failure is None for a in accounts
+    ):
         return None
-    names = ", ".join(f"{a.name} ({a.email or 'no email on disk'})" for a in accounts)
-    return f"every registered Claude CLI account is logged out: {names}"
+    if all(a.logged_in is False for a in accounts):
+        names = ", ".join(
+            f"{a.name} ({a.email or 'no email on disk'})" for a in accounts
+        )
+        return f"every registered Claude CLI account is logged out: {names}"
+    states = ", ".join(
+        f"{a.name} ({'logged out' if a.logged_in is False else a.login_failure})"
+        for a in accounts
+    )
+    return f"every registered Claude CLI account is logged out or failed its login: {states}"
 
 
 def _reason(model: str, accounts: list[ClaudeAccount], now: float) -> str | None:

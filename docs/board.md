@@ -63,6 +63,18 @@ number of working reviewers even when models drop:
   seat as usable or UNUSABLE with the reason and its substitute, and each registered Claude
   CLI account as logged in or LOGGED OUT with the `CLAUDE_CONFIG_DIR=… claude auth login`
   command that fixes it.
+- **A failed Claude CLI login is remembered per account (review-cli#596)** — `claude auth
+  status` can say logged in while every call on the account fails ("OAuth session expired
+  and could not be refreshed"). When a call fails its login, that account is recorded as
+  LOGIN FAILED (the seat-cooldown store's escalating 10m/30m/2h/8h window) and is not
+  tried again while another account answers. Once every account has failed its login the
+  `claude:*` seats are unusable: a board or panel hands them straight to the omp twin
+  without paying the failed call first, and bare `review status` shows the seat UNUSABLE
+  with the failure, the accounts it hit and their `CLAUDE_CONFIG_DIR=… claude auth login`
+  commands. The record is dropped by a later successful call on the account, or as soon as
+  the account is logged back in (its stored login — the macOS Keychain item or
+  `.credentials.json` — rewritten after the failure). `REVIEW_SEAT_COOLDOWN_SECONDS=0`
+  ignores it, like every other cooldown.
 
 Each seat carries its own configured role/lens: priority decides *who* sits in the pool,
 the role decides *with what lens* they review. The run owes the pool's roles, so a

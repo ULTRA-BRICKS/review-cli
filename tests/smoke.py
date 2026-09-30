@@ -805,6 +805,11 @@ _UNIT_FILES = [
     # `review status` / `review entities` say why a seat cannot run. Offline — executors
     # faked by id; cache, logs, cooldown store and account registry in temp dirs.
     ("test_claude_omp_twin.py", {}),
+    # review-cli#596: a Claude CLI login that failed is recorded per account, so bare
+    # `review status` shows the seat UNUSABLE and the next call goes to the omp twin
+    # without paying the failed call; a later success or a re-login clears it. Offline —
+    # Claude CLI and omp faked; registry, cooldown store, cache and logs in temp dirs.
+    ("test_claude_login_failure.py", {}),
     # Reuse-aware board/panel composition (review-cli#205): scarce/near-limit models
     # reuse across roles instead of shrinking the panel. Pure algorithm, no I/O.
     ("test_pool_reuse.py", {}),

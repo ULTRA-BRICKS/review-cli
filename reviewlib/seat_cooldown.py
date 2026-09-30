@@ -40,6 +40,13 @@ cooldown. An auth failure, a bad model, or any other seat-fatal class is NOT cac
 skipping a "real" retry after a key rotation would hide the fix. Chronic-only means a
 false-cache costs at most one cooldown window of extra skips, never a wrong-forever verdict.
 
+One deliberate exception (review-cli#596): a failed Claude CLI LOGIN is recorded here too,
+keyed by the Claude ACCOUNT rather than a model (``claude_accounts.record_login_failure``).
+An expired OAuth login kept `claude auth status` saying logged in while every call on the
+account failed, so without a record every review paid the failed call again. The "hides
+the fix" concern above does not apply to it: the record is dropped the moment the account's
+stored login is rewritten after the failure (a ``claude auth login``), not after a timer.
+
 FIXED (was review-cli#187): the store used to be keyed by ``model`` alone, checked BEFORE
 ``REVIEW_CLAUDE_MODE``/CLI-vs-API transport selection, so a session-limit cooldown
 recorded from the CLI transport (subscription quota) also skipped that model's separate,
@@ -544,7 +551,7 @@ def active_cooldown(
     access_method: str,
     now: float | None = None,
 ) -> dict | None:
-    """``{"reason", "until", "remaining_seconds", "fail_count"}`` if
+    """``{"reason", "until", "remaining_seconds", "fail_count", "recorded_at"}`` if
     ``(model, access_method)`` is currently cooling down, else ``None``. Never raises —
     a corrupt/missing store reads as "no cooldown", fail-open toward dispatching (never
     fail-closed toward silently starving a seat that would actually work). A store
@@ -609,11 +616,18 @@ def active_cooldown(
     # EXCEPT the display value itself must never render as a bare `True`/`False`.
     if type(fail_count) is not int or fail_count < 1:
         fail_count = 1
+    # When the cooldown was recorded, or None for a store entry without a usable one
+    # (review-cli#596: `claude_accounts.login_failure` compares it against a later
+    # re-login). Same corrupt-shape guard as `until` above.
+    recorded_at = entry.get("recorded_at")
+    if type(recorded_at) not in (int, float) or not math.isfinite(recorded_at):
+        recorded_at = None
     return {
         "reason": reason,
         "until": until,
         "remaining_seconds": until - now,
         "fail_count": fail_count,
+        "recorded_at": recorded_at,
     }
 
 

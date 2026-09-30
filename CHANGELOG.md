@@ -3,6 +3,32 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.41.0 — 2026-09-30
+
+- **Fix(board): a failed Claude CLI login is remembered, so `review status` says the seat is
+  unusable and the next call goes straight to omp**
+  ([review-cli#596](https://git.hyperide.ai/ultrabricks/review-cli/issues/596)). On
+  2026-09-30 `claude auth status` said `loggedIn: true` for account-0 and account-1 while
+  every call on them failed with "Failed to authenticate: OAuth session expired and could
+  not be refreshed". Nothing recorded that, so bare `review status` kept calling the
+  `claude:*` seats usable and every review paid the failed Claude CLI call again before its
+  omp twin answered. Now:
+  - a call whose login fails records LOGIN FAILED for that Claude account (the failure
+    line, in the seat-cooldown store with its escalating 10m/30m/2h/8h window), and the
+    account is not tried again while another registered account answers;
+  - once every account has failed its login, the `claude:*` seats count as unusable: a
+    board, `-m` review or just-ask / quorum / brainstorm hands them straight to their
+    `omp:anthropic/` twin without calling the Claude CLI first, and the `substituted:` line
+    names the login failure and the `CLAUDE_CONFIG_DIR=… claude auth login` commands;
+  - bare `review status [--json]` and `review entities` show the seat UNUSABLE with the
+    failure, the accounts it hit and the omp substitute, and each such account as
+    `LOGIN FAILED <time> (<failure>) -- log it back in: <command>`;
+  - the record is dropped by a later successful call on the account, or as soon as the
+    account is logged back in: its stored login (the macOS Keychain item's modification
+    date, or `.credentials.json`'s mtime; the secret itself is never read) rewritten after
+    the failure. With no omp twin reachable, the Claude CLI is still tried, since nothing
+    else can answer.
+
 ## 0.40.0 — 2026-09-30
 
 - **Fix(board): a dead Claude CLI seat answers through omp, and `review status` says why a

@@ -752,7 +752,8 @@ Claude multi-account roster (`reviewlib.claude_accounts`), the effort/role fallb
 lenses (`reviewlib.role_models.ROLE_FALLBACK_MODELS`), and a compact per-harness
 call-health summary for the last 7 days (the same data `review stat` reads). A seat that
 cannot run shows why and who answers for it; each Claude account shows whether it is
-logged in (one local `claude auth status` each). No network call, no key printed.
+logged in (one local `claude auth status` each) and whether a call on it failed its login
+since (review-cli#596). No network call, no key printed.
 
 ```bash
 review entities                    # text report
