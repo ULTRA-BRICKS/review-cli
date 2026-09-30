@@ -3,6 +3,31 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.43.0 — 2026-09-30
+
+- **Fix(task --check): `--verify-repo-only`, and review history that survives a repository
+  move** ([review-cli#589](https://git.hyperide.ai/ultrabricks/review-cli/issues/589)).
+  `gh ship` used `--no-verify-identity`, so its quorum counted every repository's
+  iterations for a task code: `#464` in sme-archiving-gc passed on rig-cli and review-cli
+  reviews stored as `464`. Now:
+  - `review task CODE --check --verify-repo-only -C <repo>` compares the repository alone.
+    Iterations recorded in another repository no longer count toward iterations, models or
+    roles, whatever spelling of the code they used. Same-repository iterations count even
+    when their files don't overlap the checkout's own diff, which is unrelated to the PR
+    when `gh ship` runs from the primary checkout. `identity_verification` reads
+    `repo_only`. `gh ship` switches to it in agent-tools#824;
+  - `--check --json` names the iterations dropped for being from another repository in
+    `foreign_repo_iterations` (`repo_id`, `task_code`, `ts`, `passed`). The list stops at
+    50; `excluded_foreign_repo_iterations` holds the full count and
+    `foreign_repo_iterations_truncated` marks a cut list. When no diff is compared
+    (`--verify-repo-only`, or a clean checkout), a refusal's `error` and stderr warning
+    both count these records, failed ones included;
+  - a repository's former remotes are one table of old id → current id
+    (`_REPO_ID_ALIASES` in `reviewlib/stats.py`), which now also maps
+    `git.hyperide.ai/ultrabricks/sme-archiving-gc-tmp` to
+    `github.com/alex-mextner/sme-archiving-gc`. The checkout's reviews from its Forgejo
+    period count again after its origin moved back to GitHub.
+
 ## 0.42.1 — 2026-09-30
 
 - **Fix(omp): an omp seat that answered keeps its answer when its scratch dir can't be

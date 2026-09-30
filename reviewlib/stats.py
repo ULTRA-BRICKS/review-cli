@@ -60,6 +60,12 @@ task's legitimate iterations. `diff_sha256` is recorded too (an exact hash of
 the reviewed diff text) purely as an additional diagnostic signal for
 `--detail`/debugging, not as part of the mismatch-detection gate.
 
+A repository that was renamed or moved hosts stays one `repo_id`: its former
+remotes map to the current one through `_REPO_ID_ALIASES`. A caller whose own
+diff says nothing about the reviewed change (`gh ship` checking a PR from the
+primary checkout) passes the repo alone, with no file set, so only the REPO is
+compared (`review task --check --verify-repo-only`, review-cli#589).
+
 Threat-model boundary: this store is a local, self-reported JSONL file — nothing
 stops a caller with write access from appending a FRESH record with a fabricated
 `repo_id`/`diff_files` that happen to match the current check context (the test
@@ -148,16 +154,30 @@ _DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
 _SCP_STYLE_REMOTE_RE = re.compile(r"^[^@/]+@([^:/]+):(.+)$")
 
 
-# Repositories whose canonical home moved from the old alex-mextner GitHub mirror to
-# ultrabricks Forgejo. Normalize both URLs to one identity so historical review/quorum
-# records survive the migration instead of splitting into two logical repositories.
-_FORGEJO_MIGRATED_REPOS = frozenset({
-    "agent-tools", "dev-cli", "review-cli", "rig-cli", "task-cli", "tg-cli"
-})
-# Cap on `quorum_check`'s `mismatch_details` list (the COUNT in
-# `excluded_mismatched_iterations` is always the true total, uncapped) -- a
-# task with thousands of polluted iterations (the HYP-858 shape this feature
-# targets) must not balloon `--check --json` into a multi-MB payload.
+# Former repository identities -> the identity the repository moved to. A repo that
+# moved hosts or was renamed keeps its review/quorum history this way instead of
+# splitting into two logical repositories (review-cli#589). Keys are lowercase
+# normalized ``host/owner/repo`` ids. Record a new move as one more row here; a row
+# may point at an id that later moved again (lookups follow the chain).
+_REPO_ID_ALIASES: dict[str, str] = {
+    # The alex-mextner GitHub mirrors moved to ultrabricks Forgejo.
+    "github.com/alex-mextner/agent-tools": "git.hyperide.ai/ultrabricks/agent-tools",
+    "github.com/alex-mextner/dev-cli": "git.hyperide.ai/ultrabricks/dev-cli",
+    "github.com/alex-mextner/review-cli": "git.hyperide.ai/ultrabricks/review-cli",
+    "github.com/alex-mextner/rig-cli": "git.hyperide.ai/ultrabricks/rig-cli",
+    "github.com/alex-mextner/task-cli": "git.hyperide.ai/ultrabricks/task-cli",
+    "github.com/alex-mextner/tg-cli": "git.hyperide.ai/ultrabricks/tg-cli",
+    # sme-archiving-gc lived on Forgejo as sme-archiving-gc-tmp, then moved back to
+    # GitHub on 2026-09-29.
+    "git.hyperide.ai/ultrabricks/sme-archiving-gc-tmp": (
+        "github.com/alex-mextner/sme-archiving-gc"
+    ),
+}
+# Cap on `quorum_check`'s `mismatch_details` AND `foreign_repo_iterations` lists
+# (the COUNTS in `excluded_mismatched_iterations` / `excluded_foreign_repo_iterations`
+# are always the true totals, uncapped) -- a task with thousands of polluted
+# iterations (the HYP-858 shape this feature targets) must not balloon
+# `--check --json` into a multi-MB payload.
 _MISMATCH_DETAILS_CAP = 50
 
 
@@ -199,7 +219,9 @@ def normalize_repo_remote(url: str) -> str | None:
     matches the portless ``git@host:org/repo`` form (codex/fable review findings on
     this feature's own PR — both were real "same repo, spurious repo_mismatch"
     false-positive gaps in the ORIGINAL cut of this function; a NON-default port is
-    intentionally NOT stripped since it plausibly names a different remote). This
+    intentionally NOT stripped since it plausibly names a different remote). A
+    former identity listed in ``_REPO_ID_ALIASES`` maps to the repository's current
+    one, so history recorded before a rename or host move still matches. This
     is an identity key for cross-repo mismatch detection, not a URL a caller should
     try to clone from.
     """
@@ -225,15 +247,29 @@ def normalize_repo_remote(url: str) -> str | None:
         path = path[: -len(".git")]
     if not host or not path:
         return None
-    parts = path.split("/", 1)
-    if (
-        host == "github.com"
-        and len(parts) == 2
-        and parts[0].lower() == "alex-mextner"
-        and parts[1].lower() in _FORGEJO_MIGRATED_REPOS
-    ):
-        return f"git.hyperide.ai/ultrabricks/{parts[1].lower()}"
-    return f"{host}/{path}"
+    identity = f"{host}/{path}"
+    # Follow a chain of moves to the current id. Keys and values are lowercase, so
+    # an aliased id comes back lowercase; `seen` stops a cyclic table.
+    seen: set[str] = set()
+    while (key := identity.lower()) in _REPO_ID_ALIASES and key not in seen:
+        seen.add(key)
+        identity = _REPO_ID_ALIASES[key]
+    return identity
+
+
+def _comparable_repo_id(repo_id: str) -> str:
+    """``repo_id`` normalized for comparison. An id that isn't a parseable remote
+    (an opaque local ``path:`` identity) is kept as-is, so it stays distinct."""
+    return normalize_repo_remote(repo_id) or repo_id
+
+
+def _recorded_repo_id(item: dict) -> str | None:
+    """The iteration's recorded repository as ``_comparable_repo_id`` gives it, or
+    None when the record carries no ``repo_id`` (identity unverifiable)."""
+    item_repo = item.get("repo_id")
+    if not isinstance(item_repo, str) or not item_repo:
+        return None
+    return _comparable_repo_id(item_repo)
 
 
 def normalize_task_code(value: str | None) -> str | None:
@@ -575,14 +611,10 @@ def _classify_iteration_identity(
       * ``"unverifiable"`` — the iteration predates diff-identity recording (no
         ``repo_id`` on the record); can't be verified either way, ``reason`` None.
     """
-    item_repo = item.get("repo_id")
-    if not isinstance(item_repo, str) or not item_repo:
+    recorded_repo = _recorded_repo_id(item)
+    if recorded_repo is None:
         return "unverifiable", None
-    # Normalize both persisted historical identities and the current repository.
-    # Keep opaque local identities distinct when remote normalization is unavailable.
-    stored_id = normalize_repo_remote(item_repo) or item_repo
-    current_id = normalize_repo_remote(repo_id) or repo_id
-    if stored_id != current_id:
+    if recorded_repo != _comparable_repo_id(repo_id):
         return "mismatched", "repo_mismatch"
     item_files = item.get("diff_files")
     if current_files and isinstance(item_files, list) and item_files:
@@ -944,6 +976,40 @@ def _iterations_excluding_mismatched(
     ]
 
 
+def _foreign_repo_iterations(
+    iterations: list[dict], repo_id: str
+) -> tuple[list[dict], int]:
+    """``(details, count)`` for iterations of ANY verdict recorded in a different
+    repository; ``details`` stops at ``_MISMATCH_DETAILS_CAP``, ``count`` does not.
+
+    Every one of them is excluded from the gate: passed ones from the iteration and
+    model counts, all of them from role credit. ``mismatch_details`` lists only the
+    passed ones, so a caller like ``gh ship`` reads this list to say which foreign
+    reviews it dropped (review-cli#589). ``task_code`` is the spelling as stored, so
+    a digit twin (``464`` recorded for ``#464``) shows up as such. A record without
+    ``repo_id`` is unverifiable (see ``_classify_iteration_identity``), not foreign.
+    """
+    current_id = _comparable_repo_id(repo_id)
+    details: list[dict] = []
+    count = 0
+    for item in iterations:
+        recorded_repo = _recorded_repo_id(item)
+        if recorded_repo is None or recorded_repo == current_id:
+            continue
+        count += 1
+        if len(details) < _MISMATCH_DETAILS_CAP:
+            details.append(
+                {
+                    "iteration": item.get("iteration"),
+                    "repo_id": item.get("repo_id"),
+                    "task_code": item.get("task_code"),
+                    "ts": item.get("ts"),
+                    "passed": item.get("passed"),
+                }
+            )
+    return details, count
+
+
 def _models_behind_role_coverage(items: list[dict]) -> list[str]:
     """Distinct models that actually EARNED a VALID (``REVIEW_ROLES``) role — the
     population the ``--min-roles`` monoculture guard in ``quorum_check``'s
@@ -994,6 +1060,7 @@ def _finalize_quorum_result(
     iterations: list[dict],
     mismatched: list[dict],
     clean: str,
+    foreign_count: int | None = None,
 ) -> None:
     """Set the terminal ``passed``/``error`` keys on an in-progress quorum result, in
     fail-closed priority order: an unreadable store, then zero history, then (only if
@@ -1010,20 +1077,28 @@ def _finalize_quorum_result(
     (no different from an ordinary "2/3 distinct roles" shortfall, which also
     never becomes an "error" here), churning stream expectations no other
     shortfall-only denial disturbs."""
+    # No diff compared (review-cli#589; `foreign_count` given): the exclusions are other
+    # repositories' records of ANY verdict -- the population `foreign_repo_iterations`
+    # names and the stderr warning counts.
+    excluded = len(mismatched) if foreign_count is None else foreign_count
     if store_error is not None:
         result["passed"] = False
         result["error"] = store_error
     elif not iterations:
         result["passed"] = False
         result["error"] = f"no recorded review iterations for {clean}"
-    elif mismatched and not result["passed"]:
+    elif excluded and not result["passed"]:
         # Bar not met AND some history was excluded as mismatched -- surface WHY in
         # the human-facing error too (not just the diagnostic keys), so an operator
         # staring at "0/3 iterations" understands it isn't simply "never reviewed".
-        result["error"] = (
-            f"{len(mismatched)} recorded iteration(s) for {clean} were excluded: "
+        why = (
             "recorded repo/diff did not match the code currently being checked "
             "(see mismatch_details)"
+            if foreign_count is None
+            else "recorded in another repository (see foreign_repo_iterations)"
+        )
+        result["error"] = (
+            f"{excluded} recorded iteration(s) for {clean} were excluded: {why}"
         )
 
 
@@ -1080,7 +1155,11 @@ def quorum_check(
     (the caller has no check context to give — direct library callers that omit it,
     exactly as before this parameter existed), NO verification is attempted: no
     mismatch/unverifiable keys, every passed iteration counts. Passing a check context
-    is what turns the gate on. (review-cli#221: independently of ``repo_id``, a
+    is what turns the gate on. ``repo_id`` with ``diff_files=None`` checks the
+    repository alone (the CLI's ``--verify-repo-only``, review-cli#589): same-repo
+    iterations count whatever files they touched, other repositories' do not, and
+    ``foreign_repo_iterations`` names every one excluded that way, of any verdict.
+    (review-cli#221: independently of ``repo_id``, a
     ``stalled_models`` key is added whenever the bar ISN'T met and an attempted model
     is currently cooling down — this is the one exception to "identical to pre-v4
     shape when passing," since it doesn't depend on diff-identity at all.)
@@ -1458,7 +1537,14 @@ def quorum_check(
         # was actually given (Opus review finding: a direct library caller that
         # omits repo_id has no such context, and the unqualified message reads
         # oddly claiming a comparison that never happened).
-        scope = " against the current repo/diff" if repo_id is not None else ""
+        # Repo-only mode (diff_files None with a repo_id) compared no diff.
+        scope = ""
+        if repo_id is not None:
+            scope = (
+                " against the current repo"
+                if diff_files is None
+                else " against the current repo/diff"
+            )
         # GLM/Opus round-review finding on this feature's own PR: this
         # re-parses each item's `ts` a second time in the case-(b) branch
         # below (which rebuilds an equivalent list). Deliberately NOT
@@ -1486,11 +1572,13 @@ def quorum_check(
             # unconditional claim here would assert a repo/diff comparison
             # that never ran for a direct library caller -- exactly the
             # imprecision `scope` itself exists to avoid.
-            in_scope_note = (
-                " -- excluding any recorded for a different repo/diff --"
-                if repo_id is not None
-                else ""
-            )
+            in_scope_note = ""
+            if repo_id is not None:
+                in_scope_note = (
+                    " -- excluding any recorded for a different repository --"
+                    if diff_files is None
+                    else " -- excluding any recorded for a different repo/diff --"
+                )
             quorum_mode_fallback = (
                 f"no role-tagged review history recorded for {clean}{scope}; fell "
                 "back to the pre-review-cli#246 model-counting default "
@@ -1919,12 +2007,24 @@ def quorum_check(
         result["mismatch_details"] = mismatched[:_MISMATCH_DETAILS_CAP]
         if len(mismatched) > _MISMATCH_DETAILS_CAP:
             result["mismatch_details_truncated"] = True
+        foreign, foreign_count = _foreign_repo_iterations(iterations, repo_id)
+        result["excluded_foreign_repo_iterations"] = foreign_count
+        result["foreign_repo_iterations"] = foreign
+        if foreign_count > len(foreign):
+            result["foreign_repo_iterations_truncated"] = True
     _finalize_quorum_result(
         result,
         store_error=store_error,
         iterations=iterations,
         mismatched=mismatched,
         clean=clean,
+        # No diff compared (``diff_files is None``): the only exclusions are other
+        # repositories' records, so the error counts those (any verdict).
+        foreign_count=(
+            result["excluded_foreign_repo_iterations"]
+            if repo_id is not None and diff_files is None
+            else None
+        ),
     )
     if not result["passed"] and clean:
         # Failed/empty check: name the key we searched and any near-miss keys

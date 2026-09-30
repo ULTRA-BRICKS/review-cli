@@ -25,6 +25,7 @@ import time
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -5620,6 +5621,9 @@ _KNOWN_QUORUM_CHECK_FIELDS = frozenset(
         "excluded_mismatched_iterations",
         "mismatch_details",
         "mismatch_details_truncated",
+        "excluded_foreign_repo_iterations",
+        "foreign_repo_iterations",
+        "foreign_repo_iterations_truncated",
         "searched_key",
         "near_miss_keys",
         "near_miss_counted",
@@ -6455,7 +6459,7 @@ def test_cli_check_near_miss_note_points_to_json_not_bare_field_review_cli_431()
             diff_files=["b.py"],
         )
         old_resolve = _cli._resolve_quorum_check_context
-        _cli._resolve_quorum_check_context = lambda cwd_raw, verify_identity: (
+        _cli._resolve_quorum_check_context = lambda cwd_raw, identity_mode: (
             "repo-a",
             ["a.py"],
             "ran",
@@ -6567,7 +6571,7 @@ def test_cli_check_json_near_miss_fields_mismatched_review_cli_431():
             diff_files=["b.py"],
         )
         old_resolve = _cli._resolve_quorum_check_context
-        _cli._resolve_quorum_check_context = lambda cwd_raw, verify_identity: (
+        _cli._resolve_quorum_check_context = lambda cwd_raw, identity_mode: (
             "repo-a",
             ["a.py"],
             "ran",
@@ -6610,6 +6614,298 @@ def test_ship_min_roles_stays_synced_with_default_quorum_floor():
         SHIP_MIN_ROLES,
         _stats._DEFAULT_QUORUM_FLOOR,
     )
+
+
+# ---------------------------------------------------------------------------
+# review-cli#589: repo-only identity mode (gh ship) and repository aliases
+# ---------------------------------------------------------------------------
+_OWN_REPO_ID = "github.com/acme/widget"
+
+
+def _record_589(task_code, repo_id, diff_files, roles, *, passed=True):
+    # One seat per role, so record_run keeps `roles` (it drops a list that doesn't
+    # line up with `models`) as well as `usable_roles`.
+    _stats.record_run(
+        task_code=task_code,
+        mode="review",
+        models=["codex"] * len(roles),
+        duration_seconds=1.0,
+        ok_count=1 if passed else 0,
+        fail_count=0 if passed else 1,
+        passed=passed,
+        repo_id=repo_id,
+        diff_files=diff_files,
+        roles=roles,
+        usable_roles=roles,
+    )
+
+
+def _checkout_with_origin(url: str) -> tempfile.TemporaryDirectory:
+    """A repo whose working-tree diff touches only f.txt, with `origin` at `url`."""
+    import subprocess
+
+    repo = _git_init_with_diff()
+    subprocess.run(["git", "-C", repo.name, "remote", "add", "origin", url], check=True)
+    return repo
+
+
+def _check_json(code: str, repo_dir: str, *flags: str) -> tuple[int, dict, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stderr(err), redirect_stdout(out):
+        rc = _cli.main(
+            ["task", code, "--check", "-C", repo_dir, "--json"]
+            + ["--min-iter", "2", "--min-roles", "3", *flags]
+        )
+    return rc, json.loads(out.getvalue()), err.getvalue()
+
+
+def test_check_verify_repo_only_keeps_own_repo_drops_other_repos_review_cli_589():
+    """gh ship checks a PR from the primary checkout, whose own diff (f.txt here)
+    has nothing to do with the PR. Repo-only mode counts the PR's own iterations
+    whatever files they touched, and drops same-code iterations recorded in other
+    repositories -- the digit twin `464` for `#464` included -- from iterations,
+    models and roles, naming each one it dropped."""
+    with _TmpStore():
+        repo = _checkout_with_origin("https://github.com/acme/widget.git")
+        try:
+            _record_589("#464", _OWN_REPO_ID, ["src/pr.py"], ["correctness", "quality"])
+            _record_589("#464", _OWN_REPO_ID, [], ["performance"])
+            _record_589(
+                "464", "github.com/acme/other", ["x.py"], ["consistency", "security"]
+            )
+            _record_589(
+                "#464",
+                "git.hyperide.ai/ultrabricks/rig-cli",
+                ["y.py"],
+                ["architect"],
+                passed=False,
+            )
+
+            rc, payload, err = _check_json("#464", repo.name, "--verify-repo-only")
+            assert rc == 0, payload
+            assert payload["identity_verification"] == "repo_only"
+            assert payload["passed_iterations"] == 2
+            assert set(payload["roles"]) == {"correctness", "performance", "quality"}
+            assert payload["excluded_foreign_repo_iterations"] == 2
+            foreign = payload["foreign_repo_iterations"]
+            assert [(f["repo_id"], f["task_code"], f["passed"]) for f in foreign] == [
+                ("github.com/acme/other", "464", True),
+                ("git.hyperide.ai/ultrabricks/rig-cli", "#464", False),
+            ]
+            assert all(f["ts"] for f in foreign), foreign
+            # No diff was compared, and --no-verify-identity is not the remedy for
+            # another repository's review. Both foreign records count, the failed one
+            # included: it is named in foreign_repo_iterations too.
+            assert "excluded 2 recorded iteration(s) for #464" in err, err
+            assert "recorded in another repository" in err, err
+            assert "--no-verify-identity" not in err, err
+
+            # The default mode also needs a touched-file overlap with this
+            # checkout's unrelated diff, so it drops the PR's own src/pr.py review.
+            rc, payload, _err = _check_json("#464", repo.name)
+            assert rc != 0, payload
+            assert payload["identity_verification"] == "ran"
+            assert payload["passed_iterations"] == 1
+            assert payload["excluded_foreign_repo_iterations"] == 2
+        finally:
+            repo.cleanup()
+
+
+def test_check_verify_repo_only_rejects_no_verify_identity_review_cli_589():
+    """The two identity flags exclude each other: `--no-verify-identity` winning
+    would count every repository's iterations again."""
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            rc = _cli.main(
+                [
+                    "task",
+                    "#464",
+                    "--check",
+                    "--verify-repo-only",
+                    "--no-verify-identity",
+                ]
+            )
+        except SystemExit as exc:
+            rc = exc.code
+    assert rc == 2, err.getvalue()
+    assert "not allowed with argument" in err.getvalue(), err.getvalue()
+
+
+def test_check_verify_repo_only_unresolvable_dir_is_not_repo_only_review_cli_589():
+    """When -C does not resolve to a directory nothing was verified, so the payload
+    must not claim `repo_only` -- gh ship authorizes only on that value."""
+    with _TmpStore():
+        _record_589("#464", "github.com/acme/other", ["x.py"], ["security"])
+        missing = os.path.join(tempfile.gettempdir(), "no-such-dir-review-cli-589")
+        rc, payload, _err = _check_json("#464", missing, "--verify-repo-only")
+        assert rc != 0, payload
+        assert payload["identity_verification"] == "skipped_unresolvable", payload
+
+
+def test_check_verify_repo_only_twin_from_other_repo_says_so_review_cli_589():
+    """The refusal for a digit twin that passed only in another repository says the
+    twin was another repository's, not a repo/diff mismatch -- no diff was compared."""
+    with _TmpStore():
+        repo = _checkout_with_origin("https://github.com/acme/widget.git")
+        try:
+            _record_589("464", "github.com/acme/other", ["x.py"], ["security"])
+            rc, payload, err = _check_json("#464", repo.name, "--verify-repo-only")
+            assert rc != 0, payload
+            assert payload["near_miss_keys"] == ["464"], payload
+            assert payload["error"] == (
+                "1 recorded iteration(s) for #464 were excluded: recorded in another "
+                "repository (see foreign_repo_iterations)"
+            ), payload
+            assert "as another repository's above" in err, err
+            assert "repo/diff" not in err, err
+        finally:
+            repo.cleanup()
+
+
+def test_check_no_diff_compared_error_counts_every_foreign_record_review_cli_589():
+    """With no diff compared -- `--verify-repo-only`, or the default mode on a clean
+    checkout -- a refusal's JSON `error` and stderr warning give the same count and
+    wording, and count failed foreign records too: `foreign_repo_iterations`, which
+    the error cites, lists every verdict."""
+    import subprocess
+
+    with _TmpStore():
+        repo = _checkout_with_origin("https://github.com/acme/widget.git")
+        try:
+            _record_589("#464", _OWN_REPO_ID, ["src/pr.py"], ["correctness"])
+            _record_589("#464", "github.com/acme/other", ["x.py"], ["security"])
+            _record_589(
+                "#464", "github.com/acme/other", ["x.py"], ["quality"], passed=False
+            )
+            rc, payload, err = _check_json("#464", repo.name, "--verify-repo-only")
+            assert rc != 0, payload
+            assert payload["excluded_foreign_repo_iterations"] == 2, payload
+            assert payload["error"] == (
+                "2 recorded iteration(s) for #464 were excluded: recorded in another "
+                "repository (see foreign_repo_iterations)"
+            ), payload
+            assert "excluded 2 recorded iteration(s) for #464" in err, err
+
+            # Default mode, clean checkout: no diff resolves, so only the repository
+            # was compared -- same count and wording, no --no-verify-identity pointer.
+            subprocess.run(
+                ["git", "-C", repo.name, "checkout", "-q", "f.txt"], check=True
+            )
+            rc, payload, err = _check_json("#464", repo.name)
+            assert rc != 0, payload
+            assert payload["identity_verification"] == "ran", payload
+            assert payload["error"].startswith("2 recorded iteration(s)"), payload
+            assert "recorded in another repository" in payload["error"], payload
+            assert "excluded 2 recorded iteration(s) for #464" in err, err
+            assert "--no-verify-identity" not in err, err
+        finally:
+            repo.cleanup()
+
+
+def test_check_repo_only_failed_foreign_records_still_explain_refusal_review_cli_589():
+    """Only failed iterations from another repository: the refusal still says they
+    were excluded as another repository's, not just "0/2 iterations"."""
+    with _TmpStore():
+        repo = _checkout_with_origin("https://github.com/acme/widget.git")
+        try:
+            _record_589(
+                "#464", "github.com/acme/other", ["x.py"], ["security"], passed=False
+            )
+            rc, payload, _err = _check_json("#464", repo.name, "--verify-repo-only")
+            assert rc != 0, payload
+            assert payload["error"] == (
+                "1 recorded iteration(s) for #464 were excluded: recorded in another "
+                "repository (see foreign_repo_iterations)"
+            ), payload
+        finally:
+            repo.cleanup()
+
+
+def test_repo_id_alias_rows_are_normalized_ids_review_cli_589():
+    """normalize_repo_remote looks rows up by lowercased `host/owner/repo` and returns
+    the value as-is, so a row written as a URL, with `.git` or in mixed case never
+    matches and splits the repository's history silently."""
+    for old, new in _stats._REPO_ID_ALIASES.items():
+        for repo_id in (old, new):
+            assert repo_id == repo_id.lower(), repo_id
+            assert repo_id.count("/") == 2, repo_id
+            assert "://" not in repo_id and "@" not in repo_id, repo_id
+            assert not repo_id.endswith(".git"), repo_id
+        assert _stats.normalize_repo_remote(f"https://{old}.git") == (
+            _stats.normalize_repo_remote(f"https://{new}.git")
+        ), (old, new)
+
+
+def test_foreign_repo_iterations_capped_count_exact_review_cli_589():
+    """A task polluted by many other-repository records lists at most the cap, and
+    still reports the true count and that the list was cut."""
+    with _TmpStore():
+        total = _stats._MISMATCH_DETAILS_CAP + 2
+        for n in range(total):
+            _record_589("#464", f"github.com/acme/other-{n}", ["x.py"], ["security"])
+        result = _stats.quorum_check(
+            "#464", min_iter=1, min_roles=1, repo_id=_OWN_REPO_ID, diff_files=None
+        )
+        assert result["passed"] is False, result
+        assert result["excluded_foreign_repo_iterations"] == total
+        assert len(result["foreign_repo_iterations"]) == _stats._MISMATCH_DETAILS_CAP
+        assert result["foreign_repo_iterations_truncated"] is True
+
+
+def test_repo_alias_chain_resolves_to_current_id_review_cli_589():
+    """A repository that moved twice: records under either former id match the
+    current one, so adding a row for the newest move keeps the oldest history."""
+    added = {
+        "github.com/alex-mextner/sme-archiving-gc": "git.example.org/acme/sme",
+    }
+    with mock.patch.dict(_stats._REPO_ID_ALIASES, added):
+        for former in (
+            "git.hyperide.ai/ultrabricks/sme-archiving-gc-tmp",
+            "github.com/alex-mextner/sme-archiving-gc",
+            "https://git.example.org/acme/sme.git",
+        ):
+            assert _stats.normalize_repo_remote(former) == "git.example.org/acme/sme"
+
+
+def test_repo_move_keeps_review_history_sme_archiving_gc_review_cli_589():
+    """sme-archiving-gc lived on Forgejo as sme-archiving-gc-tmp and moved back to
+    GitHub on 2026-09-29. Both remotes are one repository in every URL form, so
+    iterations recorded under either one still count."""
+    github = _stats.normalize_repo_remote(
+        "https://github.com/alex-mextner/sme-archiving-gc.git"
+    )
+    for former in (
+        "https://git.hyperide.ai/ultrabricks/sme-archiving-gc-tmp.git",
+        "git@git.hyperide.ai:ultrabricks/sme-archiving-gc-tmp.git",
+        "git.hyperide.ai/ultrabricks/sme-archiving-gc-tmp",  # as stored in run-stats
+    ):
+        assert _stats.normalize_repo_remote(former) == github, former
+    assert (
+        _stats.normalize_repo_remote("https://github.com/other/sme-archiving-gc-tmp")
+        != github
+    )
+    with _TmpStore():
+        repo = _checkout_with_origin("git@github.com:alex-mextner/sme-archiving-gc.git")
+        try:
+            _record_589(
+                "#464",
+                "git.hyperide.ai/ultrabricks/sme-archiving-gc-tmp",
+                ["a.ts"],
+                ["correctness", "quality", "performance"],
+            )
+            _record_589(
+                "#464",
+                "github.com/alex-mextner/sme-archiving-gc",
+                ["b.ts"],
+                ["security"],
+            )
+            rc, payload, _err = _check_json("#464", repo.name, "--verify-repo-only")
+            assert rc == 0, payload
+            assert payload["passed_iterations"] == 2
+            assert payload["excluded_foreign_repo_iterations"] == 0
+        finally:
+            repo.cleanup()
 
 
 # ---------------------------------------------------------------------------

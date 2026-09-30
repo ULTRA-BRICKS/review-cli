@@ -189,14 +189,23 @@ def test_normalize_github_mirror_aliased_to_forgejo():
 
 
 def test_normalize_all_migrated_repos_aliased():
-    for repo in ("agent-tools", "dev-cli", "review-cli", "rig-cli", "task-cli", "tg-cli"):
+    for repo in (
+        "agent-tools",
+        "dev-cli",
+        "review-cli",
+        "rig-cli",
+        "task-cli",
+        "tg-cli",
+    ):
         got = _stats.normalize_repo_remote(f"git@github.com:alex-mextner/{repo}.git")
         assert got == f"git.hyperide.ai/ultrabricks/{repo}", repo
 
 
 def test_normalize_unmigrated_repos_not_aliased():
     for repo in ("draw-cli", "3d-cli"):
-        got = _stats.normalize_repo_remote(f"https://github.com/alex-mextner/{repo}.git")
+        got = _stats.normalize_repo_remote(
+            f"https://github.com/alex-mextner/{repo}.git"
+        )
         assert got == f"github.com/alex-mextner/{repo}", repo
 
 
@@ -457,7 +466,9 @@ def test_quorum_check_stalled_models_coexists_with_mismatch_error():
                 passed=False,
                 repo_id=this_repo,
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode"
+            )
 
             result = _stats.quorum_check(
                 TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
@@ -517,7 +528,9 @@ def test_quorum_check_stalled_models_present_when_mismatch_exclusion_drops_below
                 passed=False,
                 repo_id=this_repo,
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode"
+            )
 
             result = _stats.quorum_check(
                 TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
@@ -924,7 +937,9 @@ def test_cli_check_error_branch_prints_header_and_stalled_lines_on_same_stream()
                 passed=False,
                 repo_id=f"path:{Path(repo_a.name).resolve()}",
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode"
+            )
 
             out = io.StringIO()
             err = io.StringIO()
@@ -1012,6 +1027,7 @@ def test_cli_check_no_verify_identity_restores_legacy_count():
             assert payload["passed_iterations"] == 2
             # Legacy shape: no diagnostic keys when verification is disabled.
             assert "excluded_mismatched_iterations" not in payload
+            assert "foreign_repo_iterations" not in payload
             # Review finding: "verified" must never be silently indistinguishable
             # from "verification never ran" -- a visible warning AND a
             # machine-readable JSON field either way (round-3 review finding:

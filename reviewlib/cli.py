@@ -18,7 +18,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Literal, TextIO
 
 from . import backends
 from . import jobs
@@ -105,6 +105,10 @@ from .stats import (
 
 if TYPE_CHECKING:
     from agenttools_service import ServiceManager
+
+# `review task --check` identity modes (review-cli#589): repo AND touched-file overlap,
+# repository alone (`--verify-repo-only`), or none (`--no-verify-identity`).
+IdentityMode = Literal["full", "repo_only", "disabled"]
 
 # Keep the mode-handler names imported off `cli` for legacy import compatibility ONLY
 # (some external/legacy callers `from reviewlib.cli import mode_review`). Dispatch goes
@@ -1052,13 +1056,23 @@ def _task_subcommand(rest: list[str]) -> int:
         help="--check only: repo to verify recorded iterations against "
         "(diff-identity binding — see reviewlib.stats module docstring)",
     )
-    parser.add_argument(
+    identity_flags = parser.add_mutually_exclusive_group()
+    identity_flags.add_argument(
         "--no-verify-identity",
         action="store_true",
         help="--check only: skip repo/diff mismatch detection entirely (legacy "
         "behavior — every PASSED iteration counts, exactly as before this gate "
         "existed). Escape hatch for a cwd that can't resolve a repo; NOT a way "
         "around a genuine mismatch finding.",
+    )
+    identity_flags.add_argument(
+        "--verify-repo-only",
+        action="store_true",
+        help="--check only: verify recorded iterations by repository alone. "
+        "Iterations recorded in another repository (even under the '#'-twin "
+        "code) are excluded; same-repo iterations count whatever files they "
+        "touched. For a caller like `gh ship` that checks a PR from a checkout "
+        "whose own diff is unrelated to it (review-cli#589).",
     )
     ns = parser.parse_args(rest)
 
@@ -1097,6 +1111,11 @@ def _task_subcommand(rest: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
+        identity_mode: IdentityMode = "full"
+        if ns.no_verify_identity:
+            identity_mode = "disabled"
+        elif ns.verify_repo_only:
+            identity_mode = "repo_only"
         return _quorum_check_subcommand(
             ns.code,
             ns.min_iter,
@@ -1104,7 +1123,7 @@ def _task_subcommand(rest: list[str]) -> int:
             min_roles=ns.min_roles,
             as_json=ns.json,
             cwd_raw=ns.cwd,
-            verify_identity=not ns.no_verify_identity,
+            identity_mode=identity_mode,
         )
 
     if not ns.code:
@@ -1704,7 +1723,9 @@ def _configured_board(config: dict) -> list[BoardReviewer]:
     configure_provider_chains(config.get("provider_chains"))
     config_models = _split_models(config.get("models") or [])
     return (
-        board_from_models(config_models, config) if config_models else load_board(config)
+        board_from_models(config_models, config)
+        if config_models
+        else load_board(config)
     )
 
 
@@ -1788,7 +1809,9 @@ def _seat_status_report(*, as_json: bool) -> int:
         elif a.logged_in:
             state = "logged in"
         else:
-            state = "login state unknown (no `claude` CLI answered `claude auth status`)"
+            state = (
+                "login state unknown (no `claude` CLI answered `claude auth status`)"
+            )
         lines.append(
             f"  {marker} {a.name:<12} {(a.email or '(no email on disk)'):<28} {state}"
         )
@@ -1953,12 +1976,17 @@ def _render_entities_report(payload: dict) -> str:
 
 
 def _resolve_quorum_check_context(
-    cwd_raw: str, verify_identity: bool
+    cwd_raw: str, identity_mode: IdentityMode
 ) -> tuple[str | None, list[str] | None, str]:
     """Resolve the (repo_id, diff_files, status) check context for `--check`. See
     `_quorum_check_subcommand`.
 
-    `status` is one of ``"ran"`` (repo_id/diff_files are usable), ``"disabled"``
+    `identity_mode` is ``"full"`` (repo AND touched-file overlap, the default),
+    ``"repo_only"`` (`--verify-repo-only`: repo alone, so `diff_files` is None), or
+    ``"disabled"`` (`--no-verify-identity`).
+
+    `status` is one of ``"ran"`` (repo_id/diff_files are usable), ``"repo_only"``
+    (repo_id is usable, no file-set check), ``"disabled"``
     (`--no-verify-identity`), or ``"skipped_unresolvable"`` (`-C`/`cwd_raw` isn't
     even a real directory — `_compute_repo_id` otherwise always has a `path:`
     fallback). This is a MACHINE-READABLE version of the same distinction the
@@ -1970,7 +1998,7 @@ def _resolve_quorum_check_context(
     task genuinely has zero passed iterations". `_quorum_check_subcommand` writes
     `status` into the result as `"identity_verification"`.
     """
-    if not verify_identity:
+    if identity_mode == "disabled":
         print(
             "[review task] warning: diff-identity verification disabled "
             "(--no-verify-identity) — every PASSED iteration counts regardless of "
@@ -1988,6 +2016,8 @@ def _resolve_quorum_check_context(
             file=sys.stderr,
         )
         return None, None, "skipped_unresolvable"
+    if identity_mode == "repo_only":
+        return repo_id, None, "repo_only"
     return repo_id, _current_diff_files_for_check(cwd), "ran"
 
 
@@ -2148,7 +2178,7 @@ def _quorum_check_subcommand(
     min_roles: int | None = None,
     as_json: bool,
     cwd_raw: str = ".",
-    verify_identity: bool = True,
+    identity_mode: IdentityMode = "full",
 ) -> int:
     """`review task CODE --check [--min-iter N] [--min-models M] [--min-roles R] [-C DIR]`.
 
@@ -2163,17 +2193,20 @@ def _quorum_check_subcommand(
     short. See quorum_check's docstring for the "passed, not just dispatched"
     semantics this check enforces.
 
-    `verify_identity` (default True) resolves `cwd_raw` (`-C`) to a repo id + the
-    current diff's touched-file set and hands both to `quorum_check`, so a PASSED
+    `identity_mode` ``"full"`` (the default) resolves `cwd_raw` (`-C`) to a repo id +
+    the current diff's touched-file set and hands both to `quorum_check`, so a PASSED
     iteration recorded against a DIFFERENT repo, or a diff sharing no touched file,
     is EXCLUDED from the count rather than silently trusted — see reviewlib.stats
     "Diff-identity binding" for why (closes 3 real quorum-pollution incidents).
-    `--no-verify-identity` restores the pre-binding behavior (every passed iteration
-    counts, no repo/diff cross-check) — an escape hatch for a cwd that can't resolve
-    a repo, not a way around a genuine mismatch finding.
+    ``"repo_only"`` (`--verify-repo-only`, review-cli#589) hands over the repo id
+    alone: `gh ship` checks a PR from a checkout whose own diff has nothing to do
+    with the PR, so only the repository can be compared there.
+    ``"disabled"`` (`--no-verify-identity`) restores the pre-binding behavior (every
+    passed iteration counts, no repo/diff cross-check) — an escape hatch for a cwd
+    that can't resolve a repo, not a way around a genuine mismatch finding.
     """
     repo_id, diff_files, verification_status = _resolve_quorum_check_context(
-        cwd_raw, verify_identity
+        cwd_raw, identity_mode
     )
     result = quorum_check(
         code,
@@ -2192,13 +2225,25 @@ def _quorum_check_subcommand(
     # machine reader, but a human watching stderr (e.g. `gh ship`'s own console
     # output) must see the mismatch surfaced too, not just a smaller-than-expected
     # number with no explanation.
-    excluded = result.get("excluded_mismatched_iterations", 0)
+    # With no diff compared (`--verify-repo-only`, or a full-mode check whose checkout
+    # resolves no diff -- `quorum_check` compares the repository alone either way), the
+    # exclusions are other repositories' records only, of any verdict (a failed one
+    # still names a review that did not happen here) -- the same count and wording as
+    # the JSON `error`. Pointing `gh ship` at --no-verify-identity would be wrong there.
+    no_diff_compared = repo_id is not None and diff_files is None
+    if no_diff_compared:
+        excluded = result.get("excluded_foreign_repo_iterations", 0)
+        why = "recorded in another repository (--json lists them in foreign_repo_iterations)"
+    else:
+        excluded = result.get("excluded_mismatched_iterations", 0)
+        why = (
+            "recorded repo/diff did not match the code currently being checked "
+            "(--json for detail; --no-verify-identity disables this check)"
+        )
     if excluded:
         print(
             f"[review task] warning: excluded {excluded} recorded iteration(s) for "
-            f"{result['task_code']} — recorded repo/diff did not match the code "
-            "currently being checked (--json for detail; --no-verify-identity disables "
-            "this check)",
+            f"{result['task_code']} — {why}",
             file=sys.stderr,
         )
 
@@ -2229,7 +2274,11 @@ def _quorum_check_subcommand(
             # pointed a plain-text reader at a field they have no way to see)
             # -- point at the flag that actually gets them there instead.
             detail = (
-                f"{prefix}but diff-identity verification excluded the twin's "
+                f"{prefix}but repository verification excluded the twin's passed "
+                "iteration(s) as another repository's above -- re-run with --json "
+                "to see foreign_repo_iterations for confirmation"
+                if no_diff_compared
+                else f"{prefix}but diff-identity verification excluded the twin's "
                 "passed iteration(s) as a repo/diff mismatch above -- re-run "
                 "with --json to see mismatch_details for confirmation"
             )
@@ -4951,8 +5000,9 @@ WHAT --check DECIDES
 
   ALWAYS present:
     task_code, passed_iterations, total_iterations, distinct_models_passed, models,
-    min_iter, passed, identity_verification (ran / disabled / skipped_unresolvable —
-    see -C/--no-verify-identity on `review task --help`).
+    min_iter, passed, identity_verification (ran / repo_only / disabled /
+    skipped_unresolvable — see -C/--verify-repo-only/--no-verify-identity on
+    `review task --help`).
 
   MODEL FLOOR — present whenever a model floor governs, explicitly OR via the
   zero-role-data fallback:
@@ -4981,11 +5031,19 @@ WHAT --check DECIDES
     stalled_models — list of {model, reason, remaining_seconds,
     consecutive_failures} naming any attempted model currently cooling down.
 
-  IDENTITY VERIFICATION — present only when identity_verification == "ran" (a repo_id
-  resolved; see -C/--no-verify-identity):
+  IDENTITY VERIFICATION — present only when identity_verification is "ran" or
+  "repo_only" (a repo_id resolved; see -C/--verify-repo-only/--no-verify-identity).
+  Repository ids are normalized remotes; a repository's former ids (a rename or a
+  host move, e.g. sme-archiving-gc-tmp on Forgejo -> sme-archiving-gc on GitHub)
+  count as the same repository:
     verified_iterations, unverifiable_iterations, excluded_mismatched_iterations,
     mismatch_details — list of {iteration, reason, recorded_repo_id,
-    recorded_diff_files, ts}, capped (mismatch_details_truncated when capped).
+    recorded_diff_files, ts} for excluded PASSED iterations, capped
+    (mismatch_details_truncated when capped).
+    excluded_foreign_repo_iterations, foreign_repo_iterations — list of {iteration,
+    repo_id, task_code, ts, passed} for every iteration of ANY verdict recorded in
+    another repository (none of them count toward iterations, models or roles),
+    capped (foreign_repo_iterations_truncated when capped).
 
   NEAR-MISS TWIN KEY — present only when the bar is NOT met AND a same-digits
   different-'#' twin task code exists in the store (review-cli#389):
