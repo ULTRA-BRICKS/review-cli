@@ -8,6 +8,7 @@ panel modes so streamed calls print their live-log path to stderr.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from .config import _agentic
 from .install import install_codex_recursion_guard
@@ -1388,6 +1390,55 @@ def review_omp(
     )
 
 
+# review-cli#598: removing a seat's sandbox must never cost the seat's answer. omp's
+# process lifeline (oh-my-pi f7f04f2) starts a supervisor in its OWN session — outside
+# the seat's process group, so the group kill never reaches it — that inherits the seat
+# env and, the moment the omp host exits, re-execs the CLI as a reaper. Under the
+# from-source launcher (`bun src/cli.ts`) that reaper loads its modules through Bun's
+# runtime transpiler cache, which lives under $HOME (the sandbox's `home/`) at
+# `Library/Caches/bun/@t@`, and it writes fresh `.pile` files there while the cleanup is
+# deleting the tree: a one-shot rmtree then fails with ENOTEMPTY (Errno 66 on macOS). The
+# reaper is done within tens of milliseconds, so removal retries briefly, then leaves
+# the dir to the OS temp cleaner with a warning instead of raising.
+_SANDBOX_REMOVE_ATTEMPTS = 3
+_SANDBOX_REMOVE_RETRY_SECONDS = 0.2
+
+
+def _remove_sandbox_best_effort(path: Path) -> None:
+    """Delete `path`, retrying while a process outside the seat still writes into it;
+    warn on stderr (never raise) when it cannot be fully removed."""
+    reason = ""
+    for attempt in range(_SANDBOX_REMOVE_ATTEMPTS):
+        if attempt:
+            time.sleep(_SANDBOX_REMOVE_RETRY_SECONDS)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            reason = str(exc)
+        else:
+            reason = "recreated after removal"
+        if not os.path.lexists(path):
+            return
+    print(
+        f"[review-cli] warning: could not remove seat sandbox {path} ({reason}); left "
+        "for the OS temp cleaner, the seat's answer is kept",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+@contextlib.contextmanager
+def _seat_sandbox(prefix: str) -> Iterator[Path]:
+    """A fresh private temp dir, removed best-effort on exit (see
+    `_remove_sandbox_best_effort`) — unlike `tempfile.TemporaryDirectory`, a failed
+    removal never raises over the result computed inside."""
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        yield path
+    finally:
+        _remove_sandbox_best_effort(path)
+
+
 def _review_omp_once(
     model: str,
     omp_model: str | None,
@@ -1451,8 +1502,7 @@ def _review_omp_once(
     # layer assumes omp resolves `~` via the HOME env var (not getpwuid) — verified
     # live: with HOME redirected, the seat has no user-scope MCP tools
     # (tests/test_omp_cage_live.py). The dir also holds payload + overlay.
-    with tempfile.TemporaryDirectory(prefix="review-cli-omp-") as sandbox:
-        box = Path(sandbox)
+    with _seat_sandbox("review-cli-omp-") as box:
         home = box / "home"
         home.mkdir()
         payload = box / "payload.md"

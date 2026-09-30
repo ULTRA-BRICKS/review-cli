@@ -3,6 +3,20 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.42.1 — 2026-09-30
+
+- **Fix(omp): an omp seat that answered keeps its answer when its scratch dir can't be
+  deleted** ([review-cli#598](https://git.hyperide.ai/ultrabricks/review-cli/issues/598)).
+  Since 2026-09-30 09:05 UTC every omp seat on this Mac answered and was then reported as
+  failed with `[Errno 66] Directory not empty: '…/home/Library/Caches/bun/@t@'`, so the
+  review threw the answer away and paid for a second call through the claude CLI twin.
+  The cause: omp run from source (`bun src/cli.ts`) starts a helper process in its own
+  session that outlives the omp call by a few tens of milliseconds, and that helper writes
+  Bun cache files into the seat's scratch home while review was deleting it. Now review
+  retries the delete briefly, and if the dir still can't be removed it prints
+  `[review-cli] warning: could not remove seat sandbox <path> (…)`, leaves the dir to the
+  OS temp cleaner, and keeps the seat's answer.
+
 ## 0.42.0 — 2026-09-30
 
 - **Fix(just-ask): `--timeout N` is a hard wall-clock bound, and one `-m` model is one call**

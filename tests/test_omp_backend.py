@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -636,6 +637,110 @@ def test_dashboard_attributes_omp_call_to_omp_board_seat():
         "",
     )
     assert p.model_id_for_call(bare) == "omp"
+
+
+# ---------------------------------------------------------------------------
+# Sandbox cleanup never costs the answer (review-cli#598)
+# ---------------------------------------------------------------------------
+
+
+class _AnsweringOmp(_Captured):
+    """Fake omp executor: answers "ok" with exit 0 and, like the real from-source omp,
+    leaves Bun runtime-transpiler cache files under the sandbox HOME
+    (`Library/Caches/bun/@t@`)."""
+
+    def __call__(self, argv, cwd, timeout, backend, **kwargs):
+        proc = super().__call__(argv, cwd, timeout, backend, **kwargs)
+        cache = Path(self.env["HOME"]) / "Library" / "Caches" / "bun" / "@t@"
+        cache.mkdir(parents=True)
+        (cache / "205f9a852825fc00.pile").write_bytes(b"transpiled module")
+        return proc
+
+
+@contextlib.contextmanager
+def _reaper_writes_during_cleanup(times: int | None):
+    """Stand-in for omp's process-lifeline reaper: a process outside the seat's process
+    group that the omp host's exit starts, and that writes a fresh `.pile` into the
+    sandbox HOME's `@t@` cache dir while review-cli is deleting it. Every `os.rmdir` of a
+    `@t@` dir first recreates a file in it — the first `times` attempts, or every
+    attempt when `times` is None — so the real rmdir fails with the real ENOTEMPTY
+    (Errno 66 on macOS), whichever rmtree implementation runs."""
+    real_rmdir = os.rmdir
+    state = {"recreated": 0}
+
+    def rmdir(path, *, dir_fd=None):
+        name = os.fsdecode(path)
+        if os.path.basename(name) == "@t@" and (
+            times is None or state["recreated"] < times
+        ):
+            state["recreated"] += 1
+            fd = os.open(
+                os.path.join(name, "late.pile"),
+                os.O_CREAT | os.O_WRONLY,
+                0o644,
+                dir_fd=dir_fd,
+            )
+            os.close(fd)
+        return real_rmdir(path, dir_fd=dir_fd)
+
+    os.rmdir = rmdir
+    try:
+        yield state
+    finally:
+        os.rmdir = real_rmdir
+
+
+def _run_answering_omp(times: int | None):
+    """One `review_omp` call against the answering fake while the reaper stand-in
+    writes into the sandbox during cleanup. Returns (result, sandbox, stderr text,
+    number of files the reaper recreated)."""
+    import io  # noqa: PLC0415
+
+    from reviewlib import panel  # noqa: PLC0415
+
+    fake = _AnsweringOmp()
+    orig_run = review_backends._run_streamed
+    orig_which = review_backends._which
+    review_backends._run_streamed = fake  # type: ignore[assignment]
+    review_backends._which = lambda name: f"/fake/bin/{name}"  # type: ignore[assignment]
+    err = io.StringIO()
+    try:
+        with _reaper_writes_during_cleanup(times) as reaper:
+            with contextlib.redirect_stderr(err):
+                res = review_backends.review_omp(
+                    "omp:kimi-code/k3", "q", "", REPO_ROOT, 10
+                )
+    finally:
+        review_backends._run_streamed = orig_run
+        review_backends._which = orig_which
+    assert panel.result_is_usable(res), res
+    return res, fake.cwd, err.getvalue(), reaper["recreated"]
+
+
+def test_omp_answer_survives_a_sandbox_that_cannot_be_removed():
+    """review-cli#598: the seat answered, then something kept writing into its sandbox
+    while it was being deleted. The answer must come back as a usable result (no
+    exception into the panel, no failover to a second paid call) and the leftover dir
+    must be named on stderr instead of raised."""
+    res, box, stderr, recreated = _run_answering_omp(times=None)
+    try:
+        assert res.returncode == 0 and res.stdout == "ok", res
+        assert recreated >= 2, recreated  # removal was retried, not tried once
+        assert box is not None and box.exists(), box
+        assert str(box) in stderr and "Directory not empty" in stderr, stderr
+    finally:
+        if box is not None:
+            shutil.rmtree(box, ignore_errors=True)
+
+
+def test_omp_sandbox_is_still_removed_once_the_late_writer_stops():
+    """The reaper writes for tens of milliseconds after the host exits; a removal that
+    loses the first race must retry and leave nothing behind, silently."""
+    res, box, stderr, recreated = _run_answering_omp(times=1)
+    assert res.returncode == 0 and res.stdout == "ok", res
+    assert recreated == 1, recreated
+    assert box is not None and not box.exists(), sorted(box.rglob("*"))
+    assert stderr == "", stderr
 
 
 if __name__ == "__main__":
