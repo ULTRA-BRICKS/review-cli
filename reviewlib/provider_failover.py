@@ -60,6 +60,37 @@ _CONCRETE_TO_LOGICAL: dict[str, str] = {
     for concrete in chain
 }
 
+# review-cli#594: every Claude model has TWO executors on this ecosystem's machines — the
+# `claude` CLI (`claude:<id>`, logged in per `~/.claude-accounts` account) and omp
+# (`omp:anthropic/<id>`, omp's own separately logged-in Anthropic account pool). When the
+# Claude CLI login expires or hits its session limit, the omp route usually still answers
+# the SAME model (2026-09-29/30: every claude:* seat died on "OAuth session expired" while
+# omp's Anthropic accounts kept answering), so each is the other's next executor.
+_CLAUDE_CLI_PREFIX = "claude:"
+_OMP_ANTHROPIC_PREFIX = "omp:anthropic/"
+
+
+def anthropic_twin(model: str) -> str | None:
+    """The same Claude model on the other executor — `claude:claude-X` <->
+    `omp:anthropic/claude-X` — or None for anything else (only `claude-*` ids, so a bare
+    `claude:` or a non-Anthropic omp model never gets a made-up twin)."""
+    expanded = _expand_alias(model).strip()
+    low = expanded.lower()
+    for prefix, other in (
+        (_CLAUDE_CLI_PREFIX, _OMP_ANTHROPIC_PREFIX),
+        (_OMP_ANTHROPIC_PREFIX, _CLAUDE_CLI_PREFIX),
+    ):
+        model_id = expanded[len(prefix) :]
+        if low.startswith(prefix) and model_id.lower().startswith("claude-"):
+            return other + model_id
+    return None
+
+
+def _is_twin(a: str, b: str) -> bool:
+    twin = anthropic_twin(a)
+    return twin is not None and twin.lower() == _expand_alias(b).strip().lower()
+
+
 _CACHE_ENV = "REVIEW_PROVIDER_CACHE"  # tests point this at a throwaway file
 _CACHE_LOCK = threading.Lock()
 
@@ -102,10 +133,21 @@ def _base_chain(model: str, overrides: dict[str, list[str]] | None) -> list[str]
     key = logical_key(model)
     expanded = _expand_alias(model)
     if overrides and key in overrides:
-        rest = [c for c in overrides[key] if isinstance(c, str) and c.strip()]
+        # An explicit config `provider_chains:` entry is the exact order the operator
+        # asked for — no Anthropic twin is added to it.
+        ordered = [
+            expanded,
+            *[c for c in overrides[key] if isinstance(c, str) and c.strip()],
+        ]
     else:
-        rest = list(DEFAULT_PROVIDER_CHAINS.get(key, ()))
-    ordered = [expanded, *rest]  # requested spelling leads; alternates follow
+        # Each Claude executor is followed directly by its twin (review-cli#594), so a dead
+        # Claude CLI falls to omp before any other route (opus: claude -> omp -> opencode).
+        ordered = []
+        for c in [expanded, *DEFAULT_PROVIDER_CHAINS.get(key, ())]:
+            ordered.append(c)
+            twin = anthropic_twin(c)
+            if twin is not None:
+                ordered.append(twin)
     seen: set[str] = set()
     chain: list[str] = []
     for c in ordered:
@@ -285,7 +327,14 @@ def remember_working_provider(
     model: str, provider: str, *, cache_path: Path | None = None
 ) -> None:
     """Record `provider` as the last-working provider for `model`'s logical key (tried first
-    next run). No-op when it already IS the cached value, to avoid needless writes."""
+    next run). No-op when it already IS the cached value, to avoid needless writes.
+
+    Also a no-op when `provider` is `model`'s Anthropic twin (review-cli#594): the omp
+    route answering for a dead Claude CLI seat (or the reverse) is a stand-in, not a new
+    preference — the requested executor stays first so the next run tries it again once
+    its login/session limit recovers, instead of pinning the seat on the substitute."""
+    if _is_twin(model, provider):
+        return
     key = logical_key(model)
     with _CACHE_LOCK:
         cache = _load_cache(cache_path)

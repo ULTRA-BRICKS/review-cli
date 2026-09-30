@@ -10,7 +10,8 @@ convention instead of inventing a third, review-cli-private registry: `CLAUDE_RO
 is the exact env override name claude-rotate itself honors, so pointing one at a custom
 root points the other there too.
 
-This module only DISCOVERS and ORDERS the registry -- it never logs an account in or out
+This module only DISCOVERS and ORDERS the registry and reads each account's login state
+(`account_logged_in`, a local `claude auth status`) -- it never logs an account in or out
 (that is a real interactive OAuth flow; see claude-rotate's own "rotate login", which is
 the one-time human step that populates a new account slot). An empty/absent registry
 degrades to a single implicit account (`[]` / `[(None, None)]` from the callers below) --
@@ -25,6 +26,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 _ENV_ROOT = "CLAUDE_ROTATE_ROOT"
@@ -94,3 +97,33 @@ def rotation_order(root: Path | None = None) -> list[Path]:
         return accounts
     start = names.index(current)
     return accounts[start:] + accounts[:start]
+
+
+def account_logged_in(account_dir: Path) -> bool | None:
+    """Whether the Claude CLI considers `account_dir` logged in: `loggedIn` from
+    `claude auth status --json` run with CLAUDE_CONFIG_DIR=account_dir (review-cli#594).
+    Read-only and local -- it never starts a login and never prints a credential. None
+    when it cannot tell (no `claude` binary, a timeout, output that is not that JSON)."""
+    binary = shutil.which("claude")
+    if binary is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "auth", "status", "--json"],
+            env={**os.environ, "CLAUDE_CONFIG_DIR": str(account_dir)},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    logged_in = data.get("loggedIn") if isinstance(data, dict) else None
+    return logged_in if isinstance(logged_in, bool) else None
+
+
+def login_command(account_dir: Path) -> str:
+    """The one command that logs `account_dir` back in (an interactive OAuth flow the
+    user runs themselves)."""
+    return f"CLAUDE_CONFIG_DIR={account_dir} claude auth login"

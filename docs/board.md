@@ -51,6 +51,18 @@ number of working reviewers even when models drop:
   when EVERY configured account is exhausted does the run emit the synthetic usage-limit
   skip, now naming every account it tried; a host with no registry behaves exactly as
   before.
+- **Claude CLI -> omp twin (review-cli#594)** — every `claude:claude-X` seat has
+  `omp:anthropic/claude-X` (the same model through omp's own, separately logged-in
+  Anthropic accounts) as its next executor, and the reverse. When the Claude CLI fails on
+  every registered account (login expired, session or quota limit, an active cooldown),
+  the SAME seat answers through omp under its own role, in `review diff`'s board and in
+  just-ask / quorum / brainstorm. The result carries a `substituted:` line naming what
+  failed, why, and who answered, and the ship quorum credits that role once, to the omp
+  model. The Claude CLI stays first: omp is never cached as the seat's last-working
+  provider, so the next run tries the Claude CLI again. Bare `review status` lists each
+  seat as usable or UNUSABLE with the reason and its substitute, and each registered Claude
+  CLI account as logged in or LOGGED OUT with the `CLAUDE_CONFIG_DIR=… claude auth login`
+  command that fixes it.
 
 Each seat carries its own configured role/lens: priority decides *who* sits in the pool,
 the role decides *with what lens* they review. The run owes the pool's roles, so a

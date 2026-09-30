@@ -40,6 +40,7 @@ from .config import (
     QA_TIMEOUT_DEFAULT,
     VISUAL_MODELS,
     BoardConfigError,
+    BoardReviewer,
     EffortValueError,
     _drop_malformed_board_entries,
     _expand_alias,
@@ -1246,13 +1247,24 @@ def _status_subcommand(rest: list[str]) -> int:
 
     Exit code mirrors the job (`_job_exit_code`): 0 while running, the job's OWN
     recorded exit code once it finished, 1 for "unknown-terminated", 2 for an unknown
-    job-id (a usage error, like any other bad argument)."""
+    job-id (a usage error, like any other bad argument).
+
+    Bare `review status [--json]` (no job id) is the seat-health view instead
+    (`_seat_status_report`, review-cli#594): which board seats can run right now and why not."""
 
     parser = argparse.ArgumentParser(
         prog="review status",
-        description="Show one detached (`--detach`) review job's status.",
+        description=(
+            "Show one detached (`--detach`) review job's status; with no job id, show "
+            "which board seats can run right now, why the others cannot, and what "
+            "each would be substituted with (read-only, no model is called)."
+        ),
     )
-    parser.add_argument("job_id", help="job id printed by `--detach` / `review jobs`")
+    parser.add_argument(
+        "job_id",
+        nargs="?",
+        help="job id printed by `--detach` / `review jobs` (omit for seat health)",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
         "--tail",
@@ -1262,6 +1274,8 @@ def _status_subcommand(rest: list[str]) -> int:
         help="lines of log to show (default 20)",
     )
     ns = parser.parse_args(rest)
+    if ns.job_id is None:
+        return _seat_status_report(as_json=ns.json)
 
     rec = jobs.job_status(ns.job_id)
     if rec is None:
@@ -1679,6 +1693,101 @@ def _entity_harness_for_model(model: str) -> str:
     return _ENTITY_HARNESS_LABELS.get(getattr(fn, "__name__", ""), "unknown")
 
 
+def _configured_board(config: dict) -> list[BoardReviewer]:
+    """The board `review diff` would use from `config` (its `models:` roster, else its
+    `board:`/the default board), with the config's unpaid providers and provider chains
+    applied so availability and failover read the same as a real run. Raises
+    BoardConfigError for a malformed `board:`."""
+    backends.configure_unpaid_providers(config.get("unpaid_providers"))
+    from .provider_failover import configure_provider_chains
+
+    configure_provider_chains(config.get("provider_chains"))
+    config_models = _split_models(config.get("models") or [])
+    return (
+        board_from_models(config_models, config) if config_models else load_board(config)
+    )
+
+
+def _seat_status_report(*, as_json: bool) -> int:
+    """Bare `review status` (review-cli#594): every board seat as usable or UNUSABLE with
+    the reason (unpaid provider, missing CLI/login, an active cooldown, every Claude CLI
+    account logged out) and the executor its failover would hand the seat to, plus each
+    registered Claude CLI account's login state with the command that logs it back in.
+    Read-only: no model is called and no login is started."""
+    from .seat_health import claude_accounts_state, seat_health
+
+    try:
+        board = _configured_board(load_config())
+    except BoardConfigError as exc:
+        print(f"[review status] {exc}", file=sys.stderr, flush=True)
+        return 2
+    accounts = claude_accounts_state()
+    seats = [(r, seat_health(r.model, accounts)) for r in board]
+
+    if as_json:
+        import json as _json
+
+        payload = {
+            "seats": [
+                {
+                    "seat": r.model,
+                    "display": r.display,
+                    "role": r.role,
+                    "usable": h.reason is None,
+                    "reason": h.reason,
+                    "substitute": h.substitute,
+                }
+                for r, h in seats
+            ],
+            "claude_accounts": [
+                {
+                    "name": a.name,
+                    "email": a.email,
+                    "current": a.current,
+                    "logged_in": a.logged_in,
+                    "login_command": a.login_command,
+                }
+                for a in accounts
+            ],
+        }
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    lines = [
+        "review status -- which board seats can run right now "
+        "(read-only: no model is called)\n",
+        "SEATS (board order)",
+    ]
+    name_w = max((len(r.display) for r, _h in seats), default=0)
+    model_w = max((len(r.model) for r, _h in seats), default=0)
+    for r, h in seats:
+        head = f"  {r.display.ljust(name_w)}  {(r.role or 'general'):<12} {r.model.ljust(model_w)}"
+        if h.reason is None:
+            lines.append(f"{head}  usable")
+            continue
+        then = (
+            f"answers via {h.substitute}" if h.substitute else "no substitute executor"
+        )
+        lines.append(f"{head}  UNUSABLE: {h.reason} -> {then}")
+
+    lines.append("\nCLAUDE CLI ACCOUNTS (the claude:* seats rotate through these)")
+    if not accounts:
+        lines.append("  none registered -- single implicit account")
+    for a in accounts:
+        marker = "*" if a.current else " "
+        if a.logged_in is False:
+            state = f"LOGGED OUT -- log it back in: {a.login_command}"
+        elif a.logged_in:
+            state = "logged in"
+        else:
+            state = "login state unknown (no `claude` CLI answered `claude auth status`)"
+        lines.append(
+            f"  {marker} {a.name:<12} {(a.email or '(no email on disk)'):<28} {state}"
+        )
+    print("\n".join(lines))
+    return 0
+
+
 def _entities_subcommand(rest: list[str]) -> int:
     """`review entities [--json]` -- read-only structural overview of review-cli's own
     configured entities (harnesses, providers/vendors, models, accounts, effort/role
@@ -1689,8 +1798,10 @@ def _entities_subcommand(rest: list[str]) -> int:
     browser tracked in review-cli#487 -- it prints a structured report once and exits;
     it does not yet support drill-down or live refresh (later phases). Every field comes
     from data review-cli already owns (the resolved board, `role_models`,
-    `claude_accounts`, and the real call-log stats `review stat` also reads) -- no new
-    external calls. Read-only -- no model is called, no key is printed."""
+    `claude_accounts`, and the real call-log stats `review stat` also reads) plus one
+    local `claude auth status` per registered Claude CLI account (review-cli#594: seat
+    availability is `seat_health`'s reason, the same one bare `review status` prints).
+    Read-only -- no model is called, no key is printed."""
     parser = argparse.ArgumentParser(
         prog="review entities",
         description="Read-only overview of review-cli's harnesses/providers/models/accounts/efforts.",
@@ -1698,29 +1809,24 @@ def _entities_subcommand(rest: list[str]) -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON")
     ns = parser.parse_args(rest)
 
-    config = load_config()
-    backends.configure_unpaid_providers(config.get("unpaid_providers"))
-    config_models = _split_models(config.get("models") or [])
     try:
-        board = (
-            board_from_models(config_models, config)
-            if config_models
-            else load_board(config)
-        )
+        board = _configured_board(load_config())
     except BoardConfigError as exc:
         print(f"[review entities] {exc}", file=sys.stderr, flush=True)
         return 2
 
     from .role_models import ROLE_FALLBACK_MODELS
-    from .claude_accounts import account_email, current_account_name, list_accounts
     from .dashboard.tokenstats import compute_stat_report
+    from .seat_health import claude_accounts_state, seat_health
+
+    account_state = claude_accounts_state()
 
     harnesses: dict[str, dict] = {}
     models: list[dict] = []
     for r in board:
         harness = _entity_harness_for_model(r.model)
         provider = backends.effective_provider(r.model)
-        available = backends.backend_available(r.model)
+        health = seat_health(r.model, account_state)
         entry = harnesses.setdefault(harness, {"providers": set(), "seats": 0})
         entry["providers"].add(provider)
         entry["seats"] += 1
@@ -1732,15 +1838,21 @@ def _entities_subcommand(rest: list[str]) -> int:
                 "provider": provider,
                 "role": r.role,
                 "effort": r.effort,
-                "available": available,
+                "available": health.reason is None,
+                "reason": health.reason,
+                "substitute": health.substitute,
             }
         )
 
-    account_dirs = list_accounts()
-    current = current_account_name()
     accounts = [
-        {"name": d.name, "email": account_email(d), "current": d.name == current}
-        for d in account_dirs
+        {
+            "name": a.name,
+            "email": a.email,
+            "current": a.current,
+            "logged_in": a.logged_in,
+            "login_command": a.login_command,
+        }
+        for a in account_state
     ]
 
     since = datetime.now(timezone.utc) - timedelta(days=7)
@@ -1782,7 +1894,9 @@ def _render_entities_report(payload: dict) -> str:
     lines.append("\nMODELS (board order)")
     name_w = max((len(m["display"]) for m in payload["models"]), default=0)
     for m in payload["models"]:
-        status = "available" if m["available"] else "unavailable"
+        status = "available" if m["available"] else f"unavailable: {m['reason']}"
+        if m.get("substitute"):
+            status += f" -> answers via {m['substitute']}"
         role = m["role"] or "general"
         effort = m["effort"] or "-"
         lines.append(
@@ -1796,8 +1910,12 @@ def _render_entities_report(payload: dict) -> str:
     else:
         for a in payload["accounts"]:
             marker = "*" if a["current"] else " "
+            if a.get("logged_in") is False:
+                state = f"  LOGGED OUT -- log it back in: {a['login_command']}"
+            else:
+                state = ""
             lines.append(
-                f"  {marker} {a['name']:<14} {a['email'] or '(no email on disk)'}"
+                f"  {marker} {a['name']:<14} {a['email'] or '(no email on disk)'}{state}"
             )
 
     lines.append("\nEFFORT / ROLE LENSES (fallback chain per role)")
@@ -4944,7 +5062,8 @@ def _subcommand_epilog() -> str:
             "\n  task        show review iterations and transcripts for one task code"
             "\n  stat        per-harness/per-model usage + health report from the real call logs"
             "\n  jobs        list detached (--detach) review jobs"
-            "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`)"
+            "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`);"
+            "\n              bare `status`: which board seats can run now, why not, and their substitute"
             "\n  wait        block until a detached job finishes (`wait <job-id>`)"
             "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
             "\n  install-skill / install-commit-hook / install-hook tg / register-module"

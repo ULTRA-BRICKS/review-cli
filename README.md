@@ -750,9 +750,9 @@ Read-only structural report of review-cli's own configured entities: which harne
 routes seats through, each seat's provider/role/effort/availability, the registered
 Claude multi-account roster (`reviewlib.claude_accounts`), the effort/role fallback
 lenses (`reviewlib.role_models.ROLE_FALLBACK_MODELS`), and a compact per-harness
-call-health summary for the last 7 days (the same data `review stat` reads). It makes no
-new external/network calls and prints no keys — every field is reused from data
-review-cli already resolves for a normal run.
+call-health summary for the last 7 days (the same data `review stat` reads). A seat that
+cannot run shows why and who answers for it; each Claude account shows whether it is
+logged in (one local `claude auth status` each). No network call, no key printed.
 
 ```bash
 review entities                    # text report
@@ -784,6 +784,8 @@ review jobs                                   # list every recorded job, newest 
 review jobs --json
 review status 20260718T211853-0db637ed        # status + paths + a log tail
 review status 20260718T211853-0db637ed --json
+review status                                 # no job id: which board seats can run now,
+                                               # why not, and who answers for them
 review wait 20260718T211853-0db637ed          # block until it finishes (for a human /
                                                # unbounded caller — NOT for a capped subagent;
                                                # poll `review status` instead)

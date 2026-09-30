@@ -21,11 +21,12 @@ from .backends import (
     _UNAVAILABLE_MARKERS,
     _UNAVAILABLE_MAX_LEN,
     backend_available,
+    backend_unavailable_reason,
     call_backend,
     resolve_backend,
     review_with_images,
 )
-from .config import MODERATOR_CANDIDATES, REVIEW_ROLES, BoardReviewer
+from .config import MODERATOR_CANDIDATES, REVIEW_ROLES, BoardReviewer, _expand_alias
 from .process import set_board_deadline, write_retry_log
 
 if TYPE_CHECKING:
@@ -297,6 +298,8 @@ def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
     body = result.stdout.strip()
     err = result.stderr.strip()
     parts = [f"## {result.model} [{status}]", f"`{result.command}`"]
+    if result.substitution:
+        parts.append(f"> [review-cli] substituted: {result.substitution}")
     if body:
         parts.append(body)
         if check_evidence and clean_verdict_missing_evidence(body):
@@ -692,7 +695,10 @@ def run_board_with_failover(
                 all_results.append(result)
                 if ok:
                     usable.append(result)
-                    usable_models.append(reviewer.model)
+                    # The executor that actually answered: a seat whose Claude CLI was
+                    # dead but whose omp twin answered is credited to omp (review-cli#594),
+                    # still under this seat's own role below.
+                    usable_models.append(result.served_by or reviewer.model)
                     usable_roles.append(reviewer.role)
                     _tally_ok(True)
                     if reporter is not None:
@@ -819,6 +825,35 @@ def _failure_reason(result: ReviewResult) -> str:
     return line if len(line) <= 160 else line[:157] + "..."
 
 
+def mark_substitution(
+    result: ReviewResult,
+    requested: str,
+    served_by: str,
+    failed: list[tuple[str, ReviewResult]],
+    chain: list[str],
+) -> ReviewResult:
+    """Tag a usable `result` that executor `served_by` produced for a seat that asked for
+    `requested` (review-cli#594): sets `served_by` and a one-line `substitution` naming each
+    executor that failed first and why (or why the requested one was never tried). Returns
+    `result` unchanged when `served_by` IS the requested executor, and when nothing failed
+    and the requested executor is still in `chain` — the last-working cache merely put an
+    alternate first, which is routing, not a stand-in."""
+    head = _expand_alias(requested).strip().lower()
+    if served_by.strip().lower() == head:
+        return result
+    if not failed and any(c.strip().lower() == head for c in chain):
+        return result
+    if failed:
+        why = "; ".join(f"{model} unusable: {_failure_reason(r)}" for model, r in failed)
+    else:
+        why = f"{requested} not tried: " + (
+            backend_unavailable_reason(requested) or "unavailable"
+        )
+    return replace(
+        result, served_by=served_by, substitution=f"{requested} -> {served_by} ({why})"
+    )
+
+
 def _choose_backfill(
     failed: BoardReviewer,
     reserve_queue: list[BoardReviewer],
@@ -871,7 +906,22 @@ def _choose_backfill(
 
 
 def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:
-    """Run jobs in parallel, returning results in the SAME order as `jobs`."""
+    """Run jobs in parallel, returning results in the SAME order as `jobs` — each seat
+    with PROVIDER FAILOVER, one call per provider (no transient retry).
+
+    The runner of the flat panel modes (just-ask / quorum / brainstorm) and their `--task`
+    role slots. review-cli#594: this used to be the bare one-call dispatch, so a
+    `claude:<id>` seat whose Claude CLI login had expired simply failed even though
+    `omp:anthropic/<id>` (the same model on omp's own accounts) would have answered; the
+    seat now drops to its next executor like a board seat does. One tally per seat."""
+    return run_panel_with_retry(jobs, cwd, timeout, transient_retry=False)
+
+
+def _run_panel_once(
+    jobs: list[PanelJob], cwd: Path, timeout: int
+) -> list[ReviewResult]:
+    """ONE backend call per job, in parallel, results in the SAME order as `jobs` — the raw
+    dispatch under every panel runner (no failover, no retry); auto-tallies each call."""
     results: list[ReviewResult | None] = [None] * len(jobs)
     if not jobs:
         return []
@@ -998,7 +1048,12 @@ def run_role_slots(
 
 
 def run_panel_with_retry(
-    jobs: list[PanelJob], cwd: Path, timeout: int, reporter: "BoardReporter | None" = None
+    jobs: list[PanelJob],
+    cwd: Path,
+    timeout: int,
+    reporter: "BoardReporter | None" = None,
+    *,
+    transient_retry: bool = True,
 ) -> list[ReviewResult]:
     """Run jobs in parallel like `run_panel`, but each seat RETRIES itself on a transient
     failure before giving up — same-order results out.
@@ -1008,19 +1063,19 @@ def run_panel_with_retry(
     (429/529/5xx/timeout/overloaded) sleeps a jittered backoff and retries the SAME model, up
     to the configured budget (`REVIEW_RETRY_COUNT` / `--retry`). A SEAT-FATAL failure (auth /
     bad model / 501 / refusal) returns immediately so the board's reserve-replace can take
-    over without burning the retry budget. The seat's per-call dispatch reuses `run_panel`
-    (one job), so the live per-call log files and label-wrapping are unchanged; only the
-    retry orchestration is added.
+    over without burning the retry budget. The seat's per-call dispatch reuses
+    `_run_panel_once` (one job), so the live per-call log files and label-wrapping are
+    unchanged; only the retry orchestration is added.
 
     The retry import is LAZY (function-local) to avoid an import cycle: `reviewlib.retry`
     imports `panel.result_is_usable`, so importing it at module top would be circular.
 
-    The inner per-attempt `run_panel([job])` calls would each auto-tally; that is suppressed
-    ONCE around the whole parallel dispatch (a single-threaded toggle, NOT a per-thread one —
-    the parallel seats must never race on the `_suppress_autotally` global). The caller
-    (`run_board_with_failover` / a future direct user) owns the one-per-logical-seat tally;
-    when NOT already suppressed, each seat's FINAL outcome is tallied once below, matching
-    `run_panel`'s one-call-one-tally contract.
+    The inner per-attempt `_run_panel_once([job])` calls would each auto-tally; that is
+    suppressed ONCE around the whole parallel dispatch (a single-threaded toggle, NOT a
+    per-thread one — the parallel seats must never race on the `_suppress_autotally`
+    global). The caller (`run_board_with_failover` / a future direct user) owns the
+    one-per-logical-seat tally; when NOT already suppressed, each seat's FINAL outcome is
+    tallied once below, matching `_run_panel_once`'s one-call-one-tally contract.
 
     `reporter` (review-cli#548's optional live TUI observer, None by default, forwarded
     unchanged from `run_board_with_failover`) gets `seat_status(role, model, "retrying")`
@@ -1030,7 +1085,14 @@ def run_panel_with_retry(
     curses screen would be corrupted by a raw stderr write, so those human-facing notices
     move into the TUI's scrolling event log instead. With `reporter=None` (every existing
     caller, unchanged), this function's behavior is BYTE-IDENTICAL to before this
-    parameter existed."""
+    parameter existed.
+
+    `transient_retry=False` (`run_panel`, the flat panel modes' runner) keeps the
+    provider failover but makes ONE call per provider — no same-provider backoff retry.
+
+    A verdict produced by a provider other than the one the seat asked for is tagged via
+    `mark_substitution` (review-cli#594), and each switch notice names why the previous
+    provider failed, so the output says which executor stood in and why."""
     # Use the SAME unpaid predicate backend_available uses (runtime_provider_marked_unpaid),
     # so the pool guard's liveness view and the failover chain's drop set never disagree.
     from .backends import (
@@ -1072,8 +1134,10 @@ def run_panel_with_retry(
         # dispatch does NOT touch the global, so parallel seats can't race on it.
         def _attempt(seat_job: PanelJob) -> ReviewResult:
             def _once() -> ReviewResult:
-                return run_panel([seat_job], cwd, timeout)[0]
+                return _run_panel_once([seat_job], cwd, timeout)[0]
 
+            if not transient_retry:
+                return _once()
             if reporter is None:
                 return run_seat_with_retry(label, _once)
 
@@ -1122,6 +1186,7 @@ def run_panel_with_retry(
         # write isn't gated the way the read is").
         cache_eligible = len(chain) > 1 and is_default_provider_selection(job.model)
         last: ReviewResult | None = None
+        failed: list[tuple[str, ReviewResult]] = []
         for idx, provider_model in enumerate(chain):
             result = _attempt(
                 replace(job, model=provider_model)
@@ -1131,11 +1196,15 @@ def run_panel_with_retry(
             if result_is_usable(result):
                 if cache_eligible:
                     remember_working_provider(job.model, provider_model)
-                return result
+                return mark_substitution(
+                    result, job.model, provider_model, failed, chain
+                )
             last = result
+            failed.append((provider_model, result))
             if idx + 1 < len(chain):
                 note = (
-                    f"seat {label}: provider {provider_model} failed — "
+                    f"seat {label}: provider {provider_model} failed "
+                    f"({_failure_reason(result)}) — "
                     f"switching to {chain[idx + 1]} (review continues)"
                 )
                 if reporter is not None:
@@ -1201,7 +1270,7 @@ def run_panel_with_retry(
 def run_single(
     model: str, prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0
 ) -> ReviewResult:
-    return run_panel(
+    return _run_panel_once(
         [PanelJob(model=model, prompt=prompt, diff=diff, round_no=round_no)],
         cwd,
         timeout,

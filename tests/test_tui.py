@@ -574,9 +574,10 @@ def test_provider_failover_without_reporter_is_byte_identical_to_before():
         provider_failover.is_default_provider_selection = old_is_default
         provider_failover.remember_working_provider = old_remember
         provider_failover.forget_working_provider = old_forget
+    # review-cli#594: the notice also names WHY the provider failed.
     assert (
-        "seat Fake [architect]: provider fake:model failed \u2014 switching to "
-        "fake:model-alt" in stderr_out
+        "seat Fake [architect]: provider fake:model failed (authentication failed) "
+        "\u2014 switching to fake:model-alt" in stderr_out
     ), stderr_out
 
 

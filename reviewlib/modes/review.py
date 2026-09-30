@@ -52,8 +52,10 @@ from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
     FailoverOutcome,
     _tally_ok,
+    _failure_reason,
     _tally_tokens,
     format_result,
+    mark_substitution,
     result_is_usable,
     run_board_with_failover,
 )
@@ -516,6 +518,7 @@ def _flat_seat_with_provider_failover(
     )
     cache_eligible = len(chain) > 1 and is_default_provider_selection(model)
     last: ReviewResult | None = None
+    failed: list[tuple[str, ReviewResult]] = []
     for idx, provider_model in enumerate(chain):
         result = run_seat_with_retry(
             model, lambda pm=provider_model: _safe_dispatch(pm)
@@ -523,11 +526,15 @@ def _flat_seat_with_provider_failover(
         if result_is_usable(result):
             if cache_eligible:
                 remember_working_provider(model, provider_model)
-            return replace(result, model=model)
+            # review-cli#594: name the stand-in executor (e.g. omp for a dead Claude CLI).
+            substituted = mark_substitution(result, model, provider_model, failed, chain)
+            return replace(substituted, model=model)
         last = result
+        failed.append((provider_model, result))
         if idx + 1 < len(chain):
             print(
-                f"[review-cli] seat {model}: provider {provider_model} failed — "
+                f"[review-cli] seat {model}: provider {provider_model} failed "
+                f"({_failure_reason(result)}) — "
                 f"switching to {chain[idx + 1]} (review continues)",
                 file=sys.stderr,
                 flush=True,

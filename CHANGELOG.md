@@ -3,6 +3,31 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.40.0 — 2026-09-30
+
+- **Fix(board): a dead Claude CLI seat answers through omp, and `review status` says why a
+  seat cannot run**
+  ([review-cli#594](https://git.hyperide.ai/ultrabricks/review-cli/issues/594)). On
+  2026-09-29/30 every `claude:*` seat failed ("Failed to authenticate: OAuth session
+  expired", "You've hit your session limit") while omp's own Anthropic accounts kept
+  answering the same models; reviews degraded and agents had to hand-pick
+  `-m omp:anthropic/…`. Now:
+  - every `claude:claude-X` seat falls to `omp:anthropic/claude-X` (and the reverse)
+    before any other route, in `review diff`'s board, its flat `-m` path, and just-ask /
+    quorum / brainstorm, which previously had no provider failover at all;
+  - the result prints `substituted: claude:… -> omp:… (claude:… unusable: <why>)`, and
+    each switch notice on stderr names why the previous executor failed;
+  - the substituted seat counts once under its own role for the ship quorum, recorded as
+    the omp model that actually answered;
+  - the Claude CLI stays the first executor: omp is never stored as its last-working
+    provider, so the next run tries the Claude CLI again once it recovers;
+  - bare `review status [--json]` (no job id) lists every board seat as usable or
+    UNUSABLE with the reason (unpaid provider, missing CLI or login, active cooldown and
+    its end time, every Claude CLI account logged out) and the executor it would be
+    substituted with, plus each registered Claude CLI account as logged in or LOGGED OUT
+    with the `CLAUDE_CONFIG_DIR=… claude auth login` command. `review entities` shows the
+    same reasons and account states.
+
 ## 0.39.0 — 2026-09-29
 
 - **Fix(board): a review keeps every role filled when seats fail**

@@ -66,7 +66,7 @@ def test_glm_chain_tries_zai_then_opencode_then_commandcode():
 
 # === single-provider models = a chain of themselves ==============================
 def test_single_provider_model_is_its_own_chain():
-    for m in ("codex", "claude:claude-fable-5"):
+    for m in ("codex", "oc:xai/grok-4.6"):
         chain = provider_chain(
             m, available=_ALL, unpaid=_NONE_UNPAID, cache_path=_tmp_cache()
         )

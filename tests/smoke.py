@@ -800,6 +800,11 @@ _UNIT_FILES = [
     # switchover (provider A fails on the call, the model completes via B, board not degraded).
     # Offline — availability/unpaid injected, cache is a throwaway temp file.
     ("test_provider_failover.py", {}),
+    # review-cli#594: a dead Claude CLI seat drops to its omp-routed twin (board, just-ask
+    # and the --task role slots), is credited once under its own role, and bare
+    # `review status` / `review entities` say why a seat cannot run. Offline — executors
+    # faked by id; cache, logs, cooldown store and account registry in temp dirs.
+    ("test_claude_omp_twin.py", {}),
     # Reuse-aware board/panel composition (review-cli#205): scarce/near-limit models
     # reuse across roles instead of shrinking the panel. Pure algorithm, no I/O.
     ("test_pool_reuse.py", {}),

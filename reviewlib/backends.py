@@ -75,6 +75,13 @@ class ReviewResult:
     # `_REST_USAGE_BACKENDS`) can never be misattributed here.
     prompt_tokens: int = 0
     output_tokens: int = 0
+    # Set by provider failover (reviewlib.panel.mark_substitution, review-cli#594) when the
+    # verdict came from a DIFFERENT executor than the one the seat asked for — e.g. a dead
+    # `claude:X` answered by `omp:anthropic/X`: `served_by` is the executor that answered,
+    # `substitution` the one-line human account of what failed, why, and who answered.
+    # Empty on every direct call.
+    served_by: str = ""
+    substitution: str = ""
 
 
 def _which(name: str) -> str:
@@ -2813,6 +2820,18 @@ def _review_claude_cli_with_account_fallback(
     return _usage_limit_skip_result(model, round_no, reason, backend="claude")
 
 
+def claude_access_method() -> str:
+    """Which transport `review_claude` dispatches through right now: "api" or "cli".
+
+    REVIEW_CLAUDE_MODE forces it; otherwise the CLI when the claude binary is present, and
+    the API only when there is no binary but a key IS configured (see `review_claude`)."""
+    mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
+    use_api = mode == "api" or (
+        mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None
+    )
+    return "api" if use_api else "cli"
+
+
 def review_claude(
     model: str,
     prompt: str,
@@ -2854,11 +2873,8 @@ def review_claude(
     # recorded from one transport must not shadow the other, independently-healthy one
     # for the same model, so the store is keyed by (model, access_method) and the
     # access_method must be known before the lookup, not after.
-    mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
-    use_api = mode == "api" or (
-        mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None
-    )
-    access_method = "api" if use_api else "cli"
+    access_method = claude_access_method()
+    use_api = access_method == "api"
     cooldown = _cooldown_after_recovery_probe(model, access_method=access_method)
     if cooldown is not None:
         return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
