@@ -85,6 +85,7 @@ from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import (
     announce_eta,
+    canonical_repo_id,
     diff_content_hash,
     extract_diff_files,
     fmt_duration,
@@ -353,7 +354,7 @@ def _compute_repo_id(cwd: Path) -> str | None:
     if url:
         normalized = normalize_repo_remote(url)
         if normalized:
-            return normalized
+            return canonical_repo_id(normalized)
     toplevel = _git_toplevel(cwd)
     if toplevel is not None:
         return f"path:{toplevel}"
@@ -2433,7 +2434,7 @@ def _stale_reminder_line(stale: dict) -> str:
     clipped = _clip_text(str(raw_quote), 60, collapse_whitespace=True)
     return (
         f"    ⚠ stalled {kind} #{stale.get('id') or '?'} — {age:.1f}h waiting on "
-        f"{waiting_on}: \"{clipped}\""
+        f'{waiting_on}: "{clipped}"'
     )
 
 

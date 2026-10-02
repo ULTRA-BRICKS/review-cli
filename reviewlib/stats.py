@@ -193,6 +193,11 @@ def normalize_repo_remote(url: str) -> str | None:
     intentionally NOT stripped since it plausibly names a different remote). This
     is an identity key for cross-repo mismatch detection, not a URL a caller should
     try to clone from.
+
+    Host-agnostic by design, not GitHub-specific: e.g.
+    ``https://git.hyperide.ai/ultrabricks/review-cli.git`` normalizes to
+    ``git.hyperide.ai/ultrabricks/review-cli`` exactly the same way a github.com
+    remote does.
     """
     raw = (url or "").strip()
     if not raw:
@@ -217,6 +222,27 @@ def normalize_repo_remote(url: str) -> str | None:
     if not host or not path:
         return None
     return f"{host}/{path}"
+
+
+# Repos whose canonical git host migrated from GitHub to Forgejo (git.hyperide.ai).
+# Maps the OLD normalized GitHub identity to the NEW canonical Forgejo identity, so
+# historical records tagged under the old host still resolve to the same logical
+# repo as new records. Extend this table as more repos migrate — do NOT infer a
+# blanket github.com -> git.hyperide.ai host rewrite (org/owner names differ:
+# alex-mextner -> ultrabricks), that would silently alias UNRELATED repos.
+_REPO_IDENTITY_ALIASES: dict[str, str] = {
+    "github.com/alex-mextner/review-cli": "git.hyperide.ai/ultrabricks/review-cli",
+}
+
+
+def canonical_repo_id(repo_id: str | None) -> str | None:
+    """Resolve a normalized repo identity to its CANONICAL identity for identity
+    comparison purposes (e.g. quorum-check matching), following
+    ``_REPO_IDENTITY_ALIASES``. Returns ``repo_id`` unchanged when it has no known
+    alias (including None/non-str)."""
+    if not isinstance(repo_id, str) or not repo_id:
+        return repo_id
+    return _REPO_IDENTITY_ALIASES.get(repo_id, repo_id)
 
 
 def normalize_task_code(value: str | None) -> str | None:
@@ -561,7 +587,7 @@ def _classify_iteration_identity(
     item_repo = item.get("repo_id")
     if not isinstance(item_repo, str) or not item_repo:
         return "unverifiable", None
-    if item_repo != repo_id:
+    if canonical_repo_id(item_repo) != canonical_repo_id(repo_id):
         return "mismatched", "repo_mismatch"
     item_files = item.get("diff_files")
     if current_files and isinstance(item_files, list) and item_files:

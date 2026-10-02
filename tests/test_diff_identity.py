@@ -163,6 +163,17 @@ def test_normalize_repo_remote_nondefault_ssh_port_kept_distinct():
     assert custom_port != portless
 
 
+def test_normalize_repo_remote_forgejo_host():
+    """review-cli#540: normalize_repo_remote is host-agnostic by design -- it must
+    normalize a Forgejo (git.hyperide.ai) remote just as well as a GitHub one, and
+    an SSH-form equivalent must normalize identically to the HTTPS form."""
+    https = _stats.normalize_repo_remote(
+        "https://git.hyperide.ai/ultrabricks/review-cli.git"
+    )
+    ssh = _stats.normalize_repo_remote("git@git.hyperide.ai:ultrabricks/review-cli.git")
+    assert https == ssh == "git.hyperide.ai/ultrabricks/review-cli"
+
+
 def test_diff_content_hash_deterministic_and_content_sensitive():
     h1 = _stats.diff_content_hash(_TWO_FILE_DIFF)
     h2 = _stats.diff_content_hash(_TWO_FILE_DIFF)
@@ -382,6 +393,71 @@ def test_quorum_check_min_models_advisory_present_on_mismatch_denial_review_cli_
         assert "min_models_advisory" in result
 
 
+# ---------------------------------------------------------------------------
+# canonical_repo_id: GitHub -> Forgejo migration identity aliasing (review-cli#540)
+# ---------------------------------------------------------------------------
+def test_canonical_repo_id_maps_known_github_alias_to_forgejo():
+    """review-cli's own canonical identity migrated from GitHub to Forgejo
+    (git.hyperide.ai); a historical GitHub-normalized id must resolve to the new
+    canonical Forgejo id, while an UNALIASED repo id and None pass through
+    unchanged -- the alias table is scoped, not a blanket host rewrite."""
+    assert (
+        _stats.canonical_repo_id("github.com/alex-mextner/review-cli")
+        == "git.hyperide.ai/ultrabricks/review-cli"
+    )
+    assert (
+        _stats.canonical_repo_id("github.com/org/unrelated-repo")
+        == "github.com/org/unrelated-repo"
+    )
+    assert _stats.canonical_repo_id(None) is None
+
+
+def test_quorum_check_matches_historical_github_identity_to_forgejo_canonical():
+    """review-cli#540: iterations recorded before the migration under the old
+    GitHub-normalized repo_id must still verify against a CURRENT check running
+    under the new canonical Forgejo repo_id -- the alias makes them the SAME
+    logical repo for quorum-matching purposes."""
+    with _TmpStore():
+        historical_repo = "github.com/alex-mextner/review-cli"
+        current_repo = "git.hyperide.ai/ultrabricks/review-cli"
+        _record_passed(models=["codex"], repo_id=historical_repo, diff_files=["a.py"])
+        _record_passed(models=["gemini"], repo_id=historical_repo, diff_files=["a.py"])
+        _record_passed(models=["fable5"], repo_id=historical_repo, diff_files=["a.py"])
+        result = _stats.quorum_check(
+            TASK,
+            min_iter=3,
+            min_models=3,
+            repo_id=current_repo,
+            diff_files=["a.py"],
+        )
+        assert result["passed"] is True
+        assert result["passed_iterations"] == 3
+        assert result["verified_iterations"] == 3
+        assert result["excluded_mismatched_iterations"] == 0
+
+
+def test_quorum_check_unrelated_github_repo_still_mismatches_forgejo_canonical():
+    """Regression guard: the GitHub -> Forgejo alias is scoped to review-cli's own
+    migrated identity -- an UNRELATED GitHub repo with no alias entry must still
+    mismatch against the current Forgejo repo_id, exactly as before this feature."""
+    with _TmpStore():
+        unrelated_repo = "github.com/other-org/unrelated-repo"
+        current_repo = "git.hyperide.ai/ultrabricks/review-cli"
+        _record_passed(models=["codex"], repo_id=unrelated_repo, diff_files=["a.py"])
+        result = _stats.quorum_check(
+            TASK,
+            min_iter=1,
+            min_models=1,
+            repo_id=current_repo,
+            diff_files=["a.py"],
+        )
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 0
+        assert result["excluded_mismatched_iterations"] == 1
+        reasons = {d["reason"] for d in result["mismatch_details"]}
+        assert reasons == {"repo_mismatch"}
+
+
 def test_quorum_check_stalled_models_coexists_with_mismatch_error():
     """review-cli#221 round-4 review finding (k3/Opus): a mismatch-error result is NOT
     an early return (unlike the invalid-task-code/unreadable-store/no-iterations cases)
@@ -415,7 +491,9 @@ def test_quorum_check_stalled_models_coexists_with_mismatch_error():
                 passed=False,
                 repo_id=this_repo,
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode"
+            )
 
             result = _stats.quorum_check(
                 TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
@@ -475,7 +553,9 @@ def test_quorum_check_stalled_models_present_when_mismatch_exclusion_drops_below
                 passed=False,
                 repo_id=this_repo,
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode"
+            )
 
             result = _stats.quorum_check(
                 TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
@@ -882,7 +962,9 @@ def test_cli_check_error_branch_prints_header_and_stalled_lines_on_same_stream()
                 passed=False,
                 repo_id=f"path:{Path(repo_a.name).resolve()}",
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode"
+            )
 
             out = io.StringIO()
             err = io.StringIO()

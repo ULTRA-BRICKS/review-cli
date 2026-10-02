@@ -28,13 +28,13 @@ review with the composable `--visual` flag for a keep / rollback / repair verdic
 **One-liner** (installs deps, links `review` into PATH, registers the skill):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alex-mextner/review-cli/main/install.sh | bash
+curl -fsSL https://git.hyperide.ai/ultrabricks/review-cli/raw/branch/main/install.sh | bash
 ```
 
 **pipx alternative:**
 
 ```bash
-pipx install git+https://github.com/alex-mextner/review-cli
+pipx install git+https://git.hyperide.ai/ultrabricks/review-cli
 ```
 
 After install, run `review install-skill` to register the tool into agent harnesses

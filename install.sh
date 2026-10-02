@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # install.sh — install the `review` CLI (Python 3)
 # Works both from a local clone (./install.sh) and piped from curl:
-#   curl -fsSL https://raw.githubusercontent.com/alex-mextner/review-cli/main/install.sh | bash
+#   curl -fsSL https://git.hyperide.ai/ultrabricks/review-cli/raw/branch/main/install.sh | bash
 set -euo pipefail
 
 # ── identity ──────────────────────────────────────────────────────────────────
 TOOL="review"
 REPO="review-cli"
-GITHUB_USER="alex-mextner"
+FORGEJO_HOST="git.hyperide.ai"
+FORGEJO_ORG="ultrabricks"
 ENTRY="bin/review"   # path inside repo root
 CLONE_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
 
@@ -23,7 +24,7 @@ if [[ -n "$_script_dir" && -f "$_script_dir/$ENTRY" ]]; then
 else
   mkdir -p "$CLONE_BASE"
   CLONE_DIR="$CLONE_BASE/$REPO"
-  EXPECT_URL="https://github.com/$GITHUB_USER/$REPO.git"
+  EXPECT_URL="https://$FORGEJO_HOST/$FORGEJO_ORG/$REPO.git"
   if [[ -d "$CLONE_DIR/.git" ]]; then
     actual_url="$(git -C "$CLONE_DIR" remote get-url origin 2>/dev/null || echo "")"
     if [[ "$actual_url" != "$EXPECT_URL" ]]; then
