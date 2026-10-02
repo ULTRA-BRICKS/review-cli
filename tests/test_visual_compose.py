@@ -20,6 +20,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
@@ -34,21 +36,30 @@ from reviewlib.modes import review as _review_mod  # noqa: E402
 
 TASK_ARGS = ["--task", "TEST-1"]
 
-# These composability tests assert the Stage-1 cvGate-described context threading. The
-# Stage-2 per-mode fan-out would otherwise fire a REAL vision call here (a Gemini/
-# Anthropic key is configured on a dev box). Force the fan-out to find NO vision backend
-# so the seam degrades to the cvGate-described note (the exact behaviour these tests
-# pin) and NO API is burned. The dedicated fan-out behaviour is covered, with a mocked
-# vision call, in test_visual_fanout.py.
-_cmp.select_vision_backend = lambda models: None
+
+@pytest.fixture(autouse=True)
+def isolated_composition(monkeypatch, tmp_path):
+    """Keep provider discovery and fixture files local to each composition test."""
+    monkeypatch.setattr(cli, "load_config", lambda: {"models": ["codex"]})
+    monkeypatch.setattr(cli.backends, "backend_available", lambda model: True)
+    monkeypatch.setattr(cli, "_read_stdin_if_piped", lambda: None)
+
+    def unexpected_vision(*args, **kwargs):
+        raise AssertionError("composition fixture must not invoke a vision provider")
+
+    monkeypatch.setattr(_cmp, "select_vision_backend", lambda models: None)
+    monkeypatch.setattr(_cmp, "select_vision_backends", lambda models: [])
+    monkeypatch.setattr(_cmp, "call_ai_vision", unexpected_vision)
+    monkeypatch.setenv("REVIEW_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.chdir(tmp_path)
 
 
-def _styled(tmp: str = "/tmp/visual-compose-styled.png") -> str:
-    return str(vf.styled_render(Path(tmp)))
+def _styled(tmp: str = "visual-compose-styled.png") -> str:
+    return str(vf.styled_render(Path(tmp).resolve()))
 
 
-def _blank(tmp: str = "/tmp/visual-compose-blank.png") -> str:
-    return str(vf.blank_white(Path(tmp)))
+def _blank(tmp: str = "visual-compose-blank.png") -> str:
+    return str(vf.blank_white(Path(tmp).resolve()))
 
 
 def test_visual_composes_with_brainstorm_subcommand():
@@ -234,16 +245,4 @@ def test_default_review_with_diff_threads_visual():
 
 
 if __name__ == "__main__":
-    failures = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                failures += 1
-                print(f"ERROR {name}: {type(exc).__name__}: {exc}")
-    sys.exit(1 if failures else 0)
+    raise SystemExit(pytest.main([__file__, "-q"]))

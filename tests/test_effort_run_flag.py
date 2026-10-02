@@ -174,20 +174,35 @@ def test_by_provider_is_immutable():
         o.by_provider["claude"] = "low"  # type: ignore[index]
 
 
-def test_overridden_board_flows_into_panel_jobs_once():
-    """The override is applied to the board ONCE; the built PanelJobs carry that effort
-    (the backend applies it — no second application on the board seam)."""
+@pytest.mark.parametrize(
+    "available", [{"codex:gpt-5", "claude:opus"}, {"claude:opus"}, set()]
+)
+def test_overridden_board_flows_into_panel_jobs_once(monkeypatch, available):
+    """Override each seat once, independently of installed CLIs or accounts.
+
+    panel imports backend_available into its own module namespace. Patching
+    backends.backend_available alone leaves that lookup untouched, so the
+    previous test accidentally used the contributor's real availability.
+    """
+    import reviewlib.panel as panel
+
+    seen = []
+
+    def available_for_test(model):
+        seen.append(model)
+        return model in available
+
+    monkeypatch.setattr(panel, "backend_available", available_for_test)
     board = apply_effort_override(_board(), parse_effort_flag(["high", "codex=low"]))
-    old = backends.backend_available
-    backends.backend_available = lambda _m: True
-    try:
-        jobs, skipped = build_board_jobs(board, "prompt", "diff")
-    finally:
-        backends.backend_available = old
-    assert skipped == []
-    assert {j.model: j.effort for j in jobs} == {
-        "codex:gpt-5": "low",
-        "claude:opus": "high",
+    jobs, skipped = build_board_jobs(board, "prompt", "diff")
+    assert seen == [reviewer.model for reviewer in board]
+    assert [reviewer.model for reviewer in skipped] == [
+        reviewer.model for reviewer in board if reviewer.model not in available
+    ]
+    assert {job.model: job.effort for job in jobs} == {
+        model: effort
+        for model, effort in {"codex:gpt-5": "low", "claude:opus": "high"}.items()
+        if model in available
     }
 
 

@@ -120,7 +120,7 @@ def _liveness_argv(record_dir: str, hold: float = 0.6) -> list[str]:
         "open(os.path.join(d, pid+'.end'),'w').write(str(time.time()))\n"
         "print('done', flush=True)\n"
     )
-    return [sys.executable, "-c", code]
+    return [sys.executable, "-I", "-S", "-c", code]
 
 
 def _peak_concurrency(events_dir: Path) -> int:

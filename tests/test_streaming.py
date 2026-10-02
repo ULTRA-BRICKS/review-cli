@@ -67,7 +67,8 @@ def _slow_argv(lines: int, interval: float = 0.4) -> list[str]:
         "    print('line-%d' % i, flush=True)\n"
         f"    time.sleep({interval})\n"
     )
-    return [sys.executable, "-c", code]
+    # Site hooks must not consume the fake backend's idle or wall deadline.
+    return [sys.executable, "-I", "-S", "-c", code]
 
 
 def test_log_file_grows_incrementally_before_exit():
@@ -125,7 +126,7 @@ def test_log_file_grows_incrementally_before_exit():
 def test_timeout_preserves_partial_output():
     """(b) On idle timeout, return partial stdout + a TIMEOUT marker and rc 124."""
     code = "import time\nprint('line-0', flush=True)\ntime.sleep(60)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -290,7 +291,7 @@ def test_idle_timeout_seconds_deadline_skips_explicit_disable_contracts():
 def test_silent_child_can_think_until_requested_timeout():
     """No output is not itself a hang signal; only the requested timeout can stop it."""
     code = "import time\ntime.sleep(1.2)\nprint('done', flush=True)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -326,7 +327,7 @@ def test_heartbeat_fires_periodically_during_silent_idle_wait():
     independent of `backends._ANNOUNCE_LOGS` (which the plain `review diff` mode never
     sets, so there is not even a "tail -f this log" pointer to fall back on)."""
     code = "import time\ntime.sleep(4)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     buf = io.StringIO()
     with _with_env(REVIEW_HEARTBEAT_SECONDS="1"), contextlib.redirect_stderr(buf):
@@ -354,7 +355,7 @@ def test_heartbeat_fires_during_wall_mode_wait():
     """Bounded wall-clock callers (QA/vision) get the same heartbeat treatment as the
     idle-mode poll loop -- one shared observability fix, not a one-off."""
     code = "import time\ntime.sleep(4)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     buf = io.StringIO()
     with _with_env(REVIEW_HEARTBEAT_SECONDS="1"), contextlib.redirect_stderr(buf):
@@ -382,7 +383,7 @@ def test_heartbeat_disabled_via_env_zero():
     """$REVIEW_HEARTBEAT_SECONDS=0 opts out entirely, mirroring the existing
     $REVIEW_IDLE_TIMEOUT_SECONDS=0 "0 means disabled" convention."""
     code = "import time\ntime.sleep(2)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     buf = io.StringIO()
     with _with_env(REVIEW_HEARTBEAT_SECONDS="0"), contextlib.redirect_stderr(buf):
@@ -443,7 +444,7 @@ def test_heartbeat_reports_output_then_idle_state():
     must say so (distinct wording from "no output yet") -- the same distinction
     `_opencode_call_stalled`/true-silence detection already draws elsewhere."""
     code = "import time\nprint('alive', flush=True)\ntime.sleep(4)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     buf = io.StringIO()
     with (
@@ -476,7 +477,7 @@ def test_heartbeat_survives_a_closed_stderr():
     io.StringIO raises ValueError, not OSError -- `_emit_wait_heartbeat` must catch
     both, or a closed stderr turns a harmless heartbeat into a failed review."""
     code = "import time\ntime.sleep(2)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     buf = io.StringIO()
     buf.close()  # any write now raises ValueError: I/O operation on closed file
@@ -552,7 +553,7 @@ def test_heartbeat_never_blocks_the_timeout_loop_on_a_full_pipe():
     writer = os.fdopen(write_fd, "w", buffering=1)
 
     code = "import time\ntime.sleep(4)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
     result_holder: dict[str, object] = {}
 
     def _run_it():
@@ -677,7 +678,7 @@ def test_heartbeat_thread_leak_is_bounded_not_unbounded():
     # tick/call opportunities to leak a thread -- well past the forced cap of 2.
     cap = "2"
     code = "import time\ntime.sleep(10)\n"  # well past the 2s timeout -- no race margin
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
     result_holder: dict[str, object] = {}
 
     def _run_two_calls():
@@ -800,7 +801,7 @@ def test_liveness_timeout_kills_a_totally_silent_process_fast():
     zai/glm seat hanging on quota exhaustion) must be reaped at `liveness_timeout`, well
     before the generous default idle window."""
     code = "import time\ntime.sleep(30)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -823,7 +824,7 @@ def test_liveness_timeout_does_not_fire_once_output_arrives():
     only total silence from spawn is a liveness failure; silence AFTER output is still
     governed by the normal (generous) idle timeout."""
     code = "import time\nprint('alive', flush=True)\ntime.sleep(2)\nprint('done', flush=True)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -846,7 +847,7 @@ def test_liveness_timeout_still_fires_when_idle_reap_is_disabled():
     zero-output backend must still be reaped at the liveness bound, not left to wait
     out the full wall-clock `timeout`."""
     code = "import time\ntime.sleep(30)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
@@ -903,7 +904,7 @@ def test_liveness_timeout_is_clamped_to_a_smaller_idle_window():
     stall (not an ordinary idle timeout) -- the idle bound firing first must not mask
     the fact that the call never produced a single byte."""
     code = "import time\ntime.sleep(30)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="1"):
         result = review._run_streamed(
@@ -930,7 +931,7 @@ def test_liveness_stall_at_the_requested_bound_is_not_marked_clamped():
     the one that actually fires (idle window larger), `stall_bound_clamped` is False --
     this is the genuine quota-exhaustion signature the opencode retry loop acts on."""
     code = "import time\ntime.sleep(30)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="100"):
         result = review._run_streamed(
@@ -950,7 +951,7 @@ def test_liveness_stall_at_the_requested_bound_is_not_marked_clamped():
 def test_disabled_idle_reap_falls_back_to_wall_timeout():
     """REVIEW_IDLE_TIMEOUT_SECONDS=0 must not turn _run_streamed into an unbounded wait."""
     code = "import time\nprint('started', flush=True)\ntime.sleep(60)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
         result = review._run_streamed(
@@ -979,11 +980,11 @@ def test_flushed_partial_line_survives_timeout():
         "sys.stdout.write('partial-no-newline')\n"  # flushed, but NO newline
         "sys.stdout.flush()\n"
         # escaped descendant keeps stdout open so the parent's pipe never EOFs
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "subprocess.Popen([sys.executable, '-I', '-S', '-c', 'import time; time.sleep(30)'], "
         "start_new_session=True)\n"
         "time.sleep(60)\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv, cwd=REPO_ROOT, timeout=2, backend="faketest-partial", round_no=7
@@ -1009,10 +1010,10 @@ def test_timeout_kills_process_tree_without_hanging():
         "import os, sys, subprocess, time\n"
         "print('parent-line', flush=True)\n"
         # grandchild keeps stdout (fd 1) open while sleeping 60s
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "subprocess.Popen([sys.executable, '-I', '-S', '-c', 'import time; time.sleep(60)'])\n"
         "time.sleep(60)\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -1044,10 +1045,10 @@ def test_clean_exit_with_grandchild_holding_pipe_does_not_hang_or_leak():
         "import sys, subprocess, time\n"
         "print('parent-line', flush=True)\n"
         # grandchild inherits stdout (same group) and sleeps; parent exits right away.
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "subprocess.Popen([sys.executable, '-I', '-S', '-c', 'import time; time.sleep(60)'])\n"
         "sys.exit(0)\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -1085,11 +1086,11 @@ def test_timeout_when_grandchild_escapes_the_process_group():
         "print('parent-line', flush=True)\n"
         # grandchild starts a NEW session -> escapes the parent's process group, but
         # still inherits stdout (fd 1) and holds it open while sleeping.
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "subprocess.Popen([sys.executable, '-I', '-S', '-c', 'import time; time.sleep(60)'], "
         "start_new_session=True)\n"
         "time.sleep(60)\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -1127,13 +1128,13 @@ def test_no_daemon_traceback_when_escaped_writer_outlives_close():
             "code = (\n"
             '  "import sys, subprocess, time\\n"\n'
             "  \"print('p', flush=True)\\n\"\n"
-            "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\n\"\n"
+            "  \"subprocess.Popen([sys.executable,'-I','-S','-c','import sys,time\\\\n\"\n"
             '  "time.sleep(3)\\\\nwhile True:\\\\n "\n'
             '  "sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)\'], "\n'
             '  "start_new_session=True)\\n"\n'
             '  "time.sleep(60)\\n"\n'
             ")\n"
-            "r = rv._run_streamed([sys.executable,'-c',code], cwd=rv.Path('.'), timeout=2, "
+            "r = rv._run_streamed([sys.executable,'-I','-S','-c',code], cwd=rv.Path('.'), timeout=2, "
             "backend='postclose', round_no=1)\n"
             "assert r.returncode == 124 and 'p' in r.stdout\n"
             "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
@@ -1162,7 +1163,7 @@ def test_log_file_is_private():
     """Logs may contain reviewed prompts/diffs, so files must be 0600 (owner-only)."""
     import stat
 
-    argv = [sys.executable, "-c", "print('x', flush=True)"]
+    argv = [sys.executable, "-I", "-S", "-c", "print('x', flush=True)"]
     review._run_streamed(
         argv, cwd=REPO_ROOT, timeout=10, backend="faketest", round_no=4
     )
@@ -1351,7 +1352,7 @@ def test_true_silence_kills_a_never_talking_child_before_the_idle_floor():
     """A child that NEVER writes anything must be reaped by true_silence_timeout, well
     before the (much longer) ordinary idle timeout would have caught it."""
     code = "import time\ntime.sleep(60)\n"  # never prints a single byte
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -1385,7 +1386,7 @@ def test_a_genuine_child_exit_125_is_not_mistaken_for_true_silence():
     before any timeout — must get `.true_silenced is False`; only the poll loop's own
     true-silence kill may ever set it True."""
     code = "print('real output', flush=True)\nraise SystemExit(125)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -1412,7 +1413,7 @@ def test_true_silence_still_fires_when_larger_than_the_idle_timeout():
     the race and reap with rc 124 first, silently making the generous true-silence
     budget unreachable."""
     code = "import time\ntime.sleep(60)\n"  # never prints a single byte
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -1442,7 +1443,7 @@ def test_true_silence_does_not_fire_once_any_output_arrives():
         "time.sleep(1.5)\n"
         "print('done', flush=True)\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -1475,7 +1476,7 @@ def test_true_silence_does_not_fire_for_stderr_only_progress():
         "time.sleep(1.5)\n"
         "print('more progress', file=sys.stderr, flush=True)\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -1513,7 +1514,7 @@ def test_true_silence_does_not_fire_on_a_stalled_partial_multibyte_sequence():
         "sys.stdout.buffer.write(b'\\x97\\xa5 done\\n')\n"  # completes the character
         "sys.stdout.buffer.flush()\n"
     )
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -1536,7 +1537,7 @@ def test_true_silence_timeout_none_disables_the_check():
     """The default (true_silence_timeout=None) must not change ANY existing caller's
     behavior — a silent-but-eventually-talking child still gets its full idle budget."""
     code = "import time\ntime.sleep(1.2)\nprint('done', flush=True)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -1561,7 +1562,7 @@ def test_true_silence_wall_mode_is_unaffected():
     would be reaped at 1s by the true-silence path if it were reachable, but must
     instead run the full 3s wall budget it actually requested)."""
     code = "import time\ntime.sleep(60)\n"
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     started = time.monotonic()
     result = review._run_streamed(
@@ -1603,7 +1604,7 @@ def test_true_silence_timeout_is_clamped_to_a_near_board_deadline():
     not just on idle_timeout), by monkeypatching the shared clamp function to a fast,
     deterministic stand-in rather than waiting out the real floor."""
     code = "import time\ntime.sleep(60)\n"  # never prints a single byte
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     calls: list[int] = []
     orig_clamp = process._clamp_to_board_deadline
@@ -1654,7 +1655,7 @@ def test_true_silence_clamp_reflects_state_after_the_concurrency_wait_not_before
     cannot compute the clamp until the real semaphore unblocks it -- no earlier
     than our release()."""
     code = "import time\ntime.sleep(60)\n"  # never prints a single byte
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     clamp_return = {"value": 999}  # the "pre-flip" (stale) value
 
@@ -1807,7 +1808,7 @@ def test_true_silence_is_also_disabled_when_idle_reap_is_disabled():
     refactor of the wait paths can't silently re-arm true-silence under
     idle_timeout=None with no test catching it."""
     code = "import time\ntime.sleep(60)\n"  # never prints a single byte
-    argv = [sys.executable, "-c", code]
+    argv = [sys.executable, "-I", "-S", "-c", code]
 
     with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
         result = review._run_streamed(
