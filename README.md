@@ -114,12 +114,20 @@ review task HYP-742 --detail 2
 > the config file + cascade, the model/board selection, and keys/auth. The main `--help`
 > lists the available topics.
 
-> **Task history: `--task CODE` is required for review modes.** `review` stores the code
-> in run stats and per-call logs, so `review task CODE` and the dashboard can show how many
-> iterations were run for that task, which models participated, and the detailed
-> conversations when logs are still present. Use `$REVIEW_TASK_CODE` in hooks/agents when
-> repeating `--task` on every command would be noisy. `CODE` is one non-whitespace token,
-> max 120 characters, with no control characters; examples: `HYP-742`, `review-cli-108`.
+> **Task codes are optional in every execution mode.** Supply `--task CODE` or
+> `$REVIEW_TASK_CODE` when known. Every run has a durable ID, visible in `review jobs`
+> and `review status RUN_ID --json`. Unassociated runs print a copyable attachment
+> command on stderr after saving their output:
+>
+> `review attach 20260914T120000-a1b2c3d4 --task CODE`
+>
+> Replace the example run ID with yours, or copy the command printed by your run.
+> If the review belongs to a task, attach it; if no task exists, consider creating one.
+> Attachment never reruns models or changes recorded outcomes, timestamps, roles or
+> diff identity. Repeating the same association succeeds; a different task conflicts.
+> Codes remain one non-whitespace token, max 120 characters, without control characters.
+> `review task CODE` resolves later associations in history and available call logs.
+> See [the run association specification](docs/specs/optional-task-association.md).
 
 ---
 

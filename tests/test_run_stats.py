@@ -605,7 +605,7 @@ def test_load_records_skips_junk_lines():
 # ---------------------------------------------------------------------------
 # CLI wiring: a real run records a stat record + prints an ETA line (mocked backends)
 # ---------------------------------------------------------------------------
-def test_cli_diff_requires_task_code_before_dispatch():
+def test_cli_diff_without_task_records_run():
     with _TmpStore() as store:
         d = _git_init_with_diff()
         restore = _with_backend_stub(_stub_resolve_backend(0))
@@ -616,9 +616,10 @@ def test_cli_diff_requires_task_code_before_dispatch():
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
                 rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
-            assert rc == 2, rc
-            assert "--task CODE" in err.getvalue()
-            assert store.records() == []
+            assert rc == 0, rc
+            assert "review attach " in err.getvalue()
+            assert len(store.records()) == 1
+            assert "task_code" not in store.records()[0]
         finally:
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -627,22 +628,22 @@ def test_cli_diff_requires_task_code_before_dispatch():
             d.cleanup()
 
 
-def test_cli_visual_diff_requires_task_code_before_dispatch():
+def test_cli_visual_diff_reaches_image_validation_without_task():
     with _TmpStore() as store:
         old_task = os.environ.pop("REVIEW_TASK_CODE", None)
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
                 rc = _cli.main(["visual", "shot.png", "--diff", "-C", str(REPO_ROOT)])
-            assert rc == 2, rc
-            assert "--task CODE" in err.getvalue()
+            assert rc != 0, rc
+            assert "missing required --task" not in err.getvalue()
             assert store.records() == []
         finally:
             if old_task is not None:
                 os.environ["REVIEW_TASK_CODE"] = old_task
 
 
-def test_cli_visual_piped_diff_requires_task_code_before_dispatch():
+def test_cli_visual_piped_diff_reaches_image_validation_without_task():
     with _TmpStore() as store:
         old_task = os.environ.pop("REVIEW_TASK_CODE", None)
         old_stdin = _cli._read_stdin_if_piped
@@ -651,8 +652,8 @@ def test_cli_visual_piped_diff_requires_task_code_before_dispatch():
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
                 rc = _cli.main(["visual", "shot.png", "--no-ai", "-C", str(REPO_ROOT)])
-            assert rc == 2, rc
-            assert "--task CODE" in err.getvalue()
+            assert rc != 0, rc
+            assert "missing required --task" not in err.getvalue()
             assert store.records() == []
         finally:
             _cli._read_stdin_if_piped = old_stdin
@@ -949,13 +950,20 @@ def test_cli_default_board_run_records_preset_pool_size():
     recorded run floors that to 3 so `review task CODE --check` / gh ship can pass from
     one run. The run-stats record must report pool_size == 3 (the sliced board, not the
     full preset board, and not the un-floored light pool of 2)."""
-    r = _run_board_review_and_get_record(
-        []
-    )  # default preset (light) recorded -> floored to 3
-    assert r["mode"] == "review"
-    assert r["pool_size"] == 3, r  # the sliced, ship-floored board
-    assert len(r["models"]) == 3, r
-    assert "[review] pool=3 (review)" in r["_stderr"]
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends, panel as _fixture_panel
+    # Keep direct fixture assignments local to this test, including assertion failure.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, "backend_available", _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, "backend_available", _fixture_panel.backend_available),
+    ):
+        r = _run_board_review_and_get_record(
+            []
+        )  # default preset (light) recorded -> floored to 3
+        assert r["mode"] == "review"
+        assert r["pool_size"] == 3, r  # the sliced, ship-floored board
+        assert len(r["models"]) == 3, r
+        assert "[review] pool=3 (review)" in r["_stderr"]
 
 
 def test_cli_default_board_run_records_roles_review_cli_221():
@@ -970,14 +978,22 @@ def test_cli_default_board_run_records_roles_review_cli_221():
     legitimately pick a different trio of seats than raw board order -- see
     tests/test_run_stats.py::test_cli_failover_backfill_records_actual_models_not_planned
     and rig-cli TaskList #80 for the same pre-existing, already-tracked sensitivity."""
-    from reviewlib.config import REVIEW_ROLES
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    from reviewlib import panel as _fixture_panel
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, 'backend_available', _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, 'backend_available', _fixture_panel.backend_available),
+    ):
+        from reviewlib.config import REVIEW_ROLES
 
-    r = _run_board_review_and_get_record(
-        []
-    )  # default preset (light) recorded -> floored to 3
-    assert len(r["roles"]) == 3, r
-    assert set(r["roles"]) <= set(REVIEW_ROLES), r
-    assert len(set(r["roles"])) == 3, r  # 3 DISTINCT roles, not a repeat
+        r = _run_board_review_and_get_record(
+            []
+        )  # default preset (light) recorded -> floored to 3
+        assert len(r["roles"]) == 3, r
+        assert set(r["roles"]) <= set(REVIEW_ROLES), r
+        assert len(set(r["roles"])) == 3, r  # 3 DISTINCT roles, not a repeat
 
 
 def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
@@ -988,26 +1004,34 @@ def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
     default-board dispatch produces are valid `REVIEW_ROLES` keys that
     `_distinct_roles` wouldn't silently filter out (a silent no-op on the most
     common path, invisible to the rest of the suite)."""
-    dispatched = _run_board_review_and_get_record(
-        []
-    )  # default preset (light) recorded -> floored to 3
-    real_roles = dispatched["roles"]
-    assert len(real_roles) == 3, dispatched
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    from reviewlib import panel as _fixture_panel
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, 'backend_available', _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, 'backend_available', _fixture_panel.backend_available),
+    ):
+        dispatched = _run_board_review_and_get_record(
+            []
+        )  # default preset (light) recorded -> floored to 3
+        real_roles = dispatched["roles"]
+        assert len(real_roles) == 3, dispatched
 
-    with _TmpStore():
-        _stats.record_run(
-            task_code=TASK,
-            mode="review",
-            models=dispatched["models"],
-            roles=real_roles,
-            duration_seconds=1.0,
-            ok_count=2,
-            fail_count=0,
-            passed=True,
-        )
-        result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=2)
-        assert result["passed"] is True, result
-        assert result["distinct_roles_passed"] == 3
+        with _TmpStore():
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=dispatched["models"],
+                roles=real_roles,
+                duration_seconds=1.0,
+                ok_count=2,
+                fail_count=0,
+                passed=True,
+            )
+            result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=2)
+            assert result["passed"] is True, result
+            assert result["distinct_roles_passed"] == 3
 
 
 def test_cli_single_model_task_pad_satisfies_check_end_to_end_review_cli_309():
@@ -1020,74 +1044,90 @@ def test_cli_single_model_task_pad_satisfies_check_end_to_end_review_cli_309():
     quorum_check via the `task --check` subcommand, same repo/diff identity
     context) end-to-end -- no test before this one proved the padding achieves
     its purpose rather than merely producing a correctly-shaped board/pool."""
-    from reviewlib import backends as _backends
-    from reviewlib.modes import review as _review_mode
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    from reviewlib import panel as _fixture_panel
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, 'backend_available', _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, 'backend_available', _fixture_panel.backend_available),
+    ):
+        from reviewlib import backends as _backends
+        from reviewlib.modes import review as _review_mode
 
-    with _TmpStore() as store:
-        d = _git_init_with_diff()
-        restore = _with_backend_stub(_stub_resolve_backend(0))
-        saved_avail_b = _backends.backend_available
-        saved_avail_p = _panel.backend_available
-        saved_avail_r = _review_mode.backend_available
-        _backends.backend_available = lambda _m: True
-        _panel.backend_available = lambda _m: True
-        _review_mode.backend_available = lambda _m: True
-        saved_cfg = _cli.load_config
-        _cli.load_config = lambda: {}
-        log = tempfile.mkdtemp()
-        os.environ["REVIEW_LOG_DIR"] = log
-        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
-        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(log) / "seat-cooldown.json")
-        try:
-            err = io.StringIO()
-            with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "grok"])
-            assert rc == 0, err.getvalue()
-            recs = store.records()
-            assert len(recs) == 1, recs
-            rec = recs[0]
-            assert rec["pool_size"] == 3, rec  # ship-floored, task_role_pad
-            assert len(set(rec["roles"])) == 3, rec  # 1 model, 3 distinct lenses
+        with _TmpStore() as store:
+            d = _git_init_with_diff()
+            restore = _with_backend_stub(_stub_resolve_backend(0))
+            saved_avail_b = _backends.backend_available
+            saved_avail_p = _panel.backend_available
+            saved_avail_r = _review_mode.backend_available
+            _backends.backend_available = lambda _m: True
+            _panel.backend_available = lambda _m: True
+            _review_mode.backend_available = lambda _m: True
+            saved_cfg = _cli.load_config
+            _cli.load_config = lambda: {}
+            log = tempfile.mkdtemp()
+            os.environ["REVIEW_LOG_DIR"] = log
+            saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+            os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(log) / "seat-cooldown.json")
+            try:
+                err = io.StringIO()
+                with redirect_stderr(err), _capture_stdout():
+                    rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "grok"])
+                assert rc == 0, err.getvalue()
+                recs = store.records()
+                assert len(recs) == 1, recs
+                rec = recs[0]
+                assert rec["pool_size"] == 3, rec  # ship-floored, task_role_pad
+                assert len(set(rec["roles"])) == 3, rec  # 1 model, 3 distinct lenses
 
-            # The gate this padding exists to satisfy, run for REAL (not a direct
-            # quorum_check() call): same repo/diff context (diff-identity binding,
-            # see reviewlib.stats module docstring) as the recording dispatch above.
-            # `--min-iter 1` isolates the distinct-ROLE floor this test targets from
-            # the (unrelated, default 3) passed-ITERATION floor -- a single dispatch
-            # can only ever produce one passed iteration.
-            out = io.StringIO()
-            with redirect_stderr(io.StringIO()), redirect_stdout(out):
-                check_rc = _cli.main(
-                    ["task", TASK, "--check", "--min-iter", "1", "-C", d.name]
-                )
-            assert check_rc == 0, out.getvalue()
-            payload = out.getvalue()
-            # Must pass on DISTINCT-ROLE grounds -- a single model could never
-            # satisfy a >=2 distinct-MODEL floor, so a pass here that silently fell
-            # back to model-counting would prove nothing about the role pad.
-            assert "role" in payload.lower(), payload
-        finally:
-            restore()
-            _backends.backend_available = saved_avail_b
-            _panel.backend_available = saved_avail_p
-            _review_mode.backend_available = saved_avail_r
-            _cli.load_config = saved_cfg
-            os.environ.pop("REVIEW_LOG_DIR", None)
-            if saved_cd_file is None:
-                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
-            else:
-                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
-            d.cleanup()
+                # The gate this padding exists to satisfy, run for REAL (not a direct
+                # quorum_check() call): same repo/diff context (diff-identity binding,
+                # see reviewlib.stats module docstring) as the recording dispatch above.
+                # `--min-iter 1` isolates the distinct-ROLE floor this test targets from
+                # the (unrelated, default 3) passed-ITERATION floor -- a single dispatch
+                # can only ever produce one passed iteration.
+                out = io.StringIO()
+                with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                    check_rc = _cli.main(
+                        ["task", TASK, "--check", "--min-iter", "1", "-C", d.name]
+                    )
+                assert check_rc == 0, out.getvalue()
+                payload = out.getvalue()
+                # Must pass on DISTINCT-ROLE grounds -- a single model could never
+                # satisfy a >=2 distinct-MODEL floor, so a pass here that silently fell
+                # back to model-counting would prove nothing about the role pad.
+                assert "role" in payload.lower(), payload
+            finally:
+                restore()
+                _backends.backend_available = saved_avail_b
+                _panel.backend_available = saved_avail_p
+                _review_mode.backend_available = saved_avail_r
+                _cli.load_config = saved_cfg
+                os.environ.pop("REVIEW_LOG_DIR", None)
+                if saved_cd_file is None:
+                    os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+                else:
+                    os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+                d.cleanup()
 
 
 def test_cli_board_run_records_explicit_pool_size():
     """`--pool 2` must record pool_size == 2 (not 4, not 9): the slice feeds run-stats
     at arbitrary sizes, not just the default (GLM finding 23)."""
-    r = _run_board_review_and_get_record(["--pool", "2"])
-    assert r["mode"] == "review"
-    assert r["pool_size"] == 2, r
-    assert len(r["models"]) == 2, r
-    assert "[review] pool=2 (review)" in r["_stderr"]
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    from reviewlib import panel as _fixture_panel
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, 'backend_available', _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, 'backend_available', _fixture_panel.backend_available),
+    ):
+        r = _run_board_review_and_get_record(["--pool", "2"])
+        assert r["mode"] == "review"
+        assert r["pool_size"] == 2, r
+        assert len(r["models"]) == 2, r
+        assert "[review] pool=2 (review)" in r["_stderr"]
 
 
 def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
@@ -1174,28 +1214,36 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     from HEAVY_PRESET_BOARD entirely, so heavy pool 4 is now [Sol, Opus, GLM-cc, Kimi];
     the top seat (Sol) fails, Astra (the next reserve seat) backfills, and the record
     excludes Sol while keeping pool_size 4."""
-    from reviewlib.config import ASTRA_SEAT
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    from reviewlib import panel as _fixture_panel
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, 'backend_available', _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, 'backend_available', _fixture_panel.backend_available),
+    ):
+        from reviewlib.config import ASTRA_SEAT
 
-    # Sol (priority #1 in the heavy pool of 4, now that Fable is excluded) fails;
-    # everything else succeeds.
-    resolver = _stub_resolve_backend({"codex:gpt-5.6-sol": 1})
-    r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
-    assert r["_rc"] == 0, r
-    assert r["mode"] == "review"
-    assert r["pool_size"] == 4, r  # backfilled back up to 4
-    # Full set, not individual `in` checks: Kimi is now a PLANNED pool seat (heavy pool 4
-    # is Sol/Opus/GLM-cc/Kimi post-exclusion), so a regression where Kimi also silently
-    # failed and the NEXT reserve backfilled instead would pass a partial `in`-only check.
-    assert set(r["models"]) == {
-        "claude:claude-opus-4-8",
-        "commandcode:zai-org/GLM-5.2",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        ASTRA_SEAT,  # the promoted reserve (#5, post-exclusion), by its real id
-    }, r
-    assert "claude:claude-fable-5" not in r["models"], r
-    assert "codex:gpt-5.6-sol" not in r["models"], r  # the failed seat, not backfilled
-    assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
-    assert "promoting reserve" in r["_stderr"]  # failover actually fired
+        # Sol (priority #1 in the heavy pool of 4, now that Fable is excluded) fails;
+        # everything else succeeds.
+        resolver = _stub_resolve_backend({"codex:gpt-5.6-sol": 1})
+        r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
+        assert r["_rc"] == 0, r
+        assert r["mode"] == "review"
+        assert r["pool_size"] == 4, r  # backfilled back up to 4
+        # Full set, not individual `in` checks: Kimi is now a PLANNED pool seat (heavy pool 4
+        # is Sol/Opus/GLM-cc/Kimi post-exclusion), so a regression where Kimi also silently
+        # failed and the NEXT reserve backfilled instead would pass a partial `in`-only check.
+        assert set(r["models"]) == {
+            "claude:claude-opus-4-8",
+            "commandcode:zai-org/GLM-5.2",
+            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+            ASTRA_SEAT,  # the promoted reserve (#5, post-exclusion), by its real id
+        }, r
+        assert "claude:claude-fable-5" not in r["models"], r
+        assert "codex:gpt-5.6-sol" not in r["models"], r  # the failed seat, not backfilled
+        assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
+        assert "promoting reserve" in r["_stderr"]  # failover actually fired
 
 
 def test_cli_failover_exhausted_reserve_degrades_exit_1():
@@ -1204,17 +1252,25 @@ def test_cli_failover_exhausted_reserve_degrades_exit_1():
     only the seats that produced verdicts. Bare invocation targets the light preset's
     pool of 2 (Alex, 2026-08-28), so only ONE usable seat is needed to fall short."""
     # Fail everything EXCEPT opus -> only 1 usable, reserve can't reach the pool of 2.
-    from reviewlib.config import DEFAULT_BOARD
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    from reviewlib import panel as _fixture_panel
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, 'backend_available', _fixture_backends.backend_available),
+        _fixture_binding_patch.object(_fixture_panel, 'backend_available', _fixture_panel.backend_available),
+    ):
+        from reviewlib.config import DEFAULT_BOARD
 
-    ok = {"claude:claude-opus-4-8"}
-    resolver = _stub_resolve_backend(
-        {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
-    )
-    r = _run_board_review_with_resolver([], resolver)
-    assert r["_rc"] == 1, r
-    assert "degraded" in r["_stderr"], r["_stderr"]
-    assert set(r["models"]) == ok, r  # only the seats that produced verdicts
-    assert r["pool_size"] == 1, r
+        ok = {"claude:claude-opus-4-8"}
+        resolver = _stub_resolve_backend(
+            {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
+        )
+        r = _run_board_review_with_resolver([], resolver)
+        assert r["_rc"] == 1, r
+        assert "degraded" in r["_stderr"], r["_stderr"]
+        assert set(r["models"]) == ok, r  # only the seats that produced verdicts
+        assert r["pool_size"] == 1, r
 
 
 def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failure():
@@ -1672,45 +1728,51 @@ def test_cli_task_detail_matches_logs_by_timestamp_not_iteration_index():
 def test_cli_brainstorm_records_persona_slot_pool_not_raw_models():
     """A 2-model brainstorm dispatches max(3, len(panel))=3 persona slots per round, so
     the recorded pool_size must be 3, not 2 (codex P2: don't undercount small panels)."""
-    with _TmpStore() as store:
-        d = tempfile.TemporaryDirectory()  # no diff needed for brainstorm
-        restore = _with_backend_stub(_stub_resolve_backend(0))
-        log = tempfile.mkdtemp()
-        os.environ["REVIEW_LOG_DIR"] = log
-        # Keep the run tiny: min rounds is floored at 5 internally, but the moderator is
-        # also stubbed (returns ok), so each round is instant. Cap rounds via --rounds.
-        try:
-            with redirect_stderr(io.StringIO()), _capture_stdout():
-                _cli.main(
-                    [
-                        "brainstorm",
-                        "topic",
-                        *TASK_ARGS,
-                        "-C",
-                        d.name,
-                        "-m",
-                        "codex,gemini",
-                        "--rounds",
-                        "1",
-                        "--max-rounds",
-                        "1",
-                    ]
-                )
-            recs = store.records()
-            assert len(recs) == 1, recs
-            r = recs[0]
-            assert r["mode"] == "brainstorm"
-            assert r["pool_size"] == 3, r  # 2 models -> 3 persona slots
-            # Every stubbed backend (personas + moderator) returns rc=0, so a healthy
-            # run must tally ZERO failures and a positive ok_count. This guards the
-            # success path: before the stub accepted round_no, the 6-arg panel call
-            # raised TypeError and these would have been ok=0 / fail>0 unnoticed.
-            assert r["fail_count"] == 0, r
-            assert r["ok_count"] >= 1, r
-        finally:
-            restore()
-            os.environ.pop("REVIEW_LOG_DIR", None)
-            d.cleanup()
+    from unittest.mock import patch as _fixture_binding_patch
+    from reviewlib import backends as _fixture_backends
+    # Restore observed fixture state before another test uses the real product.
+    with (
+        _fixture_binding_patch.object(_fixture_backends, '_ANNOUNCE_LOGS', _fixture_backends._ANNOUNCE_LOGS),
+    ):
+        with _TmpStore() as store:
+            d = tempfile.TemporaryDirectory()  # no diff needed for brainstorm
+            restore = _with_backend_stub(_stub_resolve_backend(0))
+            log = tempfile.mkdtemp()
+            os.environ["REVIEW_LOG_DIR"] = log
+            # Keep the run tiny: min rounds is floored at 5 internally, but the moderator is
+            # also stubbed (returns ok), so each round is instant. Cap rounds via --rounds.
+            try:
+                with redirect_stderr(io.StringIO()), _capture_stdout():
+                    _cli.main(
+                        [
+                            "brainstorm",
+                            "topic",
+                            *TASK_ARGS,
+                            "-C",
+                            d.name,
+                            "-m",
+                            "codex,gemini",
+                            "--rounds",
+                            "1",
+                            "--max-rounds",
+                            "1",
+                        ]
+                    )
+                recs = store.records()
+                assert len(recs) == 1, recs
+                r = recs[0]
+                assert r["mode"] == "brainstorm"
+                assert r["pool_size"] == 3, r  # 2 models -> 3 persona slots
+                # Every stubbed backend (personas + moderator) returns rc=0, so a healthy
+                # run must tally ZERO failures and a positive ok_count. This guards the
+                # success path: before the stub accepted round_no, the 6-arg panel call
+                # raised TypeError and these would have been ok=0 / fail>0 unnoticed.
+                assert r["fail_count"] == 0, r
+                assert r["ok_count"] >= 1, r
+            finally:
+                restore()
+                os.environ.pop("REVIEW_LOG_DIR", None)
+                d.cleanup()
 
 
 def test_moderator_empty_output_tallies_as_fail_not_ok():

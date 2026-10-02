@@ -190,8 +190,8 @@ def test_wait_blocks_until_done_and_returns_job_exit_code():
 def test_wait_and_status_pass_through_the_job_own_distinctive_exit_code():
     """`review wait`/`review status` must report the JOB's own recorded exit code, not
     collapse every failure to a bare 1 — a caller scripting against a specific code
-    (2 for a usage error, 124 for a timeout, …) needs the real value. A missing
-    `--task` is a deterministic, fake-backend-independent way to force exit code 2."""
+    (2 for a usage error, 124 for a timeout, …) needs the real value. An invalid
+    supplied task is a deterministic, provider-independent way to force exit code 2."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         repo = _make_repo(tmp)
@@ -205,6 +205,7 @@ def test_wait_and_status_pass_through_the_job_own_distinctive_exit_code():
             str(repo),
             "-m",
             "claude:claude-opus-4-8",
+            "--task", "invalid task",
             "--detach",
         ]
         detach = _run_cli(args, env)
@@ -617,45 +618,24 @@ def test_detach_accepts_a_leading_global_option_before_the_mode():
         assert final.get("status") == "done", final
 
 
-def test_main_finalizer_never_turns_a_finished_review_into_a_failure():
-    """Review round 3 (GH-162), Codex P1: `main`'s finally-block job-status write caught
-    only `InvalidJobId`. A jobs dir that became unwritable AFTER spawn (a sandbox grant
-    expiring mid-review) made that write raise `OSError`, which escaped the finalizer
-    and replaced an otherwise successful review's exit code with a traceback. The
-    write is best-effort: the review's own exit code wins, and stderr says why the
-    record was not updated. Simulated by parking a DIRECTORY at the record's path so
-    `_atomic_write`'s `os.replace` fails with `OSError` exactly where a permission
-    error would."""
+def test_main_rejects_unowned_or_corrupt_job_identity():
+    """Inherited IDs must not overwrite unrelated records, even on a help request."""
     from reviewlib import jobs as jobs_mod
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         env = _env(tmp)
         (tmp / "jobs").mkdir()
-        job_id = jobs_mod.new_job_id()
-        env["REVIEW_JOB_ID"] = job_id
-        (tmp / "jobs" / f"{job_id}.json").mkdir()
-        proc = _run_cli(["--help"], env, timeout=10)
-        assert proc.returncode == 0, (proc.stdout, proc.stderr)
-        assert proc.stdout.startswith("usage:"), proc.stdout
-        assert "Traceback" not in proc.stderr, proc.stderr
-        assert "could not record the final status" in proc.stderr, proc.stderr
-        assert job_id in proc.stderr
-        # Same P1, second shape (Codex, staged round): the record file holds valid JSON
-        # that is not an object. `write_job`'s read-modify-write used to raise
-        # `TypeError` on it; `read_job` now treats a non-dict as "no record" and the
-        # finalizer simply (re)creates the record.
-        for body in ("[]", '"x"', "null"):
-            other = jobs_mod.new_job_id()
-            env["REVIEW_JOB_ID"] = other
-            (tmp / "jobs" / f"{other}.json").write_text(body, encoding="utf-8")
+        for body in ("[]", '\"x\"', "null"):
+            run_id = jobs_mod.new_job_id()
+            env["REVIEW_JOB_ID"] = run_id
+            path = tmp / "jobs" / f"{run_id}.json"
+            path.write_text(body, encoding="utf-8")
             proc = _run_cli(["--help"], env, timeout=10)
-            assert proc.returncode == 0, (body, proc.stdout, proc.stderr)
-            assert "Traceback" not in proc.stderr, (body, proc.stderr)
-            assert (
-                json.loads((tmp / "jobs" / f"{other}.json").read_text())["status"]
-                == "done"
-            ), body
+            assert proc.returncode == 2
+            assert "REVIEW_JOB_ID" in proc.stderr
+            assert "Traceback" not in proc.stderr
+            assert path.read_text() == body
 
 
 def test_jobs_listing_skips_schema_malformed_records():

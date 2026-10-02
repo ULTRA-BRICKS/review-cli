@@ -842,7 +842,16 @@ def current_task_code() -> str | None:
 
 def _task_header_suffix() -> str:
     code = current_task_code()
-    return f" task={code}" if code else ""
+    suffix = f" task={code}" if code else ""
+    run_id = os.environ.get("REVIEW_JOB_ID")
+    if run_id:
+        from .jobs import _validate_job_id, InvalidJobId
+        try:
+            _validate_job_id(run_id)
+        except InvalidJobId:
+            return suffix
+        suffix += f" run={run_id}"
+    return suffix
 
 
 def _open_log(backend: str, round_no: int) -> Path:

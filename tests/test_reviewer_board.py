@@ -3887,9 +3887,9 @@ def test_cli_recorded_task_explicit_pool_above_floor_wins_over_single_model_pad(
     assert captured["pool_size"] == 5, captured
 
 
-def test_show_board_light_preset_keeps_pool_two_without_task():
-    """`--show-board` is not a recorded review: light stays pool 2.
-    Isolated from `$REVIEW_TASK_CODE` so a session env cannot floor this pin."""
+def test_show_board_light_preset_applies_role_floor_without_task():
+    """Omitting task identity must not lower the configured review-role floor."""
+    from reviewlib.config import SHIP_MIN_ROLES
     import contextlib
     import io
 
@@ -3911,7 +3911,7 @@ def test_show_board_light_preset_keeps_pool_two_without_task():
             os.environ["REVIEW_TASK_CODE"] = old_task
     assert rc == 0, buf.getvalue()
     out = buf.getvalue()
-    assert "top 2 AVAILABLE" in out, out
+    assert f"top {SHIP_MIN_ROLES} AVAILABLE" in out, out
 
 
 def test_show_board_with_task_floors_light_pool_to_three():

@@ -34,9 +34,14 @@ diff review is the `diff` subcommand: `review diff` (renamed from the stuttering
 verb) print a one-line "use `review diff`" pointer and exit non-zero. The meta flags
 (`--list-defaults` / `--show-board` / `--help`) still work with no subcommand. The OLD
 mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were likewise REMOVED — they print
-a "use the subcommand" pointer and exit non-zero. Every recorded review mode requires
-`--task CODE` or `$REVIEW_TASK_CODE`; standalone `review visual IMAGE` is the exception,
-while `review visual IMAGE --diff` is a diff-review iteration and must carry a task code.
+a "use the subcommand" pointer and exit non-zero. Every model-executing review mode accepts an omitted task code.
+Supply `--task CODE` or `$REVIEW_TASK_CODE` when known, or attach afterwards with
+`review attach RUN_ID --task CODE`. `review jobs` lists synchronous and detached runs;
+`review status RUN_ID --json` exposes their saved output and original evidence.
+Attachment changes association only: never recompute repository/diff identity, alter
+outcomes, or rerun providers. The post-run guidance belongs on stderr, after durable
+output exists. Role planning must not depend on task presence. `attach` is management,
+not a fan-out mode. See `docs/specs/optional-task-association.md`.
 Task codes are one non-whitespace token, max 120 characters, with no control characters.
 
 Bare subcommands also handled directly by the CLI: `dashboard`, `sessions`, `spec-web`,
