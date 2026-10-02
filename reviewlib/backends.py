@@ -892,7 +892,7 @@ def _record_true_silence_if_needed(model: str, proc) -> None:
     Opus review finding, round 14 (doc accuracy): `_chronic_unavailable_reason` runs
     on EVERY non-true-silenced outcome, not just the rc=0 sentinel case — a non-zero
     exit whose stderr/short-stdout matches `_CHRONIC_QUOTA_MARKERS` ("session limit" /
-    "usage-credits" / "usage credits") ALSO records a cooldown here, mirroring
+    "usage-credits" / "usage credits" / "limit exhausted") ALSO records a cooldown here, mirroring
     `review_claude`'s identical handling of that same signal. The narrower framing
     above ("closes the false-clear ... rc=0 body") describes the round-12 FIX's
     motivating scenario, not the full scope of what this call now covers."""
@@ -2590,7 +2590,16 @@ _UNAVAILABLE_MARKERS = (
 # OTHER chronic shape the token-burn investigation found dominates Fable's real failures
 # (1,836 of 4,322 recorded failures) — it is NOT rc=0/short-body shaped like the sentinel
 # above (the CLI exits non-zero), so it needs its own marker check.
-_CHRONIC_QUOTA_MARKERS = ("session limit", "usage-credits", "usage credits")
+_CHRONIC_QUOTA_MARKERS = (
+    "session limit",
+    "usage-credits",
+    "usage credits",
+    "limit exhausted",
+)
+# "limit exhausted" added 2026-09-01: a real production log showed a backend returning
+# "Weekly/Monthly Limit Exhausted. Your limit will reset at <timestamp>" — this phrase
+# was not in the marker tuple, so `_chronic_unavailable_reason` never recognised it and
+# the seat kept being retried on every subsequent call instead of being cooled down.
 # The administrative sentinel is only trustworthy when the WHOLE body is short (a
 # one-liner notice) — a real, long review that happens to mention availability must
 # never be cached as a chronic failure. Shared by panel.result_is_usable and

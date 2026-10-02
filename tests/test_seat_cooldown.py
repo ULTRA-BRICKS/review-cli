@@ -1959,6 +1959,38 @@ def test_review_claude_caches_chronic_quota_exhaustion_delivered_as_429():
     _with_store(_run)
 
 
+def test_review_claude_caches_the_weekly_monthly_limit_exhausted_marker():
+    """Regression: a real production log (2026-09-01) showed a backend returning
+    "Weekly/Monthly Limit Exhausted. Your limit will reset at <timestamp>" -- this exact
+    phrase was not in `_CHRONIC_QUOTA_MARKERS`, so `_chronic_unavailable_reason` never
+    recognised it and the seat kept being retried on every subsequent call instead of
+    being cooled down."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr="Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10 21:15:09",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
+
+    _with_store(_run)
+
+
 def test_review_claude_caches_a_quota_marker_in_a_long_partial_transcript():
     """k3 review finding (round 9): `reviewlib/dashboard/parser.py` documents a
     VERIFIED real shape -- a CLI call can stream a long partial review transcript
