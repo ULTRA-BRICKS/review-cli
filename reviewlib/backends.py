@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +28,11 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
+
+try:
+    import fcntl  # POSIX advisory file locking (cross-process) -- mirrors seat_cooldown.py
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
 
 from .config import _agentic
 from .install import install_codex_recursion_guard
@@ -296,7 +302,9 @@ def review_with_images(
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         if not allow_spawn_for_model(model):
-            reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            reason = (
+                spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            )
             return _usage_limit_skip_result(model, round_no, reason, backend="claude")
         result = review_claude_cli_with_images(
             model, prompt, diff, cwd, timeout, round_no, images, effort=effort
@@ -1413,7 +1421,9 @@ def review_gemini(
             stderr = ""
         else:
             stdout = ""
-            stderr = f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            stderr = (
+                f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            )
         _emit_rest_log(
             "gemini",
             command,
@@ -2374,7 +2384,8 @@ def review_claude_api(
         # content to `result_is_usable()`; keep the failed result's stdout empty
         # like the other REST paths (tokens still ride on the result fields).
         stdout = (
-            text.strip() + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            text.strip()
+            + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
             if rc == 0
             else ""
         )
@@ -4645,7 +4656,16 @@ def backend_unavailable_reason(model: str) -> str | None:
     Mirrors `backend_available`'s probe exactly but surfaces WHY a seat is dead so the
     pool-selection guard (reviewlib.pool_guard) can annotate every printed model list with
     per-seat health (live / down + reason). Never raises: a probe RuntimeError (missing
-    key/CLI) becomes its message; unpaid/paywalled providers get their dedicated reason."""
+    key/CLI) becomes its message; unpaid/paywalled providers get their dedicated reason.
+
+    On top of the per-backend auth/CLI probe (`_backend_probe_reason`), a backend that IS
+    reachable still gets a pre-emptive `spawn_refuse_reason` check: a seat whose
+    harness-tracked 5-hour/7-day window is already 100% exhausted (codex/claude today;
+    zai/xai/kimi-code once usage_limits' family maps carry them — see
+    usage_limits._AGENT_FAMILY_PREFIXES) is reported unavailable here instead of being
+    dispatched and failing slowly. `review_claude`'s own dispatch already does this same
+    check for itself; this makes it apply to EVERY backend uniformly, so pool_guard/
+    --show-board surface the real reason instead of dispatching a doomed seat."""
     # TEST-ONLY: under the fake backend EVERY model is reachable (it is faked in-process,
     # no key/CLI needed). Without this the panel/moderator selection would prune the faked
     # models as "unavailable" on a host lacking the real CLIs (e.g. CI), defeating the e2e.
@@ -4656,7 +4676,23 @@ def backend_unavailable_reason(model: str) -> str | None:
     preflight = cached_payment_preflight_unavailable_reason(model)
     if preflight is not None:
         return preflight
-    backend = resolve_backend(model)
+    probe_reason = _backend_probe_reason(model, resolve_backend(model))
+    if probe_reason is not None:
+        return probe_reason
+    refuse = spawn_refuse_reason(model)
+    if refuse is not None:
+        return refuse
+    return None
+
+
+def _backend_probe_reason(
+    model: str, backend: Callable[..., ReviewResult]
+) -> str | None:
+    """The per-backend auth/CLI/payment-mode probe portion of `backend_unavailable_reason`:
+    None when `backend` itself is reachable (key present / CLI on PATH / auth ok), else the
+    reason it is not. Split out so `backend_unavailable_reason` can layer the harness-quota
+    check (`spawn_refuse_reason`) on top without it running ahead of a genuinely-broken
+    backend's own reason (auth/CLI failures take precedence)."""
     try:
         if backend is review_gemini:
             _gemini_key()

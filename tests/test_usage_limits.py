@@ -55,7 +55,6 @@ def _sample(
     }
 
 
-
 def _window(name, used_percent, window_seconds):
     return {
         "name": name,
@@ -75,8 +74,15 @@ def _harness_card(provider, windows, *, status="ok", account="a@b"):
 
 
 def test_unmapped_provider_is_unknown():
+    # commandcode's Kimi seat deliberately stays unmapped (it shares the commandcode
+    # gateway account, not kimi's own account -- see usage_limits._AGENT_FAMILY_PREFIXES).
     samples = [_sample("claude", "weekly", 99)]
-    assert usage_percent_for_model("zai:glm-5.2", samples=samples, now=NOW) is None
+    assert (
+        usage_percent_for_model(
+            "commandcode:moonshotai/Kimi-K2.7-Code", samples=samples, now=NOW
+        )
+        is None
+    )
     assert usage_percent_for_model("gemini", samples=samples, now=NOW) is None
 
 
@@ -94,6 +100,27 @@ def test_claude_prefix_maps_to_claude_family():
 def test_bare_codex_maps_to_codex_family():
     samples = [_sample("codex", "5-hour", 55)]
     assert usage_percent_for_model("codex", samples=samples, now=NOW) == 55
+
+
+def test_zai_prefixes_map_to_zai_family():
+    samples = [_sample("zai", "weekly", 73)]
+    assert usage_percent_for_model("zai:glm-5.2", samples=samples, now=NOW) == 73
+    assert usage_percent_for_model("oc:zai/glm-5.2", samples=samples, now=NOW) == 73
+    assert usage_percent_for_model("glm:glm-4.7", samples=samples, now=NOW) == 73
+
+
+def test_xai_oc_prefix_maps_to_xai_family():
+    samples = [_sample("xai", "5-hour", 61)]
+    assert usage_percent_for_model("oc:xai/grok-4.6", samples=samples, now=NOW) == 61
+
+
+def test_kimi_code_omp_prefix_maps_to_kimi_family():
+    samples = [_sample("kimi", "weekly", 88)]
+    assert usage_percent_for_model("omp:kimi-code/k3", samples=samples, now=NOW) == 88
+    # A different omp provider selector does not pick up the kimi family.
+    assert (
+        usage_percent_for_model("omp:openai/gpt-5.5", samples=samples, now=NOW) is None
+    )
 
 
 def test_context_window_limit_is_ignored():
@@ -281,9 +308,7 @@ def test_harness_session_100_refuses_claude_spawn():
             ],
         )
     ]
-    assert (
-        usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
-    )
+    assert usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is False
 
 
@@ -311,9 +336,7 @@ def test_harness_missing_card_fails_open():
         )
     ]
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=missing) is True
-    unknown = [
-        _harness_card("Claude Code", [_window("Session", None, 18000)])
-    ]
+    unknown = [_harness_card("Claude Code", [_window("Session", None, 18000)])]
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=unknown) is True
 
 
@@ -327,9 +350,7 @@ def test_harness_identifies_windows_by_seconds_not_name():
             ],
         )
     ]
-    assert (
-        usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
-    )
+    assert usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is False
 
 
@@ -415,6 +436,58 @@ def test_exhausted_5h_does_not_popen_claude():
     assert "5-hour" in result.stdout or "5h" in result.stdout
 
 
+def test_backend_unavailable_reason_skips_exhausted_zai_seat():
+    """review-cli#skip-dblock-color: `backend_unavailable_reason` now layers
+    `spawn_refuse_reason` on top of EVERY backend's own auth/CLI probe, not just
+    claude's dispatch -- so a GLM seat whose z.ai account is already 100% exhausted
+    is reported unavailable pre-dispatch instead of being tried and failing slowly."""
+    from reviewlib import backends
+
+    cards = [_harness_card("z.ai", [_window("Weekly", 100.0, 7 * 86400)])]
+    saved_json = os.environ.get("REVIEW_HARNESS_LIMITS_JSON")
+    saved_key = os.environ.get("ZAI_API_KEY")
+    saved_env_file = os.environ.get("GEMINI_ENV_FILE")
+    saved_unpaid = backends._CONFIG_UNPAID_PROVIDERS
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = json.dumps({"cards": cards})
+    os.environ["ZAI_API_KEY"] = "test-key-live"
+    os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    backends.configure_unpaid_providers(None)
+    try:
+        reason = backends.backend_unavailable_reason("zai:glm-5.2")
+        assert reason is not None, "exhausted z.ai weekly window still reported live"
+        assert "weekly" in reason and "exhausted" in reason, reason
+        assert backends.backend_available("zai:glm-5.2") is False
+    finally:
+        for key, saved in (
+            ("REVIEW_HARNESS_LIMITS_JSON", saved_json),
+            ("ZAI_API_KEY", saved_key),
+            ("GEMINI_ENV_FILE", saved_env_file),
+        ):
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+        backends.configure_unpaid_providers(saved_unpaid)
+    # With the key present and NO exhausted card, the same seat is live.
+    os.environ["ZAI_API_KEY"] = "test-key-live"
+    os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = json.dumps({"cards": []})
+    backends.configure_unpaid_providers(None)
+    try:
+        assert backends.backend_unavailable_reason("zai:glm-5.2") is None
+    finally:
+        for key, saved in (
+            ("REVIEW_HARNESS_LIMITS_JSON", saved_json),
+            ("ZAI_API_KEY", saved_key),
+            ("GEMINI_ENV_FILE", saved_env_file),
+        ):
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+        backends.configure_unpaid_providers(saved_unpaid)
+
+
 def test_composition_closure_with_session_100_excludes_claude_family():
     # Production _dispatch must pass cards= (not samples= alone, which this
     # branch treats as disabling live harness). A 100% Session card excludes
@@ -434,18 +507,12 @@ def test_composition_closure_with_session_100_excludes_claude_family():
         return usage_percent_for_model(model, samples=samples, now=NOW)
 
     def with_cards(model: str) -> float | None:
-        return usage_percent_for_model(
-            model, samples=samples, cards=cards, now=NOW
-        )
+        return usage_percent_for_model(model, samples=samples, cards=cards, now=NOW)
 
-    kept = expand_flat_models_with_reuse(
-        roster, 2, usage_percent=samples_only
-    )
+    kept = expand_flat_models_with_reuse(roster, 2, usage_percent=samples_only)
     assert "claude:claude-opus-4-8" in kept
 
-    excluded = expand_flat_models_with_reuse(
-        roster, 2, usage_percent=with_cards
-    )
+    excluded = expand_flat_models_with_reuse(roster, 2, usage_percent=with_cards)
     assert "claude:claude-opus-4-8" not in excluded
     assert excluded  # gemini remains
 

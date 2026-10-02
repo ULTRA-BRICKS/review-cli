@@ -84,6 +84,11 @@ _KEY_ENV_NAMES = (
     "FIREWORKS_API_KEY",
     "FIREWORKS_BASE_URL",
     "REVIEW_UNPAID_PROVIDERS",
+    # review-cli#skip-dblock-color: spawn_refuse_reason now runs for EVERY backend
+    # (not just claude), so a family-mapped provider (zai/xai/kimi-code, see
+    # usage_limits._AGENT_FAMILY_PREFIXES) must not pick up this dev machine's real
+    # `harness limits` state -- sandboxed to empty cards below, same as GEMINI_ENV_FILE.
+    "REVIEW_HARNESS_LIMITS_JSON",
 )
 
 
@@ -99,6 +104,10 @@ class _EnvSandbox:
         # Point the .env fallback at a path that does not exist so, by default,
         # no key resolves unless a test sets one explicitly.
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        # No harness cards by default -- a family-mapped model (zai/xai/kimi-code/
+        # codex/claude) must not be excluded by this dev machine's REAL harness
+        # quota state; a test that wants to exercise exhaustion sets this itself.
+        os.environ["REVIEW_HARNESS_LIMITS_JSON"] = '{"cards":[]}'
         backends.configure_unpaid_providers(None)
         with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
             backends._PAYMENT_PREFLIGHT_CACHE.clear()
@@ -845,7 +854,12 @@ def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty
         ("", {"promptTokenCount": 1234}, 1, (1234, 0)),
         # Non-string `text` parts are not content -- never stringified into a verdict.
         (None, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
-        ({"nested": 1}, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+        (
+            {"nested": 1},
+            {"promptTokenCount": 1234, "candidatesTokenCount": 3},
+            1,
+            (1234, 3),
+        ),
         (["a"], {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
     )
     for text, usage, rc, expected in cases:
@@ -868,7 +882,13 @@ def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty
             assert "None" not in res.stdout, res
     # `{"candidates": []}` -- the exact shape Codex flagged -- must also fail closed.
     old_open = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen({}, {"candidates": [], "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}})
+    urllib.request.urlopen = _fake_urlopen(
+        {},
+        {
+            "candidates": [],
+            "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0},
+        },
+    )
     with _EnvSandbox():
         os.environ["GEMINI_API_KEY"] = "k"
         try:
@@ -897,7 +917,9 @@ def test_anthropic_api_applies_the_same_usage_validity_rule():
         with _EnvSandbox():
             os.environ["ANTHROPIC_API_KEY"] = "k"
             try:
-                res = backends.review_claude_api("claude:claude-opus-4-8", "q", "+x", REPO_ROOT, 10)
+                res = backends.review_claude_api(
+                    "claude:claude-opus-4-8", "q", "+x", REPO_ROOT, 10
+                )
             finally:
                 urllib.request.urlopen = old_open
         assert res.returncode == rc, (text, usage, res)

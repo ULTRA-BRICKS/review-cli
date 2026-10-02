@@ -71,17 +71,49 @@ DEFAULT_LIMIT_THRESHOLD = 70.0
 # docstring's "coverage is PARTIAL" note). `codex:gpt-...` seats (e.g. SOL_SEAT
 # in config.py) route through the SAME codex account as the bare `"codex"`
 # seat, so they share the prefix mapping too.
+#
+# zai/xai/kimi-code (review-cli#skip-dblock-color): `backend_unavailable_reason`
+# now checks `spawn_refuse_reason` for EVERY backend (not just claude's own
+# dispatch), so a GLM/Grok/Kimi seat whose harness-tracked window is already
+# 100% exhausted is pre-emptively skipped instead of dispatched-then-failed.
+# `oc:zai/glm-5.2` (opencode transport, provider_failover.DEFAULT_PROVIDER_CHAINS)
+# shares the SAME z.ai account as the direct `zai:glm-5.2` keyed-HTTP seat, so
+# both prefixes map to the "zai" family. `oc:xai/...` (GROK_SEAT) is xai's ONLY
+# route (review-cli has no diff-only xai backend -- see backends._AGENTIC_ONLY_PROVIDERS).
+# `omp:kimi-code/...` is the sole kimi-code route (KIMI_SEAT itself routes through
+# the commandcode gateway account, NOT kimi's own account, so it deliberately
+# stays unmapped here).
 _AGENT_FAMILY_PREFIXES: tuple[tuple[str, str], ...] = (
     ("claude:", "claude"),
     ("codex:", "codex"),
+    ("zai:", "zai"),
+    ("z.ai:", "zai"),
+    ("zhipu:", "zai"),
+    ("glm:", "zai"),
+    ("oc:zai/", "zai"),
+    ("opencode:zai/", "zai"),
+    ("oc:xai/", "xai"),
+    ("opencode:xai/", "xai"),
+    ("omp:kimi-code/", "kimi"),
 )
 # Bare (non-prefixed) model ids routed through a specific agent's own account.
-_AGENT_FAMILY_EXACT: dict[str, str] = {"codex": "codex"}
+_AGENT_FAMILY_EXACT: dict[str, str] = {
+    "codex": "codex",
+    "zai": "zai",
+    "z.ai": "zai",
+    "zhipu": "zai",
+    "glm": "zai",
+}
 
-# harness-cli LimitCard.provider -> the same family ids as above.
+# harness-cli LimitCard.provider -> the same family ids as above. Provider strings
+# verified live via `harness limits --all --json` (2026-09-09): "z.ai", "x.ai",
+# "kimi" (lower-cased below by `_family_from_provider`).
 _HARNESS_PROVIDER_FAMILY = {
     "claude code": "claude",
     "codex": "codex",
+    "z.ai": "zai",
+    "x.ai": "xai",
+    "kimi": "kimi",
 }
 
 

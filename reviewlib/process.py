@@ -20,6 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from .stats import normalize_task_code
 
@@ -1295,6 +1296,7 @@ def _run_streamed(
     timeout_mode: str = "idle",
     liveness_timeout: int | None = None,
     true_silence_timeout: int | None = None,
+    on_spawn: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a long backend call, streaming its output in real time.
 
@@ -1331,6 +1333,15 @@ def _run_streamed(
         with ``true_silence_timeout`` set; a never-talking child then runs to the full
         wall-clock ``timeout`` like any other idle-reap-disabled call (Opus review
         finding: worth knowing before relying on true-silence as an independent guard).
+
+    ``on_spawn``, when given, is called SYNCHRONOUSLY once `Popen` returns successfully
+    (before anything else — registration, pgid resolution, the read loop), i.e. as close
+    to the actual spawn instant as this function can offer a caller. Exists so a caller
+    can release a lock it took to serialize the SPAWN itself (contention on some
+    resource the child touches at startup) without holding that lock for the whole,
+    potentially many-minute, call (review-cli#skip-dblock-color: opencode's local
+    sqlite state db). Exceptions from `on_spawn` are swallowed — a broken release hook
+    must never abort an already-spawned child's review.
 
     Returns a CompletedProcess-compatible object (.returncode/.stdout/.stderr) so
     callers like review_codex need no structural change.
@@ -1464,6 +1475,15 @@ def _run_streamed(
             # if a descendant keeps the pipe open past the deadline.
             start_new_session=True,  # own process group, so we can kill the whole tree
         )
+        # Fire the spawn hook AS EARLY AS POSSIBLE — before registration/pgid/anything
+        # else — so a caller serializing the spawn itself (not the whole call) holds
+        # its lock for the shortest possible window. Swallowed: a broken hook must
+        # never abort an already-spawned child's review (see the docstring above).
+        if on_spawn is not None:
+            try:
+                on_spawn()
+            except Exception:  # noqa: BLE001 - a broken hook must not break the review
+                pass
         running = proc  # non-None alias for the nested closures
         # Register IMMEDIATELY — before resolving the pgid — so a backstop fire can never
         # orphan a just-Popen'd backend in the window before `os.getpgid` returns. At this
