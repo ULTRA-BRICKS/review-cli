@@ -1120,7 +1120,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 
 | Specifier | Transport | What runs under the hood |
 |-----------|-----------|--------------------------|
-| `codex` / `codex:<model>` | cli | `codex exec -s read-only --ephemeral` |
+| `codex` / `codex:<model>` | cli | `codex exec -s read-only -c approval_policy="never" --ignore-rules --ephemeral` (the three flags are the read-only cage: the seatbelt, no auto-approved escalation out of it, no execpolicy `allow` rule running a command unsandboxed — review-cli#399) |
 | `claude` / `claude:<model>` | api \| cli | `claude-p` CLI, or the Anthropic-compatible Messages API |
 | `fable` / `fable5` | api \| cli | Alias for `claude:claude-fable-5` |
 | `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-3.5-flash` by default) |

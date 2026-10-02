@@ -688,6 +688,20 @@ def test_codex_bare_seat_runs_agentic_read_only_in_repo_no_model_flag():
         # read-only scope + the real repo as -C, never a write/agentic-edit posture.
         assert "-s" in argv and argv[argv.index("-s") + 1] == "read-only", argv
         assert "-C" in argv and argv[argv.index("-C") + 1] == str(repo), argv
+        # review-cli#399: the cage is THREE explicit flags, not the operator's config
+        # defaults. `codex exec` defaults to approval_policy=on-request and a machine-wide
+        # `approvals_reviewer = "auto_review"` then re-runs every sandbox denial OUTSIDE
+        # the seatbelt; an execpolicy `allow` prefix_rule runs its command unsandboxed
+        # even under `never`. Exact adjacency: `-c` immediately followed by the policy.
+        assert argv[argv.index("-c") + 1] == 'approval_policy="never"', argv
+        assert "--ignore-rules" in argv, argv
+        assert argv.index("--ignore-rules") < argv.index("-C"), argv
+        # The prompt itself tells the model it is read-only and that the harness-level
+        # AGENTS.md/memory/skills doctrine (file a ticket, run the gate) does not apply.
+        assert review_backends.READONLY_SEAT_NOTICE in (cap.input_text or ""), cap.input_text
+        assert (cap.input_text or "").index("Review.") < (cap.input_text or "").index(
+            review_backends.READONLY_SEAT_NOTICE
+        )
         # Ephemeral session + the stdin marker `-` as the last arg (payload piped in).
         assert "--ephemeral" in argv, argv
         assert argv[-1] == "-", argv
@@ -699,6 +713,55 @@ def test_codex_bare_seat_runs_agentic_read_only_in_repo_no_model_flag():
         assert "Review." in (cap.input_text or ""), cap.input_text
         assert "some diff" in (cap.input_text or ""), cap.input_text
         assert cap.header_argv0 is None
+
+
+def test_codex_pinned_model_seat_keeps_approval_policy_before_effort_override():
+    """A `-c model_reasoning_effort=...` override must not displace the `-c
+    approval_policy="never"` pair: both `-c` pairs are present, the policy first."""
+    with _capture_codex() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_codex(
+                "codex:gpt-5.5", "Review.", "diff", repo, 60, effort="high"
+            )
+        argv = cap.argv or []
+        pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+        assert pairs[0] == 'approval_policy="never"', argv
+        assert any(p.startswith("model_reasoning_effort=") for p in pairs), argv
+
+
+def test_codex_seat_warns_when_the_working_tree_moved_during_the_run():
+    """The tripwire behind the sandbox flags: a checkout whose HEAD/status differ after
+    the seat ran gets a loud marker in the seat's stderr (a WARNING, never a forced
+    failure — concurrent seats and operator edits make a change unattributable)."""
+    with _capture_codex() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            # A fake seat that "escapes": drop a file into the checkout mid-run.
+            orig_call = cap.__call__
+
+            def escaping(argv, **kw):
+                (repo / "escaped.txt").write_text("x", encoding="utf-8")
+                return orig_call(argv, **kw)
+
+            review_backends._run_streamed = escaping  # type: ignore[assignment]
+            res = review_backends.review_codex("codex", "Review.", "diff", repo, 60)
+        assert review_backends.TREE_CHANGED_MARKER in res.stderr, res.stderr
+        assert "codex seat" in res.stderr, res.stderr
+
+
+def test_codex_seat_is_silent_when_the_working_tree_is_untouched():
+    with _capture_codex():
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            res = review_backends.review_codex("codex", "Review.", "diff", repo, 60)
+        assert review_backends.TREE_CHANGED_MARKER not in res.stderr, res.stderr
 
 
 def test_codex_pinned_model_seat_passes_model_flag():

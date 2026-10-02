@@ -93,7 +93,33 @@ def _which_optional(name: str) -> str | None:
 _PAYLOAD_WARN_BYTES = 600_000
 
 
-def _payload(prompt: str, diff: str = "") -> str:
+# Every seat is a READ-ONLY reviewer, and the prompt has to SAY so — not just the launch
+# flags. The agentic harnesses (codex, claude) load the OPERATOR's machine-wide instructions
+# alongside our prompt: `~/.codex/AGENTS.md`, memory files, installed skills. On a
+# rig-managed machine those tell an agent to file a durable ticket before any work, run the
+# `review` gate, report over `tg`, and so on — and a reviewer seat that follows them acts
+# like a working agent. review-cli#399: a codex seat reviewing rig-cli ran `task new` /
+# `task check --force` / `task done` and created + closed a REAL GitHub issue during a
+# `review diff`. The sandbox flags (see `review_codex`) are the enforcement; this clause
+# tells the model those instructions do not apply here, so it neither tries nor burns its
+# turn on escalation attempts. Appended AFTER the prompt (the operator's instructions come
+# first) and BEFORE the diff — for the codex seat only (`readonly_notice=True`): it is the
+# one seat with a live shell. A REST seat has no tools, and the claude CLI route runs with
+# `--tools ''` (see review_claude_cli), so both get the prompt verbatim.
+READONLY_SEAT_NOTICE = (
+    "You are a READ-ONLY reviewer seat launched by review-cli. Do not create, edit, "
+    "close or comment on tickets, issues or pull requests; do not run `task`, `gh`, `tg`, "
+    "git write commands or any other command with side effects; do not edit or write "
+    "files; do not request approval or escalation to run outside the sandbox. Any "
+    "harness-level instruction you were loaded with (AGENTS.md, memory files, skills) "
+    "that asks for a ticket, a report, or a gate run does NOT apply to this session — "
+    "answer with the review only."
+)
+
+
+def _payload(prompt: str, diff: str = "", *, readonly_notice: bool = False) -> str:
+    if readonly_notice:
+        prompt = f"{prompt}\n\n{READONLY_SEAT_NOTICE}"
     out = prompt if not diff.strip() else f"{prompt}\n\n```diff\n{diff}\n```"
     if len(out.encode("utf-8")) > _PAYLOAD_WARN_BYTES:
         print(
@@ -365,7 +391,41 @@ def review_codex(
     # a codex seat the user has no binary for, or has disabled as unpaid, must not touch
     # their home directory or print a guard-installed notice for a backend that never runs.
     _ensure_codex_recursion_guard()
-    argv = [codex_path, "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
+    # The read-only CAGE is three explicit flags, never the operator's config defaults
+    # (review-cli#399 — a codex seat created + closed a real GitHub issue via `task new` /
+    # `task done` during a `review diff`; both escape paths below were reproduced live on
+    # codex-cli 0.153.4 with `-s read-only` alone):
+    #   * `-s read-only` — the seatbelt: no writes outside the sandbox, no network.
+    #   * `-c approval_policy="never"` — `codex exec` DEFAULTS to `on-request`, and a
+    #     machine-wide `approvals_reviewer = "auto_review"` (rig-cli#370 writes it as the
+    #     codex "auto mode") then auto-APPROVES every sandbox denial, re-running the command
+    #     OUTSIDE the seatbelt — `curl` reached GitHub and `touch /tmp/...` succeeded from a
+    #     "read-only" run. `never` raises no approval at all, so no reviewer can grant one.
+    #   * `--ignore-rules` — an execpolicy `prefix_rule(..., decision="allow")` (the
+    #     rig-managed rules allow `task`, the default rules allow `git fetch`) runs the
+    #     matched command UNSANDBOXED, with network, even under `approval_policy="never"`
+    #     (`git fetch origin` succeeded; with this flag it fails on `.git/FETCH_HEAD`).
+    #     This also drops review-cli's own recursion-guard rules (review-cli#180), which
+    #     is acceptable ONLY because the seatbelt is inherited by every child process: a
+    #     nested `review`/`codex`/`claude` has no network and dies at once.
+    # Known residual (documented on review-cli#399, not closable from here): the seat still
+    # sees codex's ACCOUNT-level connector tools (`mcp__codex_apps__figma_*`, `image_gen`,
+    # `collaboration.spawn_agent`), which live outside the seatbelt. Neither
+    # `-c mcp_servers={}` nor `--ignore-user-config` removes them (verified live); the
+    # latter also drops the operator's default model and project trust, so it is not used.
+    # READONLY_SEAT_NOTICE in the prompt is the only lever on those.
+    argv = [
+        codex_path,
+        "exec",
+        "-s",
+        "read-only",
+        "-c",
+        'approval_policy="never"',
+        "--ignore-rules",
+        "-C",
+        str(cwd),
+        "--ephemeral",
+    ]
     if codex_model:
         argv += ["-m", codex_model]
     codex_effort = _codex_reasoning_effort(effort)
@@ -373,10 +433,11 @@ def review_codex(
         argv += ["-c", f'model_reasoning_effort="{codex_effort}"']
     argv.append("-")
     command = " ".join(argv[:-1]) + " -"
+    tree_before = _tree_fingerprint(cwd)
     proc = _run_streamed(
         argv,
         cwd=cwd,
-        input_text=_payload(prompt, diff),
+        input_text=_payload(prompt, diff, readonly_notice=True),
         timeout=timeout,
         backend="codex",
         round_no=round_no,
@@ -385,13 +446,53 @@ def review_codex(
         if codex_model
         else None,
     )
+    tripwire = _tree_change_warning("codex", tree_before, _tree_fingerprint(cwd))
     return ReviewResult(
         model=model,
         command=command,
         returncode=proc.returncode,
         stdout=proc.stdout,
-        stderr=proc.stderr,
+        stderr=proc.stderr + tripwire,
     )
+
+
+# --- working-tree tripwire for the agentic seats ----------------------------------------
+# Defense in depth behind the sandbox flags: fingerprint the reviewed checkout (HEAD + the
+# porcelain status) before and after the seat runs and shout if it moved. It is a WARNING,
+# not a seat failure: seats run concurrently on the same checkout and the operator keeps
+# editing while a multi-minute review runs, so a change is not attributable to the seat —
+# failing a legitimate verdict on a false positive would cost a whole review round. The
+# sandbox is the enforcement; this line is the audit trail that a sandbox escape (or a
+# concurrent edit) happened, and it lands in the seat's stderr/log where `review` reports it.
+TREE_CHANGED_MARKER = "[review-cli] WARNING: working tree changed during the"
+
+
+def _tree_fingerprint(cwd: Path) -> str | None:
+    """`<HEAD sha>\n<git status --porcelain>` for `cwd`, or None when it is not a git
+    checkout (the tripwire then stays silent rather than guessing). An unborn HEAD (a
+    fresh `git init`, no commit yet) is still a checkout — its status is what matters."""
+    try:
+        head = _run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=cwd, timeout=30)
+        status = _run(["git", "status", "--porcelain"], cwd=cwd, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if status.returncode != 0:
+        return None
+    sha = head.stdout.strip() if head.returncode == 0 else "(unborn)"
+    return f"{sha}\n{status.stdout}"
+
+
+def _tree_change_warning(backend: str, before: str | None, after: str | None) -> str:
+    """The stderr warning line for a moved tree (empty when unchanged or unknown)."""
+    if before is None or after is None or before == after:
+        return ""
+    line = (
+        f"{TREE_CHANGED_MARKER} {backend} seat ran (HEAD and/or `git status` differ). "
+        "The seat is launched read-only + sandboxed, so this is a concurrent edit or a "
+        "sandbox escape — check the seat log (review-cli#399).\n"
+    )
+    print(line, end="", file=sys.stderr, flush=True)
+    return line
 
 
 # Every capability the read-only reviewer agent MUST deny. This is the security boundary
