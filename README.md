@@ -1949,3 +1949,7 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
+
+### Groq API reviews
+
+`review diff -m groq:llama-3.3-70b-versatile --task CODE` uses `GROQ_API_KEY` for a tool-free diff review at the official Groq endpoint, with bounded output. It does not send a coding-agent tool catalog. Existing disabled-provider and review-quorum checks still apply. OMP availability also recognizes provider-specific environment keys; a missing credential vault no longer hides a valid environment credential.

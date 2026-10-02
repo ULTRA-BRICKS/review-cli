@@ -2379,6 +2379,33 @@ def _header_value_is_safe(value: str) -> bool:
     )
 
 
+def _groq_key() -> str:
+    key = _resolve_key(("GROQ_API_KEY",), "GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("GROQ_API_KEY not configured")
+    return key
+
+
+def review_groq(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+    """Tool-free keyed review; credentials are only sent to the official Groq API."""
+    api_model = model.split(":", 1)[1].strip() if ":" in model else "llama-3.3-70b-versatile"
+    api_model = api_model or "llama-3.3-70b-versatile"
+    command = f"groq API {api_model}"
+    denied = unpaid_provider_result(model, backend="groq", command=command, round_no=round_no)
+    if denied is not None:
+        return denied
+    try:
+        key = _groq_key()
+    except RuntimeError as exc:
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+    return _openai_compatible_request(
+        model=model, api_model=api_model, label="groq", backend="groq",
+        base_url="https://api.groq.com/openai/v1", key=key,
+        prompt=_prompt_with_effort(prompt, effort), diff=diff, timeout=timeout,
+        round_no=round_no, extra_body={"max_tokens": 2000},
+    )
+
+
 def review_openrouter(
     model: str,
     prompt: str,
@@ -4023,6 +4050,8 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
     # `openrouter:<provider>/<model>` (e.g. openrouter:anthropic/claude-3.5-sonnet). Does NOT
     # collide with opencode's `oc:`/`opencode:` prefixes — `openrouter:` shares no prefix with
     # either, so the order relative to the opencode catch-all below is irrelevant.
+    if lowered == "groq" or lowered.startswith("groq:"):
+        return review_groq
     if lowered == "openrouter" or lowered.startswith("openrouter:"):
         return review_openrouter
     # Oh My Pi (omp) — agentic read-only CLI seat (review-cli#174). `omp` plus
@@ -4795,6 +4824,8 @@ def _omp_auth_available(provider: str | None) -> bool:
     credential (or ANY provider does, for a bare `omp` seat). One stamp miss hydrates
     every live provider in a single db read (`_OMP_AUTH_CACHE`), so probing N omp seats
     costs one db read per board pass; see `_omp_auth_probe` for the read itself."""
+    if provider is not None and any(os.environ.get(key, "").strip() for key in _OC_PROVIDER_ENV_VARS.get(provider, ())):
+        return True
     db = _omp_auth_db()
     stamp = _omp_db_stamp(db)
     if stamp is None:
@@ -4914,6 +4945,7 @@ def provider_route_name(model: str) -> str:
         review_commandcode: "commandcode",
         review_zai: "zai",
         review_openrouter: "openrouter",
+        review_groq: "groq",
     }.get(resolve_backend(model), "opencode")
 
 
@@ -4957,6 +4989,9 @@ def backend_unavailable_reason(model: str) -> str | None:
         return preflight
     backend = resolve_backend(model)
     try:
+        if backend is review_groq:
+            _groq_key()
+            return None
         if backend is review_gemini:
             _gemini_key()
             return None
