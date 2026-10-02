@@ -47,7 +47,7 @@ _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
 # Brainstorm discussion md: 20260613T114552_999796Z-brainstorm.md
 _BRAINSTORM_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-brainstorm\.md$")
 _HEADER_RE = re.compile(
-    r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)(?: task=(?P<task>\S+))?\s*$"
+    r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)(?: task=(?P<task>\S+))?(?: run=(?P<run>\S+))?\s*$"
 )
 _NO_TASK_RE = re.compile(r"^\[review-cli\] TASK\s*$")
 _WAITING_RE = re.compile(
@@ -654,6 +654,9 @@ def parse_call_log(path: Path) -> CallLog | None:
                 # filename backend wins (header backend can be the same), but keep argv0.
                 argv0 = hm.group("argv0")
                 task_code = hm.group("task")
+                if not task_code and hm.group("run"):
+                    from ..jobs import read_job
+                    task_code = (read_job(hm.group("run")) or {}).get("task_code")
                 header_seen = True
                 pre_header = False
                 expect_legacy_empty_task_marker = True

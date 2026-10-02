@@ -1,4 +1,4 @@
-"""Detached background review jobs (`review <mode> --detach` / `review status` / `review jobs`).
+"""Durable synchronous and detached review runs (`review <mode> --detach` / `review status` / `review jobs`).
 
 A normal `review diff`/`quorum`/`brainstorm`/`just-ask` run blocks the calling process for
 the whole review — fine for a human terminal or an unbounded background agent call, but a
@@ -12,7 +12,7 @@ and `review jobs` read what this module writes.
 Nothing about the review itself is reimplemented here: the detached child runs the exact
 same `reviewlib.cli.main` code path (backstop, the SIGTERM/SIGINT reaper from
 `reviewlib.process`, the `-o` quorum-stamp output) as a synchronous run — this module only
-tracks its pid/status/paths so a caller can poll instead of block.
+tracks pid/status, output and original evidence so callers can discover and attach runs.
 
 Job records are small JSON files, one per job, under `jobs_dir()`. TWO processes DO write
 the same job-id record (the spawning parent's initial + pid-only writes, and the spawned
@@ -41,6 +41,7 @@ import re
 import stat
 import sys
 import time
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -397,13 +398,20 @@ def job_path(job_id: str) -> Path:
 def _atomic_write(path: Path, data: dict[str, Any]) -> None:
     """Write via a same-directory temp file + `os.replace` so a reader never observes a
     half-written record (a plain truncate-then-write can race `read_job`/`list_jobs`)."""
-    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             tmp.unlink()
@@ -412,7 +420,7 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
-def _job_lock_path(job_id: str) -> Path:
+def _job_lock_path(job_id: str, directory: Path | None = None) -> Path:
     # Deliberately NOT `job_path()` + a suffix swap — the lock must exist even for a
     # job-id that has no `.json` record YET (the parent's very first write), so it is
     # keyed the same way but built directly from `jobs_dir()`. Still runs the SAME
@@ -422,10 +430,10 @@ def _job_lock_path(job_id: str) -> Path:
     # malformed id — e.g. an absolute path — OUTSIDE `jobs_dir()` entirely, before
     # `write_job()`'s later `job_path()` call ever got a chance to raise).
     _validate_job_id(job_id)
-    return jobs_dir() / f"{job_id}.lock"
+    return (directory if directory is not None else jobs_dir()) / f"{job_id}.lock"
 
 
-def _job_lock(job_id: str) -> int:
+def _job_lock(job_id: str, directory: Path | None = None) -> int:
     """Open (creating if needed) and take an exclusive `flock` on this job's lock file,
     returning the fd for the caller to release via `fcntl.flock(fd, fcntl.LOCK_UN)` +
     `os.close(fd)`. Serializes `write_job` across PROCESSES for the same job-id — the
@@ -435,23 +443,25 @@ def _job_lock(job_id: str) -> int:
     stale in-memory copy of the other's (codex review). `flock` (not a `fcntl.lockf`
     byte-range lock) because the whole tiny file is always the one critical section —
     no need for byte-range granularity here."""
-    path = _job_lock_path(job_id)
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    path = _job_lock_path(job_id, directory)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
     return fd
 
 
-def _update_job_locked(job_id: str, mutate: Callable[[dict[str, Any]], bool]) -> bool:
+def _update_job_locked(job_id: str, mutate: Callable[[dict[str, Any]], bool], *, directory: Path | None = None) -> bool:
     """The one locked read-modify-write every job-record writer goes through: read the
     record under `_job_lock`, hand it to `mutate`, and write it back only when `mutate`
     returns True. Returning False leaves the on-disk record untouched — that is how a
     compare-and-set writer (`_persist_unknown_terminated`) declines to overwrite a
     status another process wrote between its own read and this lock. Returns whether
     a write happened."""
-    lock_fd = _job_lock(job_id)
+    lock_fd = _job_lock(job_id, directory)
     try:
-        path = job_path(job_id)
-        data = read_job(job_id) or {}
+        path = job_path(job_id) if directory is None else directory / f"{job_id}.json"
+        data = (read_job(job_id) or {}) if directory is None else json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("run record is malformed; expected a JSON object")
         data["job_id"] = job_id
         if not mutate(data):
             return False
@@ -684,3 +694,59 @@ def tail_lines(path: Path, n: int) -> list[str]:
         return []
     lines = text.splitlines()
     return lines[-n:] if n > 0 else []
+
+
+def attach_task(job_id: str, task_code: str) -> bool:
+    """Atomically associate one completed run; evidence and outcome remain immutable.
+
+    Exact IDs only. A duplicate across primary/fallback stores is ambiguous, even
+    when its contents happen to match. Never import a record from a caller path.
+    """
+    from .stats import normalize_task_code
+
+    _validate_job_id(job_id)
+    code = normalize_task_code(task_code)
+    if code is None:
+        raise ValueError("task code is empty; supply --task CODE")
+    primary = job_path(job_id)
+    secondary = _secondary_jobs_dir()
+    candidates = [primary]
+    if secondary is not None and secondary.resolve() != primary.parent.resolve():
+        candidates.append(secondary / primary.name)
+    existing_paths = [path for path in candidates if path.exists() or path.is_symlink()]
+    if len(existing_paths) > 1:
+        raise ValueError("run ID is ambiguous across job stores")
+    if not existing_paths:
+        raise ValueError(f"run {job_id} not found; use review jobs for exact IDs")
+    selected = existing_paths[0]
+    if selected.is_symlink():
+        raise ValueError("run record must not be a symlink")
+
+    def associate(data: dict[str, Any]) -> bool:
+        if selected.is_symlink() or not selected.is_file() or not _is_well_formed_record(
+            json.loads(selected.read_text(encoding="utf-8")), job_id
+        ):
+            raise ValueError(f"run {job_id} not found; use review jobs for exact IDs")
+        if data.get("status") not in TERMINAL_STATUSES or "output" not in data:
+            raise ValueError("run has no durable completed output; wait for completion first")
+        existing = data.get("task_code")
+        if existing and existing != code:
+            raise ValueError(f"run is already attached to {existing}; association cannot be replaced")
+        if existing == code:
+            return False
+        data["task_code"] = code
+        return True
+
+    return _update_job_locked(job_id, associate, directory=selected.parent)
+
+
+def record_evidence(job_id: str, record: dict[str, Any]) -> None:
+    """Keep original evidence in the run store, independent of the stats index."""
+    def append(data: dict[str, Any]) -> bool:
+        evidence = data.setdefault("evidence", [])
+        record["run_id"] = job_id
+        record["evidence_id"] = f"{job_id}:{len(evidence)}"
+        evidence.append(dict(record))
+        return True
+
+    _update_job_locked(job_id, append)

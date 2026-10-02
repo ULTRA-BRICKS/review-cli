@@ -102,13 +102,13 @@ flag for text modes, e.g. `review brainstorm "Q" --task CODE --visual IMAGE`.
 For configuration (config file, model/board selection, keys/auth) run `review help config`
 (alias `review --help config`); per-subcommand flags are on `review <mode> --help`.
 
-## Task code is REQUIRED for review iterations
-Pass `--task CODE` on every recorded review mode, or set `REVIEW_TASK_CODE=CODE` in the
-environment for a whole automation/session. Standalone `review visual IMAGE` is the only
-normal exception; `review visual IMAGE --diff` is a diff-review iteration and still needs
-the task code. The code is written to run-stats and per-call logs so `review task CODE` and
-the dashboard can show how many iterations ran, which models were used, and the detailed
-conversations.
+## Task code is optional
+Supply `--task CODE` or `REVIEW_TASK_CODE=CODE` when known. Every synchronous or detached
+run has a durable ID in `review jobs`. After an unassociated run saves its output, stderr
+prints `review attach RUN_ID --task CODE` with the actual run ID filled in. Attach it if
+it belongs to a task; consider creating a task first when appropriate. No task is created
+automatically. Attachment never reruns models or alters evidence/outcomes. `review task
+CODE` and available call-log readers resolve later associations.
 
 ## Save the result to a file: `-o FILE`, NOT `> FILE`
 Use `review diff --task CODE -C <repo> -o out.md`, NOT `review diff -C <repo> … > out.md`. Under zsh
@@ -121,7 +121,7 @@ a file, reach for `-o file.md`, never `> file.md`.
 
 ## Reviewer board, presets, and `--pool` (priority-ordered failover pool)
 A plain unrecorded `review diff` runs the **light preset**: pool 2, medium effort, no Fable/Sol.
-A recorded `review diff --task CODE` floors that pool to **3 distinct board roles** so
+A `review diff` run floors that pool to **3 distinct board roles** so
 `review task CODE --check` / gh ship can pass from one run (re-running light's top-2 never
 accumulates a 3rd role). Explicit `--pool N` still wins (warns if N<3). `-m one-model` with
 `--task` pads that model across 3 roles via `select_pool_with_reuse`. Use `--preset default`
@@ -256,8 +256,8 @@ SKILL_BLURB = (
     '`review just-ask "Q" --task CODE -C <repo>`. '
     "A bare `review` prints HELP — the diff review is `review diff` (NOT a bare "
     "`review`); the old --quorum/--brainstorm/--just-ask flags were removed. "
-    "Always pass -C <project-root>. Always pass --task CODE (or set REVIEW_TASK_CODE) for "
-    "review iterations; `review task CODE` shows iterations, models, and transcripts. "
+    "Always pass -C <project-root>. Optionally pass --task CODE (or set REVIEW_TASK_CODE) for "
+    "review iterations; use `review attach RUN_ID --task CODE` afterwards. `review task CODE` shows iterations, models, and transcripts. "
     "Use before commits and for hard decisions. Before a COMMIT use `review diff --staged --task CODE`: only a PASSING staged review satisfies agent-tools' require-review-before-commit gate (it writes that gate's marker itself — never `touch` the marker by hand). "
     "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
     "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "

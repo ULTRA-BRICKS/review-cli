@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -1196,7 +1197,7 @@ def _jobs_subcommand(rest: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         prog="review jobs",
-        description="List detached (`--detach`) review jobs.",
+        description="List recorded review runs (synchronous and detached).",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     ns = parser.parse_args(rest)
@@ -1211,7 +1212,7 @@ def _jobs_subcommand(rest: list[str]) -> int:
         return 0
 
     if not records:
-        print("No detached jobs recorded.")
+        print("No review runs recorded.")
         return 0
 
     for rec in records:
@@ -2852,6 +2853,10 @@ def _run_mode_with_stats(
     """
     import time
 
+    run_id = os.environ.get("REVIEW_JOB_ID")
+    if run_id:
+        jobs.write_job(run_id, executed=True, repo_id=repo_id,
+                       diff_files=diff_files, diff_sha256=diff_sha256)
     pool_size = len(pool_models)
     announce_eta(mode, pool_size)
     begin_call_tally()
@@ -3024,6 +3029,9 @@ def _run_mode_with_stats(
 
 def _call_with_task_env(task_code: str | None, fn):
     """Run a pre-stats helper while exposing the validated task code to log writers."""
+    run_id = os.environ.get("REVIEW_JOB_ID")
+    if run_id:
+        jobs.write_job(run_id, executed=True)
     clean_task = normalize_task_code(task_code)
     if not clean_task:
         return fn()
@@ -3530,6 +3538,56 @@ def _dispatch_with_backstop(raw: list[str], output_path: str | None) -> int:
     return 1 if write_error is not None else rc
 
 
+def _capture_run_output(run_id: str, raw: list[str]) -> int:
+    """Persist the exact output, including failed runs, before publishing a hint."""
+    captured = io.StringIO()
+    errors = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_Tee(sys.stdout, captured)):
+            with contextlib.redirect_stderr(_Tee(sys.stderr, errors)):
+                return _main_dispatch(raw)
+    finally:
+        jobs.write_job(run_id, output=captured.getvalue(), stderr=errors.getvalue())
+
+
+def _attachment_hint(run_id: str) -> None:
+    record = jobs.read_job(run_id)
+    if record and record.get("executed") and "output" in record and not record.get("task_code"):
+        print(
+            f"[review-cli] Run {run_id} saved. If this review belongs to a task, attach it:\n"
+            f"  review attach {run_id} --task CODE\n"
+            "If there is no task yet, consider creating one first.",
+            file=sys.stderr, flush=True,
+        )
+
+
+def _run_with_identity(raw: list[str]) -> int:
+    run_id = jobs.new_job_id()
+    jobs.write_job(run_id, mode=raw[0], status="running", started_at=time.time(),
+                   pid=os.getpid(), cwd=os.getcwd(), argv=raw, detached=False)
+    os.environ["REVIEW_JOB_ID"] = run_id
+    try:
+        return main(raw)
+    finally:
+        os.environ.pop("REVIEW_JOB_ID", None)
+
+
+def _attach_subcommand(rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="review attach", description="Attach a completed run to a task without rerunning models.")
+    parser.add_argument("run_id", help="exact run ID from review jobs")
+    parser.add_argument("--task", required=True, help="task code to associate")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(rest)
+    try:
+        changed = jobs.attach_task(args.run_id, args.task)
+    except (ValueError, OSError) as exc:
+        print(f"[review attach] {exc}", file=sys.stderr)
+        return 2
+    result = {"run_id": args.run_id, "task_code": args.task, "changed": changed}
+    print(json.dumps(result) if args.json else f"Run {args.run_id}: attached to {args.task}" + ("" if changed else " (already attached)"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point: install the child-reaper, then either detach a background job or
     run the review inline (reentrancy guard + backstop).
@@ -3555,7 +3613,7 @@ def main(argv: list[str] | None = None) -> int:
     # process before any `finally` runs, orphaning session-isolated backend children.
     install_signal_reaper()
 
-    raw = sys.argv[1:] if argv is None else argv
+    raw = _normalize_leading_mode_options(list(sys.argv[1:] if argv is None else argv))
     # The reentrancy guard runs BEFORE the --detach split (review-cli#180 x #160): a
     # backend nested inside a running `review` must not be able to sidestep the
     # fork-bomb guard by detaching — the spawned child would start from a clean
@@ -3570,7 +3628,17 @@ def main(argv: list[str] | None = None) -> int:
 
     job_id = os.environ.get("REVIEW_JOB_ID")
     if not job_id:
+        if raw and raw[0] in known_subcommands() and not any(
+            flag in raw for flag in ("--help", "-h", "--list-defaults", "--show-board")
+        ):
+            return _run_with_identity(raw)
         return _main_dispatch(raw)
+
+    record = jobs.read_job(job_id)
+    if (not record or record.get("status") != "running"
+            or record.get("pid") not in (None, os.getpid())):
+        print("[review-cli] REVIEW_JOB_ID must identify this process's running job; unset it for a new run.", file=sys.stderr)
+        return 2
 
     # Detached-child finalization path: run the SAME body as a normal foreground call,
     # then durably record how it ended — including a SystemExit (argparse usage error,
@@ -3579,7 +3647,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = 1
     try:
-        rc = _main_dispatch(raw)
+        rc = _capture_run_output(job_id, raw)
     except SystemExit as exc:
         code = exc.code
         rc = 0 if code is None else (code if isinstance(code, int) else 1)
@@ -3597,6 +3665,7 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code=rc,
                 finished_at=time.time(),
             )
+            _attachment_hint(job_id)
         except jobs.InvalidJobId:
             print(
                 f"[review-cli] $REVIEW_JOB_ID is not a valid job id ({job_id!r}) — "
@@ -4044,8 +4113,8 @@ def _add_global_options(
         metavar="CODE",
         default=None,
         help=(
-            "task/issue code for this review iteration (required for recorded review "
-            "modes; standalone visual without diff is exempt; may also be supplied by "
+            "optional task/issue code (attach later with review attach RUN_ID --task CODE; "
+            "may also be supplied by "
             "$REVIEW_TASK_CODE)"
         ),
     )
@@ -4094,12 +4163,7 @@ def _add_global_options(
             choices=preset_names(),
             default=None,
             help=(
-                "diff-review preset: light = quick/cheap preflight (pool 2, medium effort; "
-                "a recorded `--task` run floors that to 3 distinct roles so gh ship can pass); "
-                "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, excludes "
-                "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
-                f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
+                'diff-review preset: light = quick/cheap preflight (requested pool 2, medium effort; the role floor may expand the default pool regardless of task association); default = routine change review (pool 4, high effort, excludes Fable/Sol); heavy = release/risky-change review (pool 4, highest effort, excludes Fable but includes Sol). Without a configured board or model roster, diff uses light.'
             ),
         )
     parser.add_argument(
@@ -4108,17 +4172,7 @@ def _add_global_options(
         default=None,
         metavar="N",
         help=(
-            "how many of the board's seats to run (default "
-            f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
-            f"for light — a bare `review diff` uses {preset_pool_size(DEFAULT_PRESET)}, the "
-            f"{DEFAULT_PRESET!r} preset's pool; a recorded `--task` run floors that to "
-            f"{SHIP_MIN_ROLES} so gh ship can pass; {DEFAULT_POOL_SIZE} is only the fallback "
-            "for a custom config `models:`/`board:` roster with no `pool:` key set); the "
-            "first N seats participate, the rest are kept in reserve. The board is "
-            "never off — --pool only sizes it. N<=0 means all seats. An explicit `--pool N` "
-            "below 3 with `--task` still wins but warns. Ignored for exact multi-model -m; "
-            "a recorded `--task -m` one-model run pads that model across the ship floor. "
-            "Recorded `--task --pool 0` still pads a same-role config roster to the ship floor."
+            'how many board seats to select: the first N participate and the rest remain in reserve. N<=0 selects all seats. Preset defaults request 2 for light or 4 for default/heavy; an implicit pool may expand to the role floor. An explicit positive value below the role floor wins but warns. Ignored for an exact multi-model -m selection; a single selected model may be reused across distinct roles. Task association is optional and does not alter the role plan.'
         ),
     )
     parser.add_argument(
@@ -4324,6 +4378,7 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "register-module",
         "spec-web",
         "jobs",
+        "attach",
         "status",
         "wait",
     }
@@ -4438,7 +4493,7 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   A priority-ordered panel of seats, each model carrying its own
   role/lens. The listing also prints per-role fallback model ids (bare names; harness auto-resolved). A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
   {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
-  Fable/Sol. A recorded `review diff --task CODE` floors that pool to {SHIP_MIN_ROLES}
+  Fable/Sol. A `review diff` run floors that pool to {SHIP_MIN_ROLES}
   distinct roles so `review task CODE --check` / gh ship can pass from one run; explicit
   `--pool N` still wins (warns if N<{SHIP_MIN_ROLES}). `-m one-model` with `--task` pads
   that model across {SHIP_MIN_ROLES} roles for review, just-ask, quorum, and brainstorm.
@@ -4588,7 +4643,8 @@ def _subcommand_epilog() -> str:
             "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
             "\n  task        show review iterations and transcripts for one task code"
             "\n  stat        per-harness/per-model usage + health report from the real call logs"
-            "\n  jobs        list detached (--detach) review jobs"
+            "\n  attach      attach a completed run: review attach RUN_ID --task CODE"
+            "\n  jobs        list recorded review runs"
             "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`)"
             "\n  wait        block until a detached job finishes (`wait <job-id>`)"
             "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
@@ -5045,6 +5101,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `--detach` companion commands (review-cli#160): inspect or block on a
     # session-detached background review started elsewhere. Bare subcommands, same
     # reasoning as `sessions`/`task` above.
+    if argv and argv[0] == "attach":
+        return _attach_subcommand(argv[1:])
     if argv and argv[0] == "jobs":
         return _jobs_subcommand(argv[1:])
     if argv and argv[0] == "status":
@@ -5235,17 +5293,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
         print("\n".join(effective))
         return 0
 
-    # Optional `--task` (or $REVIEW_TASK_CODE) floors the pool BEFORE --show-board
-    # so `review diff --task CODE --show-board --preset light` displays 3, not 2
-    # (review-cli#309). Missing --task is not fatal here — show-board stays light's 2.
-    raw_early_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
-    early_task: str | None = None
-    if raw_early_task:
-        try:
-            early_task = normalize_task_code(raw_early_task)
-        except ValueError:
-            early_task = None
-    if early_task and mode.name == "review":
+    # Role coverage is an execution property, independent of task association.
+    if mode.name == "review":
         config_roster_len = (
             len(config_models)
             if config_models
@@ -5375,8 +5424,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             preset=active_preset,
             explicit_models=explicit_models,
             pad_task_roles=bool(
-                early_task
-                and mode.name == "review"
+                mode.name == "review"
                 and (
                     (len(explicit_models) <= 1 and effective_pool_size > 1)
                     or (not explicit_models and effective_pool_size <= 0)
@@ -5386,31 +5434,21 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
     piped_input = _read_stdin_if_piped()
     task_code: str | None = None
-    requires_task_code = is_subcommand and (
-        mode.name != "visual"
-        or getattr(args, "diff", False)
-        or getattr(args, "staged", False)
-        or piped_input is not None
-    )
-    if requires_task_code:
-        raw_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
+    if is_subcommand:
+        raw_task = getattr(args, "task", None)
+        if raw_task is None:
+            raw_task = os.environ.get("REVIEW_TASK_CODE")
         try:
             task_code = normalize_task_code(raw_task)
+            if raw_task is not None and task_code is None:
+                raise ValueError("supplied task code is empty; omit --task for an unassociated run")
         except ValueError as exc:
-            print(
-                f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True
-            )
-            return 2
-        if task_code is None:
-            print(
-                "[review-cli] missing required --task CODE for review iteration history.\n"
-                "  use: review <mode> --task CODE ...\n"
-                "  or set REVIEW_TASK_CODE=CODE for automation.",
-                file=sys.stderr,
-                flush=True,
-            )
+            print(f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True)
             return 2
         args.task = task_code
+        run_id = os.environ.get("REVIEW_JOB_ID")
+        if run_id:
+            jobs.write_job(run_id, task_code=task_code)
 
     # A bare `review` (or `review --flag …` with no verb / an unknown verb) reaches here
     # without a meta flag to serve: print the HELP/usage instead of silently running a diff
@@ -5637,8 +5675,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # (effective_pool_size > 1 is false) and warns above. Review uses the board
     # path; panel modes pad the flat `models` list below.
     task_role_pad = (
-        bool(task_code)
-        and mode.name in ("review", "just-ask", "quorum", "brainstorm")
+        mode.name in ("review", "just-ask", "quorum", "brainstorm")
         and len(explicit_models) == 1
         and effective_pool_size > 1
     )
@@ -5745,8 +5782,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 effective_pool_size if effective_pool_size > 0 else SHIP_MIN_ROLES
             )
             if (
-                bool(task_code)
-                and mode.name == "review"
+                mode.name == "review"
                 and role_repair_min > 1
                 and (
                     task_role_pad
@@ -5945,6 +5981,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # an agent might wrongly short-timeout (codex P2).
         if not panel_mode and not diff.strip():
             from .features.visual.visual_cli import run_visual_standalone
+            if run_id:
+                jobs.write_job(run_id, executed=True, repo_id=repo_id,
+                               diff_files=diff_files, diff_sha256=diff_sha256)
 
             return run_visual_standalone(
                 args.visual,

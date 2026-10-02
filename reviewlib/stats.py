@@ -431,6 +431,14 @@ def record_run(
         # review-cli#137: no `models`-length alignment requirement (unlike `roles`
         # above) -- see this function's `usable_roles` docstring paragraph for why.
         record["usable_roles"] = list(usable_roles)
+    run_id = os.environ.get("REVIEW_JOB_ID")
+    if run_id:
+        from . import jobs
+        try:
+            record["stats_store"] = str(stats_path().resolve())
+        except (OSError, RuntimeError):
+            pass
+        jobs.record_evidence(run_id, record)
     try:
         p = stats_path()  # may raise RuntimeError on an unexpandable ~user / no HOME
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -464,7 +472,7 @@ def _load_records() -> list[dict]:
             encoding="utf-8"
         )  # stats_path() may raise RuntimeError
     except Exception:  # noqa: BLE001 — unreadable/unexpandable store -> no history, never crash
-        return out
+        raw = ""
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -475,6 +483,26 @@ def _load_records() -> list[dict]:
             continue
         if isinstance(rec, dict) and "duration_seconds" in rec:
             out.append(rec)
+    from . import jobs
+    runs = {run["job_id"]: run for run in jobs.list_jobs()}
+    try:
+        store = str(stats_path().resolve())
+    except (OSError, RuntimeError):
+        store = None
+    seen = {rec.get("evidence_id") for rec in out if rec.get("evidence_id")}
+    for run in runs.values():
+        for evidence in run.get("evidence", []):
+            if (store is not None and evidence.get("stats_store") == store
+                    and evidence.get("evidence_id") not in seen):
+                out.append(dict(evidence))
+                seen.add(evidence.get("evidence_id"))
+    for record in out:
+        run = runs.get(record.get("run_id"), {})
+        if run:
+            record["run_status"] = run.get("status")
+            record["run_exit_code"] = run.get("exit_code")
+        if not record.get("task_code") and run.get("task_code"):
+            record["task_code"] = run["task_code"]
     return out
 
 
@@ -1323,7 +1351,10 @@ def quorum_check(
     iterations = iterations_for_task(clean) if clean else []
     # Fail-closed: a record with no "passed" key (pre-v3, verdict unknown) is NOT
     # passed -- `is True` (not truthy) so it never accidentally matches None/missing.
-    passed_iterations = [item for item in iterations if item.get("passed") is True]
+    passed_iterations = [
+        item for item in iterations
+        if item.get("passed") is True and item.get("run_status", "done") == "done"
+    ]
     verified, mismatched, unverifiable = _sort_passed_iterations_into_buckets(
         passed_iterations, repo_id, diff_files
     )
