@@ -56,7 +56,7 @@ from ..panel import (
     result_is_usable,
     run_board_with_failover,
 )
-from ..process import _run, git_repo_env
+from ..process import _run, git_repo_env, write_skip_log
 from ..retry import retry_default, run_seat_with_retry
 from . import _visual_images
 from .contract import ModeContext, ModeSpec
@@ -1354,6 +1354,21 @@ def _mode_review_board(
             _chain_aware_available,
             usage_percent=usage_percent,
         )
+        # Every board seat absent from BOTH `pool` and `reserve` was excluded before
+        # ever attempting a call (select_pool_and_reserve_with_reuse's docstring: an
+        # unavailable seat is "in NEITHER list"), so no backend function -- and thus
+        # no per-call log -- ever runs for it. Record it explicitly so a skipped
+        # seat's reason survives the run instead of vanishing with no trace
+        # (task-cli logging audit, Ticket A: `--show-board` shows this live, but a
+        # completed `review diff` invocation left nothing on disk to reconstruct it
+        # from afterward).
+        _live_ids = {id(r) for r in pool} | {id(r) for r in reserve}
+        for _skipped in board:
+            if id(_skipped) not in _live_ids:
+                write_skip_log(
+                    _skipped.model,
+                    reason=backend_unavailable_reason(_skipped.model) or "unavailable",
+                )
         _warn_if_board_reused(board, pool)
         _report_pool_shortfall(board, pool, reserve=reserve, pool_size=pool_size)
     if not pool:

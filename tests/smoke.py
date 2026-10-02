@@ -774,6 +774,12 @@ _UNIT_FILES = [
     # than writing to the real log dir if a seat there ever fails (GLM review finding,
     # round 8).
     ("test_pool_shortfall_warning.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # task-cli logging audit, Ticket A (P1): write_skip_log + its wiring into
+    # `_mode_review_board` -- a hard-unavailable board seat (in neither pool nor
+    # reserve) durably records its model + reason instead of vanishing with no
+    # trace. Drives the real mode_review call site with a fake backend, no real
+    # dispatch; REVIEW_LOG_DIR isolated like its sibling dispatch-driving tests.
+    ("test_skip_log.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # Adversarial review-rigor audit fixes (Alex, 2026-08-21): the adversarial base
     # prompt + evidence-for-a-clean-verdict surfacing, the security/tests role
     # blending, and quorum's opt-in --adversarial-check refutation pass. Pure

@@ -1247,6 +1247,43 @@ def write_retry_log(
     return path
 
 
+def write_skip_log(model: str, *, reason: str) -> Path:
+    """Durably record ONE board seat excluded from BOTH the dispatch pool AND the
+    mid-run reserve before it ever attempted a call.
+
+    `select_pool_and_reserve_with_reuse` (reviewlib.config) explicitly documents that
+    an unavailable seat is "in NEITHER list" -- it simply vanishes from the run. Since
+    no backend function is ever invoked for such a seat, none of the normal per-call
+    log paths (`_run_streamed`, `write_sidecar_log`) ever run for it either, so a
+    hard-unavailable seat (no key/CLI, an active cooldown, an exhausted provider
+    chain) left NO trace anywhere on disk -- `--show-board` shows it live, but that's
+    a separate, later, read-only probe; the actual `review diff` invocation that
+    skipped it recorded nothing (Alex's live-run report, 2026-09-09: a skipped seat's
+    reason could not be reconstructed after the fact from the run's own logs).
+
+    Same sidecar convention as `write_retry_log`: one file per event under
+    `log_dir()`, disambiguated by the same process-wide sequence counter, with a
+    `-skip-` infix (like the existing `-retry-` infix) so `dashboard.parser`'s
+    `_CALL_RE` (which requires a trailing `-r<digits>.log`) never miscounts it as a
+    real dispatched call. Best-effort: any OS error is swallowed -- a log we can't
+    write must never break the review."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    seq = _next_retry_log_seq()
+    path = log_dir() / f"{stamp}-{_safe_backend(model)}-skip-{seq:04d}.log"
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"[review-cli] SKIP-EVENT model={model} reason={reason}\n")
+            fh.write(_exit_line(1))
+    except OSError as exc:  # noqa: BLE001 - a log we can't write must not break the review
+        print(
+            f"[review-cli] could not write skip log ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+    return path
+
+
 def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     """Best-effort terminate→kill of the child's whole process group.
 
