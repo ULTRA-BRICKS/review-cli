@@ -296,7 +296,9 @@ def review_with_images(
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         if not allow_spawn_for_model(model):
-            reason = spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            reason = (
+                spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
+            )
             return _usage_limit_skip_result(model, round_no, reason, backend="claude")
         result = review_claude_cli_with_images(
             model, prompt, diff, cwd, timeout, round_no, images, effort=effort
@@ -1413,7 +1415,9 @@ def review_gemini(
             stderr = ""
         else:
             stdout = ""
-            stderr = f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            stderr = (
+                f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
+            )
         _emit_rest_log(
             "gemini",
             command,
@@ -2374,7 +2378,8 @@ def review_claude_api(
         # content to `result_is_usable()`; keep the failed result's stdout empty
         # like the other REST paths (tokens still ride on the result fields).
         stdout = (
-            text.strip() + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            text.strip()
+            + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
             if rc == 0
             else ""
         )
@@ -2600,12 +2605,108 @@ _UNAVAILABLE_MARKERS = (
 # OTHER chronic shape the token-burn investigation found dominates Fable's real failures
 # (1,836 of 4,322 recorded failures) — it is NOT rc=0/short-body shaped like the sentinel
 # above (the CLI exits non-zero), so it needs its own marker check.
-_CHRONIC_QUOTA_MARKERS = ("session limit", "usage-credits", "usage credits")
+#
+# Live-reproduced bug (2026-09-09): three further chronic-unavailability shapes,
+# captured verbatim from real `review diff` invocations the same day, matched NONE of
+# the four original phrases below, so a genuinely exhausted seat never got cached and
+# kept paying for a wasted dispatch on every subsequent invocation:
+#   - "Weekly/Monthly Limit Exhausted, resets 2026-09-10 21:15" (Codex)
+#   - "personal-team-blocked:spending-limit, out of credits" (Grok)
+#   - "You've hit your usage limit... try again at Sep 15th, 2026 5:22 AM" (Claude)
+# "usage limit" / "limit exhausted" / "spending-limit" / "out of credits" close that
+# gap. Kept deliberately narrow, same rationale as the original three markers: none of
+# these four substrings occurs in an unrelated transient message ("database is
+# locked", a bare network timeout) or a seat-fatal one.
+_CHRONIC_QUOTA_MARKERS = (
+    "session limit",
+    "usage-credits",
+    "usage credits",
+    "usage limit",
+    "limit exhausted",
+    "spending-limit",
+    "out of credits",
+)
 # The administrative sentinel is only trustworthy when the WHOLE body is short (a
 # one-liner notice) — a real, long review that happens to mention availability must
 # never be cached as a chronic failure. Shared by panel.result_is_usable and
 # retry._is_rc0_sentinel too (both import this name), so all three agree on the bound.
 _UNAVAILABLE_MAX_LEN = 400
+
+# Trailing clause naming an explicit reset instant, e.g. "resets 2026-09-10 21:15" or
+# "try again at Sep 15th, 2026 5:22 AM". Captures everything to the end of the line —
+# every live-captured example puts the timestamp last, with nothing after it to trim.
+_QUOTA_RESET_CLAUSE_RE = re.compile(
+    r"(?:resets|try again at)\s+([^\n]+)", re.IGNORECASE
+)
+
+# Strips an English ordinal day suffix ("15th", "1st", "22nd", "3rd") so a captured date
+# like "Sep 15th, 2026" parses with a plain %d once the suffix is gone.
+_ORDINAL_SUFFIX_RE = re.compile(r"(?<=\d)(?:st|nd|rd|th)\b", re.IGNORECASE)
+
+# Every reset-clause wire format seen in a live capture so far. datetime.strptime has no
+# built-in fallback chain, so each candidate is tried until one parses; a newly-observed
+# provider format is a one-line append here, not a rewrite.
+_QUOTA_RESET_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M",  # "2026-09-10 21:15" (ISO date, 24h clock) — Codex
+    "%b %d, %Y %I:%M %p",  # "Sep 15, 2026 5:22 AM" (post ordinal-strip) — Claude
+)
+
+# A parsed reset instant is trusted for at most this long past "now" — a misparsed year
+# or a provider stating an absurd future date must not pin a seat's cooldown for months.
+# 14 days comfortably covers every live-captured example (the furthest is ~6 days out)
+# while still bounding a parse failure to something a human will notice quickly.
+_MAX_PARSED_RESET_TTL_SECONDS = 14 * 24 * 3600.0  # 14 days
+
+
+def _parse_quota_reset_ttl_seconds(
+    text: str, *, now: float | None = None
+) -> float | None:
+    """``ttl_seconds`` computed from an explicit reset instant named in ``text`` (a
+    "resets <...>" or "try again at <...>" clause), or ``None`` when no such clause is
+    present or it doesn't parse against any known format — callers must then fall back
+    to `record_cooldown`'s own escalating-TTL default, exactly like a message with no
+    stated reset time always has.
+
+    None of the three live-captured messages this exists for carry a timezone, so a
+    parsed, timezone-naive instant is deliberately treated as UTC rather than guessed
+    at from the host's local zone — a wrong guess would be silently wrong, while UTC is
+    at least a documented, consistent choice.
+
+    A non-positive computed ttl (the stated instant has already passed — clock skew, or
+    a message read slightly late) is floored to `DEFAULT_COOLDOWN_SECONDS` rather than
+    returned as-is: `record_cooldown` treats `ttl_seconds <= 0` as "don't record
+    anything at all", which would defeat the point for a message that IS fatal. A
+    wildly-far-future or otherwise implausible instant is capped at
+    `_MAX_PARSED_RESET_TTL_SECONDS` so a parse quirk can never pin a seat for months."""
+    match = _QUOTA_RESET_CLAUSE_RE.search(text)
+    if match is None:
+        return None
+    candidate = _ORDINAL_SUFFIX_RE.sub("", match.group(1))
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+    parsed = None
+    for fmt in _QUOTA_RESET_TIME_FORMATS:
+        try:
+            parsed = datetime.strptime(candidate, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    until_epoch = parsed.replace(tzinfo=timezone.utc).timestamp()
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
+    ttl = until_epoch - now
+    if ttl <= 0:
+        ttl = DEFAULT_COOLDOWN_SECONDS
+    return min(ttl, _MAX_PARSED_RESET_TTL_SECONDS)
+
+
+def _quota_reset_ttl_seconds(result: ReviewResult) -> float | None:
+    """`_parse_quota_reset_ttl_seconds` applied to `result`'s combined stdout+stderr —
+    the same two channels `_chronic_unavailable_reason` itself scans, so a reset clause
+    is found regardless of which of the two channels a given backend puts it in."""
+    text = f"{result.stdout or ''}\n{result.stderr or ''}"
+    return _parse_quota_reset_ttl_seconds(text)
+
 
 # Byte-exact match for the numeric codes retry.py's `_TRANSIENT_PATTERNS` regex
 # targets (`\b429\b`, `\b5(?:0[0234]|2[0-4]|29)\b`): 429, 500/502/503/504, 520-524,
