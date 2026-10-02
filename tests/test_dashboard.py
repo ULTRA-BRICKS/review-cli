@@ -599,6 +599,36 @@ def test_parse_call_log_understands_explicit_no_task_marker():
         assert "[review-cli] TASK SPOOFED" in c.body
 
 
+def test_parse_call_log_skips_both_queue_markers_before_the_header():
+    """`process._run_streamed` can write TWO pre-header queue markers — the per-process
+    cap's and the machine-wide pool's (review-cli#592). Both must be recognised as
+    pre-header noise: an unmatched marker closes the pre-header window, the real header
+    line then lands in the body and its argv0/task attribution is silently lost. The
+    per-process line is the LITERAL historical on-disk form (logs written before #592
+    must keep parsing); the machine-wide line comes from the live producer."""
+    from reviewlib.concurrency_caps import waiting_marker
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = ld / "20260601T100000_000000Z-opus-r0.log"
+        path.write_text(
+            "[review-cli] opus: waiting for a concurrency slot (cap 4)\n"
+            + waiting_marker("opus", 6, machine_wide=True)
+            + "[review-cli] opus: /usr/bin/claude-p (args redacted) task=HYP-742\n"
+            "verdict body\n"
+            "[review-cli] EXIT 0\n",
+            encoding="utf-8",
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert c.argv0 == "/usr/bin/claude-p"
+        assert c.task_code == "HYP-742"
+        assert "waiting for a" not in c.body, c.body
+        assert "(args redacted)" not in c.body, c.body
+        assert "verdict body" in c.body
+
+
 def test_parse_call_log_timeout_and_stderr():
     from reviewlib.dashboard import parser as p
 
@@ -1840,7 +1870,9 @@ def test_scan_log_dir_entries_reuses_name_list_when_dir_mtime_unchanged():
         ld = Path(d)
         stamp = "20260601T100000_000000"
         path = _write_call_log(ld, stamp, "codex", 0, "partial output so far\n")
-        quiet = os.stat(ld).st_mtime - 60  # a directory nobody created/deleted in for a while
+        quiet = (
+            os.stat(ld).st_mtime - 60
+        )  # a directory nobody created/deleted in for a while
         os.utime(ld, (quiet, quiet))
         p.os.scandir = _counting_scandir
         try:
@@ -1940,7 +1972,9 @@ def test_load_sessions_days_window_skips_old_stamped_files():
         old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
         body = "[review-cli] codex: /usr/bin/fake (args redacted)\nok\n[review-cli] EXIT 0\n"
         for i in range(n_old):
-            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(body, encoding="utf-8")
+            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(
+                body, encoding="utf-8"
+            )
         for i in range(n_recent):
             recent_dt = newest - timedelta(minutes=i)
             stamp = recent_dt.strftime("%Y%m%dT%H%M%S") + "_000000"
@@ -1995,7 +2029,9 @@ def test_load_sessions_without_days_keeps_all_history():
         old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
         body = "[review-cli] codex: /usr/bin/fake (args redacted)\nok\n[review-cli] EXIT 0\n"
         for i in range(n_old):
-            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(body, encoding="utf-8")
+            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(
+                body, encoding="utf-8"
+            )
         for i in range(n_recent):
             recent_dt = newest - timedelta(minutes=i)
             stamp = recent_dt.strftime("%Y%m%dT%H%M%S") + "_000000"
@@ -3302,7 +3338,9 @@ def test_get_derived_never_caches_a_retry_fallback_result_under_a_foreign_genera
         cache._fingerprint = (1, 1.0, 1)
         cache._generation = 3
         orig_ensure_fresh = cache._ensure_fresh
-        cache._ensure_fresh = lambda gap, *, force, days=7.0: None  # never installs gap=30
+        cache._ensure_fresh = lambda gap, *, force, days=7.0: (
+            None
+        )  # never installs gap=30
         try:
             value = cache.get_derived(
                 30.0, "stats", lambda sessions: f"stats-for-{len(sessions)}-sessions"
@@ -3624,8 +3662,6 @@ def test_compute_stats_by_dimension_counts_exit_0_paywall_as_a_failure(monkeypat
         assert dim["ok"] == 0
         assert dim["error"] == 1
         assert dim["ok_rate"] == 0.0
-
-
 
 
 # --- per-model health classifier (Models & roles tab) -----------------------
@@ -6027,8 +6063,12 @@ def test_scan_log_dir_entries_does_not_cache_a_listing_taken_in_the_dir_mtime_ti
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        keep = _write_call_log(ld, "20260601T100000_000000", "codex", 0, "a\n", exit_code=0)
-        gone = _write_call_log(ld, "20260601T100001_000000", "codex", 0, "b\n", exit_code=0)
+        keep = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, "a\n", exit_code=0
+        )
+        gone = _write_call_log(
+            ld, "20260601T100001_000000", "codex", 0, "b\n", exit_code=0
+        )
         tick = os.stat(ld).st_mtime
         assert p._scan_log_dir_entries(ld).total_count == 2
         gone.unlink()

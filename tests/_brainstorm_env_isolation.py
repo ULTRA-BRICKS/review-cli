@@ -28,16 +28,20 @@ from typing import Callable, TypeVar
 
 _T = TypeVar("_T")
 
-_ISOLATED_ENV_KEYS = ("REVIEW_LOG_DIR", "REVIEW_STATS_FILE")
+# REVIEW_MACHINE_SLOT_DIR: the machine-wide seat pool (review-cli#592) is shared by every
+# review process of this user; a test that spawns fake seats must not queue behind — or
+# steal slots from — a real review running on the same box.
+_ISOLATED_ENV_KEYS = ("REVIEW_LOG_DIR", "REVIEW_STATS_FILE", "REVIEW_MACHINE_SLOT_DIR")
 
 
 def with_isolated_brainstorm_paths(fn: Callable[[], _T]) -> _T:
-    """Run `fn` (a real `mode_brainstorm` call) with `REVIEW_LOG_DIR` and
-    `REVIEW_STATS_FILE` redirected to a throwaway temp dir, restored afterward."""
+    """Run `fn` (a real `mode_brainstorm` call) with `REVIEW_LOG_DIR`, `REVIEW_STATS_FILE`
+    and `REVIEW_MACHINE_SLOT_DIR` redirected to a throwaway temp dir, restored afterward."""
     saved = {k: os.environ.get(k) for k in _ISOLATED_ENV_KEYS}
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["REVIEW_LOG_DIR"] = tmp
         os.environ["REVIEW_STATS_FILE"] = str(Path(tmp) / "run-stats.jsonl")
+        os.environ["REVIEW_MACHINE_SLOT_DIR"] = str(Path(tmp) / "slots")
         try:
             return fn()
         finally:

@@ -175,10 +175,24 @@ disables it, and a value above **64** is clamped to that ceiling so a typo can't
 absurd number of children). A seat over the cap simply **waits** for a slot — it is never
 dropped, and its per-call timeout starts only once it actually spawns, so queueing on the
 cap can't falsely time it out. The common single-seat gate (`--pool 1`) and the default
-(light) pool of 2 are unaffected (both `<=` the cap). This is a *per-process* cap; a swarm
-of separate `review` processes also leans on the per-seat timeout (a stalled seat frees its
-slot fast) and on the slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort
-reserve** (review-cli#65).
+(light) pool of 2 are unaffected (both `<=` the cap). This is a *per-process* cap; #65
+also leans on the per-seat timeout (a stalled seat frees its slot fast) and on the slow
+`oc:zai/glm-5.2` seat being **deprioritized to last-resort reserve**. The swarm of
+separate `review` processes it cannot see is bounded by the **machine-wide cap** below.
+
+**Machine-wide cap (review-cli#592).** Several agent sessions each running `review diff`, or
+one script fanning a review per worktree, are N independent per-process caps — the
+2026-09-29 overload was 10 concurrent reviews x 3 seats, ~30 model children, load 39 on 14
+CPUs. `reviewlib/machine_slots.py` bounds the TOTAL heavy seats across every `review`
+process of the user: a pool of `flock`-held lock files in `/tmp/review-cli-slots-<uid>`
+(`$REVIEW_MACHINE_SLOT_DIR` overrides), default **6** via `$REVIEW_MACHINE_MAX_CONCURRENCY`
+(`<= 0` disables, above **64** clamps). A seat takes a slot right after the per-process
+semaphore and before spawn, waits (never drops) when the pool is full — logging
+`waiting for a machine-wide concurrency slot (cap N)` — and releases it once its child is
+reaped. The lock lives on the open file description, so a holder that crashes or is
+`kill -9`'d frees its slot in the kernel: there is no stale-lock state to reap. If the pool
+directory can't be created (sandbox, foreign-owned squat) the seat runs uncapped with a
+stderr warning rather than not running at all.
 
 **To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the

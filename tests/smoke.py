@@ -78,6 +78,11 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "HOME": home,
         "XDG_CONFIG_HOME": str(Path(home) / ".config"),
         "REVIEW_TASK_CODE": "SMOKE-1",
+        # Every child that drives a real `_run_streamed` seat contends the machine-wide slot
+        # pool (review-cli#592). Point the whole smoke run at its own pool so a unit file
+        # never queues behind — or steals slots from — a live review on the same box (the
+        # per-file _FRESH_TMP log dirs don't cover this; it must be unconditional).
+        "REVIEW_MACHINE_SLOT_DIR": str(Path(home) / "review-slots"),
     }
     full_env.update(env or {})
     return full_env
@@ -841,6 +846,9 @@ _UNIT_FILES = [
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The machine-wide cap (review-cli#592) spawns real separate _run_streamed processes; it
+    # sets its own REVIEW_MACHINE_SLOT_DIR per test so it never contends a live review's pool.
+    ("test_machine_slots.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_inseat_retry.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_brainstorm_diff.py", {}),
     ("test_brainstorm_dead_panel.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

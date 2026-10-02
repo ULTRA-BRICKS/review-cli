@@ -296,10 +296,29 @@ line to stderr every 60 seconds once the call is actually RUNNING (the trailing 
 heartbeats entirely; a positive value below the poll granularity (0.5s) clamps up to
 it. (Scope: this covers the review/panel seat dispatch path, `_run_streamed`, from the
 moment its subprocess spawns — the one implicated in the incident that motivated it.
-Two things it does NOT cover: a seat still queued on `REVIEW_MAX_CONCURRENCY`'s
-concurrency cap, waiting for a slot before it can even spawn; and a handful of short,
-bounded, non-seat subprocess calls elsewhere — e.g. `git worktree add` during QA
-isolation setup — that use the plain, non-streamed runner.)
+Two things it does NOT cover: a seat still queued on a concurrency cap
+(`REVIEW_MAX_CONCURRENCY` per process, `REVIEW_MACHINE_MAX_CONCURRENCY` across every
+`review` process on the machine — see "Concurrency caps" below), waiting for a slot
+before it can even spawn; and a handful of short, bounded, non-seat subprocess calls
+elsewhere — e.g. `git worktree add` during QA isolation setup — that use the plain,
+non-streamed runner.)
+
+**Concurrency caps — per process AND machine-wide.** Every heavy seat is a fat agent
+CLI subprocess (hundreds of MB). `REVIEW_MAX_CONCURRENCY` (default 4) bounds how many
+ONE `review` invocation spawns at once; `REVIEW_MACHINE_MAX_CONCURRENCY` (default 6)
+bounds the TOTAL across every `review` process of your user on the machine — several
+agent sessions each running `review diff`, or one script fanning a review per
+worktree, otherwise multiply into dozens of model children at once (the 2026-09-29
+overload: 10 concurrent reviews, ~30 seats, load 39 on 14 CPUs). A seat over either
+cap waits for a slot (a `waiting for a … concurrency slot` line in its per-call log),
+is never dropped, and its timeout starts only when it actually spawns. The machine-wide
+pool is `flock`-held lock files in `/tmp/review-cli-slots-<uid>` (`REVIEW_MACHINE_SLOT_DIR`
+overrides), so a slot is released by the kernel when its holder dies — nothing to clean
+up after a crash or `kill -9`. `<= 0` disables either cap; values above 64 clamp. Set
+`REVIEW_MACHINE_MAX_CONCURRENCY` in your login environment, not per invocation: the cap
+is the number of slot files a process contends, so one process running with a bigger
+cap than the others gets extra slots nobody else takes and the effective bound becomes
+the largest cap in use.
 
 **Run stats & a startup ETA — never short-timeout `review`.** `review` is
 multi-model and (for the panel modes) multi-round, so a run takes **minutes**, and a

@@ -3,6 +3,23 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.38.2 — 2026-09-29
+
+- **Fix: machine-wide cap on heavy backend seats across every `review` process
+  (review-cli#592).** `$REVIEW_MAX_CONCURRENCY` only ever bounded ONE `review` invocation;
+  several agent sessions each running `review diff` — or one script fanning a review per
+  worktree — were N independent caps. sysmon incident 20260929T195657-live: 10 concurrent
+  reviews, ~30 model children at once, load 39 on 14 CPUs, swap 76%, the same overload class
+  that kernel-panicked the machine earlier that day. New `reviewlib/machine_slots.py`: a pool
+  of `flock`-held lock files in `/tmp/review-cli-slots-<uid>` (`$REVIEW_MACHINE_SLOT_DIR`),
+  default **6** via `$REVIEW_MACHINE_MAX_CONCURRENCY` (`<= 0` disables, `> 64` clamps),
+  taken in `_run_streamed` right after the per-process semaphore. A seat over the cap waits
+  (`waiting for a machine-wide concurrency slot (cap N)` in its per-call log; the dashboard
+  parser credits it as queue time), is never dropped, and its timeout starts at spawn. The
+  lock lives on the open file description, so a holder that crashes or is `kill -9`'d frees
+  its slot in the kernel — no stale-lock state. An unusable pool dir degrades to uncapped
+  with a stderr warning per seat. Tests drive real separate processes (`tests/test_machine_slots.py`). The env reader, ceiling and queue-marker shape shared by both caps live in `reviewlib/concurrency_caps.py`.
+
 ## 0.38.0 — 2026-09-26
 
 - **Build: published on PyPI as `hyper-review`** (the command stays `review`; `review-cli` on

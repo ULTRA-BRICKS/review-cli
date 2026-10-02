@@ -20,6 +20,7 @@ depends on a real model CLI being installed. The fake records its own start/exit
 into a shared dir so the test can compute the true peak concurrency from on-disk evidence
 (not a mock's say-so).
 """
+
 from __future__ import annotations
 
 import os
@@ -32,15 +33,21 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import reviewlib.concurrency_caps as concurrency_caps  # noqa: E402
 import reviewlib.process as process  # noqa: E402
 
 
 def _with_env(**env):
     """Set env vars for the body, restore exactly afterward (no monkeypatch fixture so the
-    standalone __main__ runner works). Returns a context manager."""
+    standalone __main__ runner works). Returns a context manager.
+
+    Always points `REVIEW_MACHINE_SLOT_DIR` at a fresh temp dir unless the caller sets it:
+    these tests measure the PER-PROCESS cap, and the machine-wide pool (review-cli#592)
+    would otherwise make the fake seats queue behind a real review on the same box."""
 
     class _Ctx:
         def __enter__(self):
+            env.setdefault("REVIEW_MACHINE_SLOT_DIR", tempfile.mkdtemp())
             self._saved = {k: os.environ.get(k) for k in env}
             for k, v in env.items():
                 if v is None:
@@ -87,7 +94,7 @@ def test_max_concurrency_zero_or_negative_disables():
 
 def test_max_concurrency_clamps_to_ceiling():
     with _with_env(REVIEW_MAX_CONCURRENCY="100000"):
-        assert process.max_concurrency() == process._MAX_CONCURRENCY_CEILING
+        assert process.max_concurrency() == concurrency_caps.CAP_CEILING
 
 
 # === (b) the semaphore is built once + cached, disabled cap is None ==============
@@ -155,7 +162,11 @@ def _run_n_seats(n: int, record_dir: str, hold: float = 0.6) -> None:
 
     def _seat(i: int) -> None:
         process._run_streamed(
-            argv, cwd=REPO_ROOT, timeout=30, backend=f"capfake{i}", round_no=0,
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend=f"capfake{i}",
+            round_no=0,
         )
 
     threads = [threading.Thread(target=_seat, args=(i,)) for i in range(n)]
@@ -210,7 +221,11 @@ def test_queued_seat_is_not_falsely_timed_out():
         # A SHORT per-call timeout (2s) — shorter than the total queue+run wall time for the
         # last seat (~3s), so a queue that wrongly counted toward the timeout would kill it.
         results[i] = process._run_streamed(
-            argv, cwd=REPO_ROOT, timeout=2, backend=f"queuefake{i}", round_no=0,
+            argv,
+            cwd=REPO_ROOT,
+            timeout=2,
+            backend=f"queuefake{i}",
+            round_no=0,
         )
 
     with _with_env(REVIEW_MAX_CONCURRENCY="1", REVIEW_LOG_DIR=tempfile.mkdtemp()):
@@ -222,10 +237,16 @@ def test_queued_seat_is_not_falsely_timed_out():
 
     events = Path(tmp) / "events"
     # All three completed normally (an `.end` marker each) — none was timed out while queued.
-    assert len(list(events.glob("*.start"))) == 3, sorted(p.name for p in events.glob("*.start"))
-    assert len(list(events.glob("*.end"))) == 3, sorted(p.name for p in events.glob("*.end"))
+    assert len(list(events.glob("*.start"))) == 3, sorted(
+        p.name for p in events.glob("*.start")
+    )
+    assert len(list(events.glob("*.end"))) == 3, sorted(
+        p.name for p in events.glob("*.end")
+    )
     # And none returned the timeout exit code (124) — a queued-then-timed-out seat would.
-    assert all(r.returncode == 0 for r in results.values()), {i: r.returncode for i, r in results.items()}
+    assert all(r.returncode == 0 for r in results.values()), {
+        i: r.returncode for i, r in results.items()
+    }
 
 
 # === (g) a spawn FAILURE releases the slot (the sem_acquired guard's whole point) =
@@ -243,19 +264,28 @@ def test_spawn_failure_releases_the_slot():
         # must be released by the finally despite the raise.
         try:
             process._run_streamed(
-                ["/nonexistent/review-cap-test-binary"], cwd=REPO_ROOT, timeout=5,
-                backend="missingbin", round_no=0,
+                ["/nonexistent/review-cap-test-binary"],
+                cwd=REPO_ROOT,
+                timeout=5,
+                backend="missingbin",
+                round_no=0,
             )
         except FileNotFoundError:
             pass  # expected — the binary is not on PATH
         # Second seat: a REAL seat. If the slot leaked, cap=1 would block this forever.
         argv = _liveness_argv(tmp, hold=0.3)
         result = process._run_streamed(
-            argv, cwd=REPO_ROOT, timeout=10, backend="afterfail", round_no=0,
+            argv,
+            cwd=REPO_ROOT,
+            timeout=10,
+            backend="afterfail",
+            round_no=0,
         )
     events = Path(tmp) / "events"
     assert result.returncode == 0, result.returncode
-    assert len(list(events.glob("*.end"))) == 1, "the real seat ran — the leaked slot was freed"
+    assert len(list(events.glob("*.end"))) == 1, (
+        "the real seat ran — the leaked slot was freed"
+    )
 
 
 # === (e) the single-seat gate path is unaffected ================================

@@ -21,6 +21,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import machine_slots
+from .concurrency_caps import capped_env_int, waiting_marker
 from .portable import (
     IS_WINDOWS,
     TEXT_SUBPROCESS_KWARGS,
@@ -96,12 +98,12 @@ def strip_control_sequences(text: str) -> str:
 # disables the cap (unbounded, the legacy behaviour) for a box that can sustain it.
 #
 # NOTE: this is a PER-PROCESS cap. A swarm of N separate `review` processes is N independent
-# caps — the cross-process lever is the per-seat timeout (a stalled seat frees its slot fast)
-# plus deprioritizing the known-slow reserve seat, both also part of #65. A per-process cap
-# still bounds the worst single-invocation fan-out (`--pool 0` on a large board, or a cascade of
-# reserve backfills) that one process can create.
+# caps — that swarm is what `machine_slots` (review-cli#592) bounds: a flock-held slot pool
+# shared by every review process of this user, acquired right after this semaphore in
+# `_run_streamed`. A per-process cap still bounds the worst single-invocation fan-out
+# (`--pool 0` on a large board, or a cascade of reserve backfills) that one process can create
+# without ever touching the shared pool.
 _DEFAULT_MAX_CONCURRENCY = 4
-_MAX_CONCURRENCY_CEILING = 64  # a typo'd env can't pin an absurd number of children
 _DEFAULT_IDLE_TIMEOUT = 20 * 60
 _SHORT_TIMEOUT_EXACT_THRESHOLD = 60
 _IDLE_TIMEOUT_ENV = "REVIEW_IDLE_TIMEOUT_SECONDS"
@@ -191,19 +193,10 @@ _concurrency_built = False
 
 def max_concurrency() -> int:
     """The configured cap on concurrent heavy backend subprocesses, read from
-    $REVIEW_MAX_CONCURRENCY (a missing/blank/non-integer value falls back to the default; a
-    value above the ceiling clamps down; <= 0 disables the cap). Read at build time so a run
-    can pin it via the env before the first spawn."""
-    raw = os.environ.get("REVIEW_MAX_CONCURRENCY")
-    if raw is None or not raw.strip():
-        return _DEFAULT_MAX_CONCURRENCY
-    try:
-        value = int(raw)
-    except ValueError:
-        return _DEFAULT_MAX_CONCURRENCY
-    if value <= 0:
-        return 0  # disabled
-    return min(value, _MAX_CONCURRENCY_CEILING)
+    $REVIEW_MAX_CONCURRENCY (`concurrency_caps.capped_env_int` contract: missing/garbage → default,
+    <= 0 disables, above `concurrency_caps.CAP_CEILING` clamps). Read at build time so a run can pin
+    it via the env before the first spawn."""
+    return capped_env_int("REVIEW_MAX_CONCURRENCY", default=_DEFAULT_MAX_CONCURRENCY)
 
 
 def idle_timeout_seconds(
@@ -1504,6 +1497,7 @@ def _run_streamed(
     # that raised between acquire and Popen.
     concurrency_sem = _get_concurrency_sem()
     sem_acquired = False
+    machine_slot: machine_slots.MachineSlot | None = None
     # Last char written to the log, so the trailing `EXIT {code}` footer can be put on
     # its own line even when the subprocess flushed stdout without a trailing newline
     # (codex P2: an unanchored footer is unparsable). The header ends with "\n".
@@ -1538,12 +1532,18 @@ def _run_streamed(
                 sem_acquired = True
             else:
                 log_fh.write(
-                    f"[review-cli] {backend}: waiting for a concurrency slot "
-                    f"(cap {max_concurrency()})\n"
+                    waiting_marker(backend, max_concurrency(), machine_wide=False)
                 )
                 log_fh.flush()
                 concurrency_sem.acquire()
                 sem_acquired = True
+
+        # Then the MACHINE-WIDE slot (review-cli#592): the semaphore above only bounds THIS
+        # process; N concurrent `review` invocations from N agent sessions each got their own
+        # cap and fanned out to ~30 model children at once. Same contract as the semaphore
+        # — blocks before spawn only, never drops the seat, one WAITING marker when full —
+        # and None when disabled or the pool is unavailable (uncapped, warned on stderr).
+        machine_slot = machine_slots.acquire(backend, log_fh)
 
         log_fh.write(
             f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n"
@@ -2061,5 +2061,7 @@ def _run_streamed(
         if sem_acquired and concurrency_sem is not None:
             sem_acquired = False
             concurrency_sem.release()
+        if machine_slot is not None:
+            machine_slot.release()
         with log_lock:
             log_fh.close()

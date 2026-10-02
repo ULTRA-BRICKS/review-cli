@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import call_log_cache
+from ..concurrency_caps import WAITING_MARKER_RE
 
 # Per-call log filename: 20260613T040611_516399Z-claude-r0.log
 _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
@@ -51,9 +52,10 @@ _HEADER_RE = re.compile(
     r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)(?: task=(?P<task>\S+))?\s*$"
 )
 _NO_TASK_RE = re.compile(r"^\[review-cli\] TASK\s*$")
-_WAITING_RE = re.compile(
-    r"^\[review-cli\] .+?: waiting for a concurrency slot \(cap \d+\)\s*$"
-)
+# Both queue markers `process._run_streamed` can write before a seat's header — the
+# per-process semaphore's and the machine-wide slot pool's (review-cli#592) — built from
+# the producers' own phrase pieces so wording and parser can't drift apart.
+_WAITING_RE = WAITING_MARKER_RE
 _TIMEOUT_RE = re.compile(r"^\[review-cli\] TIMEOUT after (?P<secs>\d+)s")
 _TRUE_SILENCE_RE = re.compile(
     r"^\[review-cli\] TRUE-SILENCE TIMEOUT after (?P<secs>\d+)s"
