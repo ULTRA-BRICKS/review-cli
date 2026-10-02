@@ -34,6 +34,7 @@ from ..panel import (
     run_role_slots,
 )
 from ..process import current_task_code, log_dir
+from ..log_archive import archive_db_path, store_brainstorm, use_sqlite_logs
 from . import PERSONAS, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
 
@@ -227,41 +228,56 @@ def mode_brainstorm(
     # On RESUME the original log is APPENDED to (O_APPEND, no O_EXCL/O_CREAT-new), so the
     # continued rounds + the final synthesis land in the SAME session log — a resumed
     # session is not a fresh file.
+    disc_started = datetime.now(timezone.utc)
+    sqlite_disc = use_sqlite_logs() and not resuming
+    disc_body: list[str] = []
     if resuming:
         disc_path = resume_log  # type: ignore[assignment]
+        if sqlite_disc and resume_log is not None:
+            try:
+                disc_body.append(resume_log.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
     else:
-        disc_path = (
-            log_dir()
-            / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
-        )
+        disc_path = log_dir() / f"{disc_started.strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
     disc = None
-    try:
-        flags = (
-            (os.O_WRONLY | os.O_APPEND)
-            if resuming
-            else (os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        )
-        disc = os.fdopen(
-            os.open(str(disc_path), flags, 0o600), "w", encoding="utf-8", buffering=1
-        )
-        verb = "resuming discussion log" if resuming else "brainstorm discussion log"
-        print(
-            f"[review-cli] {verb}: {disc_path} (tail -f to follow)",
-            file=sys.stderr,
-            flush=True,
-        )
-    except OSError as exc:
-        # A read-only log dir must NOT take down a brainstorm that worked without one.
-        print(
-            f"[review-cli] discussion log unavailable ({exc}); continuing without it",
-            file=sys.stderr,
-            flush=True,
-        )
+    if not sqlite_disc:
+        try:
+            flags = (
+                (os.O_WRONLY | os.O_APPEND)
+                if resuming
+                else (os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            )
+            disc = os.fdopen(
+                os.open(str(disc_path), flags, 0o600), "w", encoding="utf-8", buffering=1
+            )
+        except OSError as exc:
+            print(
+                f"[review-cli] discussion log unavailable ({exc}); continuing without it",
+                file=sys.stderr,
+                flush=True,
+            )
+    verb = "resuming discussion log" if resuming else "brainstorm discussion log"
+    target = archive_db_path() if sqlite_disc else disc_path
+    print(
+        f"[review-cli] {verb}: {target} (tail -f to follow)",
+        file=sys.stderr,
+        flush=True,
+    )
 
     def _disc(text: str) -> None:
+        chunk = text if text.endswith("\n") else text + "\n"
+        if sqlite_disc:
+            disc_body.append(chunk)
+            store_brainstorm(
+                started=disc_started,
+                topic=topic,
+                body="".join(disc_body),
+            )
+            return
         if disc is None:
             return
-        disc.write(text if text.endswith("\n") else text + "\n")
+        disc.write(chunk)
         disc.flush()
 
     # Per-run nonce for the structural sentinels (see _SESSION_SENTINEL). The nonce is the

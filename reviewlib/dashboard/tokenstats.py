@@ -99,6 +99,7 @@ __all__ = [
     "list_call_logs",
     "extract_usage_tokens",
     "compute_harness_stats",
+    "compute_harness_stats_from_daily_stats",
     "compute_model_stats",
     "compute_fable_report",
     "top_oversized_calls",
@@ -224,12 +225,21 @@ def list_retry_events(
     return events
 
 
+def _has_flat_call_logs(directory: Path) -> bool:
+    """True when ``directory`` contains flat per-call ``*.log`` files (not archive-only)."""
+    return any(_CALL_RE.match(path.name) for path in directory.glob("*.log"))
+
+
 def list_call_logs(directory: Path, *, since: datetime | None = None) -> list[CallLog]:
     """All per-call logs in `directory`, oldest first. Same cheap-filename-prefilter
     pattern as `list_retry_events`."""
+    from ..log_archive import load_calls_from_archive_since, use_sqlite_logs
     from .parser import (
         parse_call_log,
     )  # local import: avoids a hard cycle at module load
+
+    if use_sqlite_logs() and not _has_flat_call_logs(directory):
+        return load_calls_from_archive_since(since)
 
     calls: list[CallLog] = []
     for path in sorted(directory.glob("*.log")):
@@ -434,6 +444,30 @@ def compute_harness_stats(calls: list[CallLog]) -> dict[str, HarnessStats]:
             stats.skill_md_calls += 1
         if _MEMORY_MD_MARKER in call.body:
             stats.memory_md_calls += 1
+    return out
+
+
+def compute_harness_stats_from_daily_stats(rows: list[dict]) -> dict[str, HarnessStats]:
+    """Build per-harness totals from ``daily_stats`` rows (no chunk decompress)."""
+    out: dict[str, HarnessStats] = {}
+    for row in rows:
+        backend = row["backend"]
+        stats = out.setdefault(backend, HarnessStats(harness=backend))
+        n_calls = int(row["n_calls"])
+        n_fail = int(row["n_fail"])
+        stats.calls += n_calls
+        stats.fail += n_fail
+        stats.ok += max(0, n_calls - n_fail)
+        raw_bytes = int(row["raw_bytes"])
+        stats.bytes_total += raw_bytes
+        if raw_bytes:
+            stats.bytes_list.append(raw_bytes)
+        prompt = int(row["prompt_tokens"])
+        output = int(row["output_tokens"])
+        if prompt > 0 or output > 0:
+            stats.calls_with_real_tokens += n_calls
+            stats.tokens_prompt += prompt
+            stats.tokens_output += output
     return out
 
 
@@ -675,19 +709,28 @@ def compute_stat_report(
 ) -> dict:
     """Assemble the full `review stat` report: per-harness breakdown, per-model health,
     the Fable pattern, retry/promotion totals, and the largest-call outliers."""
+    from ..log_archive import query_daily_stats, use_sqlite_logs
+
     directory = directory if directory is not None else _dashboard_log_dir()
-    calls = list_call_logs(directory, since=since)
     retry_events = list_retry_events(directory, since=since)
 
     retry_by_kind: dict[str, int] = {}
     for event in retry_events:
         retry_by_kind[event.kind] = retry_by_kind.get(event.kind, 0) + 1
 
-    harnesses = compute_harness_stats(calls)
+    calls = list_call_logs(directory, since=since)
+
+    if use_sqlite_logs() and not _has_flat_call_logs(directory):
+        daily_rows = query_daily_stats(since=since)
+        harnesses = compute_harness_stats_from_daily_stats(daily_rows)
+    else:
+        harnesses = compute_harness_stats(calls)
+    call_count = len(calls)
+
     return {
         "log_dir": str(directory),
         "since": since.isoformat() if since else None,
-        "call_count": len(calls),
+        "call_count": call_count,
         "retry_event_count": len(retry_events),
         # Honest, explicit like the dashboard's compute_stats: real numbers exist ONLY
         # for the REST-backed subset (see extract_usage_tokens); never fabricated for
