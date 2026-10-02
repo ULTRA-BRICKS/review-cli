@@ -64,6 +64,23 @@ if ! python3 -c 'import yaml' 2>/dev/null; then
   fi
 fi
 
+# ── dependency: shtab (optional) ────────────────────────────────────────────────
+# Powers `review --print-completion {bash,zsh,tcsh}` (rig-cli's zsh-completion mechanism,
+# docs/specs/rig-zsh-completion.md). This is the symlink install path (no `pip install
+# -e .`, so pyproject.toml's `dependencies` never get resolved) — without this block
+# shtab stays missing and the completion-refresh footer below silently no-ops every time.
+if ! python3 -c 'import shtab' 2>/dev/null; then
+  echo "review: shtab not found, attempting: pip install --user shtab"
+  if ! pip install --user shtab 2>/dev/null; then
+    echo ""
+    echo "  WARNING: could not install shtab. 'review --print-completion' (shell"
+    echo "  completions) will not work until it is installed."
+    echo "  To install manually: pip install --user shtab"
+    echo "  Or via pipx: pipx install review-cli  (handles all deps automatically)"
+    echo ""
+  fi
+fi
+
 # ── symlink entry ─────────────────────────────────────────────────────────────
 ENTRY_PATH="$SRC/$ENTRY"
 chmod +x "$ENTRY_PATH"
@@ -280,3 +297,10 @@ echo "         review install-skill      — re-register skill with agent harnes
 echo "         review install-commit-hook — install pre-commit hook"
 echo "         review --help             — full usage (bare 'review' prints this)"
 echo ""
+
+# ── refresh zsh completion (best-effort) ────────────────────────────────────────
+# rig-cli's zsh-completion mechanism (docs/specs/rig-zsh-completion.md) regenerates
+# `review`'s completion script from `review --print-completion zsh` once rig is on
+# PATH. Non-fatal: a machine without rig yet (e.g. the very first ecosystem install)
+# must not fail review-cli's own install over this.
+rig completion refresh --tool review || true

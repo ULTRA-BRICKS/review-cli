@@ -4421,6 +4421,54 @@ def _build_mode_parser(mode: ModeSpec) -> argparse.ArgumentParser:
     return parser
 
 
+def _build_completion_parser() -> argparse.ArgumentParser:
+    """Build a full synthetic `review` parser purely for `--print-completion` generation
+    (see rig-cli's docs/specs/rig-zsh-completion.md for the mechanism/rationale). shtab
+    walks ONE already-assembled argparse tree; review's real dispatch has no such tree -
+    `_dispatch` resolves each mode's parser LAZILY (`_build_mode_parser`) only after
+    matching `argv[0]` against `known_subcommands()`/`_BARE_SUBCOMMANDS`. This function
+    mirrors the real surface instead: the same top-level flags (`_build_top_level_parser`),
+    a real subparser per review mode built with the SAME `_add_mode_options` the real
+    per-mode parser uses (so the two trees can't drift apart), a thin placeholder
+    subparser per bare management subcommand (`dashboard`/`sessions`/...) so those verb
+    NAMES also complete - their own flags are hand-rolled ad hoc parsers, not argparse
+    trees, so this synthetic tree only advertises the verb, not their flags - plus a
+    `help` placeholder subparser (handled in `_dispatch` before mode resolution, so it is
+    NOT in `_BARE_SUBCOMMANDS`) whose one positional completes the real `HELP_TOPICS`
+    keys. Never used by the real dispatch path; built fresh and discarded on every
+    `--print-completion` call."""
+    parser = _build_top_level_parser()
+    subs = parser.add_subparsers(dest="_completion_subcommand", metavar="SUBCOMMAND")
+    for mode in iter_modes():
+        sub = subs.add_parser(
+            mode.subcommand, aliases=list(mode.aliases), help=mode.summary
+        )
+        _add_mode_options(sub, mode=mode)
+    for name in sorted(_BARE_SUBCOMMANDS):
+        subs.add_parser(name, help=f"see `review {name} --help`")
+    help_sub = subs.add_parser(
+        "help", help="deep help topics (see `review help` for the topic list)"
+    )
+    help_sub.add_argument(
+        "topic", nargs="?", choices=sorted(HELP_TOPICS), help="help topic"
+    )
+    return parser
+
+
+def _print_completion(argv: list[str]) -> int:
+    """`review --print-completion {bash,zsh,tcsh}` - shtab's hidden completion-generation
+    flag, wired onto the SYNTHETIC `_build_completion_parser()` tree (see that function's
+    docstring for why it's synthetic, not the real dispatch parsers). Exits via shtab's own
+    argparse action (prints the generated script, then `sys.exit(0)`); the `return 0` below
+    is defensive and normally unreachable."""
+    import shtab
+
+    parser = _build_completion_parser()
+    shtab.add_argument_to(parser, ["--print-completion"])
+    parser.parse_args(argv)
+    return 0
+
+
 def _reject_removed_flags(argv: list[str]) -> int | None:
     """Reject flags this redesign REMOVED with a clear, actionable error instead of letting
     them silently mis-parse (mode flags) or hit argparse's opaque `unrecognized arguments`
@@ -4776,6 +4824,11 @@ def _evaluate_pool_or_bail(
 def _dispatch(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # `review --print-completion {bash,zsh,tcsh}` - shtab's hidden flag (rig-cli zsh-
+    # completion mechanism, docs/specs/rig-zsh-completion.md). Intercepted before any of
+    # the manual argv[0] dispatch below so it works with no verb, exactly like `--help`.
+    if argv and argv[0] == "--print-completion":
+        return _print_completion(argv)
     argv = _normalize_leading_mode_options(list(argv))
     # `review help [<topic>]` — deep topic help. Wired here (a bare management subcommand
     # like `dashboard`), before mode resolution, so it stays off the main argparse surface.

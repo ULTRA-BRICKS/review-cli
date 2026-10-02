@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "review-cli"
-version = "0.37.1"
+version = "0.37.2"
 description = "Multi-model read-only code review + AI panels."
 requires-python = ">=3.9"
-dependencies = ["pyyaml"]
+# shtab powers `review --print-completion {bash,zsh,tcsh}` (rig-cli's zsh-completion
+# mechanism — see rig-cli's docs/specs/rig-zsh-completion.md for the full contract).
+# It walks a synthetic argparse tree (`_build_completion_parser` in reviewlib/cli.py).
+dependencies = ["pyyaml", "shtab>=1.6,<2"]
 
 # The visual-verification test suite generates fixture PNGs with Pillow and shells out
 # to ImageMagick (`magick`, a SYSTEM dependency — install separately, e.g. `brew install
