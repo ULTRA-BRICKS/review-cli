@@ -2002,7 +2002,11 @@ def test_mode_review_board_runs_and_succeeds():
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         calls.append((model, prompt))
         return ReviewResult(
-            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+            model=model,
+            command="fake",
+            returncode=0,
+            stdout="checked: ok — no issues",
+            stderr="",
         )
 
     board = [
@@ -2074,7 +2078,11 @@ def test_mode_review_board_backfills_preflight_skip_from_reserve():
                 stderr="provider 'commandcode' failed payment/availability preflight (HTTP 402); skipping",
             )
         return ReviewResult(
-            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+            model=model,
+            command="fake",
+            returncode=0,
+            stdout="checked: ok — no issues",
+            stderr="",
         )
 
     board = [
@@ -2119,7 +2127,11 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
                 stderr="authentication failed",
             )
         return ReviewResult(
-            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+            model=model,
+            command="fake",
+            returncode=0,
+            stdout="checked: ok — no issues",
+            stderr="",
         )
 
     board = [

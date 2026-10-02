@@ -454,7 +454,7 @@ def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_13
             model=model,
             command="fake",
             returncode=0,
-            stdout=f"ok from {model}",
+            stdout=f"checked: ok from {model} — no issues",
             stderr="",
         )
 

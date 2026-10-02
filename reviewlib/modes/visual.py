@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import argparse
 
-from ..config import DEFAULT_PROMPT
 from .contract import ModeContext, ModeSpec
 from .review import _handler as _review_handler
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("visual", nargs="?", metavar="IMAGE", help="image to verify")
-    parser.set_defaults(prompt=DEFAULT_PROMPT)
+    parser.set_defaults(prompt=None)
 
 
 def _handler(ctx: ModeContext) -> int:

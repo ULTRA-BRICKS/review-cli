@@ -62,6 +62,10 @@ class ModeContext:
     # The composition seam (§2.1): folds the --visual context into the mode's
     # prompt/question/topic. Identity-returns text when there is no --visual context.
     with_visual: Callable[[str], str]
+    # Whether the CLI-selected prompt is the untouched DEFAULT_PROMPT contract. This
+    # provenance is explicit because visual composition and custom text can make the
+    # resulting prompt string indistinguishable from the default by prefix matching.
+    prompt_is_default: bool = False
     # The parsed --visual companion context (or None). A mode that wants to thread the
     # image into its prompt uses `with_visual`; this is exposed for completeness.
     visual_ctx: object | None = None

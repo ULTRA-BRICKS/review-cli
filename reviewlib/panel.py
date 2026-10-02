@@ -212,8 +212,83 @@ def result_is_usable(result: ReviewResult) -> bool:
 # review-cli#137) — so a body shaped like a bare "looks good" gets a visible warning
 # instead of being silently trusted.
 _FINDING_EVIDENCE_RE = re.compile(
-    r"[\w./-]+\.[a-zA-Z0-9]+:\d+"
-)  # e.g. reviewlib/foo.py:42
+    r"(?<![\w./:@-])(?!//)"
+    r"(?:\.[A-Za-z0-9_-]+|[\w./-]+\.[a-zA-Z0-9]+|[\w./-]+/[\w-]+|Makefile|Dockerfile|README):\d+(?!\w)"
+)  # e.g. reviewlib/foo.py:42, config/Makefile:9
+_EVIDENCE_TOKEN_RE = re.compile(r"[\w./-]+")
+# Bare dotted names are ambiguous: a source/config filename and a DNS host have the same
+# ``name.ext:line`` shape. Keep this list deliberately compact; suffixes outside it are
+# treated as host-like when they otherwise look like a dotted DNS name. Slash paths remain
+# citations, so this boundary only applies to bare names.
+_BARE_CITATION_EXTENSIONS = frozenset(
+    {
+        "c",
+        "cc",
+        "cpp",
+        "cxx",
+        "h",
+        "hh",
+        "hpp",
+        "hxx",
+        "go",
+        "java",
+        "js",
+        "jsx",
+        "m",
+        "mm",
+        "php",
+        "py",
+        "rb",
+        "rs",
+        "sh",
+        "swift",
+        "ts",
+        "tsx",
+        "css",
+        "md",
+        "html",
+        "scss",
+        "sql",
+        "vue",
+        "cfg",
+        "conf",
+        "config",
+        "env",
+        "ini",
+        "json",
+        "toml",
+        "xml",
+        "yaml",
+        "yml",
+    }
+)
+_IPV4_HOST_PORT_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}:\d+$")
+_DOTTED_HOST_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+"
+)
+_SCHEME_URL_RE = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*:|)//(?:[^\s;]|;(?=\S))*")
+
+
+def _split_clauses(line: str) -> list[str]:
+    """Split ordinary semicolons while keeping URL query/fragment spans intact."""
+    protected_ranges = [(match.start(), match.end()) for match in _SCHEME_URL_RE.finditer(line)]
+    clauses = []
+    start = 0
+    range_index = 0
+    for match in re.finditer(";", line):
+        while range_index < len(protected_ranges) and protected_ranges[range_index][1] <= match.start():
+            range_index += 1
+        if range_index == len(protected_ranges) or match.start() < protected_ranges[range_index][0]:
+            clauses.append(line[start:match.start()])
+            start = match.end()
+    clauses.append(line[start:])
+    return clauses
+
+
+def _citation_is_in_scheme_url(clause: str, start: int, end: int) -> bool:
+    return any(match.start() <= start < match.end() for match in _SCHEME_URL_RE.finditer(clause))
+
 _CHECKED_EVIDENCE_RE = re.compile(r"(?i)\bchecked\s*:")
 # No 'approved' alternative (k3 review finding, round 8): a bare `\bapproved\b` also
 # matches inside a REJECTING verdict — "Not approved — the checkpoint races the
@@ -230,7 +305,7 @@ _CLEAN_VERDICT_RE = re.compile(
     r"(?i)\b(no issues|looks good|lgtm|nothing (?:blocking|to flag)|no (?:blocking )?"
     r"findings|no problems(?: found)?)\b"
 )
-# Above this length the finding-evidence scan is skipped outright (glm-cc review
+# Above this length the warning-only finding-evidence scan is skipped (glm-cc review
 # finding, round 1): `_FINDING_EVIDENCE_RE` backtracks per start position across an
 # unbroken `[\w./-]` run with no match inside it (a model echoing a long hex blob,
 # dotted identifier chain, or minified line from the diff), which is O(L^2) on that
@@ -267,9 +342,80 @@ def clean_verdict_missing_evidence(body: str) -> bool:
     already cited its own evidence, never a silently-dropped finding."""
     if not body.strip() or len(body) > _EVIDENCE_SCAN_MAX_LEN:
         return False
-    if _FINDING_EVIDENCE_RE.search(body) or _CHECKED_EVIDENCE_RE.search(body):
+    for line in body.splitlines():
+        for clause in _split_clauses(line):
+            checked = _CHECKED_EVIDENCE_RE.search(clause)
+            if _clause_has_citation(clause[:checked.start()] if checked else clause):
+                return False
+    if _CHECKED_EVIDENCE_RE.search(body):
         return False
     return bool(_CLEAN_VERDICT_RE.search(body))
+
+
+def _citation_token_is_host(token: str) -> bool:
+    if "/" in token:
+        return False
+    if _IPV4_HOST_PORT_RE.fullmatch(token):
+        return True
+    host, separator, port = token.rpartition(":")
+    return bool(
+        separator
+        and port.isdigit()
+        and _DOTTED_HOST_RE.fullmatch(host)
+        and host.rsplit(".", 1)[-1].lower() not in _BARE_CITATION_EXTENSIONS
+    )
+
+
+def _clause_has_citation(clause: str) -> bool:
+    """Scan maximal path tokens once, including arbitrarily long unbroken runs."""
+    # An anchored match can backtrack only through its own token; extension
+    # characters exclude dots, so the total work stays linear in clause length.
+    # Searching at every character instead would retry overlapping token suffixes.
+    return any(
+        (match := _FINDING_EVIDENCE_RE.match(clause, token.start()))
+        and not _citation_is_in_scheme_url(clause, match.start(), match.end())
+        and not _citation_token_is_host(match.group())
+        for token in _EVIDENCE_TOKEN_RE.finditer(clause)
+    )
+
+
+def body_reports_findings(body: str) -> bool:
+    """Does a USABLE review body read as reporting at least one FINDING?
+
+    Powers `review diff`'s EXIT_FINDINGS_REPORTED class (review-cli#517): the
+    mode's exit code used to track only SEAT HEALTH, so a body full of
+    correctness/security findings still exited 0 and automation treating nonzero
+    as trouble sailed past them. This classifier follows DEFAULT_PROMPT's own
+    verdict contract, in fail-closed priority order:
+
+    1. A file:line citation (`_FINDING_EVIDENCE_RE`) before any `checked:`
+       marker in its clause reports a finding. Citations after that marker are
+       ruled-out evidence; each semicolon-separated clause is independent.
+    2. Otherwise the body is judged by its clean-verdict SIGNALS: a "checked:"
+       statement anywhere, or one of `_CLEAN_VERDICT_RE`'s clean phrases, reads
+       clean. A body with NEITHER (a contract-violating skim like "seems
+       reasonable overall") fails CLOSED into the findings class — the same
+       direction `clean_verdict_missing_evidence`'s WARNING already nudges.
+
+    Citation scanning covers the entire body regardless of length. Each clause
+    is scanned by maximal path tokens with anchored matches, keeping total work
+    linear even for an unbroken blob or minified line. The warning-only sibling's
+    `_EVIDENCE_SCAN_MAX_LEN` cap does not suppress findings in this classifier.
+
+    A later checked marker cannot suppress an earlier cited finding. A body
+    with neither a checked marker nor a clean phrase likewise fails closed
+    under rule 2.
+    """
+    if not body.strip():
+        return False  # empty = unusable, the seat-health gate's business, not findings
+    for line in body.splitlines():
+        for clause in _split_clauses(line):
+            checked = _CHECKED_EVIDENCE_RE.search(clause)
+            if _clause_has_citation(clause[:checked.start()] if checked else clause):
+                return True
+    if _CHECKED_EVIDENCE_RE.search(body) or _CLEAN_VERDICT_RE.search(body):
+        return False
+    return True  # neither finding evidence nor a clean signal: fail CLOSED
 
 
 def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:

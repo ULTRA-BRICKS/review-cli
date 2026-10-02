@@ -169,6 +169,32 @@ rather than certifying a partial review as "the full diff was reviewed": a stder
 alone doesn't protect non-interactive automation from silently checkpointing a diff no
 seat fully saw. Scope the review or raise the cap, then re-run.
 
+**Piped stdin is bounded, never a hang** (review-cli#516). A non-tty stdin used to be
+read as "a diff is being piped in" with a blocking read — but a detached agent process
+(`hub start application=bash …, pty=false`) inherits a stdin pipe that nobody ever writes
+to or closes, and the review then hung forever before any output, any stats iteration,
+or any commit-gate marker refresh. FIFO/socket consumption now shares one total
+`$REVIEW_STDIN_WAIT_SECONDS` deadline (default 2s; invalid, nonfinite, or above-60s
+values use the default). At expiry, review uses the data received so far, or the
+repo's own diff if no data arrived. Regular files and `/dev/null` retain direct
+reads. `0` polls immediately and consumes ready data without waiting for EOF.
+
+
+**Findings are in the exit code** (review-cli#517). The diff review's exit code used to
+track only seat health: a run whose every seat answered, but whose verdicts were full of
+correctness/security findings, still exited `0` — a lie to any script or agent keying on
+the code. Now a healthy run where any usable verdict *reports findings* exits `14`
+(`EXIT_FINDINGS_REPORTED`), with a one-line stderr notice naming the seats; only a
+healthy all-clean run exits `0`. "Reports findings" follows the review prompt's own
+verdict contract: a `file:line` citation is a finding, even alongside `checked:` or a
+clean phrase. Without a citation, a `checked:` statement or clean phrase ("no issues",
+"LGTM", ...) is clean, and
+a body showing neither (an evidence-free skim) fails closed into the findings class.
+Seat transport trouble is NOT conflated with findings: an errored/unusable seat never
+counts as one, and a degraded pool keeps its existing exit `1` unchanged. The
+`--staged` stamp and `--commit` checkpoint stay keyed on pool health exactly as before —
+findings remain informational for the gate; only the exit class changed.
+
 **Checkpointing a multi-round fix loop (`--commit`).** An agent iterating review → fix
 findings → re-review may need several attempts, and a bad attempt needs a SAFE way back —
 not `git reset --hard`. `--commit` (requires `--staged`) creates a real `git commit` of the

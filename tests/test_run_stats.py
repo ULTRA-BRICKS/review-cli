@@ -118,7 +118,7 @@ def _stub_resolve_backend(rc_by_model: dict[str, int] | int = 0):
                 model=m,
                 command=f"stub {m}",
                 returncode=rc,
-                stdout=f"output from {m}",
+                stdout=f"checked: output from {m} — no issues",
                 stderr="",
             )
 
@@ -758,7 +758,7 @@ def test_cli_flat_m_review_threads_real_tokens_end_to_end_into_record_run():
                     model=m,
                     command=f"stub {m}",
                     returncode=0,
-                    stdout=f"output from {m}",
+                    stdout=f"checked: output from {m} — no issues",
                     stderr="",
                     prompt_tokens=tokens[0],
                     output_tokens=tokens[1],
@@ -1305,9 +1305,7 @@ def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_13
             # `min_models` stays run-level/passed-gated -- UNCHANGED by this fix: a
             # combined check still fails because the record's own `passed` is False,
             # so no iteration satisfies `min_iter`/`min_models` at all.
-            combined = _stats.quorum_check(
-                TASK, min_iter=1, min_models=1, min_roles=1
-            )
+            combined = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=1)
             assert combined["passed"] is False, combined
         finally:
             restore()
@@ -1347,7 +1345,7 @@ def test_cli_exact_board_unavailable_sentinel_seat_never_satisfies_min_roles_rev
                     model=m,
                     command=f"stub {m}",
                     returncode=0,
-                    stdout=f"output from {m}",
+                    stdout=f"checked: output from {m} — no issues",
                     stderr="",
                 )
 

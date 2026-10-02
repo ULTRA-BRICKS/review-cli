@@ -52,6 +52,7 @@ from ..panel import (
     FailoverOutcome,
     _tally_ok,
     _tally_tokens,
+    body_reports_findings,
     format_result,
     result_is_usable,
     run_board_with_failover,
@@ -90,6 +91,18 @@ EXIT_COMMIT_FAILED = 12
 # it already skips silently on `ok=False`) — the gate exists specifically to certify
 # "the full diff was reviewed", and a partial review must never certify as one.
 EXIT_COMMIT_DIFF_TRUNCATED = 13
+# review-cli#517: the diff review REPORTED FINDINGS. The mode's exit code tracked
+# only SEAT HEALTH (`ok = all(result_is_usable(...))`), so a body full of
+# correctness/security findings still exited 0 — a lie to every script/agent that
+# keys on the exit code. This class fires ONLY when the pool was healthy (an
+# errored seat is NOT a finding; a degraded run keeps its exit-1 partial-failure
+# semantics exactly) and at least one USABLE body reads as a finding per
+# `panel.body_reports_findings` (DEFAULT_PROMPT's own contract: a finding cites
+# file:line even alongside `checked:`; anything without a clean-verdict signal
+# fails closed). The stamp/checkpoint semantics are UNCHANGED — findings stay
+# informational for the commit gate; only the exit class changes. 14 is the next
+# free integer after the 11/12/13 checkpoint block above.
+EXIT_FINDINGS_REPORTED = 14
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
@@ -187,6 +200,40 @@ def _flat_seat_with_provider_failover(
     return replace(final, model=model)
 
 
+def _seats_reporting_findings(results: list[ReviewResult]) -> list[str]:
+    """Models whose USABLE body reads as reporting findings
+    (`panel.body_reports_findings`), in dispatch order. An errored/unusable seat
+    is transport trouble, never a finding — it is excluded here so the
+    EXIT_FINDINGS_REPORTED class can never conflate the two (review-cli#517)."""
+    return [
+        result.model
+        for result in results
+        if result_is_usable(result) and body_reports_findings(result.stdout)
+    ]
+
+
+def _warn_findings_reported(findings_seats: list[str], ok: bool) -> None:
+    """One stderr line whenever findings were reported: names the seats and states
+    the exit class. Printed even on a DEGRADED run (which keeps exit 1) so the
+    findings signal is never swallowed by the partial-failure class."""
+    if not findings_seats:
+        return
+    deduped = list(dict.fromkeys(findings_seats))
+    outcome = (
+        f"exit {EXIT_FINDINGS_REPORTED} (EXIT_FINDINGS_REPORTED)"
+        if ok
+        else "also present; the run stays exit 1 (degraded pool)"
+    )
+    print(
+        f"[review-cli] findings reported by: {', '.join(deduped)} — "
+        f"{'this is the run result: ' + outcome if ok else outcome} Read the "
+        "verdicts above before committing; findings are informational for the "
+        "commit-gate stamp, not a gate of their own.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def mode_review(
     models: list[str],
     prompt: str,
@@ -204,7 +251,13 @@ def mode_review(
     commit: bool = False,
     usage_percent: Callable[[str], float | None] | None = None,
     stamp_diff_hash: str | None = None,
+    prompt_is_default: bool | None = None,
 ) -> int:
+    # Legacy direct callers infer the contract, including appended visual context.
+    # Explicit CLI provenance takes precedence even for custom copies of the default.
+    if prompt_is_default is None:
+        prompt_is_default = prompt.startswith(DEFAULT_PROMPT)
+
     # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
     # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
     # multi-model review the checkpoint could never have used anyway.
@@ -243,6 +296,7 @@ def mode_review(
             commit,
             usage_percent,
             stamp_diff_hash,
+            prompt_is_default,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
@@ -335,31 +389,9 @@ def mode_review(
             # NOT also tally `results[-1]` here -- it was already counted once as
             # the last `_safe_dispatch` call that produced it; tallying it again
             # would double-count that one attempt.
-
     by_model = {result.model: result for result in results}
-    # check_evidence=prompt.startswith(DEFAULT_PROMPT) (k3 review finding, round 6;
-    # `.startswith` not `==`, k3 finding round 7 — see below): only the diff-review
-    # render paths (here and the board path below) apply the missing-evidence
-    # WARNING at all — DEFAULT_PROMPT's "checked: ..." contract is a diff-review-only
-    # ask, so quorum/just-ask/brainstorm's own format_result calls stay at the
-    # default False (glm-cc review finding, round 1). But even within diff-review,
-    # `--prompt` lets a caller REPLACE DEFAULT_PROMPT entirely (e.g. `--prompt
-    # 'Answer APPROVED if safe; otherwise list blockers.'`) — a custom prompt never
-    # asked for the "checked: ..." phrasing, so a compliant one-word "APPROVED"
-    # response must not get a warning claiming it omitted evidence it was never
-    # asked to provide. An exact `==` check (round 6's first cut) silently broke on
-    # `--visual`: `_with_visual` APPENDS the image's context note to whatever prompt
-    # is in effect (`text + visual_ctx.context_note`, cli.py's `_with_visual`), so
-    # `review diff --visual shot.png` with no `--prompt` dispatches
-    # `DEFAULT_PROMPT + context_note` — a DIFFERENT string from `DEFAULT_PROMPT`,
-    # even though the model still received DEFAULT_PROMPT's full "checked: ..."
-    # contract verbatim. `==` silently disabled the WARNING on every visual diff
-    # review, exactly the composable path this feature needs to keep covering.
-    # `.startswith` recognizes DEFAULT_PROMPT as an unmodified PREFIX (true whether
-    # visual appended nothing, or appended a context note) while still resolving to
-    # False for a genuinely custom `--prompt` (with or without `--visual`), which by
-    # construction never starts with DEFAULT_PROMPT's text.
-    check_evidence = prompt.startswith(DEFAULT_PROMPT)
+    # Both dispatch paths use the resolved default-contract provenance.
+    check_evidence = prompt_is_default
     print(
         "\n\n---\n\n".join(
             format_result(by_model[model], check_evidence=check_evidence)
@@ -406,9 +438,13 @@ def mode_review(
     override = _checkpoint_if_requested(
         commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
     )
+    findings_seats = _seats_reporting_findings(results) if check_evidence else []
+    _warn_findings_reported(findings_seats, ok)
     if override is not None:
         return override
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    return EXIT_FINDINGS_REPORTED if findings_seats else 0
 
 
 def _warn_if_dispatch_diff_truncated(
@@ -1292,6 +1328,7 @@ def _mode_review_board(
     commit: bool = False,
     usage_percent: Callable[[str], float | None] | None = None,
     stamp_diff_hash: str | None = None,
+    prompt_is_default: bool = False,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -1304,8 +1341,8 @@ def _mode_review_board(
     usable verdicts are produced or the reserve is exhausted (then it degrades, loudly).
 
     Output lists every seat that ran (successes and the failed seats that triggered a
-    backfill, so the whole story is visible). Exit 0 (and the staged stamp) iff the pool
-    refilled to `pool_size` usable verdicts — i.e. NOT degraded. A failed-then-replaced
+    backfill, so the whole story is visible). A healthy pool earns the staged stamp;
+    findings under the default prompt return EXIT_FINDINGS_REPORTED, otherwise 0. A failed-then-replaced
     seat is an expected, HANDLED failover event, not a review failure: the run still
     delivered the target number of working verdicts, so it must succeed (otherwise the
     paywalled-Fable case would make every `review --staged` fail despite a full, healthy
@@ -1379,9 +1416,7 @@ def _mode_review_board(
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
-    # check_evidence=prompt.startswith(DEFAULT_PROMPT) — see the flat path's
-    # identical note above (k3 review finding, rounds 6-7).
-    check_evidence = prompt.startswith(DEFAULT_PROMPT)
+    check_evidence = prompt_is_default
     print(
         "\n\n---\n\n".join(
             format_result(r, check_evidence=check_evidence) for r in outcome.results
@@ -1412,9 +1447,15 @@ def _mode_review_board(
     override = _checkpoint_if_requested(
         commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
     )
+    findings_seats = (
+        _seats_reporting_findings(outcome.results) if check_evidence else []
+    )
+    _warn_findings_reported(findings_seats, ok)
     if override is not None:
         return override
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    return EXIT_FINDINGS_REPORTED if findings_seats else 0
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1445,7 +1486,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             f"{EXIT_COMMIT_REQUIRES_STAGED}). This checkpoints the reviewed staged diff, "
             "it does NOT mean 'commits only when the review passes': a review with open "
             "findings still gets checkpointed (same as the existing --staged stamp gate) "
-            "— findings are informational. Runs the repo's own commit-msg/pre-commit "
+            "— findings stay informational for the GATE, but the run itself now reports "
+            f"them in its exit code ({EXIT_FINDINGS_REPORTED}, EXIT_FINDINGS_REPORTED; "
+            "an all-clean healthy review is the only shape that exits 0). Runs the "
+            "repo's own commit-msg/pre-commit "
             "hooks; a hook rejection fails the checkpoint distinctly (exit "
             f"{EXIT_COMMIT_FAILED}), never bypassed with --no-verify. Undo a bad "
             "checkpoint with `git reset --soft HEAD~1` (safe — leaves untracked/foreign "
@@ -1492,6 +1536,7 @@ def _handler(ctx: ModeContext) -> int:
             effort_override=ctx.effort_override,
             commit=commit,
             stamp_diff_hash=stamp_diff_hash,
+            prompt_is_default=ctx.prompt_is_default,
         )
     return mode_review(
         *base,
@@ -1504,6 +1549,7 @@ def _handler(ctx: ModeContext) -> int:
         commit=commit,
         stamp_diff_hash=stamp_diff_hash,
         usage_percent=ctx.extra.get("usage_percent"),
+        prompt_is_default=ctx.prompt_is_default,
     )
 
 

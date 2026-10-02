@@ -12,6 +12,7 @@ entirely. These tests pin the contract:
 
 Same harness style as tests/test_cwd.py: plain test_* functions, __main__ runner.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -38,17 +39,29 @@ _GIT_UNAVAILABLE_REASON: str | None | bool = None
 def _git_unavailable_reason() -> str | None:
     global _GIT_UNAVAILABLE_REASON
     if _GIT_UNAVAILABLE_REASON is not None:
-        return _GIT_UNAVAILABLE_REASON if isinstance(_GIT_UNAVAILABLE_REASON, str) else None
+        return (
+            _GIT_UNAVAILABLE_REASON
+            if isinstance(_GIT_UNAVAILABLE_REASON, str)
+            else None
+        )
     try:
-        version = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=15)
+        version = subprocess.run(
+            ["git", "--version"], capture_output=True, text=True, timeout=15
+        )
         if version.returncode != 0:
-            reason = (version.stdout + version.stderr).strip() or f"`git --version` exited {version.returncode}"
+            reason = (
+                version.stdout + version.stderr
+            ).strip() or f"`git --version` exited {version.returncode}"
             _GIT_UNAVAILABLE_REASON = reason
             return reason
         with tempfile.TemporaryDirectory() as d:
-            init = subprocess.run(["git", "init", "-q"], cwd=d, capture_output=True, text=True, timeout=30)
+            init = subprocess.run(
+                ["git", "init", "-q"], cwd=d, capture_output=True, text=True, timeout=30
+            )
         if init.returncode != 0:
-            reason = (init.stdout + init.stderr).strip() or f"`git init` exited {init.returncode}"
+            reason = (
+                init.stdout + init.stderr
+            ).strip() or f"`git init` exited {init.returncode}"
             _GIT_UNAVAILABLE_REASON = reason
             return reason
     except (OSError, subprocess.SubprocessError) as exc:
@@ -82,6 +95,7 @@ def _run_main(argv: list[str]) -> tuple[int, str]:
 
 
 # --- argv extraction -----------------------------------------------------------
+
 
 def test_extract_space_form():
     out, rest = _extract_output_path(["-o", "/tmp/x.md", "--list-defaults"])
@@ -210,6 +224,7 @@ def test_extract_expands_user():
 
 # --- end-to-end via main() (uses --list-defaults, which prints to stdout) -------
 
+
 def test_writes_file_and_still_prints_to_stdout():
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / "out.md"
@@ -270,7 +285,9 @@ def test_file_written_even_on_nonzero_review_exit():
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
         target = Path(d) / "out.md"
-        rc, _ = _run_main(["diff", "--task", "TEST-1", "-C", str(repo), "-o", str(target)])
+        rc, _ = _run_main(
+            ["diff", "--task", "TEST-1", "-C", str(repo), "-o", str(target)]
+        )
         # No diff -> non-zero exit, but the file exists (empty result is fine).
         assert rc != 0, rc
         assert target.is_file(), target
@@ -288,16 +305,22 @@ def test_real_review_result_text_lands_in_file():
         repo = Path(d) / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
-        subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t"], cwd=str(repo), check=True
+        )
         subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
         (repo / "f.txt").write_text("hello\n", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=str(repo), check=True)
 
-        sentinel = "SENTINEL-REVIEW-VERDICT-XYZ"
+        sentinel = "SENTINEL-REVIEW-VERDICT-XYZ\nchecked: sentinel pass — no issues"
 
         def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
             return backends.ReviewResult(
-                model=model, command="fake", returncode=0, stdout=sentinel, stderr="",
+                model=model,
+                command="fake",
+                returncode=0,
+                stdout=sentinel,
+                stderr="",
             )
 
         orig_avail = backends.backend_available
@@ -327,11 +350,22 @@ def test_real_review_result_text_lands_in_file():
         try:
             target = Path(d) / "out.md"
             rc, printed = _run_main(
-                ["diff", "--task", "TEST-1", "-C", str(repo), "--staged", "-m", "codex", "-o", str(target)],
+                [
+                    "diff",
+                    "--task",
+                    "TEST-1",
+                    "-C",
+                    str(repo),
+                    "--staged",
+                    "-m",
+                    "codex",
+                    "-o",
+                    str(target),
+                ],
             )
             body = target.read_text(encoding="utf-8")
-            assert sentinel in body, body          # the verdict reached the file
-            assert sentinel in printed, printed     # and still printed to stdout
+            assert sentinel in body, body  # the verdict reached the file
+            assert sentinel in printed, printed  # and still printed to stdout
             assert rc == 0, rc
         finally:
             panel.resolve_backend = orig_panel_resolve
@@ -380,12 +414,17 @@ def test_argparse_error_does_not_truncate_existing_output_file():
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / "important.md"
         target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             try:
                 main(["--definitely-not-a-flag", "-o", str(target)])
             except SystemExit:
                 pass
-        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", target.read_text()
+        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
+            target.read_text()
+        )
 
 
 def test_help_with_output_flag_does_not_truncate_file():
@@ -394,7 +433,10 @@ def test_help_with_output_flag_does_not_truncate_file():
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / "important.md"
         target.write_text("KEEP ME\n", encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             try:
                 main(["--help", "-o", str(target)])
             except SystemExit:
@@ -412,11 +454,16 @@ def test_removed_flag_with_output_flag_does_not_truncate_file():
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "important.md"
             target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 rc = main([bad, "-o", str(target)])
             assert rc == 2, (bad, rc)
             assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
-                bad, target.read_text())
+                bad,
+                target.read_text(),
+            )
 
 
 def test_removed_subcommand_with_output_flag_does_not_truncate_file():
@@ -427,10 +474,15 @@ def test_removed_subcommand_with_output_flag_does_not_truncate_file():
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / "important.md"
         target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             rc = main(["review", "-o", str(target)])
         assert rc == 2, rc
-        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", target.read_text()
+        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
+            target.read_text()
+        )
 
 
 def test_no_subcommand_with_args_and_output_flag_does_not_truncate_file():
@@ -440,12 +492,17 @@ def test_no_subcommand_with_args_and_output_flag_does_not_truncate_file():
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / "important.md"
         target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             try:
                 main(["-C", d, "-o", str(target)])
             except SystemExit as exc:
                 assert exc.code == 2, exc.code
-        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", target.read_text()
+        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
+            target.read_text()
+        )
 
 
 def test_bare_review_help_with_output_flag_does_not_truncate_file():
@@ -454,7 +511,10 @@ def test_bare_review_help_with_output_flag_does_not_truncate_file():
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / "important.md"
         target.write_text("KEEP ME\n", encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             try:
                 main(["-o", str(target)])
             except SystemExit as exc:
@@ -472,11 +532,16 @@ def test_subcommand_only_flag_without_verb_with_output_does_not_truncate_file():
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "important.md"
             target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 rc = main([*argv_prefix, "-o", str(target)])
             assert rc == 2, (argv_prefix, rc)
             assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
-                argv_prefix, target.read_text())
+                argv_prefix,
+                target.read_text(),
+            )
 
 
 def test_value_taking_opts_are_all_value_taking():
@@ -488,11 +553,18 @@ def test_value_taking_opts_are_all_value_taking():
     from reviewlib.cli import _VALUE_TAKING_OPTS  # noqa: PLC0415
 
     store_true_flags = {
-        "--staged", "--list-defaults", "--show-board", "--json", "--strict",
-        "--no-ai", "--no-local-model",
+        "--staged",
+        "--list-defaults",
+        "--show-board",
+        "--json",
+        "--strict",
+        "--no-ai",
+        "--no-local-model",
     }
     # None of the store_true flags must be in the value-taking set.
-    assert not (_VALUE_TAKING_OPTS & store_true_flags), _VALUE_TAKING_OPTS & store_true_flags
+    assert not (_VALUE_TAKING_OPTS & store_true_flags), (
+        _VALUE_TAKING_OPTS & store_true_flags
+    )
 
     # Each listed opt errors "expected one argument" when given no value. We pass a
     # leading no-op value-taking flag with a value so the parser reaches the bare opt
@@ -502,11 +574,20 @@ def test_value_taking_opts_are_all_value_taking():
     # longer carries the mode/visual-only flags, so a top-level `--prompt …` would now
     # error "unrecognized arguments", not "expected one argument".
     brainstorm_only = {"--rounds", "--max-rounds"}
-    specweb_only = {"--spec"}        # lives ONLY on the `spec-web reply` subparser
-    moderator_only = {"--moderator"}  # lives on quorum / brainstorm, NOT the diff review
+    specweb_only = {"--spec"}  # lives ONLY on the `spec-web reply` subparser
+    moderator_only = {
+        "--moderator"
+    }  # lives on quorum / brainstorm, NOT the diff review
     # ONLY on the `qa` subparser (modes/qa.py): the Phase-2 executor flags + the Phase-3
     # SUT-env value-taking flags (--stage-url / --config).
-    qa_only = {"--suites", "--kind", "--report", "--max-cases", "--stage-url", "--config"}
+    qa_only = {
+        "--suites",
+        "--kind",
+        "--report",
+        "--max-cases",
+        "--stage-url",
+        "--config",
+    }
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
@@ -560,7 +641,10 @@ def test_help_topic_usage_error_with_output_flag_does_not_truncate_file():
             target = Path(d) / "important.md"
             target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
             err = io.StringIO()
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(err),
+            ):
                 try:
                     rc = main([*prefix, "-o", str(target)])
                 except SystemExit as exc:
@@ -578,7 +662,10 @@ def test_help_topic_usage_error_with_output_flag_does_not_truncate_file():
     for prefix, _ in usage_error_cases:
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "newfile.md"  # does NOT pre-exist
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 try:
                     rc = main([*prefix, "-o", str(target)])
                 except SystemExit as exc:
@@ -601,7 +688,10 @@ def test_help_topic_usage_error_exits_2_without_output_flag():
         ["--help", "config", "extra-arg"],
         ["-h", "config", "extra-arg"],
     ):
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             try:
                 rc = main(list(prefix))
             except SystemExit as exc:
@@ -617,11 +707,17 @@ def test_help_valid_topic_with_output_flag_writes_topic_text():
     for prefix in (["help", "config"], ["help"]):
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "out.md"
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 rc = main([*prefix, "-o", str(target)])
             assert rc == 0, (prefix, rc)
             assert target.is_file(), (prefix, target)
-            assert target.read_text(encoding="utf-8").strip(), (prefix, "empty topic-help file")
+            assert target.read_text(encoding="utf-8").strip(), (
+                prefix,
+                "empty topic-help file",
+            )
 
 
 def test_help_documents_output_flag():

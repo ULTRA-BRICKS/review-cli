@@ -34,6 +34,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_cwd.py",
         "test_dashboard.py",
         "test_deploy_sh.py",
+        "test_findings_exit_code.py",
         "test_inseat_retry.py",
         "test_install_state.py",
         "test_no_git_repo.py",
@@ -46,6 +47,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
+        "test_stdin_open_pipe.py",
     }
 )
 
@@ -774,6 +776,8 @@ _UNIT_FILES = [
     # Per-role fallback model lists + harness seat resolution (review-cli#445).
     ("test_role_models.py", {}),
     ("test_review_marker.py", {}),
+    ("test_findings_exit_code.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    ("test_stdin_open_pipe.py", {}),
     # `review diff --staged --commit` (the checkpoint-commit feature): the usage gate
     # (--commit requires --staged), the checkpoint gate shared with the marker/stamp
     # (ok/staged/not-piped), the real `git commit` it makes, and the distinct

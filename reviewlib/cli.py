@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import math
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -160,7 +162,9 @@ EXIT_QA_NOT_IMPLEMENTED = 70
 # Codes 11/12 are CLAIMED by `modes/review.py` (EXIT_COMMIT_REQUIRES_STAGED / EXIT_COMMIT_
 # FAILED, the `--commit` checkpoint feature) — defined there, not here, because that mode
 # module can't import from cli.py without a circular import. Recorded here too so the next
-# person picking a new top-level exit code doesn't re-use them.
+# person picking a new top-level exit code doesn't re-use them. Same for 13
+# (EXIT_COMMIT_DIFF_TRUNCATED) and 14 (EXIT_FINDINGS_REPORTED -- a healthy diff
+# review whose seats reported findings; see modes/review.py, review-cli#517).
 
 
 def _is_git_repo(cwd: Path) -> bool:
@@ -454,9 +458,104 @@ def _current_diff_files_for_check(cwd: Path) -> list[str] | None:
     return union or None
 
 
+# Default bounded wait (seconds) for consumption of a piped stdin
+# (review-cli#516). Generous for a real `git diff | review` producer (which
+# delivers in milliseconds) and short enough that a detached agent's never-EOF
+# stdin costs one brief pause instead of an infinite hang.
+_STDIN_WAIT_DEFAULT = 2.0
+_STDIN_WAIT_MAX = 60.0
+
+
+def _stdin_wait_seconds() -> float:
+    """The total bounded wait for consumption of a piped stdin
+    ($REVIEW_STDIN_WAIT_SECONDS; default 2.0, invalid or above 60s falls back to default —
+    the same "threshold-shaped env knob" treatment the pre-commit hook's
+    $REVIEW_TRIVIAL_DELTA_LINES gets). See `_read_stdin_if_piped`."""
+    raw = os.environ.get("REVIEW_STDIN_WAIT_SECONDS", "")
+    try:
+        value = float(raw) if raw.strip() else _STDIN_WAIT_DEFAULT
+    except ValueError:
+        return _STDIN_WAIT_DEFAULT
+    if not math.isfinite(value) or value > _STDIN_WAIT_MAX:
+        return _STDIN_WAIT_DEFAULT
+    return max(0.0, value)
+
+
 def _read_stdin_if_piped() -> str | None:
-    if sys.stdin.isatty():
+    """Consume a diff piped on stdin — without ever blocking indefinitely.
+
+    "Not a tty" does NOT mean "a producer is piping us a diff": a detached
+    agent process (hub start application=bash …, pty=false) inherits a stdin
+    that is an OPEN PIPE nobody ever writes to and nobody ever closes, and the
+    old `sys.stdin.read()` blocked on that forever — before any dispatch, any
+    output, or any stats record, with the commit-gate marker never refreshing
+    (review-cli#516, the hatch-flood detached-agent hang). FIFO/socket reads
+    share one $REVIEW_STDIN_WAIT_SECONDS deadline (default 2s), including after
+    data arrives. At expiry, return the data received so far, or None if absent.
+    Nonblocking reads prevent readiness races from extending that deadline.
+    If select is unavailable or fails, stdin is treated as absent (None).
+    A regular-file redirect or /dev/null keeps the old direct-read behavior:
+    regular files are always at EOF or readable, so that path cannot hang
+    either. `REVIEW_STDIN_WAIT_SECONDS=0`
+    means "only consume stdin that already has data ready".
+    """
+    if sys.stdin is None or sys.stdin.isatty():
         return None
+    fd: int | None = None
+    try:
+        fd = sys.stdin.fileno()
+    except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
+        fd = None  # an in-memory fake (tests) or a detached stream: not selectable
+    if fd is not None:
+        try:
+            mode = os.fstat(fd).st_mode
+        except OSError:
+            mode = None
+        if mode is not None and (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+            # ONLY a pipe/socket can sit silent with no EOF in sight. A regular
+            # file, /dev/null and friends are always at data-or-EOF, so their
+            # direct read below cannot hang and keeps the old behavior verbatim.
+            try:
+                import codecs
+                import select as _select
+
+                wait = _stdin_wait_seconds()
+                deadline = time.monotonic() + wait
+                chunks: list[bytes] = []
+                eof = False
+                blocking = os.get_blocking(fd)
+                try:
+                    os.set_blocking(fd, False)
+                    while True:
+                        ready, _, _ = _select.select(
+                            [fd], [], [], max(0.0, deadline - time.monotonic())
+                        )
+                        if not ready:
+                            break
+                        try:
+                            chunk = os.read(fd, 65536)
+                        except BlockingIOError:
+                            chunk = None
+                        if chunk == b"":
+                            eof = True
+                            break
+                        if chunk:
+                            chunks.append(chunk)
+                        if time.monotonic() >= deadline:
+                            break
+                finally:
+                    os.set_blocking(fd, blocking)
+                # A deadline may split a multibyte character; emit only complete
+                # characters until EOF, preserving stdin's encoding/newline policy.
+                decoder = io.IncrementalNewlineDecoder(
+                    codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")(
+                        errors=sys.stdin.errors or "strict"
+                    ), translate=True,
+                )
+                data = decoder.decode(b"".join(chunks), final=eof)
+                return data if data else None
+            except (OSError, ValueError, ImportError):
+                return None  # readiness is unknown; a direct read could block forever
     try:
         data = sys.stdin.read()
     except OSError:
@@ -4068,7 +4167,11 @@ def _add_global_options(
             "per-call timeout seconds; REST uses wall/request timeout; review/panel "
             "agent CLIs use idle/silence timeout with a 20m floor for values >=60 "
             "(set REVIEW_IDLE_TIMEOUT_SECONDS to shorten); qa/vision keep wall-clock "
-            f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT})"
+            f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT}). "
+            "Piped stdin consumption has a total deadline of "
+            "$REVIEW_STDIN_WAIT_SECONDS (default 2s; values above 60s use the default) "
+            "and returns data received so far, or uses the repo's diff if absent — a detached agent's "
+            "never-EOF stdin can no longer hang the run (review-cli#516)."
         ),
     )
     parser.add_argument(
@@ -4243,7 +4346,7 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
     # --prompt is the DIFF REVIEW's prompt override only.
     if mode.name == "review":
         parser.add_argument(
-            "--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt"
+            "--prompt", default=None, help="override the diff-review prompt"
         )
     # --moderator steers the quorum / brainstorm synthesis only.
     if mode.name in ("quorum", "brainstorm"):
@@ -5140,6 +5243,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         parser = _build_top_level_parser()
 
     args = parser.parse_args(rest)
+    args.prompt_is_default = getattr(args, "prompt", None) is None
+    if hasattr(args, "prompt") and args.prompt_is_default:
+        args.prompt = DEFAULT_PROMPT
 
     # `--retry N` is wired by EXPORTING $REVIEW_RETRY_COUNT for the rest of this process, so
     # the single in-seat-retry reader (reviewlib.retry.retry_count, called deep in the panel)
@@ -6037,6 +6143,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         cwd=cwd,
         timeout=timeout,
         with_visual=_with_visual_text,
+        prompt_is_default=args.prompt_is_default,
         visual_ctx=visual_ctx,
         moderators=moderators,
         effort_override=effort_override,

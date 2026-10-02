@@ -180,9 +180,10 @@ directory). Agents often invoke `review` from a scratch or temp dir, so WITHOUT
 `-C` it silently reviews the wrong place (commonly /tmp) and returns an empty or
 irrelevant result. Always pass `-C <absolute repo path>`. If `-C` is not inside a
 git repo, review resolves to the repo root when it can and otherwise prints a
-loud warning — heed it. When piping into review non-interactively, also redirect
-stdin (`review just-ask "Q" --task CODE -C <repo> < /dev/null`); review reads stdin for an
-optional piped diff and will hang waiting for EOF if stdin is an open pipe.
+loud warning — heed it. Review waits at most `$REVIEW_STDIN_WAIT_SECONDS` (default 2s)
+for the first byte on a silent stdin pipe, then uses the repo's diff. Once data arrives,
+it reads to EOF, so a producer must close its pipe. Redirect unused stdin to `/dev/null`
+(`review just-ask "Q" --task CODE -C <repo> < /dev/null`) to skip the initial wait.
 
 ## claude / opus backend: API or CLI
 The `claude:` / opus backend runs two ways, so it works whether or not the
