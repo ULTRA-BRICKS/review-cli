@@ -6004,7 +6004,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     )
     if requires_task_code:
         raw_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
-        task_repo = _effective_cwd(args.cwd, warn=False)
+        task_repo = _effective_cwd(args.cwd, warn=False) if raw_task else None
         try:
             task_code = resolve_task_code(raw_task, task_repo)
         except ValueError as exc:

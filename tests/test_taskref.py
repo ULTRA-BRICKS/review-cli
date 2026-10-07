@@ -107,13 +107,17 @@ class _StubRefError(RuntimeError):
 
 
 def _stub_lib(calls: list[str]) -> types.ModuleType:
-    """A stand-in with the real lib's public surface and its two-backend limit: it accepts
-    only digits (github-issues) and records every ``validate()`` call."""
+    """A stand-in with the real lib's public surface and its two-backend limit: its config
+    loader refuses a ``forgejo`` rig.yaml like the real one, it accepts only digits
+    (github-issues), and it records every ``validate()`` call."""
     mod = types.ModuleType(_LIB)
     mod.VALID_BACKENDS = frozenset({"github-issues", "linear"})
     mod.TaskRefError = _StubRefError
 
     def load_repo_task_config(repo_root):
+        rig = Path(repo_root) / "rig.yaml"
+        if rig.is_file() and "forgejo" in rig.read_text(encoding="utf-8"):
+            raise _StubRefError("backend must be one of ['github-issues', 'linear']")
         return types.SimpleNamespace(
             backend="github-issues", github_repo="auto", linear_team="", sources=()
         )
@@ -261,6 +265,69 @@ def test_real_lib_this_repo_accepts_its_forgejo_codes():
     lib = _real_lib()
     with _validation_on(), _lib_module(lib), redirect_stderr(io.StringIO()):
         assert taskref.resolve_task_code("#427", REPO_ROOT) == "#427"
+
+
+def test_real_lib_github_backend_with_forgejo_origin_is_shape_only():
+    """A declared ``github-issues`` backend that resolves its repo from a Forgejo origin:
+    the lib alone rejects every code ("cannot resolve github repo")."""
+    lib = _real_lib()
+    with _validation_on(), _lib_module(lib), _repo(
+        origin=_FORGEJO_ORIGIN, files={"task.yaml": "backend: github-issues\n"}
+    ) as repo:
+        assert not lib.validate("#608", repo).ok
+        err = io.StringIO()
+        with redirect_stderr(err):
+            assert taskref.resolve_task_code("#608", repo) == "#608"
+        assert "origin (git.hyperide.ai) is not GitHub" in err.getvalue()
+
+
+def test_stub_lib_raising_degrades_to_shape_only():
+    lib = _stub_lib([])
+
+    def _boom(code, repo_root):
+        raise RuntimeError("tracker exploded")
+
+    lib.validate = _boom
+    err = io.StringIO()
+    with _validation_on(), _lib_module(lib), _repo(origin=_GITHUB_ORIGIN, files={}) as repo:
+        with redirect_stderr(err):
+            assert taskref.resolve_task_code("#608", repo) == "#608"
+        try:
+            taskref.resolve_task_code("has spaces inside", repo)
+        except ValueError as exc:
+            assert "one non-whitespace token" in str(exc)
+        else:
+            raise AssertionError("expected the shape check to reject")
+    assert "agenttools_taskref failed: RuntimeError: tracker exploded" in err.getvalue()
+
+
+def test_stub_lib_taskref_error_from_validate_fails_closed():
+    lib = _stub_lib([])
+
+    def _malformed(code, repo_root):
+        raise _StubRefError("cannot read/parse task.yaml")
+
+    lib.validate = _malformed
+    with _validation_on(), _lib_module(lib), _repo(origin=_GITHUB_ORIGIN, files={}) as repo:
+        try:
+            taskref.resolve_task_code("#608", repo)
+        except ValueError as exc:
+            assert "cannot read/parse task.yaml" in str(exc)
+        else:
+            raise AssertionError("expected a malformed config to fail closed")
+
+
+def test_real_lib_malformed_task_yaml_fails_closed():
+    lib = _real_lib()
+    with _validation_on(), _lib_module(lib), _repo(
+        origin=_GITHUB_ORIGIN, files={"task.yaml": "backend: [unclosed\n"}
+    ) as repo:
+        try:
+            taskref.resolve_task_code("#608", repo)
+        except ValueError as exc:
+            assert "task.yaml" in str(exc), exc
+        else:
+            raise AssertionError("expected a malformed task.yaml to fail closed")
 
 
 # ── lib present, an invalid code ────────────────────────────────────────────────────────────

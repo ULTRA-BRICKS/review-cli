@@ -14,11 +14,15 @@ on stderr saying why:
 - the repo declares a backend the lib lacks (``rig.yaml`` ``task.backend: forgejo``, as this
   repo does; Forgejo codes look like ``#608``). The lib would reject every code there with
   "backend must be one of ...";
-- the repo declares no backend and its ``origin`` is not a GitHub remote (or there is no
-  ``origin``). The lib's zero-config default is ``github-issues`` resolved from ``origin``,
-  so a Forgejo-hosted repo without a ``task:`` block would also have every code rejected.
+- the lib's ``github-issues`` backend resolves the repo from ``origin`` (its zero-config
+  default, ``github.repo: auto``) and ``origin`` is not a GitHub remote, or there is none.
+  The lib would reject every code there, so a Forgejo-hosted repo without a ``task:``
+  block would have every code rejected too;
+- the lib raises, against its never-raise contract.
 
-A malformed ``task.yaml`` still goes to the lib, which fails closed on it.
+A malformed ``task.yaml`` still goes to the lib, which fails closed on it. The lib calls
+``gh api`` for GitHub codes; when ``gh`` is missing or offline it answers ``ok=False``
+("could not verify"), which is refused here like any other rejection.
 
 When the lib is **not** installed: **permissive fallback** — shape-only
 ``normalize_task_code`` (the behavior before #427). This matches how other optional
@@ -69,11 +73,6 @@ def _taskref_lib() -> ModuleType | None:
     return agenttools_taskref
 
 
-def taskref_available() -> bool:
-    """True when backend validation can run (lib importable and not disabled)."""
-    return _backend_validation_enabled() and _taskref_lib() is not None
-
-
 def _yaml_mapping(path: Path) -> dict | None:
     """``path`` parsed as a YAML mapping; None when missing, unreadable or not a mapping."""
     if not path.is_file():
@@ -89,7 +88,8 @@ def _yaml_mapping(path: Path) -> dict | None:
 
 def _declared_backend(repo_root: Path) -> str | None:
     """The tracker backend the repo declares, read the way the lib reads it: ``rig.yaml``'s
-    ``task.backend``, overridden by ``task.yaml``'s ``backend``. None when neither says."""
+    ``task.backend``, overridden by ``task.yaml``'s ``backend``. None when neither says.
+    Only consulted to name a backend the lib's own config loader refused."""
     backend = None
     rig = _yaml_mapping(repo_root / "rig.yaml")
     task_block = rig.get("task") if rig else None
@@ -123,39 +123,48 @@ def _origin_host(repo_root: Path) -> str | None:
 
 
 def _unvalidatable_reason(lib: ModuleType, repo_root: Path) -> str | None:
-    """Why the lib cannot judge task codes for ``repo_root``, or None when it can."""
-    backend = _declared_backend(repo_root)
-    if backend is not None:
-        if backend in lib.VALID_BACKENDS:
-            return None
-        return f"agenttools_taskref has no {backend!r} tracker backend"
+    """Why the lib cannot judge task codes for ``repo_root``, or None when it can.
+
+    The lib's own ``load_repo_task_config`` decides the backend. Its ``TaskRefError`` covers
+    both a backend it lacks and a malformed config; only the first is skipped here, the
+    second goes on to ``lib.validate()``, which fails closed on it."""
     try:
         cfg = lib.load_repo_task_config(repo_root)
     except lib.TaskRefError:
-        return None  # malformed task.yaml: lib.validate() fails closed on it
+        backend = _declared_backend(repo_root)
+        if backend is not None and backend not in lib.VALID_BACKENDS:
+            return f"agenttools_taskref has no {backend!r} tracker backend"
+        return None
     if cfg.backend != "github-issues" or cfg.github_repo != "auto":
         return None
     host = _origin_host(repo_root)
     if host == "github.com":
         return None
     if host is None:
-        return "no task backend configured and no git origin remote"
-    return f"no task backend configured and origin ({host}) is not GitHub"
+        return "github-issues backend resolves its repo from origin, and there is no origin"
+    return f"github-issues backend resolves its repo from origin, and origin ({host}) is not GitHub"
 
 
 def _validate_with_lib(code: str, repo_root: Path) -> str:
     lib = _taskref_lib()
     if lib is None:
         return code
-    reason = _unvalidatable_reason(lib, repo_root)
-    if reason is not None:
+    try:
+        reason = _unvalidatable_reason(lib, repo_root)
+        result = None if reason is not None else lib.validate(code, repo_root)
+    except lib.TaskRefError as exc:
+        # validate() turns a malformed config into ok=False itself; should a later lib
+        # version raise it instead, it still means "malformed config": fail closed.
+        raise ValueError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - optional lib whose contract is never-raise
+        reason, result = f"agenttools_taskref failed: {type(exc).__name__}: {exc}", None
+    if result is None:
         print(
             f"[review-cli] task code {code!r} checked for shape only: {reason}",
             file=sys.stderr,
             flush=True,
         )
         return code
-    result = lib.validate(code, repo_root)
     if not result.ok:
         raise ValueError(result.reason)
     return code

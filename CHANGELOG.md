@@ -15,8 +15,8 @@ semantic versioning.
   - a repo that declares another backend (`rig.yaml` `task.backend: forgejo`, as this one
     does) gets the shape check only, and stderr says why. Without this, the lib rejects
     every code there, `#608` included;
-  - so does a repo with no backend declared whose `origin` is not on github.com, or which
-    has no `origin`;
+  - so does a GitHub-issues repo that takes its repo from `origin` (the lib's default)
+    when `origin` is not on github.com or is missing, and a run where the lib raises;
   - without the lib, every run gets the shape check only, as before;
   - `review task CODE` and `review task CODE --check` read history and keep the shape check;
   - `REVIEW_TASKREF_VALIDATE=0` turns tracker validation off; `tests/conftest.py` and
