@@ -3,6 +3,25 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.46.0 — 2026-10-08
+
+- **Feat(task): a recording run checks `--task CODE` against the repo's tracker**
+  ([review-cli#427](https://git.hyperide.ai/ultrabricks/review-cli/issues/427)). With the
+  agent-tools `agenttools_taskref` lib installed, `review <mode> --task CODE` (or
+  `$REVIEW_TASK_CODE`) asks it whether the code is real before recording the run, and exits 2
+  on an invented code with the lib's `task find` / `task new` guidance. The code is recorded
+  as written, not rewritten to the lib's canonical form. The lib knows GitHub issues and
+  Linear only:
+  - a repo that declares another backend (`rig.yaml` `task.backend: forgejo`, as this one
+    does) gets the shape check only, and stderr says why. Without this, the lib rejects
+    every code there, `#608` included;
+  - so does a repo with no backend declared whose `origin` is not on github.com, or which
+    has no `origin`;
+  - without the lib, every run gets the shape check only, as before;
+  - `review task CODE` and `review task CODE --check` read history and keep the shape check;
+  - `REVIEW_TASKREF_VALIDATE=0` turns tracker validation off; `tests/conftest.py` and
+    `tests/smoke.py` set it so the suites' synthetic codes stay valid.
+
 ## 0.44.0 — 2026-10-01
 
 - **Breaking: the `claude-p` wrapper is retired; the claude seat runs plain `claude --print`.**

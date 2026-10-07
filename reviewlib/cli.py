@@ -1146,9 +1146,10 @@ def _task_subcommand(rest: list[str]) -> int:
             )
         return 0
 
+    # History lookup reads what was recorded; it does not record, so it keeps the shape-only
+    # check (like --check above) and stays usable for codes recorded before #427.
     try:
-        repo_root = _effective_cwd(ns.cwd, warn=False)
-        code = resolve_task_code(ns.code, repo_root)
+        code = normalize_task_code(ns.code)
     except ValueError as exc:
         print(f"[review task] invalid task code: {exc}", file=sys.stderr)
         return 2

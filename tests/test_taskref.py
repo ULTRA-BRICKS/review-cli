@@ -1,134 +1,192 @@
-"""Task-code backend validation via agenttools_taskref (review-cli#427)."""
+"""Task-code tracker validation via agenttools_taskref (review-cli#427).
+
+Covers the three postures of ``reviewlib.taskref.resolve_task_code``:
+
+- lib absent: shape-only fallback, ``review --help`` still works;
+- lib present, Forgejo-backed repo: ``#N`` codes are accepted (the lib has no ``forgejo``
+  backend, so tracker validation is skipped with a note) and shape errors still reject;
+- lib present, a backend it knows: an invented code is rejected, end-to-end through
+  ``review diff --task``.
+
+Each posture runs against a stand-in ``agenttools_taskref`` module (always, so CI covers it)
+and, when the real lib is importable, against the real lib too. The real lib is found by a
+normal import, or under ``$AGENT_TOOLS_LIB`` (the agent-tools checkout's ``lib`` dir, for
+runs with a redirected ``HOME`` such as tests/smoke.py).
+"""
 
 from __future__ import annotations
 
 import io
 import os
+import subprocess
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+import tempfile
+import types
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
-import reviewlib.cli as cli
-import reviewlib.taskref as taskref
+from reviewlib import cli, taskref
 from reviewlib.stats import normalize_task_code
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-AGENT_TOOLS_LIB = REPO_ROOT.parents[2] / "agent-tools" / "lib"
+_LIB = "agenttools_taskref"
+_FORGEJO_ORIGIN = "https://git.hyperide.ai/ultrabricks/review-cli.git"
+_GITHUB_ORIGIN = "https://github.com/alex-mextner/review-cli.git"
 
 
 class _Skip(Exception):
     pass
 
 
-def _ensure_agenttools_taskref_on_path() -> None:
-    if not (AGENT_TOOLS_LIB / "agenttools_taskref").is_dir():
-        raise _Skip("agenttools_taskref checkout not present")
-    lib_root = str(AGENT_TOOLS_LIB)
-    if lib_root not in sys.path:
-        sys.path.insert(0, lib_root)
-    try:
-        import agenttools_taskref  # noqa: F401
-    except ImportError as exc:
-        raise _Skip(f"agenttools_taskref not importable: {exc}") from exc
-
-
-def test_resolve_task_code_shape_only_when_validation_disabled():
-    old = os.environ.get("REVIEW_TASKREF_VALIDATE")
-    os.environ["REVIEW_TASKREF_VALIDATE"] = "0"
-    try:
-        assert taskref.resolve_task_code("TEST-1", REPO_ROOT) == "TEST-1"
-    finally:
-        if old is None:
-            os.environ.pop("REVIEW_TASKREF_VALIDATE", None)
+@contextmanager
+def _env(**values: str | None):
+    old = {k: os.environ.get(k) for k in values}
+    for k, v in values.items():
+        if v is None:
+            os.environ.pop(k, None)
         else:
-            os.environ["REVIEW_TASKREF_VALIDATE"] = old
+            os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
-def test_resolve_task_code_uses_monkeypatch_hook():
-    old = os.environ.get("REVIEW_TASKREF_VALIDATE")
-    os.environ["REVIEW_TASKREF_VALIDATE"] = "1"
+@contextmanager
+def _validation_on():
+    """Validation enabled, no hook, stats to a throwaway file."""
     old_hook = taskref.validate_task_code_hook
-
-    def _hook(code: str, repo_root: Path) -> str:
-        assert code == "607"
-        assert repo_root == REPO_ROOT.resolve()
-        return "607"
-
-    taskref.validate_task_code_hook = _hook
-    try:
-        assert taskref.resolve_task_code("607", REPO_ROOT) == "607"
-    finally:
-        taskref.validate_task_code_hook = old_hook
-        if old is None:
-            os.environ.pop("REVIEW_TASKREF_VALIDATE", None)
-        else:
-            os.environ["REVIEW_TASKREF_VALIDATE"] = old
-
-
-def test_resolve_task_code_permissive_when_lib_missing():
-    old = os.environ.get("REVIEW_TASKREF_VALIDATE")
-    os.environ["REVIEW_TASKREF_VALIDATE"] = "1"
-    old_lib = taskref._taskref_lib
-    taskref._taskref_lib = lambda: None
-    try:
-        assert taskref.resolve_task_code("TEST-1", REPO_ROOT) == "TEST-1"
-    finally:
-        taskref._taskref_lib = old_lib
-        if old is None:
-            os.environ.pop("REVIEW_TASKREF_VALIDATE", None)
-        else:
-            os.environ["REVIEW_TASKREF_VALIDATE"] = old
-
-
-def test_resolve_task_code_rejects_invented_code():
-    _ensure_agenttools_taskref_on_path()
-    old = os.environ.get("REVIEW_TASKREF_VALIDATE")
-    old_hook = taskref.validate_task_code_hook
-    os.environ["REVIEW_TASKREF_VALIDATE"] = "1"
     taskref.validate_task_code_hook = None
-    try:
+    with tempfile.TemporaryDirectory() as stats_dir, _env(
+        REVIEW_TASKREF_VALIDATE="1",
+        REVIEW_STATS_FILE=str(Path(stats_dir) / "run-stats.jsonl"),
+    ):
         try:
-            taskref.resolve_task_code("TEST-1", REPO_ROOT)
+            yield
+        finally:
+            taskref.validate_task_code_hook = old_hook
+
+
+@contextmanager
+def _lib_module(module: types.ModuleType | None):
+    """Install ``module`` as ``agenttools_taskref`` (None = import fails) for the block."""
+    missing = object()
+    old = sys.modules.get(_LIB, missing)
+    sys.modules[_LIB] = module  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        if old is missing:
+            sys.modules.pop(_LIB, None)
+        else:
+            sys.modules[_LIB] = old  # type: ignore[assignment]
+
+
+def _real_lib() -> types.ModuleType:
+    extra = os.environ.get("AGENT_TOOLS_LIB")
+    if extra and extra not in sys.path:
+        sys.path.insert(0, extra)
+    try:
+        import agenttools_taskref
+    except ImportError as exc:
+        msg = f"agenttools_taskref not importable: {exc}"
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            import pytest
+
+            pytest.skip(msg)
+        raise _Skip(msg) from exc
+    return agenttools_taskref
+
+
+class _StubRefError(RuntimeError):
+    pass
+
+
+def _stub_lib(calls: list[str]) -> types.ModuleType:
+    """A stand-in with the real lib's public surface and its two-backend limit: it accepts
+    only digits (github-issues) and records every ``validate()`` call."""
+    mod = types.ModuleType(_LIB)
+    mod.VALID_BACKENDS = frozenset({"github-issues", "linear"})
+    mod.TaskRefError = _StubRefError
+
+    def load_repo_task_config(repo_root):
+        return types.SimpleNamespace(
+            backend="github-issues", github_repo="auto", linear_team="", sources=()
+        )
+
+    def validate(code, repo_root):
+        calls.append(code)
+        ok = code.lstrip("#").isdigit()
+        reason = "resolved" if ok else f"{code!r} is not real. Use `task find` or `task new`."
+        return types.SimpleNamespace(ok=ok, reason=reason, canonical=code.lstrip("#"))
+
+    mod.load_repo_task_config = load_repo_task_config
+    mod.validate = validate
+    return mod
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+    )
+
+
+@contextmanager
+def _repo(*, origin: str | None, files: dict[str, str]):
+    """A committed throwaway git repo with ``files`` and an optional ``origin`` remote."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        _git(repo, "init", "-q")
+        if origin:
+            _git(repo, "remote", "add", "origin", origin)
+        for name, text in files.items():
+            (repo / name).write_text(text, encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(
+            repo, "-c", "user.name=t", "-c", "user.email=t@t",
+            "commit", "-q", "--allow-empty", "-m", "init",
+        )
+        yield repo
+
+
+def _forgejo_repo():
+    return _repo(origin=_FORGEJO_ORIGIN, files={"rig.yaml": "task:\n  backend: forgejo\n"})
+
+
+def _review_diff(code: str, repo: Path) -> tuple[int, str]:
+    """``review diff --task CODE -C repo`` in-process; (rc, stdout+stderr). The repos here
+    have no changes, so a code that passes validation ends at "No diff to review"."""
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = cli.main(["diff", "--task", code, "-C", str(repo)])
+    return rc, out.getvalue() + err.getvalue()
+
+
+# ── lib absent ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_lib_absent_is_shape_only():
+    with _validation_on(), _lib_module(None):
+        assert taskref._taskref_lib() is None
+        assert taskref.resolve_task_code("TEST-1", REPO_ROOT) == "TEST-1"
+        assert taskref.resolve_task_code("#608", REPO_ROOT) == "#608"
+        try:
+            taskref.resolve_task_code("has spaces inside", REPO_ROOT)
         except ValueError as exc:
-            assert "task find" in str(exc)
+            assert "one non-whitespace token" in str(exc)
         else:
-            raise AssertionError("expected ValueError")
-    finally:
-        taskref.validate_task_code_hook = old_hook
-        if old is None:
-            os.environ.pop("REVIEW_TASKREF_VALIDATE", None)
-        else:
-            os.environ["REVIEW_TASKREF_VALIDATE"] = old
+            raise AssertionError("expected the shape check to reject")
 
 
-def test_cli_rejects_fabricated_task_code_end_to_end():
-    _ensure_agenttools_taskref_on_path()
-    old = os.environ.get("REVIEW_TASKREF_VALIDATE")
-    old_hook = taskref.validate_task_code_hook
-    os.environ["REVIEW_TASKREF_VALIDATE"] = "1"
-    taskref.validate_task_code_hook = None
-    try:
-        err = io.StringIO()
-        with redirect_stderr(err):
-            rc = cli.main(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
-        assert rc == 2
-        assert "invalid --task CODE" in err.getvalue()
-        lowered = err.getvalue().lower()
-        assert "task find" in lowered or "github" in lowered
-    finally:
-        taskref.validate_task_code_hook = old_hook
-        if old is None:
-            os.environ.pop("REVIEW_TASKREF_VALIDATE", None)
-        else:
-            os.environ["REVIEW_TASKREF_VALIDATE"] = old
-
-
-def test_help_works_without_agenttools_taskref():
-    old = os.environ.get("REVIEW_TASKREF_VALIDATE")
-    old_lib = taskref._taskref_lib
-    os.environ["REVIEW_TASKREF_VALIDATE"] = "1"
-    taskref._taskref_lib = lambda: None
-    try:
+def test_lib_absent_help_works():
+    with _validation_on(), _lib_module(None):
         out = io.StringIO()
         with redirect_stdout(out):
             try:
@@ -137,12 +195,145 @@ def test_help_works_without_agenttools_taskref():
                 rc = exc.code
         assert rc in (0, None)
         assert "review" in out.getvalue().lower()
-    finally:
-        taskref._taskref_lib = old_lib
-        if old is None:
-            os.environ.pop("REVIEW_TASKREF_VALIDATE", None)
+
+
+def test_lib_absent_review_diff_accepts_any_shaped_code():
+    with _validation_on(), _lib_module(None), _forgejo_repo() as repo:
+        rc, text = _review_diff("TEST-1", repo)
+        assert "invalid --task CODE" not in text, text
+        assert "No diff to review" in text, text
+        assert rc == 1
+
+
+# ── lib present, Forgejo-backed repo ────────────────────────────────────────────────────────
+
+
+def test_stub_lib_forgejo_code_accepted_without_calling_validate():
+    calls: list[str] = []
+    err = io.StringIO()
+    with _validation_on(), _lib_module(_stub_lib(calls)), _forgejo_repo() as repo, redirect_stderr(
+        err
+    ):
+        assert taskref.resolve_task_code("#608", repo) == "#608"
+    assert calls == []
+    assert "shape only" in err.getvalue() and "'forgejo'" in err.getvalue()
+
+
+def test_stub_lib_forgejo_shape_error_still_rejects():
+    with _validation_on(), _lib_module(_stub_lib([])), _forgejo_repo() as repo:
+        try:
+            taskref.resolve_task_code("has spaces inside", repo)
+        except ValueError as exc:
+            assert "one non-whitespace token" in str(exc)
         else:
-            os.environ["REVIEW_TASKREF_VALIDATE"] = old
+            raise AssertionError("expected the shape check to reject")
+
+
+def test_stub_lib_unconfigured_non_github_origin_is_shape_only():
+    """No ``task:`` block and a Forgejo origin: the lib's github default can't resolve, so
+    it would reject every code. Same for a repo with no origin at all."""
+    for origin in (_FORGEJO_ORIGIN, None):
+        calls: list[str] = []
+        with _validation_on(), _lib_module(_stub_lib(calls)), _repo(
+            origin=origin, files={}
+        ) as repo, redirect_stderr(io.StringIO()):
+            assert taskref.resolve_task_code("#608", repo) == "#608"
+        assert calls == [], origin
+
+
+def test_real_lib_forgejo_code_accepted():
+    lib = _real_lib()
+    with _validation_on(), _lib_module(lib), _forgejo_repo() as repo:
+        # The lib itself rejects every code on a forgejo repo — the reason for the skip.
+        assert not lib.validate("#608", repo).ok
+        with redirect_stderr(io.StringIO()):
+            assert taskref.resolve_task_code("#608", repo) == "#608"
+            assert taskref.resolve_task_code("608", repo) == "608"
+        rc, text = _review_diff("#608", repo)
+        assert "invalid --task CODE" not in text, text
+        assert "checked for shape only" in text, text
+        assert "No diff to review" in text, text
+        assert rc == 1
+
+
+def test_real_lib_this_repo_accepts_its_forgejo_codes():
+    """review-cli itself is Forgejo-backed (rig.yaml task.backend: forgejo, #585)."""
+    lib = _real_lib()
+    with _validation_on(), _lib_module(lib), redirect_stderr(io.StringIO()):
+        assert taskref.resolve_task_code("#427", REPO_ROOT) == "#427"
+
+
+# ── lib present, an invalid code ────────────────────────────────────────────────────────────
+
+
+def test_stub_lib_invalid_code_rejected_end_to_end():
+    calls: list[str] = []
+    with _validation_on(), _lib_module(_stub_lib(calls)), _repo(
+        origin=_GITHUB_ORIGIN, files={}
+    ) as repo:
+        try:
+            taskref.resolve_task_code("ambiguous-create-dedup", repo)
+        except ValueError as exc:
+            assert "task find" in str(exc)
+        else:
+            raise AssertionError("expected ValueError")
+        assert taskref.resolve_task_code("#427", repo) == "#427"  # as written, not canonical
+        rc, text = _review_diff("ambiguous-create-dedup", repo)
+        assert rc == 2
+        assert "invalid --task CODE" in text and "task find" in text, text
+    assert calls == ["ambiguous-create-dedup", "#427", "ambiguous-create-dedup"]
+
+
+def test_real_lib_invented_code_rejected_end_to_end():
+    """A free-text slug — the invented-code shape agent-tools#607 found in run-stats — is
+    rejected by the lib's shape check before any `gh` call, so no network is needed."""
+    _real_lib()
+    task_yaml = "backend: github-issues\ngithub:\n  repo: alex-mextner/review-cli\n"
+    with _validation_on(), _repo(origin=_GITHUB_ORIGIN, files={"task.yaml": task_yaml}) as repo:
+        try:
+            taskref.resolve_task_code("ambiguous-create-dedup", repo)
+        except ValueError as exc:
+            assert "not a GitHub issue/PR reference" in str(exc)
+            assert "task find" in str(exc)
+        else:
+            raise AssertionError("expected ValueError")
+        rc, text = _review_diff("ambiguous-create-dedup", repo)
+        assert rc == 2
+        assert "invalid --task CODE" in text and "task find" in text, text
+
+
+def test_real_lib_linear_wrong_team_rejected():
+    _real_lib()
+    task_yaml = "backend: linear\nlinear:\n  team: HYP\n"
+    with _validation_on(), _repo(origin=None, files={"task.yaml": task_yaml}) as repo:
+        assert taskref.resolve_task_code("HYP-742", repo) == "HYP-742"
+        try:
+            taskref.resolve_task_code("TEST-1", repo)
+        except ValueError as exc:
+            assert "team prefix" in str(exc)
+        else:
+            raise AssertionError("expected ValueError")
+
+
+# ── test seam ───────────────────────────────────────────────────────────────────────────────
+
+
+def test_validation_disabled_is_shape_only():
+    calls: list[str] = []
+    with _validation_on(), _lib_module(_stub_lib(calls)), _env(REVIEW_TASKREF_VALIDATE="0"):
+        assert taskref.resolve_task_code("TEST-1", REPO_ROOT) == "TEST-1"
+    assert calls == []
+
+
+def test_hook_replaces_lib():
+    def _hook(code: str, repo_root: Path) -> str:
+        assert code == "607"
+        assert repo_root == REPO_ROOT.resolve()
+        return "607"
+
+    with _validation_on():
+        taskref.validate_task_code_hook = _hook
+        assert taskref.resolve_task_code("607", REPO_ROOT) == "607"
 
 
 def test_normalize_task_code_still_shape_only():
@@ -175,7 +366,5 @@ if __name__ == "__main__":
             except Exception as exc:
                 failures += 1
                 print(f"ERROR {name}: {type(exc).__name__}: {exc}")
-    print(
-        f"\n{'FAILED' if failures else 'OK'}: {failures} failure(s), {skipped} skipped"
-    )
+    print(f"\n{'FAILED' if failures else 'OK'}: {failures} failure(s), {skipped} skipped")
     sys.exit(1 if failures else 0)

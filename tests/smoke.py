@@ -46,6 +46,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
+        "test_taskref.py",
         "test_tui_pty.py",
     }
 )
@@ -78,6 +79,9 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "HOME": home,
         "XDG_CONFIG_HOME": str(Path(home) / ".config"),
         "REVIEW_TASK_CODE": "SMOKE-1",
+        # Synthetic codes (SMOKE-1, TEST-1, ...) must not hit a real tracker (review-cli#427);
+        # test_taskref.py turns validation back on per test.
+        "REVIEW_TASKREF_VALIDATE": "0",
     }
     full_env.update(env or {})
     return full_env

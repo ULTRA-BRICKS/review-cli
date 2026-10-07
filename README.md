@@ -534,6 +534,8 @@ be grouped by the external task/issue that caused them. The CLI history view rea
 append-only run-stats store for the authoritative iteration count and model list, then joins
 against dashboard logs for the detailed conversations when those logs are still present.
 
+Tracker validation of CODE: see `reviewlib/taskref.py` (agenttools_taskref).
+
 ```bash
 review task                 # list all task codes seen in run-stats
 review task HYP-742         # iterations, models, ok/fail counts, log session ids
