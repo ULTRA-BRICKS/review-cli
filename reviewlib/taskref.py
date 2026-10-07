@@ -18,11 +18,13 @@ on stderr saying why:
   default, ``github.repo: auto``) and ``origin`` is not a GitHub remote, or there is none.
   The lib would reject every code there, so a Forgejo-hosted repo without a ``task:``
   block would have every code rejected too;
-- the lib raises, against its never-raise contract.
+- GitHub gave no verdict: the lib checks GitHub codes with ``gh api`` and, when ``gh`` is
+  missing, failing, unauthenticated or offline, answers ``ok=False`` with a "could not
+  verify" message (matched by its known prefixes, ``_UNVERIFIED_PREFIXES``). Every other
+  ``ok=False`` (bad shape, a 404, unknown wording) is a rejection;
+- the lib raises, or returns something without ``ok``, against its contract.
 
-A malformed ``task.yaml`` still goes to the lib, which fails closed on it. The lib calls
-``gh api`` for GitHub codes; when ``gh`` is missing or offline it answers ``ok=False``
-("could not verify"), which is refused here like any other rejection.
+A malformed ``task.yaml`` still goes to the lib, which fails closed on it.
 
 When the lib is **not** installed: **permissive fallback** — shape-only
 ``normalize_task_code`` (the behavior before #427). This matches how other optional
@@ -57,6 +59,10 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _GIT_TIMEOUT_S = 5
 # SCP-like git remote (`[user@]host:path`, no `://`), e.g. `git@github.com:o/r.git`.
 _SCP_LIKE_REMOTE_RE = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):")
+# How the lib's github-issues answers start when `gh` could not give a verdict (missing,
+# failing, unauthenticated, offline): `_check_github_issue`'s exists=None messages. Any
+# other ok=False answer (bad shape, a 404, wording this list doesn't know) is a rejection.
+_UNVERIFIED_PREFIXES = ("gh CLI not found", "gh api call failed", "could not verify")
 
 
 def _backend_validation_enabled() -> bool:
@@ -145,29 +151,40 @@ def _unvalidatable_reason(lib: ModuleType, repo_root: Path) -> str | None:
     return f"github-issues backend resolves its repo from origin, and origin ({host}) is not GitHub"
 
 
+def _shape_only(code: str, reason: str) -> str:
+    print(
+        f"[review-cli] task code {code!r} checked for shape only: {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return code
+
+
 def _validate_with_lib(code: str, repo_root: Path) -> str:
     lib = _taskref_lib()
     if lib is None:
         return code
     try:
         reason = _unvalidatable_reason(lib, repo_root)
-        result = None if reason is not None else lib.validate(code, repo_root)
+        if reason is not None:
+            return _shape_only(code, reason)
+        result = lib.validate(code, repo_root)
+        if result.ok:
+            return code
     except lib.TaskRefError as exc:
         # validate() turns a malformed config into ok=False itself; should a later lib
         # version raise it instead, it still means "malformed config": fail closed.
         raise ValueError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - optional lib whose contract is never-raise
-        reason, result = f"agenttools_taskref failed: {type(exc).__name__}: {exc}", None
-    if result is None:
-        print(
-            f"[review-cli] task code {code!r} checked for shape only: {reason}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return code
-    if not result.ok:
-        raise ValueError(result.reason)
-    return code
+        return _shape_only(code, f"agenttools_taskref failed: {type(exc).__name__}: {exc}")
+    # ok=False from here on: a rejection unless it is GitHub's "could not verify". Read
+    # with getattr so an odd result object still fails closed rather than open.
+    rejection = str(getattr(result, "reason", None) or "rejected by agenttools_taskref")
+    if getattr(result, "backend", None) == "github-issues" and rejection.startswith(
+        _UNVERIFIED_PREFIXES
+    ):
+        return _shape_only(code, f"GitHub gave no verdict: {rejection}")
+    raise ValueError(rejection)
 
 
 def resolve_task_code(

@@ -16,7 +16,9 @@ semantic versioning.
     does) gets the shape check only, and stderr says why. Without this, the lib rejects
     every code there, `#608` included;
   - so does a GitHub-issues repo that takes its repo from `origin` (the lib's default)
-    when `origin` is not on github.com or is missing, and a run where the lib raises;
+    when `origin` is not on github.com or is missing, a run where the lib raises, and a
+    GitHub number `gh` gave no verdict on (missing, unauthenticated or offline: the lib's
+    "could not verify" answers). A bad shape, a 404 or any other answer is still refused;
   - without the lib, every run gets the shape check only, as before;
   - `review task CODE` and `review task CODE --check` read history and keep the shape check;
   - `REVIEW_TASKREF_VALIDATE=0` turns tracker validation off; `tests/conftest.py` and

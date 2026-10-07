@@ -126,7 +126,9 @@ def _stub_lib(calls: list[str]) -> types.ModuleType:
         calls.append(code)
         ok = code.lstrip("#").isdigit()
         reason = "resolved" if ok else f"{code!r} is not real. Use `task find` or `task new`."
-        return types.SimpleNamespace(ok=ok, reason=reason, canonical=code.lstrip("#"))
+        return types.SimpleNamespace(
+            ok=ok, reason=reason, canonical=code.lstrip("#"), backend="github-issues"
+        )
 
     mod.load_repo_task_config = load_repo_task_config
     mod.validate = validate
@@ -299,6 +301,77 @@ def test_stub_lib_raising_degrades_to_shape_only():
         else:
             raise AssertionError("expected the shape check to reject")
     assert "agenttools_taskref failed: RuntimeError: tracker exploded" in err.getvalue()
+
+
+def _expect_rejection(code: str, repo: Path, needle: str) -> None:
+    try:
+        taskref.resolve_task_code(code, repo)
+    except ValueError as exc:
+        assert needle in str(exc), exc
+    else:
+        raise AssertionError(f"expected {code!r} to be rejected")
+
+
+def test_stub_lib_github_no_verdict_is_shape_only_everything_else_rejects():
+    """Only the lib's "could not verify" answers (gh missing/offline) get the shape check.
+    An ``ok=False`` with an empty reason, unknown wording, or no ``backend`` is a
+    rejection; an answer without ``ok`` breaks the contract and gets the shape check."""
+    lib = _stub_lib([])
+
+    def _gh(ok, reason, **extra):
+        return types.SimpleNamespace(ok=ok, reason=reason, backend="github-issues", **extra)
+
+    answers = {
+        "#601": _gh(False, "gh CLI not found on PATH; cannot verify GitHub issue/PR numbers"),
+        "#602": _gh(False, "gh api call failed: PermissionError: denied"),
+        "#603": _gh(False, "could not verify via gh api (HTTP 502)"),
+        "#604": object(),
+        "#605": _gh(False, ""),
+        "#606": _gh(False, "#606 does not exist; run `task new` to create it"),
+        "#607": types.SimpleNamespace(ok=False, reason="could not verify via gh api (x)"),
+    }
+    lib.validate = lambda code, repo_root: answers[code]
+    err = io.StringIO()
+    with _validation_on(), _lib_module(lib), _repo(
+        origin=_GITHUB_ORIGIN, files={}
+    ) as repo, redirect_stderr(err):
+        for code in ("#601", "#602", "#603", "#604"):
+            assert taskref.resolve_task_code(code, repo) == code
+        _expect_rejection("#605", repo, "rejected by agenttools_taskref")
+        _expect_rejection("#606", repo, "does not exist")
+        _expect_rejection("#607", repo, "could not verify")  # no backend: fail closed
+    assert err.getvalue().count("GitHub gave no verdict") == 3
+    assert "agenttools_taskref failed: AttributeError" in err.getvalue()
+
+
+def test_real_lib_github_verdicts_via_fake_gh():
+    """The real lib against a fake ``gh`` (no network): missing ``gh`` and a non-404 error
+    get the shape check; a 404 and an invented slug are rejected with guidance."""
+    import shutil
+
+    lib = _real_lib()
+    git = shutil.which("git")
+    assert git
+    with tempfile.TemporaryDirectory() as bindir, _validation_on(), _lib_module(lib), _repo(
+        origin=_GITHUB_ORIGIN, files={}
+    ) as repo, _env(PATH=bindir):
+        os.symlink(git, Path(bindir) / "git")
+        gh = Path(bindir) / "gh"
+
+        def _fake_gh(stderr: str) -> None:
+            gh.write_text(f"#!/bin/sh\necho '{stderr}' >&2\nexit 1\n", encoding="utf-8")
+            gh.chmod(0o755)
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            assert taskref.resolve_task_code("#608", repo) == "#608"  # no gh at all
+            _fake_gh("HTTP 502: Bad Gateway")
+            assert taskref.resolve_task_code("#609", repo) == "#609"
+        assert "GitHub gave no verdict: gh CLI not found" in err.getvalue()
+        assert "GitHub gave no verdict: could not verify via gh api" in err.getvalue()
+        _fake_gh("HTTP 404: Not Found (https://api.github.com/repos/x/y/issues/99999)")
+        _expect_rejection("#99999", repo, "does not exist")
+        _expect_rejection("ambiguous-create-dedup", repo, "task find")
 
 
 def test_stub_lib_taskref_error_from_validate_fails_closed():
