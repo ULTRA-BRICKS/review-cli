@@ -480,7 +480,7 @@ def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
     """Resolve the review cwd, preferring the enclosing git repository root.
 
     Agents commonly invoke `review` from a scratch / temp directory and forget
-    -C, so the diff and the claude-p workspace silently point at the wrong place
+    -C, so the diff and the claude workspace silently point at the wrong place
     (often /tmp) and the review is empty or about the wrong code. Resolve to the
     git toplevel when inside a repo (also robust to being run from a subdir), and
     warn loudly when the cwd is not a git repo at all so the mistake is visible

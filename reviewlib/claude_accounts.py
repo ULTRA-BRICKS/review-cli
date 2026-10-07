@@ -3,20 +3,20 @@
 WHY THIS EXISTS (review-cli#168/#169/#170, Alex's hatch-request incident 2026-09-09):
 review-cli's `claude:*` seats and any omp-hosted Anthropic seat authenticate as exactly
 ONE Claude Code account. This machine (and any multi-account setup) keeps N separate
-personal logins side by side under `~/.claude-accounts/account-N/` -- the SAME layout the
-`claude-rotate` launcher (~/.files/bin/claude-rotate) and harness-cli
-(harness_cli.discovery) already use. This module deliberately reuses that ONE existing
-convention instead of inventing a third, review-cli-private registry: `CLAUDE_ROTATE_ROOT`
-is the exact env override name claude-rotate itself honors, so pointing one at a custom
-root points the other there too.
+personal logins side by side under `~/.claude-accounts/account-N/`, one per-account
+`CLAUDE_CONFIG_DIR` each -- the SAME layout harness-cli (harness_cli.discovery) and rig
+already read. This module deliberately reuses that ONE existing convention instead of
+inventing a review-cli-private registry. `$REVIEW_CLAUDE_ACCOUNTS_ROOT` points review-cli
+at a different root (tests use it to build a throwaway registry).
 
 This module DISCOVERS and ORDERS the registry, reads each account's login state
 (`account_logged_in`, a local `claude auth status`), and remembers a login that failed on
 an account (`record_login_failure`/`login_failure`, review-cli#596) -- it never logs an
-account in or out (that is a real interactive OAuth flow; see claude-rotate's own "rotate
-login", which is the one-time human step that populates a new account slot). An
-empty/absent registry degrades to a single implicit account (`[]` / `[(None, None)]` from
-the callers below) -- exactly today's pre-#168 single-account behaviour, unchanged.
+account in or out (that is a real interactive OAuth flow: the one-time human step
+`CLAUDE_CONFIG_DIR=<account dir> claude auth login`, see `login_command`, populates a new
+account slot). An empty/absent registry degrades to a single implicit account (`[]` /
+`[(None, None)]` from the callers below) -- exactly today's pre-#168 single-account
+behaviour, unchanged.
 
 Accessed via: reviewlib.backends' `review_claude`/`review_omp` account-rotation loop, and
 indirectly by `usage_limits`'s `account=` filter (backends resolves the email, usage_limits
@@ -38,12 +38,12 @@ from pathlib import Path
 
 from . import seat_cooldown
 
-_ENV_ROOT = "CLAUDE_ROTATE_ROOT"
+_ENV_ROOT = "REVIEW_CLAUDE_ACCOUNTS_ROOT"
 
 
 def accounts_root() -> Path:
-    """The account registry directory -- `$CLAUDE_ROTATE_ROOT` (claude-rotate's own
-    override name) or `~/.claude-accounts`. Never created here; callers only read."""
+    """The account registry directory -- `$REVIEW_CLAUDE_ACCOUNTS_ROOT` or
+    `~/.claude-accounts`. Never created here; callers only read."""
     override = os.environ.get(_ENV_ROOT, "").strip()
     if override:
         return Path(override).expanduser()
@@ -51,10 +51,10 @@ def accounts_root() -> Path:
 
 
 def list_accounts(root: Path | None = None) -> list[Path]:
-    """Registered `account-*` config dirs, sorted by name. Mirrors claude-rotate's own
-    `list_accounts`: any directory literally named `account-*` is auto-discovered, so
-    adding a 4th account needs no review-cli code change. `[]` when the registry dir
-    does not exist or is unreadable (the single-implicit-account case)."""
+    """Registered `account-*` config dirs, sorted by name: any directory literally named
+    `account-*` is auto-discovered, so adding a 4th account needs no review-cli code
+    change. `[]` when the registry dir does not exist or is unreadable (the
+    single-implicit-account case)."""
     base = root if root is not None else accounts_root()
     try:
         entries = [
@@ -66,8 +66,9 @@ def list_accounts(root: Path | None = None) -> list[Path]:
 
 
 def current_account_name(root: Path | None = None) -> str | None:
-    """The persisted `current` account name (claude-rotate's state file), or None when
-    absent/unreadable -- callers then just use registry order as-is."""
+    """The account named in the registry root's optional `current` file (the account to
+    try first), or None when absent/unreadable -- callers then just use registry order
+    as-is."""
     base = root if root is not None else accounts_root()
     try:
         saved = (base / "current").read_text(encoding="utf-8").strip()

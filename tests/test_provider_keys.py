@@ -2086,10 +2086,8 @@ def test_unpaid_provider_uses_canonical_gemini_and_claude_aliases():
 
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
-        assert backends.effective_provider("claude-p") == "claude"
         assert backends.effective_provider("claude-fable-5") == "claude"
         assert backends.effective_provider("fable5") == "claude"
-        assert backends.provider_marked_unpaid("claude-p") is True
         assert backends.provider_marked_unpaid("claude-fable-5") is True
         assert backends.provider_marked_unpaid("fable5") is True
 

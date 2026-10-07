@@ -189,7 +189,7 @@ The `claude:` / opus backend runs two ways, so it works whether or not the
   `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`), and optionally
   `ANTHROPIC_BASE_URL` for an Anthropic-compatible gateway (default
   `https://api.anthropic.com`). Same vars the Anthropic SDK / claude CLI read.
-- **CLI**: the `claude-p` wrapper (needs the `claude` binary; subscription).
+- **CLI**: `claude --print` (needs the `claude` binary; subscription).
 - **Selection**: `REVIEW_CLAUDE_MODE=api|cli` forces it; otherwise it auto-picks
   the CLI when the `claude` binary is present (subscription, no API cost) and the
   API only when there's no binary but a key is set. Set `REVIEW_CLAUDE_MODE=api`

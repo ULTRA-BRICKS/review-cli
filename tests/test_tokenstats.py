@@ -58,7 +58,7 @@ def _claude_paywall_log(d: Path, stamp="20260813T100200_000000Z", task="T1") -> 
     return _write(
         d,
         f"{stamp}-claude-r0.log",
-        f"[review-cli] claude: claude-p (args redacted) task={task}\n"
+        f"[review-cli] claude: claude (args redacted) task={task}\n"
         "Claude Fable 5 is currently unavailable. Learn more: https://example.com\n"
         "[review-cli] EXIT 0\n",
     )
@@ -217,14 +217,14 @@ def test_extract_usage_tokens_claude_api_mode_eligible():
 
 
 def test_extract_usage_tokens_claude_cli_mode_not_eligible():
-    """claude in CLI mode (argv0 == 'claude-p', not 'Anthropic API ...') must never be
+    """claude in CLI mode (argv0 == 'claude', not 'Anthropic API ...') must never be
     treated as a REST call even if its body happens to contain a usage-shaped line."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         path = _write(
             d,
             "20260813T100000_000000Z-claude-r0.log",
-            "[review-cli] claude: claude-p (args redacted) task=T1\n"
+            "[review-cli] claude: claude (args redacted) task=T1\n"
             "input_tokens=50 output_tokens=20\n"
             "[review-cli] EXIT 0\n",
         )
@@ -517,7 +517,7 @@ def test_fable_report_failure_rate_never_exceeds_one():
         _write(
             d,
             "20260813T100500_000000Z-claude-r0.log",
-            "[review-cli] claude: claude-p (args redacted) task=T1\n"
+            "[review-cli] claude: claude (args redacted) task=T1\n"
             "Claude Fable 5 is currently unavailable. Learn more: https://example.com\n"
             "[review-cli] EXIT 1\n",
         )
@@ -540,7 +540,7 @@ def test_is_cached_skip_not_fooled_by_quoted_prose_in_a_real_review():
         _write(
             d,
             "20260813T100600_000000Z-claude-r0.log",
-            "[review-cli] claude: claude-p (args redacted) task=T1\n"
+            "[review-cli] claude: claude (args redacted) task=T1\n"
             "Reviewing this diff: the cooldown skip writes a stdout like "
             "'cached: session limit; ... reviewlib.seat_cooldown' via _emit_rest_log.\n"
             "This looks correct.\n"

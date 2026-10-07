@@ -823,9 +823,9 @@ _UNIT_FILES = [
     # (every core assertion passes `samples=`); the few real-file tests manage their own
     # $REVIEW_USAGE_LIMITS_FILE/_DIR save-restore internally, no shared env needed.
     ("test_usage_limits.py", {}),
-    # The claude-rotate multi-account registry discovery module (review-cli#168):
+    # The multi-account `~/.claude-accounts` registry discovery module (review-cli#168):
     # listing, `current` state, oauth email extraction, rotation wrap order,
-    # $CLAUDE_ROTATE_ROOT override. Hermetic — every test builds its own throwaway
+    # $REVIEW_CLAUDE_ACCOUNTS_ROOT override. Hermetic — every test builds its own throwaway
     # registry under a temp dir; no real ~/.claude-accounts, no network.
     ("test_claude_accounts.py", {}),
     # The account-rotation fallback loops that module feeds (review-cli#168/#170):

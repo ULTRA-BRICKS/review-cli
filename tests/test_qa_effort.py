@@ -2,7 +2,7 @@
 """Run-scoped `--effort` is honored by the qa write/exec tester (review-cli#127 harvest).
 
 The run-scoped `--effort` flag (#150) lifts every REVIEW seat's reasoning effort, but the
-qa tester — a single write/exec seat that rides `claude-p`/`codex`, NOT the review panel —
+qa tester — a single write/exec seat that rides `claude --print`/`codex`, NOT the review panel —
 was left out: `review qa --effort xhigh` silently ignored the level. #150's own reviewers
 flagged exactly this ("don't expose --effort to qa unless it is honored"). This threads the
 resolved effort into both qa tester spawns using #150's shared helpers:

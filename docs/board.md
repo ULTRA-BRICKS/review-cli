@@ -40,8 +40,8 @@ number of working reviewers even when models drop:
 - **Account rotation (review-cli#168)** — every `claude:*` seat and the omp-hosted
   Claude seat authenticate as ONE Claude account, so an account-wide outage or paywall
   (or a 100% harness 5-hour/7-day window) used to take out all of them at once. On a
-  multi-account host (`~/.claude-accounts/account-*/`, the same registry `claude-rotate`
-  already uses; `$CLAUDE_ROTATE_ROOT` overrides the root) the direct `claude:*` dispatch
+  multi-account host (the per-account `CLAUDE_CONFIG_DIR` layout under `~/.claude-accounts/account-*/`;
+  `$REVIEW_CLAUDE_ACCOUNTS_ROOT` overrides the root) the direct `claude:*` dispatch
   now tries each registered account in rotation order — the persisted `current` account
   first, then wrapping through the rest — via a per-call `CLAUDE_CONFIG_DIR`, skipping
   any account whose own harness window is exhausted and falling through to the next on a
@@ -100,7 +100,7 @@ single-point-of-failure. See
 [review-cli#382](https://git.hyperide.ai/ultrabricks/review-cli/issues/382).
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
-the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
+the agentic claude CLI **when `claude` is on PATH** (they fall back to the diff-only
 Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra via the codex
 CLI (Astra — GPT-6-Astra, pinned via `codex:gpt-6-astra` — is the #5 board seat as of
 review-cli#286, was #6 before Fable's demotion moved every subsequent seat up one slot; it
@@ -135,7 +135,7 @@ post-mortem or the dashboard can reconstruct exactly how a seat recovered or fel
 
 **Cross-invocation cooldown for a chronically-unavailable claude seat.** In-seat retry only
 sees one process's worth of history, so a Fable seat that is out of session quota still
-paid for one full `claude-p` dispatch on *every* review invocation before falling to the
+paid for one full `claude` dispatch on *every* review invocation before falling to the
 reserve — real evidence: 4,322 of 6,383 recorded runs dispatched Fable and it failed, most
 with an explicit session-limit notice. Once a dispatch comes back with that notice or the
 administrative "... is currently unavailable" sentinel, `reviewlib.seat_cooldown` records a

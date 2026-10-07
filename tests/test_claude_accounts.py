@@ -3,10 +3,10 @@
 module behind review-cli#168's account-rotation fallback.
 
 Hermetic: every test builds its own throwaway registry under a fresh temp dir (or
-points $CLAUDE_ROTATE_ROOT at one with save/restore), so the suite never touches the
+points $REVIEW_CLAUDE_ACCOUNTS_ROOT at one with save/restore), so the suite never touches the
 developer machine's real ~/.claude-accounts. No network, no subprocess, no real OAuth
 state. Under pytest the conftest `_isolate_claude_accounts_root` fixture additionally
-defaults $CLAUDE_ROTATE_ROOT to an empty per-test dir; the explicit roots below work
+defaults $REVIEW_CLAUDE_ACCOUNTS_ROOT to an empty per-test dir; the explicit roots below work
 identically in the standalone `__main__` runner (no conftest there).
 """
 
@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib import claude_accounts  # noqa: E402
 
-_ENV_KEY = "CLAUDE_ROTATE_ROOT"
+_ENV_KEY = "REVIEW_CLAUDE_ACCOUNTS_ROOT"
 
 
 def _save_env(key: str) -> str | None:
@@ -40,7 +40,7 @@ def _restore_env(key: str, old: str | None) -> None:
 def _registry(
     *names: str, current: str | None = None, emails: dict | None = None
 ) -> Path:
-    """A throwaway claude-rotate-layout registry: one dir per name, an optional
+    """A throwaway `account-N` registry: one dir per name, an optional
     `current` state file, and optional per-account `.claude.json` emails."""
     root = Path(tempfile.mkdtemp())
     for name in names:
@@ -69,11 +69,11 @@ def test_accounts_root_defaults_to_home_dot_claude_accounts():
         _restore_env(_ENV_KEY, old)
 
 
-def test_accounts_root_honors_claude_rotate_root_override():
+def test_accounts_root_honors_review_claude_accounts_root_override():
     old = _save_env(_ENV_KEY)
-    os.environ[_ENV_KEY] = "/tmp/some-custom-rotate-root"
+    os.environ[_ENV_KEY] = "/tmp/some-custom-accounts-root"
     try:
-        assert claude_accounts.accounts_root() == Path("/tmp/some-custom-rotate-root")
+        assert claude_accounts.accounts_root() == Path("/tmp/some-custom-accounts-root")
     finally:
         _restore_env(_ENV_KEY, old)
 
@@ -111,7 +111,7 @@ def test_list_accounts_discovers_only_account_prefixed_dirs_sorted():
     (root / "notes").mkdir()
     (root / "account-readme").write_text("not a dir", encoding="utf-8")
     found = claude_accounts.list_accounts(root)
-    # Name-string sort (claude-rotate's own ordering), so account-10 sorts
+    # Name-string sort (plain name-string ordering), so account-10 sorts
     # between account-1 and account-2 — pinned deliberately.
     assert [p.name for p in found] == ["account-1", "account-10", "account-2"]
 

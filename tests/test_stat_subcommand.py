@@ -42,7 +42,7 @@ def _write_fixture_logs(d: Path) -> None:
         encoding="utf-8",
     )
     (d / "20260813T100200_000000Z-claude-r0.log").write_text(
-        "[review-cli] claude: claude-p (args redacted) task=T1\n"
+        "[review-cli] claude: claude (args redacted) task=T1\n"
         "Claude Fable 5 is currently unavailable. Learn more: https://example.com\n"
         "[review-cli] EXIT 0\n",
         encoding="utf-8",

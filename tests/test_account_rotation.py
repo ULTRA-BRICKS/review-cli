@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for review-cli#168/#170's ACCOUNT-ROTATION fallback loops:
 `reviewlib.backends._review_claude_cli_with_account_fallback` (direct `claude:*`
-CLI seats, rotating `CLAUDE_CONFIG_DIR` across the claude-rotate registry) and
+CLI seats, rotating `CLAUDE_CONFIG_DIR` across the `~/.claude-accounts` registry) and
 `_review_omp_with_account_fallback` (omp-hosted Claude seats, rotating omp
 `--profile`).
 
@@ -91,13 +91,13 @@ def _isolated_env(**overrides: str):
 
 def _hermetic_env() -> dict:
     """Fresh temp dirs for every side-effecting path the loops can touch: an EMPTY
-    claude-rotate registry (mirrors conftest's `_isolate_claude_accounts_root` for
+    `~/.claude-accounts` registry (mirrors conftest's `_isolate_claude_accounts_root` for
     the standalone runner), a throwaway log dir (`_usage_limit_skip_result` emits a
     sidecar log), and a throwaway seat-cooldown store (`review_claude` consults it).
     """
     tmp = tempfile.mkdtemp()
     return {
-        "CLAUDE_ROTATE_ROOT": str(Path(tmp) / "claude-accounts"),
+        "REVIEW_CLAUDE_ACCOUNTS_ROOT": str(Path(tmp) / "claude-accounts"),
         "REVIEW_LOG_DIR": tmp,
         "REVIEW_SEAT_COOLDOWN_FILE": str(Path(tmp) / "seat-cooldown.json"),
     }
@@ -344,7 +344,7 @@ def test_claude_account_candidates_follow_rotation_order_with_emails():
         "account-1", "account-2", "account-3", current="account-2"
     )
     env = _hermetic_env()
-    env["CLAUDE_ROTATE_ROOT"] = str(root)
+    env["REVIEW_CLAUDE_ACCOUNTS_ROOT"] = str(root)
     with _isolated_env(**env):
         candidates = backends._claude_account_candidates()
     assert candidates == [
@@ -357,7 +357,7 @@ def test_claude_account_candidates_follow_rotation_order_with_emails():
 # --- the full review_claude path: the review-cli#170 regression ----------------
 
 
-def test_review_claude_rotates_when_only_the_current_account_is_exhausted():
+def test_review_claude_advances_to_next_account_when_current_is_exhausted():
     """The incident shape, end to end through the REAL review_claude: the CURRENT
     account's 5-hour harness window is at 100%, the second registered account is
     fine. Pre-#168 the single aggregate gate returned a usage-limit skip without
@@ -382,7 +382,7 @@ def test_review_claude_rotates_when_only_the_current_account_is_exhausted():
     env = _hermetic_env()
     env.update(
         {
-            "CLAUDE_ROTATE_ROOT": str(root),
+            "REVIEW_CLAUDE_ACCOUNTS_ROOT": str(root),
             "REVIEW_HARNESS_LIMITS_JSON": json.dumps({"cards": cards}),
             "REVIEW_CLAUDE_MODE": "cli",
             "REVIEW_USAGE_LIMITS_FILE": str(root / "missing-usage.json"),
@@ -427,7 +427,7 @@ def test_review_claude_skips_every_seat_shape_only_when_all_accounts_exhausted()
     env = _hermetic_env()
     env.update(
         {
-            "CLAUDE_ROTATE_ROOT": str(root),
+            "REVIEW_CLAUDE_ACCOUNTS_ROOT": str(root),
             "REVIEW_HARNESS_LIMITS_JSON": json.dumps({"cards": cards}),
             "REVIEW_CLAUDE_MODE": "cli",
             "REVIEW_USAGE_LIMITS_FILE": str(root / "missing-usage.json"),

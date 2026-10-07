@@ -101,10 +101,10 @@ def _which_optional(name: str) -> str | None:
     return shutil.which(name)
 
 
-# Backends that re-argv the prompt cap out near ARG_MAX (~1 MB): opencode passes
-# the message as argv; claude-p reads stdin but its INNER `claude` exec re-argv's
-# it. Feeding via stdin (claude/codex) removes review-cli's own argv overhead, but
-# can't lift that inner ceiling — so warn well before it, loudly not silently.
+# A backend that passes the prompt as argv caps out near ARG_MAX (~1 MB): opencode
+# passes the message as argv. Feeding via stdin (claude/codex) removes that ceiling
+# for them, but opencode has no stdin path — so warn well before it, loudly not
+# silently.
 _PAYLOAD_WARN_BYTES = 600_000
 
 
@@ -113,7 +113,7 @@ def _payload(prompt: str, diff: str = "") -> str:
     if len(out.encode("utf-8")) > _PAYLOAD_WARN_BYTES:
         print(
             f"[review-cli] WARNING: payload is {len(out)} bytes — nearing the ~1 MB "
-            "ARG_MAX ceiling; opencode (argv-only) and claude-p's inner exec may fail. "
+            "ARG_MAX ceiling; opencode (argv-only) may fail. "
             "Use fewer --max-rounds or a smaller diff.",
             file=sys.stderr,
             flush=True,
@@ -2764,10 +2764,9 @@ def review_claude_api(
 
 
 def _have_claude_cli() -> bool:
-    # Either binary drives the CLI path: `claude` (preferred, genuine print mode) or the
-    # legacy `claude-p` TUI-scraper fallback (review-cli#76). A host with only one still
-    # has a working CLI seat, so the dispatcher must not route it to the paid API.
-    return bool(_which_optional("claude") or _which_optional("claude-p"))
+    # A host with the `claude` binary has a working CLI seat, so the dispatcher must not
+    # route it to the paid API.
+    return bool(_which_optional("claude"))
 
 
 def _claude_api_available_for_model(model: str) -> bool:
@@ -2966,8 +2965,8 @@ def review_claude(
 ) -> ReviewResult:
     """Dispatch the claude/opus backend between the API and CLI variants.
 
-    REVIEW_CLAUDE_MODE forces it: ``api`` (HTTP, no claude binary needed) or
-    ``cli`` (claude-p). With no override the choice is automatic and conservative:
+    REVIEW_CLAUDE_MODE forces it: ``api`` (HTTP, no claude binary needed) or ``cli``
+    (``claude --print``). With no override the choice is automatic and conservative:
     prefer the CLI when the claude binary is present (subscription, no API cost,
     and reliable now that workspace trust is deterministic), and fall back to the
     API only when there is no claude binary but a key IS configured — i.e. don't
@@ -3685,15 +3684,12 @@ def _release_trust_lock(lock) -> None:
 def _ensure_workspace_trusted(cwd: Path) -> None:
     """Pre-accept Claude Code's workspace trust for ``cwd`` in ~/.claude.json.
 
-    The headless claude-p backend drives the interactive claude TUI under a PTY;
-    in an untrusted directory (a fresh git worktree, a not-yet-opened repo) it
-    blocks on claude's "Quick safety check / Do you trust this folder?" gate.
-    claude-p's PTY auto-accept of that gate is non-deterministic (it sometimes
-    reaches the answer, sometimes reports ``workspace_trust_blocked``), and the
-    bypass routes are worse: ``--permission-mode bypassPermissions`` and
-    ``--dangerously-skip-permissions`` each raise their own safety gate the PTY
-    layer cannot dismiss. Seeding the trust flag directly makes the gate never
-    appear, so the deterministic ``dontAsk`` path just works.
+    The headless seat must never stop on Claude Code's "Quick safety check / Do you
+    trust this folder?" gate in an untrusted directory (a fresh git worktree, a
+    not-yet-opened repo). `claude --print` skips that dialog on its own (per
+    `claude --help`); seeding the trust flag directly keeps the directory trusted
+    regardless of that print-mode behaviour, so the deterministic ``dontAsk`` path
+    just works.
 
     This is a DELIBERATE, persistent edit to the user's global config (review is
     configured to auto-trust the directory it reviews): a later interactive
@@ -3822,43 +3818,10 @@ def _remove_workspace_trust(cwd: Path) -> None:
         _release_trust_lock(lock)
 
 
-# Tools the read-only review seat must never invoke. Shared by the direct `claude`
-# argv and the legacy `claude-p` argv so the two can't drift.
-_CLAUDE_DISALLOWED_TOOLS = (
-    "Edit",
-    "MultiEdit",
-    "Write",
-    "Bash",
-    "Read",
-    "Grep",
-    "Glob",
-    "NotebookEdit",
-    "SlashCommand",
-    "Task",
-    "TodoWrite",
-    "ExitPlanMode",
-    "WebFetch",
-    "WebSearch",
-)
-
-
-def _claude_cli_binary() -> tuple[str, bool]:
-    """Resolve the claude CLI binary, preferring `claude` in genuine print mode.
-
-    Returns (path, direct): `direct=True` for the `claude --print` headless path,
-    `False` for the legacy `claude-p` TUI-scraper fallback.
-
-    `claude --print` writes a clean result straight to stdout — no PTY, no fullscreen
-    TUI, no screen-scrape. `claude-p` instead spawns the interactive `claude` TUI under
-    a PTY and scrapes the screen, which is a lossy redraw surface: spinner frames and
-    cursor redraws smear into the captured output, and the scrape frequently fails
-    (`assistant_output_timeout` → empty stdout), corrupting / blanking the opus review
-    seat (review-cli#76). So we use `claude` directly whenever it is present and only
-    fall back to `claude-p` when it is not (a host that ships only the wrapper)."""
-    direct = _which_optional("claude")
-    if direct:
-        return direct, True
-    return _which("claude-p"), False  # raises a clear error if neither is present
+def _claude_cli_binary() -> str:
+    """Resolve the `claude` CLI binary (driven via `claude --print`, see
+    `_claude_cli_argv`). Raises a clear "claude not found on PATH" error when absent."""
+    return _which("claude")
 
 
 @lru_cache(maxsize=8)
@@ -3878,87 +3841,49 @@ def _claude_cli_supports_effort(binary: str) -> bool:
 
 def _claude_cli_argv(
     binary: str,
-    direct: bool,
     model: str | None,
-    cwd: Path,
-    timeout: int,
     *,
     image_dir: Path | None = None,
     effort: str | None = None,
 ) -> list[str]:
-    """Build the argv for the resolved claude CLI binary.
+    """Build the `claude --print` argv.
 
-    Both forms run headless, read the prompt from STDIN (never `-p <payload>` argv: a
+    It runs headless and reads the prompt from STDIN (never `-p <payload>` argv: a
     brainstorm round embeds the whole prior transcript and a diff can be huge, which as
     a command-line argument blows past ARG_MAX → execve E2BIG). Read-only is enforced by
     an EMPTY tool allowlist (`--tools ""` = all built-in tools off) unless a visual
-    panel job needs scoped image reads, in which case direct `claude` gets `--tools Read`
-    plus `--add-dir <staged-image-dir>`. That keeps normal text review locked down while
-    allowing the explicit screenshot attachment path to read only its temp image files."""
-    if direct:
-        # `claude --print --output-format text` is the genuine print mode. cwd is the
-        # Popen cwd (claude has no --cwd); there is no --timeout-sec (review-cli's own
-        # _run_streamed timeout governs the call). Normal text review uses `--tools ""`;
-        # visual panel jobs use `--tools Read` scoped to the temp image dir. No
-        # --disallowedTools denylist is needed (and its claude-p vocabulary, e.g.
-        # MultiEdit/SlashCommand, isn't a real `claude` tool name — review-cli#76).
-        tools = "Read" if image_dir is not None else ""
-        system_prompt = (
-            _CLAUDE_IMAGE_REVIEW_SYSTEM
-            if image_dir is not None
-            else _CLAUDE_REVIEW_SYSTEM
-        )
-        argv = [
-            binary,
-            "--print",
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "dontAsk",
-            "--tools",
-            tools,
-            "--strict-mcp-config",
-            "--disable-slash-commands",
-            "--safe-mode",
-            "--append-system-prompt",
-            system_prompt,
-        ]
-        if image_dir is not None:
-            argv += ["--add-dir", str(image_dir)]
-        claude_effort = _claude_reasoning_effort(effort)
-        if claude_effort and _claude_cli_supports_effort(binary):
-            argv += ["--effort", claude_effort]
-        if model:
-            argv += ["--model", model]
-        return argv
-    # Legacy claude-p fallback (TUI-scraper): keep its --cwd / --tools '' / --timeout-sec
-    # / -p surface and its denylist so a claude-less host still works. Disable the wrapper's
-    # wall-clock cap; review-cli's own streamed runner owns the idle timeout and can keep a
-    # chatty/known-alive Fable run going without a hidden 20m wall kill.
+    panel job needs scoped image reads, in which case it gets `--tools Read` plus
+    `--add-dir <staged-image-dir>`. That keeps normal text review locked down while
+    allowing the explicit screenshot attachment path to read only its temp image files.
+
+    cwd is the Popen cwd (claude has no --cwd); there is no --timeout-sec (review-cli's
+    own _run_streamed timeout governs the call)."""
+    tools = "Read" if image_dir is not None else ""
+    system_prompt = (
+        _CLAUDE_IMAGE_REVIEW_SYSTEM if image_dir is not None else _CLAUDE_REVIEW_SYSTEM
+    )
     argv = [
         binary,
-        "--cwd",
-        str(cwd),
+        "--print",
+        "--output-format",
+        "text",
         "--permission-mode",
         "dontAsk",
         "--tools",
-        "",
+        tools,
         "--strict-mcp-config",
         "--disable-slash-commands",
         "--safe-mode",
         "--append-system-prompt",
-        _CLAUDE_REVIEW_SYSTEM,
-        "--disallowedTools",
-        *_CLAUDE_DISALLOWED_TOOLS,
-        "--timeout-sec",
-        "0",
+        system_prompt,
     ]
-    if model:
-        argv += ["--model", model]
+    if image_dir is not None:
+        argv += ["--add-dir", str(image_dir)]
     claude_effort = _claude_reasoning_effort(effort)
     if claude_effort and _claude_cli_supports_effort(binary):
         argv += ["--effort", claude_effort]
-    argv += ["-p"]
+    if model:
+        argv += ["--model", model]
     return argv
 
 
@@ -4017,11 +3942,11 @@ def review_claude_cli(
     claude_model = model.split(":", 1)[1] if ":" in model else None
     # Resolve the binary BEFORE touching trust so a missing CLI raises here, not after
     # _ensure_workspace_trusted has already mutated ~/.claude.json.
-    binary, direct = _claude_cli_binary()
+    binary = _claude_cli_binary()
     # Pre-accept workspace trust for cwd: the headless run cannot answer the
     # interactive "Do you trust this folder?" gate (see _ensure_workspace_trusted).
     _ensure_workspace_trusted(cwd)
-    argv = _claude_cli_argv(binary, direct, claude_model, cwd, timeout, effort=effort)
+    argv = _claude_cli_argv(binary, claude_model, effort=effort)
     # A fresh per-call dict (`_claude_cli_env()` already returns `dict(os.environ)`, a
     # new object every call) -- account rotation (review-cli#168) selects a registered
     # `~/.claude-accounts/account-N` dir via CLAUDE_CONFIG_DIR here. NEVER mutate global
@@ -4043,25 +3968,16 @@ def review_claude_cli(
         true_silence_timeout=true_silence_timeout_seconds(model),
     )
     # Belt-and-suspenders: strip any terminal control noise the CLI still leaked into the
-    # pipe (a stray spinner frame from claude-p, an escape sequence) so it can never
-    # corrupt the parsed `## <model> [ok]/[needs-changes]` verdict (review-cli#76).
+    # pipe (a stray escape sequence) so it can never corrupt the parsed
+    # `## <model> [ok]/[needs-changes]` verdict (review-cli#76).
     stdout = strip_control_sequences(proc.stdout)
     stderr = strip_control_sequences(proc.stderr)
     # A redacted, human-readable command line for the result header (no prompt/diff).
-    if direct:
-        command = (
-            "claude --print --output-format text --permission-mode dontAsk --tools '' "
-            "--strict-mcp-config --disable-slash-commands --safe-mode "
-            "--append-system-prompt <read-only-review>  (prompt via stdin)"
-        )
-    else:
-        command = (
-            "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config "
-            "--disable-slash-commands --safe-mode --append-system-prompt <read-only-review> "
-            "--disallowedTools "
-            + " ".join(_CLAUDE_DISALLOWED_TOOLS)
-            + " -p  (prompt via stdin)"
-        )
+    command = (
+        "claude --print --output-format text --permission-mode dontAsk --tools '' "
+        "--strict-mcp-config --disable-slash-commands --safe-mode "
+        "--append-system-prompt <read-only-review>  (prompt via stdin)"
+    )
     return ReviewResult(
         model=model,
         command=command,
@@ -4096,9 +4012,7 @@ def review_claude_cli_with_images(
                 model, prompt, diff, cwd, timeout, round_no, effort=effort
             )
         _ensure_workspace_trusted(tmp)
-        argv = _claude_cli_argv(
-            binary, True, claude_model, tmp, timeout, image_dir=tmp, effort=effort
-        )
+        argv = _claude_cli_argv(binary, claude_model, image_dir=tmp, effort=effort)
         proc = _run_streamed(
             argv,
             cwd=tmp,
@@ -4279,11 +4193,11 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
     # `opencode:`, but an explicit branch keeps the seat off the catch-all fallthrough.
     if lowered == "omp" or lowered.startswith("omp:"):
         return review_omp
-    # fable IS claude-p. Route any fable form to review_claude defensively, so an
-    # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
+    # fable runs on the claude CLI. Route any fable form to review_claude defensively, so
+    # an unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
     if (
-        lowered in ("claude", "claude-p", "claude-fable-5")
+        lowered in ("claude", "claude-fable-5")
         or lowered.startswith("claude:")
         or lowered.startswith("fable")
     ):
@@ -4415,7 +4329,6 @@ _PROVIDER_ALIASES = {
     "common_code": "commandcode",
     "cc": "commandcode",
     "gemini-api": "gemini",
-    "claude-p": "claude",
     "claude-fable-5": "claude",
     "z.ai": "zai",
     "zhipu": "zai",
@@ -5233,8 +5146,7 @@ def backend_unavailable_reason(model: str) -> str | None:
         if backend is review_claude:
             # Mirror the dispatcher so availability matches what would actually run:
             # a forced mode is available only via that one variant; otherwise it's
-            # available via EITHER the API key or the claude CLI (the `claude` print
-            # binary or the legacy `claude-p` wrapper — review-cli#76).
+            # available via EITHER the API key or the `claude` CLI binary.
             mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
             if mode == "api":
                 if _claude_api_available_for_model(model):

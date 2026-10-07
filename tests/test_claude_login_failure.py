@@ -147,7 +147,7 @@ class _World:
         stack = self._stack
         stack.enter_context(
             _env(
-                CLAUDE_ROTATE_ROOT=str(self.root),
+                REVIEW_CLAUDE_ACCOUNTS_ROOT=str(self.root),
                 REVIEW_SEAT_COOLDOWN_FILE=str(self.tmp / "seat-cooldown.json"),
                 REVIEW_PROVIDER_CACHE=str(self.tmp / "last-provider.json"),
                 REVIEW_LOG_DIR=str(self.tmp / "logs"),

@@ -76,7 +76,7 @@ def _isolate_log_and_stats_paths(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_claude_accounts_root(tmp_path, monkeypatch):
-    """Default EVERY test to a throwaway `$CLAUDE_ROTATE_ROOT` (review-cli#168).
+    """Default EVERY test to a throwaway `$REVIEW_CLAUDE_ACCOUNTS_ROOT` (review-cli#168).
 
     `reviewlib.claude_accounts.accounts_root()` falls back to this DEVELOPER MACHINE's
     real `~/.claude-accounts/account-0/1/2` registry when the env var is unset. Without
@@ -87,4 +87,4 @@ def _isolate_claude_accounts_root(tmp_path, monkeypatch):
     `tmp_path` subdir instead; a test that wants a populated registry builds one under
     this same dir explicitly.
     """
-    monkeypatch.setenv("CLAUDE_ROTATE_ROOT", str(tmp_path / "claude-accounts"))
+    monkeypatch.setenv("REVIEW_CLAUDE_ACCOUNTS_ROOT", str(tmp_path / "claude-accounts"))

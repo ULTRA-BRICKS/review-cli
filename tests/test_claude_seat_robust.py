@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Robustness of the claude/opus review seat (review-cli#76).
 
-The opus seat is the PRIMARY review-gate seat. It used to run through `claude-p`,
-a TUI-scraper that spawns the interactive fullscreen `claude` under a PTY and
-screen-scrapes the result. The scrape is lossy: spinner redraws and bare control
-bytes smear into the captured output (or the scrape times out → empty stdout),
-corrupting / blanking the verdict. The fix:
+The opus seat is the PRIMARY review-gate seat. A TUI-scraping backend (interactive
+fullscreen `claude` under a PTY, screen-scraped) is lossy: spinner redraws and bare
+control bytes smear into the captured output (or the scrape times out → empty
+stdout), corrupting / blanking the verdict. The contract:
 
-  1. Prefer `claude --print` (genuine headless print mode — no PTY, no TUI, clean
-     stdout) over the `claude-p` scraper; fall back to `claude-p` only when the
-     `claude` binary is absent.
+  1. Run `claude --print` (genuine headless print mode — no PTY, no TUI, clean
+     stdout); a missing `claude` binary is a clear error.
   2. Spawn with a decoration-hostile env (TERM=dumb / NO_COLOR=1 / CI=1).
   3. Strip ANSI/OSC/control sequences from the captured stdout as belt-and-suspenders,
      so a stray sequence can never corrupt the parsed verdict.
@@ -92,17 +90,14 @@ def test_strip_drops_carriage_return_keeps_tab_and_newline():
     assert "\t" in clean and "\n" in clean
 
 
-# --- argv construction: direct `claude --print` path -----------------------------------
+# --- argv construction: `claude --print` path --------------------------------------------
 
 
-def test_direct_claude_argv_uses_print_mode_no_tui_flags():
+def test_claude_argv_uses_print_mode_no_tui_flags():
     argv = _with_effort_support(
         lambda: _backends._claude_cli_argv(
             "/usr/local/bin/claude",
-            direct=True,
             model="claude-opus-4-8",
-            cwd=Path("/tmp/repo"),
-            timeout=120,
             effort="xhigh",
         )
     )
@@ -117,51 +112,41 @@ def test_direct_claude_argv_uses_print_mode_no_tui_flags():
     assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
     assert argv[argv.index("--effort") + 1] == "xhigh"
     # Read-only is enforced by an EMPTY tool allowlist (all built-in tools off), not a
-    # denylist — strictly stronger and avoids real `claude` warning on claude-p tool names.
+    # denylist — strictly stronger.
     assert argv[argv.index("--tools") + 1] == ""
     assert "--disallowedTools" not in argv
-    # The direct path does NOT carry claude-p-only flags (those drive the TUI wrapper).
-    assert "--cwd" not in argv  # claude uses the process cwd
+    assert "--cwd" not in argv  # claude has no --cwd; it uses the process cwd
     assert "--timeout-sec" not in argv  # review-cli's own timeout governs the call
-    assert "-p" not in argv  # claude-p's print toggle; here we use --print
+    assert "-p" not in argv  # the long form --print is used
 
 
-def test_direct_claude_argv_omits_model_when_unspecified():
+def test_claude_argv_omits_model_when_unspecified():
     argv = _backends._claude_cli_argv(
         "/usr/local/bin/claude",
-        direct=True,
         model=None,
-        cwd=Path("/tmp/repo"),
-        timeout=120,
     )
     assert "--model" not in argv
     assert "--print" in argv
 
 
-def test_direct_claude_argv_maps_minimal_effort_to_low():
+def test_claude_argv_maps_minimal_effort_to_low():
     argv = _with_effort_support(
         lambda: _backends._claude_cli_argv(
             "/usr/local/bin/claude",
-            direct=True,
             model="claude-opus-4-8",
-            cwd=Path("/tmp/repo"),
-            timeout=120,
             effort="minimal",
         )
     )
     assert argv[argv.index("--effort") + 1] == "low"
 
 
-def test_direct_claude_argv_omits_effort_when_binary_lacks_flag():
+def test_claude_argv_omits_effort_when_binary_lacks_flag():
     old_supports = _backends._claude_cli_supports_effort
     _backends._claude_cli_supports_effort = lambda _binary: False
     try:
         argv = _backends._claude_cli_argv(
             "/usr/local/bin/claude",
-            direct=True,
             model="claude-opus-4-8",
-            cwd=Path("/tmp/repo"),
-            timeout=120,
             effort="high",
         )
     finally:
@@ -189,66 +174,11 @@ def test_claude_effort_probe_degrades_to_prompt_hint_on_probe_failures():
         _backends._claude_cli_supports_effort.cache_clear()
 
 
-# --- argv construction: legacy claude-p fallback ---------------------------------------
-
-
-def test_claude_p_fallback_argv_keeps_wrapper_surface():
-    argv = _with_effort_support(
-        lambda: _backends._claude_cli_argv(
-            "/usr/local/bin/claude-p",
-            direct=False,
-            model="claude-opus-4-8",
-            cwd=Path("/tmp/repo"),
-            timeout=90,
-            effort="xhigh",
-        )
-    )
-    # The wrapper needs its own --cwd / --tools '' / --timeout-sec / -p surface, but
-    # review-cli disables claude-p's wall timer so _run_streamed owns the idle timeout.
-    assert argv[argv.index("--cwd") + 1] == "/tmp/repo"
-    assert argv[argv.index("--timeout-sec") + 1] == "0"
-    assert argv[argv.index("--effort") + 1] == "xhigh"
-    assert "-p" in argv
-    assert "--print" not in argv  # claude-p has no --print; -p is its print toggle
-    # Same read-only guarantees as the direct path.
-    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-    for tool in _backends._CLAUDE_DISALLOWED_TOOLS:
-        assert tool in argv
-
-
-def test_claude_p_fallback_timeout_disables_wrapper_wall_reap():
-    argv = _backends._claude_cli_argv(
-        "/usr/local/bin/claude-p",
-        direct=False,
-        model="claude-fable-5",
-        cwd=Path("/tmp/repo"),
-        timeout=90,
-    )
-    assert argv[argv.index("--timeout-sec") + 1] == "0"
-
-
-def test_claude_p_fallback_maps_minimal_effort_to_low():
-    argv = _with_effort_support(
-        lambda: _backends._claude_cli_argv(
-            "/usr/local/bin/claude-p",
-            direct=False,
-            model="claude-opus-4-8",
-            cwd=Path("/tmp/repo"),
-            timeout=90,
-            effort="minimal",
-        )
-    )
-    assert argv[argv.index("--effort") + 1] == "low"
-
-
-def test_direct_claude_image_argv_threads_effort():
+def test_claude_image_argv_threads_effort():
     argv = _with_effort_support(
         lambda: _backends._claude_cli_argv(
             "/usr/local/bin/claude",
-            direct=True,
             model="claude-fable-5",
-            cwd=Path("/tmp/repo"),
-            timeout=90,
             image_dir=Path("/tmp/images"),
             effort="xhigh",
         )
@@ -258,33 +188,28 @@ def test_direct_claude_image_argv_threads_effort():
     assert argv[argv.index("--effort") + 1] == "xhigh"
 
 
-# --- binary resolution prefers the direct print binary ---------------------------------
+# --- binary resolution -----------------------------------------------------------------
 
 
-def test_binary_resolution_prefers_claude_over_claude_p():
+def test_binary_resolution_returns_claude_path():
     saved = _backends._which_optional
-
-    def _which(name):
-        return f"/bin/{name}" if name in ("claude", "claude-p") else None
-
-    _backends._which_optional = _which
+    _backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
     try:
-        path, direct = _backends._claude_cli_binary()
-        assert path == "/bin/claude" and direct is True
+        assert _backends._claude_cli_binary() == "/bin/claude"
     finally:
         _backends._which_optional = saved
 
 
-def test_binary_resolution_falls_back_to_claude_p_when_claude_absent():
+def test_binary_resolution_raises_clear_error_when_claude_absent():
     saved = _backends._which_optional
-
-    def _which(name):
-        return "/bin/claude-p" if name == "claude-p" else None
-
-    _backends._which_optional = _which
+    _backends._which_optional = lambda name: None
     try:
-        path, direct = _backends._claude_cli_binary()
-        assert path == "/bin/claude-p" and direct is False
+        try:
+            _backends._claude_cli_binary()
+        except RuntimeError as exc:
+            assert "claude not found on PATH" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for a missing claude binary")
     finally:
         _backends._which_optional = saved
 
@@ -353,12 +278,12 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     assert "\x1b" not in res.stdout
     assert "## verdict [ok]" in res.stdout
     assert res.returncode == 0
-    # The direct print path was used, with the decoration-hostile env.
+    # The print path was used, with the decoration-hostile env.
     assert "--print" in captured["argv"]
     assert captured["env"]["TERM"] == "dumb"
     assert captured["timeout"] == 30
     assert captured["backend"] == "claude"
-    # The reported command reflects the direct binary, not claude-p.
+    # The reported command reflects the `claude --print` invocation.
     assert "claude --print" in res.command
 
 
@@ -484,15 +409,11 @@ def test_review_claude_cli_with_images_falls_back_when_no_image_can_be_staged():
     assert captured["round_no"] == 4
 
 
-def test_have_claude_cli_true_with_either_binary():
+def test_have_claude_cli_tracks_the_claude_binary():
     saved = _backends._which_optional
     try:
         _backends._which_optional = lambda name: (
             "/bin/claude" if name == "claude" else None
-        )
-        assert _backends._have_claude_cli() is True
-        _backends._which_optional = lambda name: (
-            "/bin/claude-p" if name == "claude-p" else None
         )
         assert _backends._have_claude_cli() is True
         _backends._which_optional = lambda name: None

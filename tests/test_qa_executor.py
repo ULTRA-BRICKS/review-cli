@@ -194,9 +194,9 @@ def test_parse_verdict_tolerates_trailing_text():
 
 
 def test_extract_claude_final_text_from_json_result():
-    """claude-p --output-format json returns the final assistant text in a `result` field;
-    the extractor pulls it so the parser sees the real ## QA RESULTS block, not the lossy TUI
-    scrape (the live-run UNKNOWN regression)."""
+    """claude --print --output-format json returns the final assistant text in a `result` field;
+    the extractor pulls it so the parser sees the real ## QA RESULTS block, not progress
+    output."""
     import json
 
     payload = json.dumps({"type": "result", "result": _FAIL_TAIL, "is_error": False})
@@ -310,7 +310,7 @@ def test_backend_launch_failure_yields_blocked_not_traceback():
     os.environ.pop("REVIEW_QA_FAKE_TESTER", None)  # use the real dispatch path
 
     def _boom_spawn(*_a, **_k):
-        raise RuntimeError("claude-p not found on PATH")
+        raise RuntimeError("claude not found on PATH")
 
     ex._spawn_claude_writeexec = _boom_spawn  # type: ignore[assignment]
     try:
@@ -530,6 +530,13 @@ def test_claude_spawn_forwards_model_flag():
         ex._spawn_claude_writeexec("prompt", Path("/tmp/review-qa-wt-x"), 60, "claude-opus-4-8")
         argv = captured["argv"]
         assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-opus-4-8", argv
+        # Plain `claude --print` surface: no retired-wrapper flags, and the variadic
+        # `--allowedTools <tools...>` list is closed by `--output-format` (else the tool
+        # names would leak into the positional prompt slot).
+        assert argv[0] == "/usr/bin/claude" and "--print" in argv, argv
+        assert not {"-p", "--cwd", "--timeout-sec"} & set(argv), argv
+        assert argv.index("--allowedTools") < argv.index("Grep") < argv.index("--output-format"), argv
+        assert argv[argv.index("--output-format") + 1] == "json", argv
         ex._spawn_claude_writeexec("prompt", Path("/tmp/review-qa-wt-x"), 60, None)
         assert "--model" not in captured["argv"], captured["argv"]
     finally:
@@ -675,7 +682,7 @@ def test_launch_failure_persists_a_report():
     old_fake = os.environ.get("REVIEW_QA_FAKE_TESTER")
     old_spawn = ex._spawn_claude_writeexec
     os.environ.pop("REVIEW_QA_FAKE_TESTER", None)
-    ex._spawn_claude_writeexec = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no claude-p"))
+    ex._spawn_claude_writeexec = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no claude"))
     try:
         report = sut / "out" / "r.md"
         outcome = ex.run_tester(

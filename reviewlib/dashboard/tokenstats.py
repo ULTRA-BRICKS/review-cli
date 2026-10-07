@@ -564,7 +564,7 @@ def compute_fable_report(calls: list[CallLog], retry_events: list[RetryEvent]) -
     HONEST LIMITATION (codex/kimi review finding, not fixed here — it is a pre-existing
     constraint of `model_id_for_call`, not something this report introduced): a claude
     CLI-mode call is only ever attributable to Fable when its body carries the exact
-    paywall sentinel ("... is currently unavailable"); every OTHER claude-p call —
+    paywall sentinel ("... is currently unavailable"); every OTHER claude CLI call —
     including a genuinely SUCCESSFUL Fable dispatch, or a Fable failure shaped like a
     session-limit notice rather than the sentinel — is attributed to the Opus seat
     instead, because review-cli's own CLI-mode logs never record which model was

@@ -280,7 +280,7 @@ def _seat_health_world():
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             _env(
-                CLAUDE_ROTATE_ROOT=str(root),
+                REVIEW_CLAUDE_ACCOUNTS_ROOT=str(root),
                 REVIEW_SEAT_COOLDOWN_FILE=str(tmp / "cooldown.json"),
                 REVIEW_PROVIDER_CACHE=str(tmp / "last-provider.json"),
                 REVIEW_LOG_DIR=str(tmp / "logs"),

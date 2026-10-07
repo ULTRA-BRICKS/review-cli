@@ -48,10 +48,9 @@ def _safe_log_header(value: object) -> str:
 
 # Single source of truth for stripping terminal control noise out of captured
 # backend output. A backend can leak ANSI/VT100 escapes into its stdout — colour
-# codes, cursor moves, OSC hyperlinks — and an interactive-TUI-scraper backend (the
-# `claude` seat historically ran through `claude-p`, which drives the fullscreen
-# `claude` TUI under a PTY and screen-scrapes it) can additionally bleed spinner
-# redraws and bare C0 control bytes into the pipe. Either corrupts the parsed
+# codes, cursor moves, OSC hyperlinks — and a backend that drives an interactive TUI
+# under a PTY can additionally bleed spinner redraws and bare C0 control bytes into
+# the pipe. Either corrupts the parsed
 # `## <model> [ok]/[needs-changes]` verdict, so the captured text is sanitised before
 # it reaches the verdict pipeline AND the `-o` output file. cli._ANSI_ESCAPE_RE
 # (output-file path) and the claude backend both delegate here so the rules never drift.
@@ -881,7 +880,7 @@ def log_dir() -> Path:
     prompts/diffs (possibly secrets).
 
     If the standard location can't be CREATED (review-cli#162: a sandboxed caller
-    denies writes outside its allowed roots — observed live as a Fable/claude-p seat
+    denies writes outside its allowed roots — observed live as a Fable/claude seat
     dying with a raw `PermissionError`/"Operation not permitted" from deep inside
     `_run_streamed`, since `_open_log` calls this before the backend subprocess is even
     spawned), fall back to a writable temp dir (`_fallback_log_dir`) with a loud

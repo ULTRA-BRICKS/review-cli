@@ -1173,24 +1173,6 @@ def test_log_file_is_private():
     assert mode & 0o077 == 0, f"log file is group/other-readable (mode {oct(mode)})"
 
 
-_CLAUDE_READONLY_TOOLS = (
-    "Edit",
-    "MultiEdit",
-    "Write",
-    "Bash",
-    "Read",
-    "Grep",
-    "Glob",
-    "NotebookEdit",
-    "SlashCommand",
-    "Task",
-    "TodoWrite",
-    "ExitPlanMode",
-    "WebFetch",
-    "WebSearch",
-)
-
-
 def _run_claude_cli_capture(which_fn):
     """Drive review_claude_cli with the backend boundary stubbed and the binary resolver
     (`backends._which_optional`) forced by `which_fn`, returning the captured argv/kwargs.
@@ -1236,7 +1218,7 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     assert argv[argv.index("--output-format") + 1] == "text"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     # Read-only via an EMPTY tool allowlist (all built-in tools off) — stronger and more
-    # future-proof than a denylist, and it avoids real `claude` warning on claude-p tool names.
+    # future-proof than a denylist.
     assert argv[argv.index("--tools") + 1] == ""
     assert (
         "--disallowedTools" not in argv
@@ -1252,23 +1234,6 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     # The payload is fed over STDIN, not a `-p <payload>` argv arg: a brainstorm round's
     # growing transcript (or a big diff) as an argument blows past ARG_MAX → execve E2BIG.
     assert cap["kwargs"]["input_text"] == "prompt\n\n```diff\ndiff\n```"
-
-
-def test_claude_backend_falls_back_to_claude_p_when_claude_absent():
-    # A host that ships only the legacy `claude-p` TUI-scraper still gets a working seat,
-    # with its wrapper-specific surface (--cwd / --tools '' / --timeout-sec / -p) intact.
-    cap = _run_claude_cli_capture(
-        lambda name: "/bin/claude-p" if name == "claude-p" else None
-    )
-    assert cap["result"].returncode == 0
-    argv = cap["argv"]
-    assert "--print" not in argv  # claude-p has no --print
-    assert argv[argv.index("--tools") + 1] == ""
-    assert "--timeout-sec" in argv
-    assert argv[-1] == "-p"
-    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-    for tool in _CLAUDE_READONLY_TOOLS:
-        assert tool in argv
 
 
 def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():

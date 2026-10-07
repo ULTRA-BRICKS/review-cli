@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests for _ensure_workspace_trusted (claude/opus headless auto-trust).
 
-The claude-p backend drives the interactive claude TUI under a PTY; in an
-untrusted cwd it blocks on the "Quick safety check / Do you trust this folder?"
-prompt and the PTY auto-accept is non-deterministic (it also fails outright
-under the bypass/skip permission gates). _ensure_workspace_trusted seeds the
+A headless claude seat must never stop on the "Quick safety check / Do you trust
+this folder?" prompt in an untrusted cwd. _ensure_workspace_trusted seeds the
 trust flag in ~/.claude.json directly so the prompt never fires. These tests
 pin its contract without spawning claude.
 
@@ -172,11 +170,11 @@ def test_forces_onboarding_true_on_partial_untrusted_entry():
 
 
 def test_review_claude_does_not_trust_when_claude_cli_is_missing():
-    # The binary is resolved before trust is touched, so a host with NEITHER `claude`
-    # nor `claude-p` must raise WITHOUT permanently trusting the repo in the user's
-    # global config. Mock backends._which_optional (the new resolution path) to report both absent.
+    # The binary is resolved before trust is touched, so a host without the `claude`
+    # binary must raise WITHOUT permanently trusting the repo in the user's
+    # global config. Mock backends._which_optional (the resolution path) to report it absent.
     def _which_none(name):
-        return None  # neither claude nor claude-p on PATH
+        return None  # no claude on PATH
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)

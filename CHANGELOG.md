@@ -3,6 +3,23 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.44.0 — 2026-10-01
+
+- **Breaking: the `claude-p` wrapper is retired; the claude seat runs plain `claude --print`.**
+  `claude --print` works on the Claude subscription again, so review no longer has a
+  `claude-p` fallback. Every `claude:` seat and the `review qa` claude tester now need the
+  real `claude` binary on PATH; with it missing the seat fails with a clear
+  `claude not found on PATH` error instead of looking for `claude-p`. The `claude-p`
+  model/provider alias is gone (use `claude` / `claude:<model>`). `review qa` now spawns
+  `claude --print --permission-mode bypassPermissions --allowedTools … --output-format json`
+  (no `--cwd`/`--timeout-sec`; the working directory is the spawn cwd and the wall timeout
+  is review's own).
+- **Breaking: `CLAUDE_ROTATE_ROOT` is renamed `REVIEW_CLAUDE_ACCOUNTS_ROOT`.** It overrides
+  the per-account `CLAUDE_CONFIG_DIR` registry root (default `~/.claude-accounts`); the
+  `claude-rotate` launcher that used to own that layout is gone, but the
+  `~/.claude-accounts/account-N` directories and review's multi-account rotation over them
+  are unchanged. Set the new name if you pointed the old one at a custom root.
+
 ## 0.43.0 — 2026-09-30
 
 - **Fix(task --check): `--verify-repo-only`, and review history that survives a repository

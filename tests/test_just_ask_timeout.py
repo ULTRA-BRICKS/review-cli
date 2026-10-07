@@ -92,7 +92,7 @@ class _World:
             "REVIEW_PROVIDER_CACHE": str(state / "last-provider.json"),
             "REVIEW_USAGE_LIMITS_DIR": str(state / "usage"),
             "REVIEW_JOBS_DIR": str(state / "jobs"),
-            "CLAUDE_ROTATE_ROOT": str(state / "claude-accounts"),
+            "REVIEW_CLAUDE_ACCOUNTS_ROOT": str(state / "claude-accounts"),
         }
 
     def pids(self) -> list[int]:

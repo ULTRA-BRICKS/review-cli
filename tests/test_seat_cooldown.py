@@ -3,7 +3,7 @@
 unavailable claude seat (Fable), and its wiring into `reviewlib.backends.review_claude`.
 
 Bug this fixes (2026-08 token-burn investigation): each `review` invocation is a fresh
-process, so a Fable seat that is out of session quota still paid for one full `claude-p`
+process, so a Fable seat that is out of session quota still paid for one full `claude`
 dispatch attempt on EVERY invocation before falling to the reserve — real evidence: 4,322
 of 6,383 recorded runs dispatched Fable and it failed, most with an explicit session-limit
 notice. This module's cache lets a later invocation, within a bounded window, skip the
@@ -1461,7 +1461,7 @@ def test_review_claude_records_cooldown_after_sentinel_response():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
                 stderr="",
@@ -1500,7 +1500,7 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording():
                 "review_claude_cli",
                 lambda *a, **k: ReviewResult(
                     model=MODEL,
-                    command="claude-p",
+                    command="claude",
                     returncode=0,
                     stdout=f"Claude Fable 5 {marker}. Learn more: https://x",
                     stderr="",
@@ -1527,7 +1527,7 @@ def test_review_claude_records_cooldown_after_session_limit_response():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr="You've hit your session limit · resets 7:30pm (Europe/Belgrade)",
@@ -1620,7 +1620,7 @@ def test_review_claude_does_not_cache_an_rc0_sentinel_with_transient_stderr():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
                 stderr="upstream HTTP 503 while proxying",
@@ -1659,7 +1659,7 @@ def test_review_claude_records_cooldown_for_unavailable_sentinel_with_nonzero_ex
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout=(
                     "Claude Fable 5 is currently unavailable. Learn more: "
@@ -1706,7 +1706,7 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording_non
                 "review_claude_cli",
                 lambda *a, **k: ReviewResult(
                     model=MODEL,
-                    command="claude-p",
+                    command="claude",
                     returncode=1,
                     stdout="",
                     stderr=f"Claude Fable 5 {marker}. Learn more: https://x",
@@ -1746,7 +1746,7 @@ def test_review_claude_does_not_cache_a_transient_5xx_status_even_with_unavailab
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=503,
                 stdout="",
                 stderr="503 Service is currently unavailable, please retry",
@@ -1778,7 +1778,7 @@ def test_review_claude_does_not_cache_transient_wording_on_a_generic_cli_exit_co
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr="503 Service is currently unavailable, please retry",
@@ -1813,7 +1813,7 @@ def test_review_claude_does_not_cache_a_process_timeout_with_incidental_unavaila
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=124,
                 stdout="Claude Fable 5 is currently unavailable",
                 stderr="",
@@ -1849,7 +1849,7 @@ def test_review_claude_does_not_cache_a_process_timeout_with_incidental_quota_te
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=124,
                 stdout=(
                     "partial review output... " * 30
@@ -1894,7 +1894,7 @@ def test_review_claude_caches_a_quota_marker_even_with_transient_looking_wording
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=503,
                 stdout="",
                 stderr="session limit reached; service unavailable",
@@ -1927,7 +1927,7 @@ def test_review_claude_caches_chronic_quota_exhaustion_delivered_as_429():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=429,
                 stdout="",
                 stderr="You've hit your session limit · resets 7:30pm (Europe/Belgrade)",
@@ -1964,7 +1964,7 @@ def test_review_claude_caches_a_quota_marker_in_a_long_partial_transcript():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr=long_stderr,
@@ -1997,7 +1997,7 @@ def test_review_claude_caches_a_quota_marker_alongside_fatal_looking_wording():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr="You've hit your session limit -- unauthorized until it resets",
@@ -2046,7 +2046,7 @@ def test_review_claude_never_caches_a_seat_fatal_channel_even_with_unavailable_w
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr="401 Unauthorized: this account is temporarily unavailable",
@@ -2079,7 +2079,7 @@ def test_review_claude_does_not_cache_a_401_that_also_says_currently_unavailable
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr="401 Unauthorized: model is currently unavailable to this account",
@@ -2115,7 +2115,7 @@ def test_review_claude_caches_an_rc0_sentinel_with_benign_nonempty_stderr():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
                 stderr="warning: config option 'foo' is deprecated, ignoring",
@@ -2162,7 +2162,7 @@ def test_review_claude_does_not_cache_an_unavailable_marker_buried_in_a_long_std
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr=long_stderr,
@@ -2206,7 +2206,7 @@ def test_review_claude_caches_a_short_sentinel_alongside_moderately_long_stderr(
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout=sentinel,
                 stderr=wrapper_stderr,
@@ -2241,7 +2241,7 @@ def test_review_claude_does_not_cache_a_numeric_only_401_with_unavailable_wordin
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=401,
                 stdout="",
                 stderr='{"error": {"message": "model is currently unavailable to this account"}}',
@@ -2271,7 +2271,7 @@ def test_review_claude_does_not_cache_a_plain_auth_failure():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=1,
                 stdout="",
                 stderr="Error: authentication failed",
@@ -2304,7 +2304,7 @@ def test_review_claude_does_not_cache_a_long_real_review():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout=long_body,
                 stderr="",
@@ -2341,7 +2341,7 @@ def test_review_claude_does_not_cache_a_successful_review_mentioning_session_lim
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout=long_body,
                 stderr="",
@@ -2372,7 +2372,7 @@ def test_review_claude_does_not_cache_a_short_rc0_body_mentioning_session_limit(
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="Fine — no session limit concerns here.",
                 stderr="",
@@ -2474,7 +2474,7 @@ def test_review_with_images_records_cooldown_after_sentinel_response():
             "review_claude_cli_with_images",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
                 stderr="",
@@ -2524,7 +2524,7 @@ def test_review_with_images_clears_cooldown_on_genuine_success():
             "review_claude_cli_with_images",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="a real review body " * 10,
                 stderr="",
@@ -3097,7 +3097,7 @@ def test_wiring_review_claude_rc0_seat_fatal_stderr_does_not_cache():
             "review_claude_cli",
             lambda *a, **k: ReviewResult(
                 model=MODEL,
-                command="claude-p",
+                command="claude",
                 returncode=0,
                 stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
                 stderr="401 Unauthorized: model is currently unavailable",

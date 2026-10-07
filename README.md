@@ -368,9 +368,8 @@ memory for the final print. That log is also what makes a crashed brainstorm
 
 The growing transcript is fed to the **claude and codex** backends over **stdin**
 (not a `-p`/argv argument), which removes review-cli's own argv overhead. Note the
-ceiling isn't fully gone: `claude-p`'s inner `claude` exec re-argv's the prompt, and
-the **opencode** backend's CLI only takes the message as argv — so a very large
-transcript (~1 MB+) can still hit `ARG_MAX` on those paths. `_payload` prints a size
+ceiling isn't fully gone: the **opencode** backend's CLI only takes the message as argv —
+so a very large transcript (~1 MB+) can still hit `ARG_MAX` on that path. `_payload` prints a size
 WARNING as it approaches the limit; keep `--max-rounds` and diffs reasonable.
 
 ```bash
@@ -910,7 +909,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | Specifier | Transport | What runs under the hood |
 |-----------|-----------|--------------------------|
 | `codex` / `codex:<model>` | cli | `codex exec -s read-only --ephemeral` |
-| `claude` / `claude:<model>` | api \| cli | `claude-p` CLI, or the Anthropic-compatible Messages API |
+| `claude` / `claude:<model>` | api \| cli | `claude --print` CLI, or the Anthropic-compatible Messages API |
 | `fable` / `fable5` | api \| cli | Alias for `claude:claude-fable-5` |
 | `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-3.5-flash` by default) |
 | `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |

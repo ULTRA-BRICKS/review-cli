@@ -158,9 +158,10 @@ def capability_for(model: str) -> VisionCapability | None:
     return cap if (cap and cap.vision) else None
 
 
-# CLI binaries per route. claude vision uses the FULL `claude` CLI (not the `claude-p`
-# wrapper review's locked-down text path uses): vision needs the Read tool to load the
-# `@<image>` reference, which the read-only text reviewer forbids.
+# CLI binaries per route. claude vision uses the FULL `claude` CLI (not the tool-less
+# `claude --print --tools ''` invocation review's locked-down text path uses): vision
+# needs the Read tool to load the `@<image>` reference, which the read-only text
+# reviewer forbids.
 _CLI_BINARY = {
     "claude-cli": "claude",
     "codex-cli": "codex",

@@ -472,7 +472,7 @@ def test_direct_construction_auto_classifies_from_body():
         started=datetime(2026, 6, 1, tzinfo=timezone.utc),
         backend="claude",
         round=0,
-        argv0="claude-p",
+        argv0="claude",
         body="currently unavailable",
         exit_code=0,
     )
@@ -495,7 +495,7 @@ def test_direct_construction_auto_classifies_from_body():
         started=datetime(2026, 6, 1, tzinfo=timezone.utc),
         backend="claude",
         round=0,
-        argv0="claude-p",
+        argv0="claude",
         body="currently unavailable",
         exit_code=0,
         is_paywall=False,
@@ -515,7 +515,7 @@ def test_direct_construction_auto_classifies_from_body():
         started=datetime(2026, 6, 1, tzinfo=timezone.utc),
         backend="claude",
         round=0,
-        argv0="claude-p",
+        argv0="claude",
         body="currently unavailable",
         exit_code=0,
         is_paywall=False,  # would be overwritten -- the other five/six are unset
@@ -3649,7 +3649,7 @@ def _fable_paywall_log(log_dir: Path, stamp: str) -> Path:
         "claude",
         0,
         "ClaudeFable5iscurrentlyunavailable.Learnmore:\nhttps://www.anthropic.com/news/fable\n",
-        argv0="/Users/x/.local/bin/claude-p",
+        argv0="/Users/x/.local/bin/claude",
         exit_code=0,
     )
 
@@ -3661,7 +3661,7 @@ def _opus_ok_log(log_dir: Path, stamp: str) -> Path:
         "claude",
         0,
         "## Findings\n1. A real, substantive review verdict about the diff.\n",
-        argv0="/Users/x/.local/bin/claude-p",
+        argv0="/Users/x/.local/bin/claude",
         exit_code=0,
     )
 
@@ -4002,10 +4002,10 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
                 exit_code=0,
             )
         )
-        # CLI mode (claude-p): argv0 has no model, so the body sentinel still decides.
+        # CLI mode (claude): argv0 has no model, so the body sentinel still decides.
         opus_cli = p.parse_call_log(_opus_ok_log(ld, "20260601T100800_000000"))
-        # CLI mode where the `claude-p` binary PATH itself contains `API ` (e.g. installed
-        # under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read `Tools/claude-p`
+        # CLI mode where the `claude` binary PATH itself contains `API ` (e.g. installed
+        # under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read `Tools/claude`
         # as the model; the anchored `^Anthropic API ` match must NOT, so this still falls
         # through to the body sentinel (paywall=Fable / else Opus).
         opus_cli_apipath = p.parse_call_log(
@@ -4015,7 +4015,7 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
                 "claude",
                 0,
                 "## Findings\n1. A real verdict from Opus via the CLI.\n",
-                argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p",
+                argv0="/opt/API Tools/claude --print --permission-mode dontAsk",
                 exit_code=0,
             )
         )
@@ -4026,7 +4026,7 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
                 "claude",
                 0,
                 "ClaudeFable5iscurrentlyunavailable.Learnmore:\n",
-                argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p",
+                argv0="/opt/API Tools/claude --print --permission-mode dontAsk",
                 exit_code=0,
             )
         )
@@ -4052,7 +4052,7 @@ def test_paywall_sentinel_survives_whitespace_collapse():
                 "claude",
                 0,
                 "Claude Fable 5 is currently unavailable. Learn more:\n",
-                argv0="/x/claude-p",
+                argv0="/x/claude",
                 exit_code=0,
             )
         )

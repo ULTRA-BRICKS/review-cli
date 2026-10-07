@@ -231,7 +231,7 @@ def test_queued_seat_is_not_falsely_timed_out():
 # === (g) a spawn FAILURE releases the slot (the sem_acquired guard's whole point) =
 def test_spawn_failure_releases_the_slot():
     """The documented real scenario the `sem_acquired` guard exists for: a missing backend
-    binary (no `claude-p` on PATH) makes Popen raise FileNotFoundError. The slot acquired
+    binary (no `claude` on PATH) makes Popen raise FileNotFoundError. The slot acquired
     just before Popen MUST be released in the finally, or it leaks forever and permanently
     shrinks the cap — eventually wedging the whole pool. Cap=1: run a seat whose binary does
     not exist (it raises), then dispatch a REAL seat and assert it actually ran (the slot was

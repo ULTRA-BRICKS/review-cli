@@ -2,7 +2,7 @@
 """Unit tests for the claude backend's API variant + api/cli dispatch (backends.py).
 
 review_claude() dispatches to review_claude_api (HTTP, no CLI needed) or
-review_claude_cli (claude-p), chosen by REVIEW_CLAUDE_MODE or, automatically, by
+review_claude_cli (`claude --print`), chosen by REVIEW_CLAUDE_MODE or, automatically, by
 whether an Anthropic-compatible key is configured. The API path POSTs the
 Anthropic Messages format to {ANTHROPIC_BASE_URL}/v1/messages. These tests stub
 urlopen and the sub-backends — no network, no claude binary, no real key.
@@ -97,8 +97,8 @@ def _which_cli(cli_present: bool):
     the presence of a CLI seat is simulated here — patching the backends-local indirection,
     NOT the stdlib shutil.which globally."""
     def which(name):
-        if name in ("claude", "claude-p"):
-            return f"/bin/{name}" if cli_present else None
+        if name == "claude":
+            return "/bin/claude" if cli_present else None
         return None
     return which
 

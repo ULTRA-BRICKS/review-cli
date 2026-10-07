@@ -7,7 +7,7 @@ live outside most sandbox allow-lists. Before this fix, `log_dir()`'s `mkdir` (w
 directory doesn't exist yet) or a per-call `os.open()` (when it already does, e.g. from
 earlier unsandboxed runs) raised an uncaught `PermissionError`/`OSError` straight out of
 `_run_streamed` BEFORE the backend subprocess was even spawned — killing that seat
-entirely (observed live: a Fable/claude-p seat, review-cli#162). Since every seat
+entirely (observed live: a Fable/claude seat, review-cli#162). Since every seat
 (opus/codex/fable/opencode) hits the identical `_open_log -> log_dir` path, this was never
 actually fable-specific — fable is simply the slowest seat and so the most likely to still
 be running if a time-scoped sandbox grant is the trigger.

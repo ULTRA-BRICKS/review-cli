@@ -22,8 +22,8 @@ not an accident:
   `bash/edit/write/webfetch/task/todowrite/websearch/lsp/skill`; `_ensure_opencode_readonly_agent`
   (`backends.py:233`) rewrites any non-strict opencode agent and refuses to run in a repo
   shipping its own opencode config.
-- `reviewlib/backends.py:1175` — claude is spawned `claude-p --permission-mode dontAsk
-  --tools '' … --disallowedTools Edit MultiEdit Write Bash Read …`.
+- `reviewlib/backends.py` `_claude_cli_argv` — claude is spawned `claude --print --permission-mode dontAsk
+  --tools '' …` (an empty tool allowlist).
 
 A tester needs the **opposite** capability profile. So **`qa` does NOT ride
 `run_panel`/the failover board** the way `diff`/`quorum`/`brainstorm` do — those paths

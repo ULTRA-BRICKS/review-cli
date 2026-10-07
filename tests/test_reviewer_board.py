@@ -1122,7 +1122,7 @@ def test_direct_claude_cli_effort_adds_prompt_hint():
     old_env = backends._claude_cli_env
     old_trust = backends._ensure_workspace_trusted
     old_run = backends._run_streamed
-    backends._claude_cli_binary = lambda: ("/bin/claude", True)
+    backends._claude_cli_binary = lambda: "/bin/claude"
     backends._claude_cli_argv = lambda *_a, **_k: ["/bin/claude"]
     backends._claude_cli_env = lambda: {}
     backends._ensure_workspace_trusted = lambda _cwd: None
@@ -1320,16 +1320,12 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     # id (it accepts gemini only as the bare `gemini-api` or a `gemini:` prefix, never the
     # `gemini-api:` form) and so falls through to opencode at runtime. The guard must agree:
     # checking the COLLAPSED provider token would wrongly bless it, so the guard validates
-    # the FULL id route (codex review of #49). Same for the `claude-p:` form.
+    # the FULL id route (codex review of #49).
     assert (
         backends.resolve_backend("gemini-api:gemini-2.5-flash")
         is backends.review_opencode
     )
     assert backends.default_routes_live("gemini-api:gemini-2.5-flash") is False
-    assert (
-        backends.resolve_backend("claude-p:claude-opus-4-8") is backends.review_opencode
-    )
-    assert backends.default_routes_live("claude-p:claude-opus-4-8") is False
     # ...but the spellings resolve_backend DOES match on the full id still pass.
     assert backends.default_routes_live("gemini:gemini-2.5-flash") is True
     assert backends.default_routes_live("zai:glm-5.2") is True
@@ -1422,7 +1418,6 @@ def test_every_named_provider_bare_token_is_recognized():
         "glm": backends.review_zai,
         "commandcode": backends.review_commandcode,
         "claude": backends.review_claude,
-        "claude-p": backends.review_claude,
         "fable": backends.review_claude,
     }
     for token, backend in bare_to_backend.items():

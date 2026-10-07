@@ -146,8 +146,8 @@ _PAYWALL_SENTINEL = "currentlyunavailable"
 _CF_BLOCK_MARKER = "error code: 1010"
 # z.ai / GLM bad-key stderr marker.
 _BAD_KEY_MARKER = '{"error":"bad key"}'
-# `claude` backend header argv0 carries NO model id (Fable and Opus share the `claude-p`
-# wrapper), so the model is inferred from the body sentinel: a paywall body = Fable, any
+# `claude` backend header argv0 carries NO model id (Fable and Opus share the `claude`
+# binary), so the model is inferred from the body sentinel: a paywall body = Fable, any
 # other = Opus. These are the two board claude seats.
 _CLAUDE_FABLE_MODEL = "claude:claude-fable-5"
 _CLAUDE_OPUS_MODEL = "claude:claude-opus-4-8"
@@ -166,7 +166,7 @@ _API_MODEL_RE = re.compile(r"\bAPI\s+(?P<model>\S+)")
 _OPENCODE_MODEL_RE = re.compile(r"-m\s+(?P<model>\S+)")
 # Claude API-mode header argv0 is EXACTLY `Anthropic API <model>` (optionally `@ <base>`),
 # written by review_claude_api. Anchor on that full prefix — NOT the generic `\bAPI` — so a
-# CLI-mode `claude-p` path that happens to contain `API ` (e.g. `/opt/API Tools/claude-p`)
+# CLI-mode `claude` path that happens to contain `API ` (e.g. `/opt/API Tools/claude`)
 # can't be mis-read as a model and bypass the paywall/Opus fallback.
 _CLAUDE_API_MODEL_RE = re.compile(r"^Anthropic API\s+(?P<model>\S+)")
 # z.ai's board seat id is `zai:<model>` (config DEFAULT_BOARD), but the log backend/header
@@ -2047,9 +2047,9 @@ def model_id_for_call(call: "CallLog") -> str:
       * `commandcode` / `z.ai`: the header argv0 carries `… API <model>` — map to the board
         prefix (`commandcode:<model>` / `zai:<model>`). A bare probe (`commandcode` with no
         `API …`) has no model, so it stays the backend name.
-      * `claude`: in API mode (`REVIEW_CLAUDE_MODE=api`, or no `claude-p`) the sidecar argv0
+      * `claude`: in API mode (`REVIEW_CLAUDE_MODE=api`, or no `claude` binary) the sidecar argv0
         carries the EXACT model as `Anthropic API <model>` — read that first and map it to
-        the board id (`claude:<model>`). Only the CLI wrapper (`claude-p`) hides the model
+        the board id (`claude:<model>`). Only the CLI path (`claude --print`) hides the model
         (its argv0 is identical for Fable and Opus); there the model is inferred from the
         body — a paywall body = Fable, anything else = the Opus seat.
       * `codex`: a suffixed run records `codex -m <model>` in argv0, so recover
@@ -2061,7 +2061,7 @@ def model_id_for_call(call: "CallLog") -> str:
         # API mode names the exact model in argv0 (`Anthropic API <model>` [@ <base>]); use
         # it before defaulting to Opus, so an API-mode Fable (no paywall body) isn't
         # mis-attributed to the Opus seat (codex P2). Anchored on the full `Anthropic API `
-        # prefix so a CLI-mode `claude-p` path containing `API ` isn't mistaken for a model.
+        # prefix so a CLI-mode `claude` path containing `API ` isn't mistaken for a model.
         m = _CLAUDE_API_MODEL_RE.match(call.argv0)
         if m:
             return f"claude:{m.group('model')}"

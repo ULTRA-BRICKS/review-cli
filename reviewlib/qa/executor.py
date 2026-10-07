@@ -744,23 +744,23 @@ def _spawn_claude_writeexec(
     effort: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Spawn Claude Code headless UN-CAGED in ``cwd`` — the deliberate inverse of the
-    read-only ``review_claude_cli`` spawn (``backends.py:1175``). NO ``--disallowedTools``,
-    NO ``--tools ''``: the tester needs bash + write to bring a SUT up and drive it.
+    read-only ``review_claude_cli`` spawn. NO ``--tools ''``: the tester needs bash + write
+    to bring a SUT up and drive it.
 
     ``model`` (review-cli#60): when given, ``--model <model>`` pins the tester's model (e.g.
-    ``review qa -m claude:claude-opus-4-8``); ``None`` uses claude-p's own default model.
+    ``review qa -m claude:claude-opus-4-8``); ``None`` uses claude's own default model.
 
     Permission mode. A headless agent cannot answer an interactive tool-approval prompt, so a
-    mode that still GATES bash (``acceptEdits`` auto-accepts only file edits) deadlocks the
-    run on the first command — claude-p returns ``tool_approval_blocked``. The tester needs
-    bash AUTO-GRANTED, so it runs ``--permission-mode bypassPermissions`` (the standard
-    headless-autonomous profile). This is the ONE place review-cli un-cages an agent on
+    mode that still GATES bash (``acceptEdits`` auto-accepts only file edits) denies the
+    tester's first command. The tester needs bash AUTO-GRANTED, so it runs
+    ``--permission-mode bypassPermissions`` (the standard headless-autonomous profile). This
+    is the ONE place review-cli un-cages an agent on
     purpose; the blast radius is fenced by the throwaway ``git worktree`` (``IsolatedSut``),
     NOT by a permission gate (that fence is the read-only board's job, which qa deliberately
     does not ride — see the note by ``_READONLY_AGENT_DENIED_PERMISSIONS``). ``--allowedTools``
     explicitly lists the tester's toolset so the grant is auditable, not a blanket wildcard.
     The system prompt goes on stdin (ARG_MAX-safe)."""
-    claude_p = _which("claude-p")
+    claude = _which("claude")
     # Pre-accept workspace trust for cwd, EXACTLY like the read-only claude backend
     # (backends._ensure_workspace_trusted): a FRESH worktree is untrusted, and claude's
     # headless safety gate BLOCKS on an untrusted folder — so without this, bare
@@ -776,62 +776,42 @@ def _spawn_claude_writeexec(
 
     _ensure_workspace_trusted(cwd)
     # Run-scoped --effort (review-cli#127 harvest): pass `--effort <level>` ONLY when the
-    # resolved claude binary advertises it (some claude-p builds don't), mirroring #150's
+    # resolved claude binary advertises it (an older build may not), mirroring #150's
     # capability-gated read-only claude seat. The universal prompt hint carries the level
     # either way, so an effort request is never silently dropped.
     prompt = _prompt_with_effort(prompt, effort)
     _ce = _claude_reasoning_effort(effort)
-    claude_effort = _ce if _ce and _claude_cli_supports_effort(claude_p) else None
+    claude_effort = _ce if _ce and _claude_cli_supports_effort(claude) else None
     argv = [
-        claude_p,
-        "--cwd",
-        str(cwd),
+        claude,
+        "--print",
         # bypassPermissions auto-grants every tool (the un-caged tester profile). The
         # explicit --allowedTools list is belt-and-suspenders, NOT the security boundary
         # (the worktree is) and NOT strictly needed under bypassPermissions — kept because
-        # the live run confirmed claude-p consumes it variadically and it documents the
-        # tester's toolset. claude-p parses --allowedTools as nargs (verified by a working
-        # live run); if a future build made it single-valued the tail would leak as
-        # positionals, so keep it adjacent to the permission flag, before --output-format.
+        # it documents the tester's toolset. claude parses --allowedTools as a variadic
+        # `<tools...>` list (`claude --help`), so keep it adjacent to the permission flag,
+        # before --output-format, which ends the list.
         "--permission-mode",
         "bypassPermissions",
         "--allowedTools",
         "Bash",
         "Edit",
-        "MultiEdit",
         "Write",
         "Read",
         "Glob",
         "Grep",
-        # CLEAN final text, not the lossy TUI scrape. claude-p drives an interactive TUI
-        # agent; an agentic run's stdout is box-drawing chrome + a spinner, NOT the agent's
-        # text — so a plain `-p` run buries the literal `## QA RESULTS` block and the parser
-        # verdicts UNKNOWN (verified across two live runs: the agent FOUND the bug but its
-        # contract block never reached stdout cleanly; `--bare`/`--no-chrome` are ignored by
-        # the subscription backend). `--output-format json` instead returns the PERSISTED
-        # final assistant text as a JSON `result` field (the help: "Default buffers until
-        # persisted JSONL final text is available"); `_extract_claude_final_text` pulls it
-        # out so the parser sees the real contract block.
-        #
-        # KNOWN BACKEND LIMITATION (verified 2026-06): some `claude-p` builds are an
-        # interactive-SUBSCRIPTION TUI backend whose JSON `result` is itself SCRAPED from the
-        # lossy TUI transcript (`final_answer_source: tui_transcript`,
-        # `extraction_confidence: medium`) — box-drawing chrome, no clean text. Against such a
-        # backend the agent still DRIVES the SUT correctly but its `## QA RESULTS` block can't
-        # survive the scrape, so the parser fail-SAFEs to UNKNOWN -> exit 1 (NEVER a false
-        # pass). The CLEAN live seat in that environment is codex (`REVIEW_QA_TESTER=codex`,
-        # `codex exec` emits structured text); the claude seat returns clean text wherever
-        # claude-p is a real `claude -p` JSONL backend. The mocked-tester DoD covers the
-        # plumbing deterministically regardless of which live backend is installed.
+        # `--output-format json` prints ONE JSON object whose `result` field is the
+        # agent's final assistant text (plus `is_error`, `usage`, ...);
+        # `_extract_claude_final_text` pulls it out so the parser sees the literal
+        # `## QA RESULTS` contract block rather than any progress output.
         "--output-format",
         "json",
-        "--timeout-sec",
-        str(timeout),
-        # Forward an explicit model when one was requested (`-m claude:<model>` /
-        # REVIEW_QA_TESTER_MODEL); otherwise claude-p uses its own default (review-cli#60).
+        # No internal wall timer: claude has none, so `_run_streamed`'s wall timeout below
+        # is the tester's only budget. Forward an explicit model when one was requested
+        # (`-m claude:<model>` / REVIEW_QA_TESTER_MODEL); otherwise claude uses its own
+        # default (review-cli#60).
         *(["--model", model] if model else []),
         *(["--effort", claude_effort] if claude_effort else []),
-        "-p",
     ]
     try:
         proc = _run_streamed(
@@ -869,14 +849,14 @@ def _completed_with_text(
 
 
 def _extract_claude_final_text(raw_stdout: str) -> str:
-    """Pull the final assistant text out of ``claude-p --output-format json`` stdout.
+    """Pull the final assistant text out of ``claude --print --output-format json`` stdout.
 
-    The documented shape is a JSON object with a ``result`` field holding the final text
-    (``claude -p --output-format json``). We parse defensively: a JSON object with a string
-    ``result`` -> that field; a JSON list (stream-json transcript) -> the last item's
-    ``result``/``text``; anything that does NOT parse as JSON -> the raw stdout unchanged (so
-    a clean text backend, or a future format change, still flows through to the parser rather
-    than being blanked). Never raises — a parse failure degrades to the raw text."""
+    The shape is a JSON object with a ``result`` field holding the final text. We parse
+    defensively: a JSON object with a string ``result`` -> that field; a JSON list
+    (stream-json transcript) -> the last item's ``result``/``text``; anything that does NOT
+    parse as JSON -> the raw stdout unchanged (so a future format change still flows through
+    to the parser rather than being blanked). Never raises — a parse failure degrades to the
+    raw text."""
     import json
 
     stripped = raw_stdout.strip()
@@ -890,7 +870,7 @@ def _extract_claude_final_text(raw_stdout: str) -> str:
 
 
 def _result_text_from_json(data: object) -> str | None:
-    """Best-effort: the final assistant text from a parsed claude-p JSON payload (a dict with
+    """Best-effort: the final assistant text from a parsed claude JSON payload (a dict with
     ``result``/``text``, or a transcript list whose last text-bearing item wins). ``None`` if
     no text field is found (the caller then falls back to the raw stdout)."""
     if isinstance(data, dict):
@@ -1088,7 +1068,7 @@ def run_tester(
             proc, backend=backend, wall=time.monotonic() - started, model=model
         )
     except (RuntimeError, OSError) as exc:
-        # The backend could not be LAUNCHED (missing `claude-p`/`codex` -> `_which` RuntimeError;
+        # The backend could not be LAUNCHED (missing `claude`/`codex` -> `_which` RuntimeError;
         # a Popen/exec OSError). "Couldn't run the tester" must be a controlled non-zero qa
         # result, NOT a traceback that escapes the exit-code contract (review P1). Synthesize a
         # BLOCKED outcome so the handler maps it to EXIT_QA_SUT_BOOT_FAILED. (SutIsolationError /
