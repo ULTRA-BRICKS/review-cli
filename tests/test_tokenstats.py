@@ -359,6 +359,30 @@ def test_fable_report_counts_dispatch_and_classifies_reason():
         assert report["retry_event_reasons"]["session_limit"] == 1
 
 
+def test_fable_report_classifies_weekly_monthly_limit_exhausted_as_session_limit():
+    """review-cli#339/#342: `_SESSION_LIMIT_MARKERS` here is a separate copy of
+    `reviewlib.backends._CHRONIC_QUOTA_MARKERS` and had drifted stale — a real
+    "Weekly/Monthly Limit Exhausted. Your limit will reset at <timestamp>" retry
+    event was correctly cooled down by the backend but miscounted here as "other"
+    instead of "session_limit". Pins that the dashboard classifier recognises the
+    same phrase the backend cooldown check does."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _claude_paywall_log(d)
+        _retry_log(
+            d,
+            detail=(
+                "Weekly/Monthly Limit Exhausted. Your limit will reset at "
+                "2026-09-03 21:15:09"
+            ),
+        )
+        calls = ts.list_call_logs(d)
+        events = ts.list_retry_events(d)
+        report = ts.compute_fable_report(calls, events)
+        assert report["retry_event_reasons"]["session_limit"] == 1
+        assert report["retry_event_reasons"]["other"] == 0
+
+
 def test_fable_report_auth_reason_not_fooled_by_author_or_authoritative():
     """kimi review finding: `"auth" in low` mis-bucketed a retry detail into "auth"
     whenever it happened to contain "author"/"authoritative" — plausible prose in a

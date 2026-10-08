@@ -1946,6 +1946,78 @@ def test_review_claude_caches_chronic_quota_exhaustion_delivered_as_429():
     _with_store(_run)
 
 
+def test_review_claude_caches_the_real_weekly_monthly_limit_exhausted_notice():
+    """review-cli#339: a real production log showed a backend returning
+    "Weekly/Monthly Limit Exhausted. Your limit will reset at <timestamp>" as its
+    error text -- this exact phrase was not in `_CHRONIC_QUOTA_MARKERS`, so
+    `_chronic_unavailable_reason` never recognised it and the seat kept being
+    retried on every subsequent call instead of being cooled down. Pins the
+    positive case at the exact production wording (including its capitalization,
+    to confirm `error_channel = stderr.lower()` covers it)."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Weekly/Monthly Limit Exhausted. Your limit will reset at "
+                    "2026-09-03 21:15:09"
+                ),
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_a_transient_rate_limit_as_chronic_quota():
+    """Codex review finding (review-cli#339, round 1): the naive fix for the test
+    above used a bare "limit exhausted" marker, which ALSO matches ordinary
+    transient throttle wording ("429 rate limit exhausted; retry after 5
+    seconds", "retry limit exhausted") that must NOT be cached as an
+    escalating chronic cooldown -- a brief throttle would otherwise bench a
+    healthy seat for hours. The marker must be anchored on the longer, quota-
+    specific "...exhausted. your limit will reset" phrase so this stays
+    uncached."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=429,
+                stdout="",
+                stderr="429 rate limit exhausted; retry after 5 seconds",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
+
+    _with_store(_run)
+
+
 def test_review_claude_caches_a_quota_marker_in_a_long_partial_transcript():
     """k3 review finding (round 9): `reviewlib/dashboard/parser.py` documents a
     VERIFIED real shape -- a CLI call can stream a long partial review transcript

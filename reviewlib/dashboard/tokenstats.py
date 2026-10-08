@@ -77,6 +77,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..process import log_dir as _dashboard_log_dir
+from ..seat_cooldown import CHRONIC_QUOTA_MARKERS
 from . import call_log_cache
 from .parser import (
     HEALTH_OK,
@@ -467,7 +468,9 @@ def compute_model_stats(calls: list[CallLog]) -> dict[str, dict]:
 # now DEFAULT_BOARD's LAST seat, a last-resort reserve — see that module for the
 # current board order). This report stays useful going forward as the ongoing "how
 # would you SEE it if this regressed again" check, not just a historical record.
-_SESSION_LIMIT_MARKERS = ("session limit", "usage-credits", "usage credits")
+# Same tuple as the backend's chronic-quota cooldown check (review-cli#342: separate
+# copies drifted and miscounted "Weekly/Monthly Limit Exhausted" as "other").
+_SESSION_LIMIT_MARKERS = CHRONIC_QUOTA_MARKERS
 # kimi review finding: a bare `"auth" in low` substring match mis-buckets an unrelated
 # retry detail into "auth" whenever it happens to contain "author"/"authoritative" —
 # plausible prose in a quoted model response, not an auth failure. A `\b`-anchored

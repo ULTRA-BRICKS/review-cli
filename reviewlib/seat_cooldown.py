@@ -111,6 +111,29 @@ from pathlib import Path
 # reference (not bare functions) so tests can swap in a stub without touching other users.
 from . import portable
 
+# A session/usage-limit notice ("You've hit your session limit ... resets 7:30pm") is the
+# OTHER chronic shape the token-burn investigation found dominates Fable's real failures
+# (1,836 of 4,322 recorded failures) — it is NOT rc=0/short-body shaped like the sentinel
+# above (the CLI exits non-zero), so it needs its own marker check.
+# Single source for `reviewlib.backends` (dispatch-side cooldown) and
+# `reviewlib.dashboard.tokenstats` (retry-event classification); review-cli#342 was
+# these two drifting apart as separate copies.
+CHRONIC_QUOTA_MARKERS = (
+    "session limit",
+    "usage-credits",
+    "usage credits",
+    "limit exhausted. your limit will reset",
+)
+# "limit exhausted. your limit will reset" added 2026-09-01 (review-cli#339): a real
+# production log showed a backend returning "Weekly/Monthly Limit Exhausted. Your limit
+# will reset at <timestamp>" — this phrase was not in the marker tuple, so
+# `_chronic_unavailable_reason` never recognised it and the seat kept being retried on
+# every subsequent call instead of being cooled down. Anchored on the full
+# "...exhausted. your limit will reset" phrase, NOT bare "limit exhausted" — codex review
+# (round 1) found the bare substring also matches transient/unrelated errors ("429 rate
+# limit exhausted; retry after 5 seconds", "retry limit exhausted") that must NOT be
+# cached as an escalating chronic cooldown; the longer anchor is specific to the actual
+# weekly/monthly quota-reset notice shape and excludes those.
 # Default cooldown window once a chronic-unavailable signal is seen. Conservative: long
 # enough to skip several would-be-wasted dispatches in a normal burst of review runs, short
 # enough that a seat back within its quota isn't skipped for long. Overridable via

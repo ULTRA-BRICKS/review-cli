@@ -3,6 +3,18 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.45.0 — 2026-10-08
+
+- **Fix(seat cooldown): recognise the "Weekly/Monthly Limit Exhausted. Your limit will reset
+  at <ts>" quota notice** ([review-cli#339](https://git.hyperide.ai/ultrabricks/review-cli/issues/339)).
+  The chronic-quota markers lacked this phrase, so a seat returning it was retried on every
+  call instead of cooling down, and the dashboard counted the retry as "other" instead of
+  "session_limit". The marker is anchored on "...limit exhausted. your limit will reset", so
+  transient wording such as "429 rate limit exhausted; retry after 5 seconds" still does not
+  cache a chronic cooldown. The backend and the dashboard now read one tuple,
+  `reviewlib.seat_cooldown.CHRONIC_QUOTA_MARKERS`, instead of two copies that had drifted
+  (review-cli#342).
+
 ## 0.44.0 — 2026-10-01
 
 - **Breaking: the `claude-p` wrapper is retired; the claude seat runs plain `claude --print`.**

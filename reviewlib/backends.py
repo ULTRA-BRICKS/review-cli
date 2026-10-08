@@ -43,7 +43,12 @@ from .process import (
     strip_control_sequences,
     write_sidecar_log,
 )
-from .seat_cooldown import active_cooldown, clear_cooldown, record_cooldown
+from .seat_cooldown import (
+    CHRONIC_QUOTA_MARKERS,
+    active_cooldown,
+    clear_cooldown,
+    record_cooldown,
+)
 from .usage_limits import (
     allow_spawn_for_model,
     spawn_refuse_reason,
@@ -3042,11 +3047,9 @@ _UNAVAILABLE_MARKERS = (
     "model is unavailable",
     "currently not available",
 )
-# A session/usage-limit notice ("You've hit your session limit ... resets 7:30pm") is the
-# OTHER chronic shape the token-burn investigation found dominates Fable's real failures
-# (1,836 of 4,322 recorded failures) — it is NOT rc=0/short-body shaped like the sentinel
-# above (the CLI exits non-zero), so it needs its own marker check.
-_CHRONIC_QUOTA_MARKERS = ("session limit", "usage-credits", "usage credits")
+# The session/usage/weekly-limit quota markers live in `reviewlib.seat_cooldown`
+# (single source shared with the dashboard's retry-event classifier).
+_CHRONIC_QUOTA_MARKERS = CHRONIC_QUOTA_MARKERS
 # The administrative sentinel is only trustworthy when the WHOLE body is short (a
 # one-liner notice) — a real, long review that happens to mention availability must
 # never be cached as a chronic failure. Shared by panel.result_is_usable and
@@ -3073,7 +3076,8 @@ def _cooldown_after_recovery_probe(model: str, *, access_method: str) -> dict | 
     blindly waiting out the full (possibly hours-long, escalated) cooldown window.
 
     Narrow on purpose: only a cooldown recorded for a QUOTA reason
-    (`_CHRONIC_QUOTA_MARKERS` -- "session limit" / "usage-credits" / "usage credits")
+    (`_CHRONIC_QUOTA_MARKERS` -- session/usage-credit limits and the weekly/monthly
+    "limit exhausted. your limit will reset" notice)
     is probed. A true-silence timeout, a bare "unavailable sentinel", or any other
     chronic reason is NOT modeled by the usage-limit percent at all -- a healthy quota
     reading says nothing about whether an unrelated hang/notice has actually cleared,
@@ -3389,9 +3393,10 @@ def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
         error_channel += "\n" + body.lower()
 
     # k3 review finding (rounds 8-9, three separate concrete repros converging on the
-    # same point): `_CHRONIC_QUOTA_MARKERS` ("session limit", "usage-credits", "usage
-    # credits") is checked FIRST, UNCONDITIONALLY — no transient guard, no seat-fatal
-    # guard, no STDERR length bound — deliberately UNLIKE `_UNAVAILABLE_MARKERS`
+    # same point): `_CHRONIC_QUOTA_MARKERS` (session/usage-credit limits and the
+    # weekly/monthly limit-reset notice) is checked FIRST, UNCONDITIONALLY — no
+    # transient guard, no seat-fatal guard, no STDERR length bound — deliberately
+    # UNLIKE `_UNAVAILABLE_MARKERS`
     # below. Three rounds of this repo's own review gate converged on why the two
     # marker sets need different treatment: (1) a genuinely chronic quota-exhaustion
     # failure can arrive via `returncode=429` on the API transport (Anthropic's own
