@@ -25,7 +25,9 @@ __main__, and also pytest-discoverable.
 from __future__ import annotations
 
 import io
+import os
 import sys
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -37,6 +39,7 @@ from reviewlib.config import (  # noqa: E402
     select_pool_and_reserve_with_reuse,
 )
 from reviewlib.modes import review as review_mod  # noqa: E402
+from reviewlib import process as process_mod  # noqa: E402
 
 
 def _captured_stdout(fn, *args, **kwargs) -> str:
@@ -400,6 +403,189 @@ def test_shortfall_notice_fires_through_the_real_mode_review_board_call_site():
     assert "Codex (codex)" not in out, out
 
 
+def test_skip_log_written_for_a_hard_unavailable_seat_padded_over():
+    """The exact gap `_report_pool_shortfall` stays silent for (review-cli#469): a
+    board seat that's hard-unavailable but gets fully PADDED OVER by seat reuse ends
+    up absent from BOTH `pool` and `reserve` even though `len(pool) == pool_size` --
+    `_report_pool_shortfall` returns at its very first line for that case, so it never
+    prints anything. `_write_skip_logs_for_unavailable_seats` must still leave a
+    durable trail for that dropped seat."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    ]
+
+    def _available(seat: BoardReviewer) -> bool:
+        return seat.model != "codex:gpt-5.6-terra"
+
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        board, 3, _available, usage_percent=lambda _m: None
+    )
+    # Confirms the scenario actually reproduces the silent-`_report_pool_shortfall`
+    # case this test is meant to cover: pool padded back up to full size, Codex in
+    # neither list.
+    assert len(pool) == 3
+    assert all(r.model != "codex:gpt-5.6-terra" for r in pool)
+    assert all(r.model != "codex:gpt-5.6-terra" for r in reserve)
+
+    saved = _patched_reason(
+        {"codex:gpt-5.6-terra": "codex: `codex` CLI not found on PATH"}
+    )
+    tmp_dir = tempfile.mkdtemp()
+    saved_env = os.environ.get("REVIEW_LOG_DIR")
+    os.environ["REVIEW_LOG_DIR"] = tmp_dir
+    try:
+        review_mod._write_skip_logs_for_unavailable_seats(board, pool, reserve)
+    finally:
+        review_mod.backend_unavailable_reason = saved
+        if saved_env is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_env
+
+    skip_logs = list(Path(tmp_dir).glob("*-skip-*.log"))
+    assert len(skip_logs) == 1, skip_logs
+    content = skip_logs[0].read_text(encoding="utf-8")
+    assert "codex:gpt-5.6-terra" in content
+    assert "codex: `codex` CLI not found on PATH" in content
+
+
+def test_skip_log_names_quota_exhaustion_not_unavailable_reason_unknown():
+    """review-cli#469's headline case, and the exact convergent finding three
+    independent reviews of this branch (opencode/GLM, opencode/Grok, omp/Opus) raised:
+    a seat that is fully LIVE (key/CLI present, no availability-check failure at all)
+    but sits at >=100% usage gets dropped from BOTH pool and reserve by the SAME
+    `< 100.0` reserve filter as `test_skip_log_written_for_a_hard_unavailable_seat_padded_over`
+    -- but `backend_unavailable_reason` never inspects usage, so without threading
+    `usage_percent` through, this exact case (the "где glm5.2?!" incident) was durably
+    misrecorded as `reason=unavailable (reason unknown)`, hiding the one cause this
+    record's entire purpose is to surface."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    ]
+
+    def _usage(model: str) -> float | None:
+        return 100.0 if model == "codex:gpt-5.6-terra" else 0.0
+
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        board, 3, lambda _r: True, usage_percent=_usage
+    )
+    # Confirms the scenario: pool padded back to full size, Codex excluded from both
+    # (the reserve `< 100.0` filter, config.py:1028) despite being fully reachable.
+    assert len(pool) == 3
+    assert all(r.model != "codex:gpt-5.6-terra" for r in pool)
+    assert all(r.model != "codex:gpt-5.6-terra" for r in reserve)
+
+    # Codex is fully LIVE -- no availability-check failure at all.
+    saved = _patched_reason({})
+    tmp_dir = tempfile.mkdtemp()
+    saved_env = os.environ.get("REVIEW_LOG_DIR")
+    os.environ["REVIEW_LOG_DIR"] = tmp_dir
+    try:
+        review_mod._write_skip_logs_for_unavailable_seats(
+            board, pool, reserve, usage_percent=_usage
+        )
+    finally:
+        review_mod.backend_unavailable_reason = saved
+        if saved_env is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_env
+
+    skip_logs = list(Path(tmp_dir).glob("*-skip-*.log"))
+    assert len(skip_logs) == 1, skip_logs
+    content = skip_logs[0].read_text(encoding="utf-8")
+    assert "codex:gpt-5.6-terra" in content
+    assert "usage 100.0% (quota exhausted)" in content, content
+    assert "reason unknown" not in content, content
+
+
+def test_skip_log_not_written_for_a_pool_or_reserve_seat():
+    """A seat that IS selected into the pool or reserve made a real backend call (or
+    is queued to) -- it must not get a spurious skip-log entry."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+        BoardReviewer("omp:kimi-code/k3", "general", "k3"),
+    ]
+    pool = [board[0], board[1]]
+    reserve = [board[2]]
+
+    tmp_dir = tempfile.mkdtemp()
+    saved_env = os.environ.get("REVIEW_LOG_DIR")
+    os.environ["REVIEW_LOG_DIR"] = tmp_dir
+    try:
+        review_mod._write_skip_logs_for_unavailable_seats(board, pool, reserve)
+    finally:
+        if saved_env is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_env
+
+    assert list(Path(tmp_dir).glob("*-skip-*.log")) == []
+    # log_dir() itself resolves under the same REVIEW_LOG_DIR override -- confirms
+    # this test is actually exercising the real `process.log_dir()` path, not some
+    # other directory.
+    os.environ["REVIEW_LOG_DIR"] = tmp_dir
+    try:
+        assert process_mod.log_dir() == Path(tmp_dir)
+    finally:
+        if saved_env is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_env
+
+
+def test_skip_log_not_written_for_a_re_lensed_dispatched_seat():
+    """The selector re-lenses a picked seat that repeats an earlier role onto a free
+    board role by returning a `replace()` copy, so the board original is in neither
+    `pool` nor `reserve` by identity. That seat still ran and must not be logged as
+    skipped; only the genuinely unavailable seat is."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-5.6-astra", "consistency", "Astra"),
+        BoardReviewer("codex:gpt-5.6-sol", "consistency", "Sol"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    ]
+
+    def _available(seat: BoardReviewer) -> bool:
+        return seat.model != "claude:claude-fable-5"
+
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        board, 3, _available, usage_percent=lambda _m: 0.0
+    )
+    # Confirms the re-lens path fired: Sol runs under Fable's free `architect` lens as
+    # a copy, so the board's Sol object is absent from both lists by identity.
+    assert any(r.model == "codex:gpt-5.6-sol" and r.role == "architect" for r in pool)
+    assert all(r is not board[2] for r in [*pool, *reserve])
+
+    saved = _patched_reason(
+        {"claude:claude-fable-5": "claude: no `claude` CLI on PATH"}
+    )
+    tmp_dir = tempfile.mkdtemp()
+    saved_env = os.environ.get("REVIEW_LOG_DIR")
+    os.environ["REVIEW_LOG_DIR"] = tmp_dir
+    try:
+        review_mod._write_skip_logs_for_unavailable_seats(
+            board, pool, reserve, usage_percent=lambda _m: 0.0
+        )
+    finally:
+        review_mod.backend_unavailable_reason = saved
+        if saved_env is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = saved_env
+
+    skip_logs = list(Path(tmp_dir).glob("*-skip-*.log"))
+    assert len(skip_logs) == 1, skip_logs
+    content = skip_logs[0].read_text(encoding="utf-8")
+    assert "claude:claude-fable-5" in content, content
+    assert "codex:gpt-5.6-sol" not in content, content
+
+
 TESTS = [
     test_shortfall_warning_fires_and_names_the_missing_seat,
     test_shortfall_warning_silent_when_pool_meets_target,
@@ -412,6 +598,10 @@ TESTS = [
     test_shortfall_warning_wired_to_real_selector_output,
     test_shortfall_warning_wired_to_real_selector_output_with_nonempty_reserve,
     test_shortfall_notice_fires_through_the_real_mode_review_board_call_site,
+    test_skip_log_written_for_a_hard_unavailable_seat_padded_over,
+    test_skip_log_names_quota_exhaustion_not_unavailable_reason_unknown,
+    test_skip_log_not_written_for_a_pool_or_reserve_seat,
+    test_skip_log_not_written_for_a_re_lensed_dispatched_seat,
 ]
 
 

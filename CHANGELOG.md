@@ -3,6 +3,15 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.45.1 — 2026-10-08
+
+- **Fix(review): durable skip log for board seats dropped before dispatch**
+  ([review-cli#469](https://git.hyperide.ai/ultrabricks/review-cli/issues/469)). A seat
+  removed from both the pool and the reserve (backend unavailable, or a live seat at
+  ≥100% usage) never reached a backend call, so no per-call log was written. Every such
+  seat now gets a `write_skip_log` entry with its reason (`usage N% (quota exhausted)`
+  for quota drops), even when seat reuse padded the pool back to size.
+
 ## 0.45.0 — 2026-10-08
 
 - **Fix(seat cooldown): recognise the "Weekly/Monthly Limit Exhausted. Your limit will reset

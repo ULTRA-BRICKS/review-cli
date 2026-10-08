@@ -59,7 +59,7 @@ from ..panel import (
     result_is_usable,
     run_board_with_failover,
 )
-from ..process import _run, git_repo_env
+from ..process import _run, git_repo_env, write_skip_log
 from ..retry import retry_default, run_seat_with_retry
 from . import _visual_images
 from .contract import ModeContext, ModeSpec
@@ -953,6 +953,55 @@ def _report_role_shortfall(outcome, *, json_output: bool = False) -> None:
     print("\n".join(lines), file=sys.stderr if json_output else sys.stdout, flush=True)
 
 
+def _write_skip_logs_for_unavailable_seats(
+    board: list[BoardReviewer],
+    pool: list[BoardReviewer],
+    reserve: list[BoardReviewer],
+    usage_percent: Callable[[str], float | None] | None = None,
+) -> None:
+    """Durable per-seat trail for every board seat dropped from BOTH `pool` and
+    `reserve` BEFORE dispatch (review-cli#469) -- no backend call is ever made for
+    that seat, so none of the normal per-call log paths (`process.write_retry_log`
+    included) ever run either, leaving zero trace on disk.
+
+    Unconditional -- unlike `_report_pool_shortfall`'s stdout notice (which returns
+    early once the pool is padded back up to its requested size via seat reuse), this
+    durable log fires for every dropped seat regardless of whether padding later hid
+    the gap from stdout. A seat that IS selected into the pool or reserve (matched by
+    object identity, same as `_report_pool_shortfall`) produces no skip-log entry.
+
+    `usage_percent`, when given (the caller's real reuse-aware selection closure --
+    see `_mode_review_board`), covers the case `backend_unavailable_reason` cannot:
+    a seat that is fully LIVE (key/CLI present, paid) but sits at >=100% usage.
+    `select_pool_and_reserve_with_reuse` drops that seat from reserve too
+    (config.py's `< 100.0` filter) even though the availability probe never
+    consulted usage and reports no reason at all -- three independent reviews of
+    this branch (opencode/GLM, opencode/Grok, omp/Opus) converged on this exact
+    gap: without this check every quota-exhausted skip -- the "где glm5.2?!"
+    incident this whole feature exists to make legible -- was durably logged as
+    the misleading `reason=unavailable (reason unknown)`, silently mislabeling the
+    one cause this record's entire purpose is to surface. Checked ONLY when
+    `backend_unavailable_reason` itself found nothing (a real availability failure
+    always takes priority as the more specific, more actionable cause).
+
+    A seat the selector re-lensed or padded is returned as a `replace(seat, role=...)`
+    copy, so its board original matches neither `pool` nor `reserve` by identity even
+    though it was dispatched. A board seat equal to a live seat in every field but
+    `role` therefore also counts as live; otherwise a dispatched model would be logged
+    as `unavailable (reason unknown)`."""
+    live = [*pool, *reserve]
+    live_ids = {id(r) for r in live}
+    for r in board:
+        if id(r) in live_ids or any(replace(s, role=r.role) == r for s in live):
+            continue
+        reason = backend_unavailable_reason(r.model)
+        if reason is None and usage_percent is not None:
+            pct = usage_percent(r.model)
+            if pct is not None and pct >= 100.0:
+                reason = f"usage {pct:.1f}% (quota exhausted)"
+        write_skip_log(r.model, reason or "unavailable (reason unknown)")
+
+
 def _report_pool_shortfall(
     board: list[BoardReviewer],
     pool: list[BoardReviewer],
@@ -1815,6 +1864,9 @@ def _mode_review_board(
             pool_size,
             _chain_aware_available,
             usage_percent=usage_percent,
+        )
+        _write_skip_logs_for_unavailable_seats(
+            board, pool, reserve, usage_percent=usage_percent
         )
         _warn_if_board_reused(board, pool)
         _report_pool_shortfall(

@@ -1473,6 +1473,53 @@ def write_retry_log(
     return path
 
 
+# Same collision concern as `_RETRY_LOG_SEQ_LOCK` above, kept as a separate counter so a
+# burst of skip events doesn't perturb retry-log sequence numbers (and vice versa).
+_SKIP_LOG_SEQ_LOCK = threading.Lock()
+_skip_log_seq = 0
+
+
+def _next_skip_log_seq() -> int:
+    global _skip_log_seq
+    with _SKIP_LOG_SEQ_LOCK:
+        _skip_log_seq += 1
+        return _skip_log_seq
+
+
+def write_skip_log(model: str, reason: str) -> Path:
+    """Durably record ONE board seat dropped BEFORE dispatch (review-cli#469).
+
+    `config.select_pool_and_reserve_with_reuse` drops a seat that fails its
+    pre-dispatch availability check (no key/CLI, an unpaid/paywalled provider mark,
+    an exhausted provider chain) OR sits at >=100% usage (quota exhausted, per
+    `usage_percent`) from BOTH the pool and the reserve. Because no backend function
+    is ever called for that seat, none of the normal per-call log paths run either --
+    `write_retry_log` included -- so the seat vanishes with zero trace on disk. This
+    writes a small `{stamp}-{backend}-skip-{seq}.log` sidecar under `log_dir()`, the
+    one durable record left for that case. `reason` is caller-supplied -- see
+    `modes.review._write_skip_logs_for_unavailable_seats`, which distinguishes a hard
+    availability failure from a quota-exhaustion drop before calling this (does NOT
+    consult `seat_cooldown`, which selection-time availability never checks either).
+
+    File perms 0600, matching `write_retry_log`. Best-effort: any OS error is
+    swallowed (a log we couldn't write must never break the review) --
+    durability is a goal, not a gate."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    seq = _next_skip_log_seq()
+    path = log_dir() / f"{stamp}-{_safe_backend(model)}-skip-{seq:04d}.log"
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"[review-cli] SKIP-EVENT model={model} reason={reason}\n")
+    except OSError as exc:  # noqa: BLE001 - a log we can't write must not break the review
+        print(
+            f"[review-cli] could not write skip log ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+    return path
+
+
 def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     """Best-effort terminate→kill of the child's whole process group.
 
