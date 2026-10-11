@@ -226,12 +226,38 @@ the same turn: create or link the task, state the owner/next command, and start 
 independent investigation that can run in parallel. A caveat without a ticket or first
 action is not a status report; it is dropped work.
 
+## Heavy work runs on Runpod
+
+This workstation is shared by many agent sessions, the review queue and the owner's own
+desktop; a full suite here starves all of them (it froze the machine twice on 2026-10-10).
+**Rule: locally, a single test file at most; the full suite goes to a Runpod pod** via the
+shared `runpod-offload` skill (`skill://runpod-offload`; script
+`~/.agents/skills/runpod-offload/runpod-run`, on PATH as `runpod-run`).
+
+Heavy here: `python tests/smoke.py` / `pytest tests/smoke.py` (the whole suite, every
+`tests/test_*.py` plus the subprocess smoke assertions).
+
+```bash
+runpod-run --apt imagemagick,nodejs -- bash -c 'uv sync --extra test -q && uv run python tests/smoke.py'
+                                        # the suite as CI runs it, on a 4-vCPU CPU pod ($0.16/h on 2026-10-11; --dry-run shows today's), pod deleted when done
+runpod-run --ttl 30 --apt imagemagick,nodejs -- bash -c 'uv sync --extra test -q && uv run pytest tests/smoke.py -q'
+                                        # same, keeping the pod 30 idle minutes between runs
+pytest tests/test_<one>.py -q           # local: one file, that's the limit
+```
+
+Like CI's stock runner, the pod gets apt's ImageMagick 6 (`convert`), not the v7 `magick` the
+visual-verification suite needs, so that suite self-skips (loudly) there too and the core suite
+runs; a v7 `magick` on the pod would un-skip it (see § Tests).
+`runpod-run --dry-run -- …` prints the plan and price. `runpod-run --status` lists every pod
+on the account; bare `runpod-run --stop` terminates only this repo's pods, `runpod-run --stop
+all` every pod created under this hostname — leave none behind.
+
 ## Tests
 
 CI runs **`python tests/smoke.py`** (this IS the test runner — the ecosystem is Python-only:
 it drives the real `bin/review` CLI via subprocess for the smoke assertions, then runs every
 `tests/test_*.py`). The same file is pytest-collectable (`pytest tests/smoke.py`). Replicate
-it locally:
+it on a Runpod pod (§ Heavy work runs on Runpod — locally, one `tests/test_<one>.py` at most):
 
 ```
 pip install -e '.[test]'      # pyyaml runtime + pillow + pytest (test); ImageMagick `magick` is a system dep
