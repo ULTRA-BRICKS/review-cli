@@ -46,6 +46,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
+        "test_stdin_silent_pipe.py",
         "test_tui_pty.py",
     }
 )
@@ -947,6 +948,10 @@ _UNIT_FILES = [
     # fresh log dir like the other log-touching tests (review-cli#65).
     ("test_signal_reaper_spawn_race.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_detach_jobs.py", {}),
+    # review-cli#613/#516: a silent (or trickling-then-stalled) non-tty stdin must never
+    # park `review` before dispatch. Spawns the real `bin/review` with a socketpair on fd 0
+    # against a throwaway git repo; needs git like the other repo-driving suites.
+    ("test_stdin_silent_pipe.py", {}),
     # Log-dir/log-file sandboxed-write fallback (review-cli#162): a seat must survive an
     # unwritable log location rather than crashing before its backend subprocess spawns.
     ("test_log_dir_fallback.py", {}),

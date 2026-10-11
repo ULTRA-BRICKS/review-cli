@@ -3,6 +3,21 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.45.2 — 2026-10-10
+
+- **Fix(cli): never hang on a silent non-tty stdin**
+  ([review-cli#613](https://git.hyperide.ai/ultrabricks/review-cli/issues/613), dup of
+  [#516](https://git.hyperide.ai/ultrabricks/review-cli/issues/516)). `sys.stdin.read()`
+  ran unconditionally before any dispatch, so a review inheriting an open-but-silent
+  socket/pipe as stdin (an omp eval kernel, a detached `pty=false` session, a hook) sat
+  forever in `unix_stream_data_wait` while holding the host-wide review lock — one such
+  run starved 34 queued reviews. Now `--staged` / `--diff` never read stdin at all (a diff
+  piped in anyway is ignored with a stderr notice), and a verb with no explicit diff source
+  reads stdin with an idle timeout of `$REVIEW_STDIN_WAIT_SECONDS` (default 5; a stall
+  before the first byte or mid-stream) before falling back to the repo diff with one
+  stderr line. `git diff | review diff` is unchanged. Regression:
+  `tests/test_stdin_silent_pipe.py`.
+
 ## 0.45.1 — 2026-10-08
 
 - **Fix(review): durable skip log for board seats dropped before dispatch**

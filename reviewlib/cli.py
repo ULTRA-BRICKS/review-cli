@@ -12,13 +12,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import math
 import os
+import select
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TextIO
+from typing import TYPE_CHECKING, Callable, Literal, TextIO
 
 from . import backends
 from . import jobs
@@ -466,14 +468,226 @@ def _current_diff_files_for_check(cwd: Path) -> list[str] | None:
     return union or None
 
 
-def _read_stdin_if_piped() -> str | None:
-    if sys.stdin.isatty():
+STDIN_WAIT_ENV = "REVIEW_STDIN_WAIT_SECONDS"
+STDIN_WAIT_DEFAULT_SECONDS = 5.0
+_STDIN_CHUNK = 1 << 16
+
+
+def _stdin_wait_seconds() -> float:
+    """How long a non-tty stdin may stay silent before it counts as "nothing piped"
+    (`$REVIEW_STDIN_WAIT_SECONDS`, default `STDIN_WAIT_DEFAULT_SECONDS`). A pipe producer
+    (`git diff | review diff`) delivers its first bytes or EOF within milliseconds, so a
+    few seconds of silence means the writer is a long-lived parent that will never
+    write (review-cli#516/#613). Non-numeric / non-finite -> the default; negative -> 0."""
+    raw = os.environ.get(STDIN_WAIT_ENV)
+    if raw is None or not raw.strip():
+        return STDIN_WAIT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return STDIN_WAIT_DEFAULT_SECONDS
+    if not math.isfinite(value):
+        return STDIN_WAIT_DEFAULT_SECONDS
+    return max(value, 0.0)
+
+
+def _stdin_unusable() -> bool:
+    """True when stdin is absent, already closed, or a tty — nothing to read in any case.
+    A daemonizer may close the Python-level `sys.stdin` (not just redirect fd 0), and
+    `isatty()` on a closed stream raises, so the `closed` check comes first."""
+    stdin = sys.stdin
+    return stdin is None or getattr(stdin, "closed", False) or stdin.isatty()
+
+
+def _stdin_fd() -> int | None:
+    """fd 0 when stdin is a usable, non-tty stream; None otherwise, including a file-like
+    without an fd (a test's StringIO — which cannot block, so the callers read it
+    directly)."""
+    if _stdin_unusable():
         return None
     try:
-        data = sys.stdin.read()
-    except OSError:
+        return sys.stdin.fileno()
+    except (OSError, ValueError, AttributeError):
         return None
-    return data if data else None
+
+
+def _stdin_notice(text: str) -> None:
+    print(f"[review-cli] {text}", file=sys.stderr, flush=True)
+
+
+def _decode_stdin(raw: bytes) -> str:
+    """Decode raw stdin bytes with stdin's encoding, always replacing undecodable bytes:
+    a stray invalid byte in a piped diff must not raise out of `_dispatch` (the stream's
+    own `errors` is normally "strict")."""
+    encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+    return raw.decode(encoding, "replace")
+
+
+# Minimum per-chunk wait on the reader-thread path: `REVIEW_STDIN_WAIT_SECONDS=0` means
+# "only data already waiting counts", and a thread needs a moment to hand over bytes a
+# closed pipe already holds — a 0 s queue wait would race the scheduler and drop them.
+_THREADED_WAIT_FLOOR = 0.1
+
+
+def _read_fd_with_idle_timeout(
+    fd: int, idle: float, *, pollable: bool | None = None
+) -> bytes | None:
+    """Read `fd` to EOF, giving up when it stays silent for `idle` seconds — whether
+    before the first byte or in the middle of the stream (a launcher that writes one
+    greeting byte and then holds the fd open must not park the read any more than a
+    fully silent one). A producer that keeps writing is read to EOF however long the
+    whole stream takes. None = gave up (the notice has been printed); bytes = EOF.
+
+    Chunk-source contract (shared by `_polled_chunks` / `_threaded_chunks`): bytes = a
+    chunk, b"" = EOF, None = idle timeout, OSError raised = the read itself failed. A
+    failed read (ECONNRESET on a socket, say) is NOT EOF: the bytes so far are an
+    incomplete diff, so they are discarded with a notice rather than reviewed.
+
+    `select` cannot poll a non-socket fd on Windows (OSError) and refuses an fd past
+    FD_SETSIZE (ValueError); such an fd is read by a daemon thread handing chunks over a
+    queue, with the SAME idle timeout applied between chunks (`_threaded_chunks`), so no
+    platform keeps the unbounded read. `pollable` forces one path (tests)."""
+    if pollable is None:
+        try:
+            select.select([fd], [], [], 0)
+            pollable = True
+        except (OSError, ValueError):
+            pollable = False
+    next_chunk = _polled_chunks(fd, idle) if pollable else _threaded_chunks(fd, idle)
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = next_chunk()
+        except OSError as exc:
+            got = sum(len(c) for c in chunks)
+            _stdin_notice(
+                f"stdin read failed after {got} bytes ({exc.strerror or exc}) — treating"
+                " it as no piped input."
+            )
+            return None
+        if chunk is None:
+            got = sum(len(c) for c in chunks)
+            arrived = f"only {got} bytes" if got else "nothing"
+            _stdin_notice(
+                f"stdin is not a terminal but {arrived} arrived and it stayed silent for"
+                f" {idle:g}s — treating it as no piped input (tune with {STDIN_WAIT_ENV})."
+            )
+            return None
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _polled_chunks(fd: int, idle: float) -> Callable[[], bytes | None]:
+    """Chunk source over `select` (contract in `_read_fd_with_idle_timeout`)."""
+
+    def _next() -> bytes | None:
+        ready, _, _ = select.select([fd], [], [], idle)
+        if not ready:
+            return None
+        return os.read(fd, _STDIN_CHUNK)
+
+    return _next
+
+
+def _threaded_chunks(fd: int, idle: float) -> Callable[[], bytes | None]:
+    """Chunk source for an unpollable fd: a daemon thread blocks in `os.read` and hands
+    each chunk (or the OSError it hit) over a queue; the caller waits at most `idle`
+    (floored at `_THREADED_WAIT_FLOOR`) per chunk. Once the caller gives up, the thread
+    stops at its next wakeup instead of draining the stream for the life of the process
+    (no unbounded buffer, and the writer sees backpressure)."""
+    import queue
+    import threading
+
+    handoff: queue.Queue[bytes | OSError] = queue.Queue()
+    stop = threading.Event()
+    wait = max(idle, _THREADED_WAIT_FLOOR)
+
+    def _drain() -> None:
+        while not stop.is_set():
+            try:
+                item: bytes | OSError = os.read(fd, _STDIN_CHUNK)
+            except OSError as exc:
+                item = exc
+            if stop.is_set():
+                return
+            handoff.put(item)
+            if not isinstance(item, bytes) or not item:
+                return
+
+    threading.Thread(target=_drain, name="review-stdin", daemon=True).start()
+
+    def _next() -> bytes | None:
+        try:
+            item = handoff.get(timeout=wait)
+        except queue.Empty:
+            stop.set()
+            return None
+        if isinstance(item, OSError):
+            raise item
+        return item
+
+    return _next
+
+
+def _read_stdin_if_piped() -> str | None:
+    """Return the diff piped on stdin, or None when stdin is a tty / empty / silent.
+
+    The read is BOUNDED (review-cli#516, #613): an inherited non-tty stdin whose writer
+    stays open but never writes (an omp eval kernel's socket, a detached launcher's pipe,
+    `pty=false` agent sessions) used to park `sys.stdin.read()` forever — before any
+    dispatch, log or heartbeat, while holding the host-wide review lock. Now the fd is
+    read with an idle timeout of `_stdin_wait_seconds()` between bytes
+    (`_read_fd_with_idle_timeout`); a stall -> one stderr line and "nothing piped"."""
+    if _stdin_unusable():
+        return None
+    fd = _stdin_fd()
+    if fd is None:
+        # No fd to poll: a file-like substituted for stdin (tests use StringIO). Such an
+        # object cannot block on a pipe, so the plain read is safe here.
+        try:
+            data = sys.stdin.read()
+        except OSError:
+            return None
+        return data if data else None
+    raw = _read_fd_with_idle_timeout(fd, _stdin_wait_seconds())
+    if not raw:
+        return None
+    return _decode_stdin(raw)
+
+
+def _warn_if_stdin_ignored(source_flag: str, what: str) -> None:
+    """With an explicit `--staged` / `--diff` source, stdin is never read — but a caller
+    who piped a diff anyway (`git show X | review diff --staged`) must hear that it was
+    ignored rather than silently get a review of the index. A zero-timeout poll plus a
+    one-byte read tells data (warn) apart from EOF (`< /dev/null`, `true |`: silent)
+    without ever blocking; the byte is discarded like the rest of the stream."""
+    fd = _stdin_fd()
+    if fd is None:
+        return
+    try:
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            return
+        peek = os.read(fd, 1)
+    except (OSError, ValueError):
+        return
+    if peek:
+        _stdin_notice(
+            f"ignoring piped stdin: {source_flag} names the diff source, so the {what}"
+            " diff is reviewed."
+        )
+
+
+def _explicit_diff_source(args: argparse.Namespace) -> tuple[str, str] | None:
+    """`(flag, what)` for an explicitly named diff source — `("--staged", "staged")` or
+    `("--diff", "working-tree")` — or None when the verb may take a diff from stdin.
+    The top-level parser (no subcommand) defines neither flag, hence `getattr`."""
+    if getattr(args, "staged", False):
+        return "--staged", "staged"
+    if getattr(args, "diff", False):
+        return "--diff", "working-tree"
+    return None
 
 
 def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
@@ -4089,9 +4303,10 @@ def _detached_child_stdin() -> int:
     in the parent and spooled it to a file for the child. That blocked the parent —
     the very process `--detach` promises returns at once — whenever a caller's stdin
     was a non-tty pipe held OPEN with nothing in it (agent tool wrappers, pre-commit
-    hooks: the feature's own audience). The synchronous path reads stdin
-    unconditionally for every review mode (a piped diff wins even under `--staged`,
-    see `_dispatch`), so the only way to keep the child's input IDENTICAL to a
+    hooks: the feature's own audience). The synchronous path reads stdin for every
+    verb without an explicit `--staged`/`--diff` source (bounded by
+    `$REVIEW_STDIN_WAIT_SECONDS`, see `_read_stdin_if_piped` / `_dispatch`), so the
+    only way to keep the child's input IDENTICAL to a
     synchronous run without the parent ever reading is to hand it the same fd: the
     pipe's writer stays open until the CHILD reads to EOF, the parent never touches
     it. A tty stdin is never inherited — a session-detached background process
@@ -4857,6 +5072,14 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
                                           <= 0 disables it. See the bold "Diff size cap"
                                           paragraph in README.md's "Diff review" section.
+    REVIEW_STDIN_WAIT_SECONDS=N         — idle timeout for a non-tty stdin (default 5). A
+                                          verb with no explicit diff source (`git diff |
+                                          review diff`) reads stdin to EOF but gives up
+                                          once it stays silent for N s (before the first
+                                          byte or mid-stream): one stderr line, then the
+                                          repo diff as usual. `--staged` / `--diff` never
+                                          read stdin (a diff piped in anyway is ignored
+                                          with a notice). 0 = only data already waiting.
     REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
                                           chronically-unavailable claude seat (Fable).
                                           opencode also consults + records + clears
@@ -5991,7 +6214,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
             ),
         )
 
-    piped_input = _read_stdin_if_piped()
+    # `--staged` / `--diff` name the diff source explicitly (the git index / the working
+    # tree), so stdin is never read for them (review-cli#613): `review diff --staged` from
+    # a launcher with an inherited, silent non-tty stdin must start reviewing immediately.
+    # A diff piped in anyway earns one "ignoring piped stdin" line (`_warn_if_stdin_
+    # ignored`, a non-blocking peek). Only a verb with no explicit source reads a piped
+    # diff (`git diff | review diff`), and that read is bounded.
+    explicit_source = _explicit_diff_source(args)
+    if explicit_source is not None:
+        _warn_if_stdin_ignored(*explicit_source)
+        piped_input = None
+    else:
+        piped_input = _read_stdin_if_piped()
     task_code: str | None = None
     requires_task_code = is_subcommand and (
         mode.name != "visual"
@@ -6413,10 +6647,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # pipeline — so we MUST still try to discover it, but a missing diff / non-repo must
     # degrade to standalone rather than abort.
     diff = piped_input
-    # A piped diff is NOT the git index, so it must not satisfy the staged commit gate
-    # even under `--staged` (the stamp/marker mean "the staged index was reviewed", and
-    # `printf ... | review --staged` reviews arbitrary stdin, not `git diff --cached`).
-    # Record the provenance so the review handler can suppress the stamp/marker for it.
+    # A piped diff is NOT the git index, so it must not satisfy the staged commit gate:
+    # the CLI never reads stdin under `--staged` (review-cli#613), but the mode handler
+    # is also a library entry point, so it records the provenance and suppresses the
+    # stamp/marker for a stdin diff on its own (`diff_from_stdin`).
     diff_from_stdin = diff is not None
     # brainstorm treats the diff as OPTIONAL grounding context even with --staged/--diff,
     # so it must NOT take the hard-fail `needs_diff` path: a non-repo `-C` or a failing
