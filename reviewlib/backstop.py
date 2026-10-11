@@ -29,6 +29,11 @@ Design:
     wall-clock bound: an explicit `review just-ask --timeout N` kills every seat call at
     N (`process.set_run_deadline`) and fires this watchdog, with a seat report instead of
     the generic line, at N + `COMMAND_TIMEOUT_GRACE_SECONDS`.
+  * Time a run spends QUEUED for host-wide admission (`exempt_from_backstop`,
+    reviewlib.admission) does not count against the run backstop: the old external
+    `flock` wrapper queued before the process even started, and a long queue is not a
+    wedged run. An explicit `--timeout N` (`command_deadline`) stays a pure wall-clock
+    bound that includes any queueing.
 """
 
 from __future__ import annotations
@@ -201,12 +206,50 @@ def _fire(seconds: int, stream, announce: Callable[[], str] | None = None) -> No
     os._exit(BACKSTOP_EXIT_CODE)
 
 
+# Admission-queue time exempt from the run backstop (see the module doc). `_exempt_total`
+# is the wall-clock seconds during which AT LEAST ONE exempt wait was in progress (the
+# union of the intervals: parallel seats waiting at once count once, not once per seat);
+# `_exempt_active` counts waits in progress and `_exempt_since` is when the current busy
+# stretch began. A watchdog that comes due re-arms for its budget minus the non-exempt
+# time used so far, and re-checks every `_EXEMPT_RECHECK_SECONDS` while a wait is open.
+_exempt_lock = threading.Lock()
+_exempt_total = 0.0
+_exempt_active = 0
+_exempt_since = 0.0
+_EXEMPT_RECHECK_SECONDS = 60.0
+
+
+@contextmanager
+def exempt_from_backstop() -> Iterator[None]:
+    """Time spent inside this block does not count against `run_backstop`."""
+    global _exempt_total, _exempt_active, _exempt_since
+    with _exempt_lock:
+        if _exempt_active == 0:
+            _exempt_since = time.monotonic()
+        _exempt_active += 1
+    try:
+        yield
+    finally:
+        with _exempt_lock:
+            _exempt_active -= 1
+            if _exempt_active == 0:
+                _exempt_total += time.monotonic() - _exempt_since
+
+
+def _exempt_seconds() -> tuple[float, bool]:
+    """Exempt seconds so far (including an open wait) and whether one is open now."""
+    with _exempt_lock:
+        open_part = time.monotonic() - _exempt_since if _exempt_active else 0.0
+        return _exempt_total + open_part, _exempt_active > 0
+
+
 @contextmanager
 def run_backstop(
     seconds: int | None = None,
     *,
     stream=None,
     announce: Callable[[], str] | None = None,
+    exempt_waits: bool = True,
 ) -> Iterator[None]:
     """Arm the internal run backstop for the duration of the `with` block.
 
@@ -216,6 +259,8 @@ def run_backstop(
     the process alive on its own. Re-entrant-safe enough for the single top-level
     `main()` use it is built for, plus one nested `command_deadline`. `announce`, if
     given, builds the line printed on fire instead of the generic backstop notice.
+    With `exempt_waits` (the default) the deadline is pushed back by every second the
+    block spends in `exempt_from_backstop` (host-wide admission queueing).
     """
     secs = (
         backstop_seconds()
@@ -223,13 +268,44 @@ def run_backstop(
         else max(1, min(int(seconds), MAX_BACKSTOP_SECONDS))
     )
     out = stream if stream is not None else sys.stderr
-    timer = threading.Timer(secs, _fire, args=(secs, out, announce))
-    timer.daemon = True
-    timer.start()
+    guard = threading.Lock()
+    started = time.monotonic()
+    state: dict = {
+        "timer": None,
+        "done": False,
+        "exempt_at_start": _exempt_seconds()[0],
+    }
+
+    def _arm(delay: float) -> None:
+        timer = threading.Timer(delay, _due)
+        timer.daemon = True
+        state["timer"] = timer
+        timer.start()
+
+    def _due() -> None:
+        with guard:
+            if state["done"]:
+                return
+            if exempt_waits:
+                exempt, waiting = _exempt_seconds()
+                used = time.monotonic() - started - (exempt - state["exempt_at_start"])
+                remaining = secs - used
+                if remaining > 0:
+                    # `used` is frozen while a wait is open, so the budget cannot run
+                    # out then: recheck on a fixed period instead of re-arming for a
+                    # possibly tiny `remaining` over and over.
+                    _arm(_EXEMPT_RECHECK_SECONDS if waiting else remaining)
+                    return
+        _fire(secs, out, announce)
+
+    with guard:
+        _arm(secs)
     try:
         yield
     finally:
-        timer.cancel()
+        with guard:
+            state["done"] = True
+            state["timer"].cancel()
 
 
 # review-cli#587: grace the whole command gets past an explicit `review just-ask
@@ -259,6 +335,7 @@ def command_deadline(seconds: int, *, command: str, stream=None) -> Iterator[Non
             seconds + grace,
             stream=stream,
             announce=lambda: _seat_report(command, seconds, grace, started),
+            exempt_waits=False,
         ):
             yield
     finally:

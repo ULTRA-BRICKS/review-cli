@@ -75,6 +75,17 @@ ever does harm here: it kills good runs before their synthesis and adds nothing 
 internal backstop doesn't already guarantee. `$REVIEW_BACKSTOP_SECONDS` can only LOWER
 the internal ceiling, never raise it past 4h.
 
+## Parallel reviews are admitted host-wide — never add your own lock
+Do NOT wrap `review` in `flock` or any slot script. `review` itself runs as many
+reviews in parallel as the machine and the AI providers can sustain with a 20% margin
+(review-cli#614): a run starts once host CPU/RAM stay within budget, each seat waits for
+a slot of its provider, and a 429 lowers that provider's limit for a while. A queued run
+prints `[review] admission: waiting — queue position P/N, ...; ETA ~T` on stderr and
+starts automatically — that is normal, keep waiting (queue time does not count toward the
+4h backstop). `review jobs` shows every running/waiting review on the host. Tuning
+(headroom, per-seat cost, min/max slots, per-provider limits): `admission:` in
+config.yaml or `REVIEW_ADMISSION_*` env, documented in `review help config`.
+
 ## Invocation — modes are SUBCOMMANDS
 Everything is a subcommand: the diff review is `review diff` (NOT a bare `review`). A bare
 `review` prints the help. The other modes: `brainstorm` / `just-ask` / `quorum`.

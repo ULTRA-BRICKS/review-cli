@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.46.0 — 2026-10-10
+
+- **Feat(admission): run reviews in parallel up to machine and provider capacity with a
+  20% margin** ([review-cli#614](https://git.hyperide.ai/ultrabricks/review-cli/issues/614)).
+  Replaces the host-wide single `flock` / fixed 3-slot wrapper with an admission controller
+  inside `review`. A run starts (FIFO) only while projected host CPU (load average + young
+  runs' estimates + its own) and RAM stay within `(1 - headroom)` of capacity; the per-run
+  estimate is learned from measured runs. Each seat call holds a slot of its provider
+  (`floor(max_concurrent × (1 - headroom))`, optional requests/minute); a 429/overload reply
+  halves that provider's limit for a cooldown, and a seat saturated past
+  `provider_wait_seconds` fails over like an unavailable seat. Leases are flock-held files
+  (a killed holder is reclaimed at once, a stale heartbeat stops counting; a process stopped
+  or gone while holding the shared `registry.lock` past `lock_stale_seconds` gets its lock
+  replaced, and no waiter blocks on it past `lock_wait_seconds`); stderr shows queue
+  position + ETA; `review jobs` / `review jobs --slots [--json]` / bare `review status` show
+  running and waiting reviews and provider seats. Every parameter is configurable via
+  `admission:` in config.yaml and `REVIEW_ADMISSION_*` env (`review help config`). Queue time
+  is excluded from run stats and from the internal backstop, but counts toward an explicit
+  `just-ask --timeout N` (a run still queued at N exits 124); a `--visual` companion run is
+  admitted against its full text panel. Callers still wrapping `review` in
+  `flock -o /tmp/review-cli.lock` keep working.
+
 ## 0.45.2 — 2026-10-10
 
 - **Fix(cli): never hang on a silent non-tty stdin**

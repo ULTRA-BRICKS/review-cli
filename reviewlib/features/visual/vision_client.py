@@ -36,6 +36,7 @@ Fail-closed: if no vision-capable backend is reachable, `call_ai_vision` returns
 `VisionVerdict` with `available=False` so the policy engine emits `unverified` (never a
 silent text-only keep).
 """
+
 from __future__ import annotations
 
 import base64
@@ -128,14 +129,24 @@ class VisionCapability:
 # attaches the image and routes to whatever model is named). The user selects a vision
 # model with `oc:<provider>/<vision-model>`.
 _CAPABILITIES: dict[str, VisionCapability] = {
-    "claude": VisionCapability(True, True, 5 * 1024 * 1024, 1568, "claude-cli", live_dispatch=True),
-    "gemini": VisionCapability(True, True, 7 * 1024 * 1024, 1568, "gemini", live_dispatch=True),
-    "codex": VisionCapability(True, True, 20 * 1024 * 1024, 1568, "codex-cli", live_dispatch=True),
-    "opencode": VisionCapability(True, True, 20 * 1024 * 1024, 1568, "opencode-cli", live_dispatch=True),
+    "claude": VisionCapability(
+        True, True, 5 * 1024 * 1024, 1568, "claude-cli", live_dispatch=True
+    ),
+    "gemini": VisionCapability(
+        True, True, 7 * 1024 * 1024, 1568, "gemini", live_dispatch=True
+    ),
+    "codex": VisionCapability(
+        True, True, 20 * 1024 * 1024, 1568, "codex-cli", live_dispatch=True
+    ),
+    "opencode": VisionCapability(
+        True, True, 20 * 1024 * 1024, 1568, "opencode-cli", live_dispatch=True
+    ),
 }
 
 
-def effort_for_model(effort_override: "EffortOverride | None", model: str) -> str | None:
+def effort_for_model(
+    effort_override: "EffortOverride | None", model: str
+) -> str | None:
     """The run-scoped effort level for a vision seat (a duck-typed config.EffortOverride),
     or None. Vision seats carry no per-seat config effort, so the run-scoped `--effort` is
     the only source; `effort_for` returns None when nothing is overridden. Shared by the
@@ -175,14 +186,30 @@ _CLI_BINARY = {
 # explicitly allowlisted via $REVIEW_OPENCODE_VISION_MODELS, comma-separated substrings),
 # so `select_vision_backend` never picks the text default for `--visual` (codex P).
 _VISION_MODEL_HINTS = (
-    "vl", "vision", "-v-", "vlm", "pixtral", "llava", "gpt-4o", "gpt-5",
-    "omni", "multimodal", "kimi-k2.7-code", "glm-4.5v", "glm-4.6v", "grok-4.6",
+    "vl",
+    "vision",
+    "-v-",
+    "vlm",
+    "pixtral",
+    "llava",
+    "gpt-4o",
+    "gpt-5",
+    "omni",
+    "multimodal",
+    "kimi-k2.7-code",
+    "glm-4.5v",
+    "glm-4.6v",
+    "grok-4.6",
 )
 
 
 def _opencode_model_is_vision(model: str) -> bool:
     spec = (model.split(":", 1)[1] if ":" in model else model).lower()
-    extra = [s.strip().lower() for s in os.environ.get("REVIEW_OPENCODE_VISION_MODELS", "").split(",") if s.strip()]
+    extra = [
+        s.strip().lower()
+        for s in os.environ.get("REVIEW_OPENCODE_VISION_MODELS", "").split(",")
+        if s.strip()
+    ]
     if any(tok and tok in spec for tok in extra):
         return True
     return any(hint in spec for hint in _VISION_MODEL_HINTS)
@@ -382,15 +409,27 @@ def build_gemini_request(system: str, blocks: list[VisionBlock], schema: dict) -
             label = _label_text(b)
             if label:
                 parts.append({"text": label})
-            parts.append({"inline_data": {"mime_type": b.media_type or "image/png", "data": b.data_base64 or ""}})
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": b.media_type or "image/png",
+                        "data": b.data_base64 or "",
+                    }
+                }
+            )
     return {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"response_mime_type": "application/json", "response_schema": _gemini_schema(schema)},
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": _gemini_schema(schema),
+        },
     }
 
 
-def build_request(model: str, system: str, blocks: list[VisionBlock], schema: dict) -> tuple[str, dict]:
+def build_request(
+    model: str, system: str, blocks: list[VisionBlock], schema: dict
+) -> tuple[str, dict]:
     """Return (route, descriptor) for the model's backend. Pure — no subprocess/network.
     For the CLI routes the descriptor records the assembled prompt + image count + schema
     (what the CLI would be invoked with); for Gemini it is the REST body."""
@@ -408,7 +447,16 @@ def build_request(model: str, system: str, blocks: list[VisionBlock], schema: di
 # Gemini's response_schema is an OpenAPI-3 subset, NOT full JSON-schema: it rejects
 # `additionalProperties`, string `maxLength`, array `maxItems`, etc. Sanitize the shared
 # schema down to the keys Gemini accepts so the same VISION_VERDICTS schema serves it.
-_GEMINI_SCHEMA_KEYS = {"type", "properties", "items", "required", "enum", "nullable", "format", "description"}
+_GEMINI_SCHEMA_KEYS = {
+    "type",
+    "properties",
+    "items",
+    "required",
+    "enum",
+    "nullable",
+    "format",
+    "description",
+}
 
 
 def _gemini_schema(schema: dict) -> dict:
@@ -454,13 +502,27 @@ def parse_structured(data: dict, *, backend: str | None = None) -> VisionVerdict
     policy engine re-validates; this only marshals. Invalid verdict enum → None so the
     policy engine fails closed."""
     if not isinstance(data, dict):
-        return VisionVerdict(available=True, verdict=None, error="output is not an object", backend=backend)
+        return VisionVerdict(
+            available=True,
+            verdict=None,
+            error="output is not an object",
+            backend=backend,
+        )
     verdict = data.get("verdict")
     if verdict not in VISION_VERDICTS:
         verdict = None
     module_answers = {
-        k: v for k, v in data.items()
-        if k not in {"verdict", "confidence", "observed_change_regions", "defects", "injection_suspected", "note"}
+        k: v
+        for k, v in data.items()
+        if k
+        not in {
+            "verdict",
+            "confidence",
+            "observed_change_regions",
+            "defects",
+            "injection_suspected",
+            "note",
+        }
     }
     return VisionVerdict(
         available=True,
@@ -566,31 +628,88 @@ def call_ai_vision(
     `--effort`, opencode `--variant`).
     """
     if model is None:
-        return VisionVerdict(available=False, verdict=None, error="no vision-capable backend configured")
+        return VisionVerdict(
+            available=False, verdict=None, error="no vision-capable backend configured"
+        )
     cap = capability_for(model)
     if cap is None:
-        return VisionVerdict(available=False, verdict=None, error=f"backend {model} is not vision-capable")
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error=f"backend {model} is not vision-capable",
+        )
     from ... import backends
 
     if backends.runtime_provider_marked_unpaid(model):
-        return VisionVerdict(available=False, verdict=None, error=backends.runtime_unpaid_provider_error(model), backend=model)
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error=backends.runtime_unpaid_provider_error(model),
+            backend=model,
+        )
 
     schema = output_schema or build_output_schema()
     sys_prompt = system or _SYSTEM_PROMPT
 
-    if cap.wire == "gemini":
+    # Each vision call holds a slot of its provider's host-wide budget and feeds a
+    # 429/overload back into it, like a text seat (reviewlib.admission, review-cli#614).
+    from ... import admission
+
+    with admission.seat_slot(model) as denied:
+        if denied is not None:
+            # Denied because an explicit --timeout passed while queued: still a timeout
+            # (exit 124), not a generic unavailable backend.
+            from ...process import run_deadline_expired
+
+            return VisionVerdict(
+                available=False,
+                verdict=None,
+                error=denied,
+                backend=model,
+                timed_out=run_deadline_expired(),
+            )
+        verdict = _dispatch_vision(
+            cap.wire, model, sys_prompt, blocks, schema, timeout_s, effort
+        )
+    # A failed call (HTTP error, non-zero CLI exit) may still report available=True with
+    # no verdict; any failure text is checked for a provider throttle.
+    if verdict.verdict is None:
+        admission.note_failure_text(model, verdict.error)
+    return verdict
+
+
+def _dispatch_vision(
+    wire, model, sys_prompt, blocks, schema, timeout_s, effort
+) -> VisionVerdict:
+    # An explicit `just-ask --timeout N` is armed before the admission wait, so time spent
+    # queued shrinks what is left for the call itself: never give a transport (the Gemini
+    # HTTP request has no other deadline) more than the command has left.
+    from ...process import run_deadline_remaining
+
+    remaining = run_deadline_remaining()
+    if remaining is not None:
+        if remaining <= 0:
+            return VisionVerdict(
+                available=False,
+                verdict=None,
+                error="--timeout reached before the vision call",
+                backend=model,
+                timed_out=True,
+            )
+        timeout_s = max(1, min(timeout_s, int(remaining + 0.999)))
+    if wire == "gemini":
         body = build_gemini_request(sys_prompt, blocks, schema)
         return _call_gemini(model, body, timeout_s)
-    if cap.wire == "codex-cli":
+    if wire == "codex-cli":
         return _call_codex_cli(model, sys_prompt, blocks, schema, timeout_s, effort)
-    if cap.wire == "claude-cli":
+    if wire == "claude-cli":
         return _call_claude_cli(model, sys_prompt, blocks, schema, timeout_s, effort)
-    if cap.wire == "opencode-cli":
+    if wire == "opencode-cli":
         return _call_opencode_cli(model, sys_prompt, blocks, schema, timeout_s, effort)
     return VisionVerdict(
         available=False,
         verdict=None,
-        error=f"unknown vision route {cap.wire!r} for backend {model}",
+        error=f"unknown vision route {wire!r} for backend {model}",
         backend=model,
     )
 
@@ -655,20 +774,33 @@ def _stage_images(blocks: list[VisionBlock], tmp: Path) -> list[Path]:
     return paths
 
 
-def _run_cli(argv: list[str], *, cwd: Path, input_text: str | None, timeout_s: int, backend: str) -> tuple[int, str, str, bool]:
+def _run_cli(
+    argv: list[str], *, cwd: Path, input_text: str | None, timeout_s: int, backend: str
+) -> tuple[int, str, str, bool]:
     """Invoke an agent CLI through review's streaming runner (`process._run_streamed`) —
     the SAME runner the text backends use, so the visual path inherits its timeout/kill-
     tree/partial-output guarantees. Returns (returncode, stdout, stderr, timed_out)."""
     from ...process import _run_streamed
 
     proc = _run_streamed(
-        argv, cwd=cwd, input_text=input_text, timeout=timeout_s,
-        backend=backend, timeout_mode="wall",
+        argv,
+        cwd=cwd,
+        input_text=input_text,
+        timeout=timeout_s,
+        backend=backend,
+        timeout_mode="wall",
     )
     return proc.returncode, proc.stdout, proc.stderr, proc.returncode == 124
 
 
-_CORE_SCHEMA_FIELDS = {"verdict", "confidence", "observed_change_regions", "defects", "injection_suspected", "note"}
+_CORE_SCHEMA_FIELDS = {
+    "verdict",
+    "confidence",
+    "observed_change_regions",
+    "defects",
+    "injection_suspected",
+    "note",
+}
 
 
 def _schema_violation(data: dict, schema: dict) -> str | None:
@@ -696,7 +828,13 @@ def _schema_violation(data: dict, schema: dict) -> str | None:
 
 
 def _cli_verdict_from_output(
-    text: str, *, backend: str, returncode: int, stderr: str, timed_out: bool, schema: dict | None = None
+    text: str,
+    *,
+    backend: str,
+    returncode: int,
+    stderr: str,
+    timed_out: bool,
+    schema: dict | None = None,
 ) -> VisionVerdict:
     """Common tail for the CLI routes: parse the structured verdict from the CLI's text
     output, or fail closed. A timeout sets timed_out (→ exit 124); a non-zero exit OR no
@@ -709,48 +847,86 @@ def _cli_verdict_from_output(
     required module field — the CLIs (claude/opencode) only get the schema as a prompt
     instruction, so it must be validated OUTSIDE the model here (codex P2)."""
     if timed_out:
-        return VisionVerdict(available=True, verdict=None, error=f"vision CLI timed out: {backend}", backend=backend, timed_out=True)
+        return VisionVerdict(
+            available=True,
+            verdict=None,
+            error=f"vision CLI timed out: {backend}",
+            backend=backend,
+            timed_out=True,
+        )
     if returncode != 0:
         detail = (stderr or text or "").strip()[:200]
         return VisionVerdict(
-            available=True, verdict=None,
-            error=f"vision CLI exited non-zero (rc={returncode}): {detail}", backend=backend,
+            available=True,
+            verdict=None,
+            error=f"vision CLI exited non-zero (rc={returncode}): {detail}",
+            backend=backend,
         )
     data = _extract_first_json_object(text)
     if data is None:
         detail = (stderr or text or "").strip()[:200]
         return VisionVerdict(
-            available=True, verdict=None,
-            error=f"CLI returned no parseable JSON verdict (rc={returncode}): {detail}", backend=backend,
+            available=True,
+            verdict=None,
+            error=f"CLI returned no parseable JSON verdict (rc={returncode}): {detail}",
+            backend=backend,
         )
     if schema is not None:
         violation = _schema_violation(data, schema)
         if violation is not None:
             return VisionVerdict(
-                available=True, verdict=None,
-                error=f"CLI output violates required schema: {violation}", backend=backend, raw=data,
+                available=True,
+                verdict=None,
+                error=f"CLI output violates required schema: {violation}",
+                backend=backend,
+                raw=data,
             )
     return parse_structured(data, backend=backend)
 
 
-def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int, effort: str | None = None) -> VisionVerdict:
+def _call_codex_cli(
+    model: str,
+    system: str,
+    blocks: list[VisionBlock],
+    schema: dict,
+    timeout_s: int,
+    effort: str | None = None,
+) -> VisionVerdict:
     """codex vision: `codex exec -i <image> --output-schema <schema> -o <out> -`. Mirrors
     review_codex's `codex exec` invocation; adds the image (`-i`) and the forced output
     schema (`--output-schema`, written to <out>). Resolves the codex model from the alias
     suffix the same way review_codex does (`codex:<model>`)."""
     if not shutil.which("codex"):
-        return VisionVerdict(available=False, verdict=None, error="codex CLI not found on PATH", backend=model)
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error="codex CLI not found on PATH",
+            backend=model,
+        )
     codex_model = model.split(":", 1)[1] if ":" in model else None
     with tempfile.TemporaryDirectory(prefix="review-cli-vision-codex-") as tmp_raw:
         tmp = Path(tmp_raw)
         images = _stage_images(blocks, tmp)
         if not images:
-            return VisionVerdict(available=True, verdict=None, error="no image to attach", backend=model)
+            return VisionVerdict(
+                available=True, verdict=None, error="no image to attach", backend=model
+            )
         schema_path = tmp / "schema.json"
         # codex --output-schema enforces OpenAI strict structured outputs; sanitize.
-        schema_path.write_text(json.dumps(_strict_output_schema(schema)), encoding="utf-8")
+        schema_path.write_text(
+            json.dumps(_strict_output_schema(schema)), encoding="utf-8"
+        )
         out_path = tmp / "verdict.json"
-        argv = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "-C", str(tmp), "--ephemeral"]
+        argv = [
+            "codex",
+            "exec",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            str(tmp),
+            "--ephemeral",
+        ]
         if codex_model:
             argv += ["-m", codex_model]
         from ... import backends
@@ -762,43 +938,78 @@ def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: 
             argv += ["-i", str(img)]
         argv += ["--output-schema", str(schema_path), "-o", str(out_path), "-"]
         prompt = f"{system}\n\n{_prompt_text(blocks, schema)}"
-        rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=prompt, timeout_s=timeout_s, backend="codex-vision")
+        rc, stdout, stderr, timed_out = _run_cli(
+            argv,
+            cwd=tmp,
+            input_text=prompt,
+            timeout_s=timeout_s,
+            backend="codex-vision",
+        )
         # codex writes the final structured message to -o; prefer it, fall back to stdout.
         out_text = ""
         try:
             out_text = out_path.read_text(encoding="utf-8")
         except OSError:
             out_text = ""
-        return _cli_verdict_from_output(out_text or stdout, backend=model, returncode=rc, stderr=stderr, timed_out=timed_out, schema=schema)
+        return _cli_verdict_from_output(
+            out_text or stdout,
+            backend=model,
+            returncode=rc,
+            stderr=stderr,
+            timed_out=timed_out,
+            schema=schema,
+        )
 
 
-def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int, effort: str | None = None) -> VisionVerdict:
+def _call_claude_cli(
+    model: str,
+    system: str,
+    blocks: list[VisionBlock],
+    schema: dict,
+    timeout_s: int,
+    effort: str | None = None,
+) -> VisionVerdict:
     """claude vision: reference the image as `@<path>` in the `-p` prompt; the Read tool
     (scoped to the image dir via --add-dir) loads it. Mirrors review_claude's direct
     headless CLI path, but ENABLES Read (vision needs to load the file). `--json-schema`
     forces the verdict shape; `--output-format json` wraps the result field."""
     if not shutil.which("claude"):
-        return VisionVerdict(available=False, verdict=None, error="claude CLI not found on PATH", backend=model)
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error="claude CLI not found on PATH",
+            backend=model,
+        )
     claude_model = model.split(":", 1)[1] if ":" in model else None
     with tempfile.TemporaryDirectory(prefix="review-cli-vision-claude-") as tmp_raw:
         tmp = Path(tmp_raw)
         images = _stage_images(blocks, tmp)
         if not images:
-            return VisionVerdict(available=True, verdict=None, error="no image to attach", backend=model)
+            return VisionVerdict(
+                available=True, verdict=None, error="no image to attach", backend=model
+            )
         refs = "\n".join(f"@{img}" for img in images)
         prompt = f"{_prompt_text(blocks, schema)}\n\nImages to inspect:\n{refs}"
         argv = [
-            "claude", "-p", prompt,
-            "--output-format", "json",
-            "--add-dir", str(tmp),
-            "--permission-mode", "dontAsk",
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            "--add-dir",
+            str(tmp),
+            "--permission-mode",
+            "dontAsk",
             "--strict-mcp-config",
             "--disable-slash-commands",
             "--safe-mode",
             "--no-session-persistence",
-            "--tools", "Read",
-            "--json-schema", json.dumps(_strict_output_schema(schema)),
-            "--append-system-prompt", system,
+            "--tools",
+            "Read",
+            "--json-schema",
+            json.dumps(_strict_output_schema(schema)),
+            "--append-system-prompt",
+            system,
         ]
         if claude_model:
             argv += ["--model", claude_model]
@@ -807,7 +1018,9 @@ def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema:
         claude_effort = backends._claude_reasoning_effort(effort)
         if claude_effort and backends._claude_cli_supports_effort("claude"):
             argv += ["--effort", claude_effort]
-        rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="claude-vision")
+        rc, stdout, stderr, timed_out = _run_cli(
+            argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="claude-vision"
+        )
         # `--output-format json` wraps the answer; the verdict JSON is the `result` field.
         text = stdout
         try:
@@ -816,10 +1029,24 @@ def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema:
                 text = wrapper["result"]
         except json.JSONDecodeError:
             pass
-        return _cli_verdict_from_output(text, backend=model, returncode=rc, stderr=stderr, timed_out=timed_out, schema=schema)
+        return _cli_verdict_from_output(
+            text,
+            backend=model,
+            returncode=rc,
+            stderr=stderr,
+            timed_out=timed_out,
+            schema=schema,
+        )
 
 
-def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int, effort: str | None = None) -> VisionVerdict:
+def _call_opencode_cli(
+    model: str,
+    system: str,
+    blocks: list[VisionBlock],
+    schema: dict,
+    timeout_s: int,
+    effort: str | None = None,
+) -> VisionVerdict:
     """opencode vision: `opencode run "<prompt>" -m <vision-model> -f <image>`. Mirrors
     review_opencode's `opencode run`; attaches the image with `-f` and routes to the named
     (vision-capable) model. opencode is a provider ROUTER, so the user selects a vision
@@ -827,7 +1054,12 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
     from ... import backends
 
     if backends.runtime_provider_marked_unpaid(model):
-        return VisionVerdict(available=False, verdict=None, error=backends.runtime_unpaid_provider_error(model), backend=model)
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error=backends.runtime_unpaid_provider_error(model),
+            backend=model,
+        )
     provider = backends._oc_provider_from_model(model)
     if provider is not None and not backends._oc_provider_auth_available(provider):
         return VisionVerdict(
@@ -837,36 +1069,68 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
             backend=model,
         )
     if not shutil.which("opencode"):
-        return VisionVerdict(available=False, verdict=None, error="opencode CLI not found on PATH", backend=model)
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error="opencode CLI not found on PATH",
+            backend=model,
+        )
     preflight = backends._provider_payment_preflight_unavailable_reason(model)
     if preflight is not None:
-        return VisionVerdict(available=False, verdict=None, error=preflight, backend=model)
+        return VisionVerdict(
+            available=False, verdict=None, error=preflight, backend=model
+        )
 
     oc_model = model.split(":", 1)[1] if ":" in model else model
     with tempfile.TemporaryDirectory(prefix="review-cli-vision-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
         images = _stage_images(blocks, tmp)
         if not images:
-            return VisionVerdict(available=True, verdict=None, error="no image to attach", backend=model)
+            return VisionVerdict(
+                available=True, verdict=None, error="no image to attach", backend=model
+            )
         # Reuse review_opencode's READ-ONLY reviewer agent (bash/edit/write/webfetch
         # denied): the screenshot prompt is untrusted, so the model must not gain tool
         # powers. The `-f` image attach is the model's input, not a tool call.
         # Strip the repo-pinning git env so a leaked GIT_DIR doesn't divert this isolated
         # sandbox `git init` to the leaked repo (review-cli#71); mirrors review_opencode. `tmp`
         # is fresh-empty so git_repo_env drops every set var (no target repo to keep).
-        backends._run(["git", "init", "-q"], cwd=tmp, env=backends.git_repo_env(tmp), timeout=30)
+        backends._run(
+            ["git", "init", "-q"], cwd=tmp, env=backends.git_repo_env(tmp), timeout=30
+        )
         backends._ensure_opencode_readonly_agent(tmp, oc_model)
         prompt = f"{system}\n\n{_prompt_text(blocks, schema)}"
         # Message FIRST (positional), then flags: the -f array flag is greedy and would
         # otherwise swallow a trailing positional message.
-        argv = ["opencode", "run", prompt, "--agent", "read-only-reviewer", "-m", oc_model]
+        argv = [
+            "opencode",
+            "run",
+            prompt,
+            "--agent",
+            "read-only-reviewer",
+            "-m",
+            oc_model,
+        ]
         variant = backends._opencode_variant(effort)
         if variant:
             argv += ["--variant", variant]
         for img in images:
             argv += ["-f", str(img)]
-        rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="opencode-vision")
-        return _cli_verdict_from_output(stdout, backend=model, returncode=rc, stderr=stderr, timed_out=timed_out, schema=schema)
+        rc, stdout, stderr, timed_out = _run_cli(
+            argv,
+            cwd=tmp,
+            input_text=None,
+            timeout_s=timeout_s,
+            backend="opencode-vision",
+        )
+        return _cli_verdict_from_output(
+            stdout,
+            backend=model,
+            returncode=rc,
+            stderr=stderr,
+            timed_out=timed_out,
+            schema=schema,
+        )
 
 
 # --- Gemini live call (the ONE REST exception — its CLI is broken). Reuses review's
@@ -877,7 +1141,13 @@ def _parse_gemini_response(payload: dict, backend: str) -> VisionVerdict:
         text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
         data = json.loads(text)
     except (KeyError, IndexError, json.JSONDecodeError, TypeError) as exc:
-        return VisionVerdict(available=True, verdict=None, error=f"unparseable response: {exc}", backend=backend, raw=payload)
+        return VisionVerdict(
+            available=True,
+            verdict=None,
+            error=f"unparseable response: {exc}",
+            backend=backend,
+            raw=payload,
+        )
     return parse_structured(data, backend=backend)
 
 
@@ -887,7 +1157,9 @@ def _call_gemini(model: str, body: dict, timeout_s: int) -> VisionVerdict:
     try:
         key = backends._gemini_key()
     except RuntimeError as exc:
-        return VisionVerdict(available=False, verdict=None, error=str(exc), backend=model)
+        return VisionVerdict(
+            available=False, verdict=None, error=str(exc), backend=model
+        )
     # Honour the SAME model resolution as review_gemini: explicit `gemini:<model>` → that
     # model; bare `gemini` → $GEMINI_MODEL else the default, so the visual path doesn't
     # silently use a different model than the configured one.
@@ -896,21 +1168,34 @@ def _call_gemini(model: str, body: dict, timeout_s: int) -> VisionVerdict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data, method="POST",
+        url,
+        data=data,
+        method="POST",
         headers={"Content-Type": "application/json", "x-goog-api-key": key},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        return VisionVerdict(available=True, verdict=None, error=f"HTTP {exc.code}: {exc.read().decode('utf-8','replace')[:200]}", backend=model)
+        return VisionVerdict(
+            available=True,
+            verdict=None,
+            error=f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:200]}",
+            backend=model,
+        )
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # A genuine timeout sets timed_out=True (→ exit 124). Any other transport failure
         # (DNS, connection refused) is NOT a timeout — no verdict → the policy engine fails
         # closed to human_review, not a spurious 124.
         timed_out = _is_timeout(exc)
         kind = "timed out" if timed_out else "failed"
-        return VisionVerdict(available=True, verdict=None, error=f"vision call {kind}: {exc}", backend=model, timed_out=timed_out)
+        return VisionVerdict(
+            available=True,
+            verdict=None,
+            error=f"vision call {kind}: {exc}",
+            backend=model,
+            timed_out=timed_out,
+        )
     return _parse_gemini_response(payload, backend=model)
 
 

@@ -88,3 +88,18 @@ def _isolate_claude_accounts_root(tmp_path, monkeypatch):
     this same dir explicitly.
     """
     monkeypatch.setenv("REVIEW_CLAUDE_ACCOUNTS_ROOT", str(tmp_path / "claude-accounts"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_admission(tmp_path, monkeypatch):
+    """Default EVERY test to host-wide admission OFF, with a throwaway registry dir
+    (review-cli#614). Admission reads the REAL host load/memory and coordinates through a
+    shared registry, so a suite left on it would queue behind reviews actually running on
+    the developer's machine. tests/test_admission.py turns it on explicitly."""
+    from reviewlib import admission
+
+    monkeypatch.setenv("REVIEW_ADMISSION", "0")
+    monkeypatch.setenv("REVIEW_ADMISSION_DIR", str(tmp_path / "admission"))
+    admission.reset_for_tests()
+    yield
+    admission.reset_for_tests()

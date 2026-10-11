@@ -1189,9 +1189,34 @@ def _dispatch_tester(
     # deterministic CI plumbing stays byte-stable; only a real backend spawn honours effort.
     if _fake_tester_enabled():
         return _fake_tester_run(prompt, cwd)
-    if backend == "codex":
-        return _spawn_codex_writeexec(prompt, cwd, timeout, model, effort)
-    return _spawn_claude_writeexec(prompt, cwd, timeout, model, effort)
+    # The tester holds a slot of its provider's host-wide budget for its whole run and feeds
+    # a 429/overload back into it, like a review seat (reviewlib.admission, review-cli#614).
+    from .. import admission
+
+    # `model` is the bare forwarded suffix (`gpt-5.5`); qualify it so it maps to the vendor.
+    seat = f"{backend}:{model}" if model else backend
+    with admission.seat_slot(seat) as denied:
+        if denied is not None:
+            # No provider capacity is an infrastructure block, not a tester crash
+            # (UNKNOWN) or a SUT failure: report it as BLOCKED with the reason.
+            return subprocess.CompletedProcess(
+                args=[backend],
+                returncode=0,
+                stdout=(
+                    f"{_QA_RESULTS_HEADER}\nCASES: 0 run, 0 passed, 0 failed, 0 blocked\n\n"
+                    f"### BLOCKED\n- tester not started: {denied}\n\nVERDICT: {VERDICT_BLOCKED}\n"
+                ),
+                stderr=denied,
+            )
+        if backend == "codex":
+            proc = _spawn_codex_writeexec(prompt, cwd, timeout, model, effort)
+        else:
+            proc = _spawn_claude_writeexec(prompt, cwd, timeout, model, effort)
+    if proc.returncode != 0:
+        admission.note_failure_text(
+            seat, proc.stderr if isinstance(proc.stderr, str) else None
+        )
+    return proc
 
 
 def _build_outcome(

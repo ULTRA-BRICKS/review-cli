@@ -29,6 +29,7 @@ administrative seat-fatal state. Default: NOT retryable (fail closed toward the 
 misclassified fatal that we retry only wastes latency; a misclassified transient that we
 DON'T retry still gets reserve-replaced, so the run is never stranded).
 """
+
 from __future__ import annotations
 
 import os
@@ -215,7 +216,11 @@ def _is_rc0_sentinel(result: ReviewResult) -> bool:
     if result.returncode != 0 or (result.stderr or "").strip():
         return False
     body = (result.stdout or "").strip()
-    return bool(body) and len(body) <= _UNAVAILABLE_MAX_LEN and not result_is_usable(result)
+    return (
+        bool(body)
+        and len(body) <= _UNAVAILABLE_MAX_LEN
+        and not result_is_usable(result)
+    )
 
 
 def _error_channel(result: ReviewResult) -> str:
@@ -278,9 +283,57 @@ def classify_failure(result: ReviewResult) -> FailureClass:
 # disables in-seat retry (straight to reserve-replace, the legacy behaviour). The default is
 # small on purpose: a couple of retries clears a brief throttle spike without lengthening a
 # genuinely-down seat's path to the reserve. Overridable via $REVIEW_RETRY_COUNT or a `--retry
+# The subset of the transient vocabulary that means "the PROVIDER is pushing back on load"
+# (as opposed to a timeout, a DNS blip or a gateway 5xx): what admission control feeds
+# back into a provider's concurrency limit (reviewlib.admission, review-cli#614).
+_THROTTLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b429\b",
+        r"\b529\b",
+        r"rate[\s_-]?limit",
+        r"too many requests",
+        r"overloaded",
+        r"temporarily limiting",
+        r"\b(?:at|over)\s+capacity",
+        r"\bthrottl",
+    )
+)
+
+
+def text_is_throttle(text: str) -> bool:
+    """True when a transport's failure text reports provider pushback (429 / 529 / rate
+    limit / overloaded) and not a quota, auth or billing failure."""
+    if any(p.search(text) for p in _SEAT_FATAL_PATTERNS):
+        return False
+    return any(p.search(text) for p in _THROTTLE_PATTERNS)
+
+
+def is_throttle(result: ReviewResult) -> bool:
+    """True when a failed seat result is a provider throttle (429 / 529 / rate limit /
+    overloaded). A usable result, a seat-fatal failure (quota, auth) or a non-throttle
+    transient (timeout, network) is not. HTTP backends (Gemini, Claude API) carry the
+    status in `returncode`, so a 429/529 there counts even with an empty body."""
+    if result_is_usable(result):
+        return False
+    channel = _error_channel(result)
+    if any(p.search(channel) for p in _SEAT_FATAL_PATTERNS):
+        return False
+    if result.returncode in _HTTP_THROTTLE_STATUSES:
+        return True
+    if classify_failure(result) is not FailureClass.RETRYABLE:
+        return False
+    return any(p.search(channel) for p in _THROTTLE_PATTERNS)
+
+
+_HTTP_THROTTLE_STATUSES = frozenset({429, 529})
+
+
 # N` flag (the CLI resolves the flag and exports the env so this one reader sees both).
 _DEFAULT_RETRY_COUNT = 2
-_MAX_RETRY_COUNT = 10  # a sane ceiling so a typo'd env can't pin a dead seat for minutes
+_MAX_RETRY_COUNT = (
+    10  # a sane ceiling so a typo'd env can't pin a dead seat for minutes
+)
 
 # Backoff schedule: delay before the Nth retry = base * factor**(N-1), capped, then jittered.
 # Small base — a throttle clears in well under a second usually, and the board already runs
@@ -288,7 +341,9 @@ _MAX_RETRY_COUNT = 10  # a sane ceiling so a typo'd env can't pin a dead seat fo
 _BASE_DELAY_SECONDS = 0.5
 _BACKOFF_FACTOR = 2.0
 _MAX_DELAY_SECONDS = 8.0
-_JITTER_FRACTION = 0.25  # ±25% of the computed delay, so concurrent seats don't sync-retry
+_JITTER_FRACTION = (
+    0.25  # ±25% of the computed delay, so concurrent seats don't sync-retry
+)
 
 
 def retry_default() -> int:
@@ -418,7 +473,9 @@ def run_seat_with_retry(
     cap_seconds = retry_max_seconds() if max_seconds is None else max_seconds
     jitter_rng = rng if rng is not None else random.Random()
     max_attempts = budget + 1  # the initial call + `budget` retries
-    timeout_retries = 0  # timeouts are capped separately (each costs a full per-call timeout)
+    timeout_retries = (
+        0  # timeouts are capped separately (each costs a full per-call timeout)
+    )
     started = clock()
 
     result = runner()
@@ -429,15 +486,27 @@ def run_seat_with_retry(
         if classify_failure(result) is FailureClass.SEAT_FATAL:
             # No retry can fix this class — hand the failed result back so the caller falls to
             # the reserve immediately, conserving the retry budget for genuine throttles.
-            write_retry_log(model, kind="seat-fatal", attempt=attempt - 1,
-                            max_attempts=max_attempts, delay=0.0, result=result)
+            write_retry_log(
+                model,
+                kind="seat-fatal",
+                attempt=attempt - 1,
+                max_attempts=max_attempts,
+                delay=0.0,
+                result=result,
+            )
             return result
         # Wall-clock backstop: if we've already spent the cap retrying (slow failed calls +
         # backoffs), stop — a SLOW transient must not cost ~budget x per-call timeout before
         # the reserve takes over. cap_seconds <= 0 disables this cap (count/timeout caps stay).
         if cap_seconds > 0 and (clock() - started) >= cap_seconds:
-            write_retry_log(model, kind="retry-time-exhausted", attempt=attempt - 1,
-                            max_attempts=max_attempts, delay=0.0, result=result)
+            write_retry_log(
+                model,
+                kind="retry-time-exhausted",
+                attempt=attempt - 1,
+                max_attempts=max_attempts,
+                delay=0.0,
+                result=result,
+            )
             return result
         # A TIMEOUT retry costs another full per-call timeout, so cap it independently of the
         # (cheap) transient budget: after _MAX_TIMEOUT_RETRIES timeouts, stop retrying and let
@@ -447,17 +516,34 @@ def run_seat_with_retry(
         # real auth/501/refusal seat-fatal.
         if result.returncode == _TIMEOUT_EXIT_CODE:
             if timeout_retries >= _MAX_TIMEOUT_RETRIES:
-                write_retry_log(model, kind="timeout-exhausted", attempt=attempt - 1,
-                                max_attempts=max_attempts, delay=0.0, result=result)
+                write_retry_log(
+                    model,
+                    kind="timeout-exhausted",
+                    attempt=attempt - 1,
+                    max_attempts=max_attempts,
+                    delay=0.0,
+                    result=result,
+                )
                 return result
             timeout_retries += 1
         delay = compute_backoff(attempt, jitter_rng)
-        event = SeatAttempt(model=model, attempt=attempt, max_attempts=max_attempts,
-                            delay=delay, prior=result)
+        event = SeatAttempt(
+            model=model,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            delay=delay,
+            prior=result,
+        )
         if announce:
             _announce_retry(event)
-        write_retry_log(model, kind="retry", attempt=attempt, max_attempts=max_attempts,
-                        delay=delay, result=result)
+        write_retry_log(
+            model,
+            kind="retry",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            delay=delay,
+            result=result,
+        )
         if on_retry is not None:
             on_retry(event)
         sleeper(delay)
@@ -465,8 +551,11 @@ def run_seat_with_retry(
         if result_is_usable(result):
             # We only reach here from inside the retry loop, so this IS a recovery.
             if announce:
-                print(f"[review-cli] seat {model} recovered on retry {attempt}/{budget}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"[review-cli] seat {model} recovered on retry {attempt}/{budget}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if on_recovered is not None:
                 on_recovered(attempt, budget)
             return result
@@ -485,7 +574,10 @@ def retry_reason(event: SeatAttempt) -> str:
 def _announce_retry(event: SeatAttempt) -> None:
     """Print a one-line retry notice to stderr (the human channel; the durable record is the
     run log). Trimmed so a long error channel doesn't flood stderr."""
-    print(f"[review-cli] seat {event.model} transient failure "
-          f"(retry {event.attempt}/{event.max_attempts - 1} in {event.delay:.1f}s): "
-          f"{retry_reason(event)}",
-          file=sys.stderr, flush=True)
+    print(
+        f"[review-cli] seat {event.model} transient failure "
+        f"(retry {event.attempt}/{event.max_attempts - 1} in {event.delay:.1f}s): "
+        f"{retry_reason(event)}",
+        file=sys.stderr,
+        flush=True,
+    )

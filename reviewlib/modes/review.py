@@ -662,8 +662,8 @@ def mode_review(
                 visual_images,
                 effort=effort,
             )
-        if effort is None:
-            return backend(model, prompt, dispatch_diff, cwd, timeout)
+        # Always through call_backend: it holds the seat's host-wide provider slot
+        # (reviewlib.admission, review-cli#614) whether or not an effort is set.
         return call_backend(
             backend, model, prompt, dispatch_diff, cwd, timeout, effort=effort
         )

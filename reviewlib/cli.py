@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, TextIO
 
+from . import admission
 from . import backends
 from . import jobs
 from . import portable
@@ -1086,15 +1087,22 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     # Panel modes announce their live-log paths (the resumed rounds stream to the log).
     backends._ANNOUNCE_LOGS = True
     try:
-        return _sessions.resume_session(
-            sess,
-            models=models,
-            cwd=cwd,
-            timeout=timeout,
-            moderators=moderators,
-            diff=diff,
-            force=ns.force,
-        )
+        # A resumed brainstorm is a full panel run: it takes a host-wide slot like any
+        # other brainstorm (review-cli#614).
+        with admission.run_slot(
+            mode="brainstorm",
+            models=admission.routed(brainstorm_pool(models)),
+            later_models=admission.routed(moderators[:1]),
+        ):
+            return _sessions.resume_session(
+                sess,
+                models=models,
+                cwd=cwd,
+                timeout=timeout,
+                moderators=moderators,
+                diff=diff,
+                force=ns.force,
+            )
     except _sessions.SessionAlreadyCompleteError as exc:
         # A refused resume (already-complete, no --force) did NO requested work. Return the
         # same non-zero code the unknown/ambiguous-id paths use so scripts and hooks can
@@ -1420,18 +1428,37 @@ def _task_subcommand(rest: list[str]) -> int:
 
 
 def _jobs_subcommand(rest: list[str]) -> int:
-    """`review jobs [--json]` — list every recorded `--detach` job, newest first.
+    """`review jobs [--json] [--slots]` — host-wide admission slots, then every recorded
+    `--detach` job, newest first.
 
     Status is the RECONCILED value (`jobs.job_status`): a job whose recorded state is
     still "running" but whose pid is gone is shown as "unknown-terminated" rather than
-    a stale "running" that never resolves."""
+    a stale "running" that never resolves. The ADMISSION block (review-cli#614) lists
+    every review on this host that is running or queued for a slot — detached or not —
+    with the host budget and per-provider seat usage. `--slots` prints only that block
+    (`--slots --json` as JSON); plain `--json` stays the job list it always was."""
 
     parser = argparse.ArgumentParser(
         prog="review jobs",
-        description="List detached (`--detach`) review jobs.",
+        description="Host-wide admission slots and detached (`--detach`) review jobs.",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--slots",
+        action="store_true",
+        help="show only the host-wide admission slots (running/waiting reviews, budgets)",
+    )
     ns = parser.parse_args(rest)
+
+    if ns.slots:
+        snap = admission.status_snapshot()
+        if ns.json:
+            import json as _json
+
+            print(_json.dumps(snap, indent=2))
+        else:
+            print(admission.render_status(snap))
+        return 0
 
     records = [jobs.job_status(rec["job_id"]) or rec for rec in jobs.list_jobs()]
     records.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
@@ -1442,10 +1469,13 @@ def _jobs_subcommand(rest: list[str]) -> int:
         print(_json.dumps(records, indent=2))
         return 0
 
+    print(admission.render_status(admission.status_snapshot()))
+    print()
     if not records:
         print("No detached jobs recorded.")
         return 0
 
+    print("DETACHED JOBS")
     for rec in records:
         started = rec.get("started_at")
         when = (
@@ -1453,9 +1483,14 @@ def _jobs_subcommand(rest: list[str]) -> int:
             if started
             else "?"
         )
+        queued = (
+            f" admission=waiting#{rec.get('queue_position')}"
+            if rec.get("status") == "running" and rec.get("admission") == "waiting"
+            else ""
+        )
         print(
             f"  {rec.get('job_id')}  {rec.get('status', '?'):<18} "
-            f"mode={rec.get('mode', '?')} pid={rec.get('pid', '?')} started={when}"
+            f"mode={rec.get('mode', '?')} pid={rec.get('pid', '?')} started={when}{queued}"
         )
     return 0
 
@@ -1987,6 +2022,7 @@ def _seat_status_report(*, as_json: bool) -> int:
                 }
                 for a in accounts
             ],
+            "admission": admission.status_snapshot(),
         }
         print(_json.dumps(payload, indent=2))
         return 0
@@ -2029,6 +2065,8 @@ def _seat_status_report(*, as_json: bool) -> int:
         lines.append(
             f"  {marker} {a.name:<12} {(a.email or '(no email on disk)'):<28} {state}"
         )
+    lines.append("")
+    lines.append(admission.render_status(admission.status_snapshot()))
     print("\n".join(lines))
     return 0
 
@@ -3313,6 +3351,54 @@ def _spec_web_reply_to_tg(
 
 
 def _run_mode_with_stats(
+    mode: str,
+    pool_models: list[str],
+    dispatch,
+    models_after=None,
+    roles_after=None,
+    usable_roles_after=None,
+    *,
+    task_code: str | None = None,
+    repo_id: str | None = None,
+    diff_files: list[str] | None = None,
+    diff_sha256: str | None = None,
+    needs_slot: bool = True,
+    direct_seats: bool = False,
+    later_models: list[str] | None = None,
+) -> int:
+    """Wait for a host-wide admission slot (reviewlib.admission, review-cli#614), then run
+    `_run_admitted_mode_with_stats`. Queue time is outside the recorded duration, so it
+    never inflates future ETAs. `needs_slot=False` (a run that calls no model, e.g. a
+    diff review with nothing to review) skips the queue. A text panel reserves the
+    providers its failover chains dispatch to; `direct_seats=True` (the qa tester) names
+    its executors exactly. `later_models` (a quorum/brainstorm moderator) run after the
+    panel and are reserved alongside it."""
+    slot = (
+        admission.run_slot(
+            mode=mode,
+            models=pool_models if direct_seats else admission.routed(pool_models),
+            later_models=admission.routed(later_models or []),
+            task_code=task_code,
+        )
+        if needs_slot
+        else contextlib.nullcontext()
+    )
+    with slot:
+        return _run_admitted_mode_with_stats(
+            mode,
+            pool_models,
+            dispatch,
+            models_after,
+            roles_after,
+            usable_roles_after,
+            task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
+        )
+
+
+def _run_admitted_mode_with_stats(
     mode: str,
     pool_models: list[str],
     dispatch,
@@ -4959,6 +5045,7 @@ def _help_topic_config() -> str:
     has UNIFORM effort across all seats (true for "light"/"default", not for "heavy",
     which mixes xhigh/max). If DEFAULT_PRESET ever becomes "heavy", that line needs a
     real fix, not just re-pointing the same expression."""
+    adm = admission.Settings()
     return f"""\
 review — configuration reference
 ================================
@@ -4988,6 +5075,9 @@ CONFIG FILE
                        review runs; REST backends use it as their HTTP request timeout.
                        `review qa` uses its timeout as a
                        wall-clock QA cost cap.
+    admission:         mapping     host-wide parallelism budget (headroom, per-seat cost,
+                       min/max slots, per-provider limits, ...). See HOST-WIDE ADMISSION
+                       below for every key, its REVIEW_ADMISSION_* env var and default.
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
   `glm` -> zai:glm-5.2, `cc` -> commandcode, `grok`/`grok46`/`grok-4.6` -> oc:xai/grok-4.6,
   `grok45` -> oc:xai/grok-4.5, `mimo`/`mimo25`/`mimo-2.5` -> omp:opencode-go/mimo-v2.5).
@@ -5182,6 +5272,68 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     OPENROUTER_X_TITLE env vars set OpenRouter's leaderboard-attribution headers
     (HTTP-Referer / X-Title) and never affect the review; a value containing a
     control character is silently dropped rather than sent.
+
+HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-cli#614)
+  Every review run (diff/visual/brainstorm/just-ask/quorum/qa) takes a host-wide slot
+  before its seats dispatch; there is no fixed slot count and no external lock to add
+  (old `flock /tmp/review-cli.lock review ...` wrappers still work, they just serialize
+  themselves). A run is admitted, oldest waiter first (FIFO), only while
+    load average(1m) + estimates of runs admitted < ramp_seconds ago + this run's estimate
+      <= (1 - headroom) x CPU count, and
+    (MemTotal - MemAvailable) + the same estimates <= (1 - headroom) x MemTotal.
+  A run's estimate is base + per_seat x seats; per_seat is learned (p75 of the last
+  learn_window runs' measured process-tree peak RSS / avg CPU) once 3+ runs exist, else
+  the configured defaults. min_slots runs always start; max_slots (0 = none) caps them.
+  Each seat call also holds a slot of its provider (anthropic, openai, zai, commandcode,
+  xai, opencode-go, google, ...): at most floor(max_concurrent x (1 - headroom)) (>= 1)
+  at once and, with rpm set, floor(rpm x (1 - headroom)) starts per minute. A 429 /
+  overload reply lowers that provider's limit to floor(current x throttle_backoff) for
+  throttle_cooldown_seconds. A seat still waiting after provider_wait_seconds (0 = wait
+  forever) is skipped as unavailable, so failover moves to the next provider/reserve. A
+  run is also held back until every provider it needs has room for its planned seats next
+  to the seats of runs already running, so admitted runs rarely wait on a provider.
+  Leases live in the registry dir as flock-held files: a killed holder is reclaimed at
+  once, a lease whose heartbeat is older than stale_lease_seconds stops counting. The
+  shared registry.lock is held only for each admission decision; a holder stopped or
+  gone for over lock_stale_seconds has its lock replaced (logged loudly), and a waiter
+  still blocked after lock_wait_seconds runs without host-wide admission. While
+  queued, stderr shows `[review] admission: waiting — queue position P/N, ... ETA ~T`;
+  queue time is excluded from the run's stats and from the internal backstop, but not
+  from an explicit just-ask --timeout N: a run still queued at N exits 124 without
+  starting a seat. A --visual companion is admitted against its full text panel, not
+  just the vision call. `review jobs` (or `review jobs --slots [--json]`)
+  and bare `review status` list running/waiting reviews, the budget and provider seats.
+  config.yaml `admission:` key / env var (env > config > default):
+    enabled                   REVIEW_ADMISSION                        default {adm.enabled}
+    headroom                  REVIEW_ADMISSION_HEADROOM               default {adm.headroom}
+    min_slots                 REVIEW_ADMISSION_MIN_SLOTS              default {adm.min_slots}
+    max_slots                 REVIEW_ADMISSION_MAX_SLOTS              default {adm.max_slots} (none)
+    cpu_per_seat              REVIEW_ADMISSION_CPU_PER_SEAT           default {adm.cpu_per_seat} cores
+    mem_per_seat_mb           REVIEW_ADMISSION_MEM_PER_SEAT_MB        default {adm.mem_per_seat_mb}
+    cpu_base                  REVIEW_ADMISSION_CPU_BASE               default {adm.cpu_base} cores
+    mem_base_mb               REVIEW_ADMISSION_MEM_BASE_MB            default {adm.mem_base_mb}
+    learn                     REVIEW_ADMISSION_LEARN                  default {adm.learn}
+    learn_window              REVIEW_ADMISSION_LEARN_WINDOW           default {adm.learn_window} runs
+    ramp_seconds              REVIEW_ADMISSION_RAMP_SECONDS           default {adm.ramp_seconds}
+    poll_seconds              REVIEW_ADMISSION_POLL_SECONDS           default {adm.poll_seconds}
+    stale_lease_seconds       REVIEW_ADMISSION_STALE_SECONDS          default {adm.stale_lease_seconds}
+    lock_wait_seconds         REVIEW_ADMISSION_LOCK_WAIT_SECONDS      default {adm.lock_wait_seconds:g}
+    lock_stale_seconds        REVIEW_ADMISSION_LOCK_STALE_SECONDS     default {adm.lock_stale_seconds:g}
+    provider_max_concurrent   REVIEW_ADMISSION_PROVIDER_MAX           default {adm.provider_max_concurrent} (0 = unlimited)
+    provider_wait_seconds     REVIEW_ADMISSION_PROVIDER_WAIT_SECONDS  default {adm.provider_wait_seconds} (0 = wait forever; queue time never counts toward the backstop)
+    throttle_backoff          REVIEW_ADMISSION_THROTTLE_BACKOFF       default {adm.throttle_backoff}
+    throttle_cooldown_seconds REVIEW_ADMISSION_THROTTLE_COOLDOWN_SECONDS default {adm.throttle_cooldown_seconds}
+    providers                 REVIEW_ADMISSION_PROVIDERS="anthropic=12,zai=4/60" (name=max[/rpm])
+    dir                       REVIEW_ADMISSION_DIR                    default $XDG_STATE_HOME/review-cli/admission
+  Example:
+    admission:
+      headroom: 0.2
+      max_slots: 12
+      providers:
+        anthropic: {{max_concurrent: 12}}
+        zai: {{max_concurrent: 4, rpm: 60}}
+  REVIEW_MAX_CONCURRENCY (default 4) is separate: it caps backend subprocesses INSIDE one
+  run.
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
 """
@@ -5824,6 +5976,14 @@ def _evaluate_pool_or_bail(
 
 
 def _dispatch(argv: list[str] | None = None) -> int:
+    """Resolve and run one `review` invocation. A host-wide run slot taken early in the
+    dispatch (`admission.hold_run_slot`, the companion vision fan-out) is released when it
+    returns (review-cli#614)."""
+    with admission.dispatch_scope():
+        return _dispatch_scoped(argv)
+
+
+def _dispatch_scoped(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     argv = _normalize_leading_mode_options(list(argv))
@@ -6798,6 +6958,55 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # whichever consumer runs. cvGate fires here regardless of mode (a broken render
     # is flagged before any model call). -----------------------------------------
     visual_ctx = None
+    # review-cli#587: an explicit `just-ask --timeout N` is a hard wall-clock bound. Armed
+    # once, before the first host-wide admission wait of this dispatch (review-cli#614).
+    just_ask_deadline_seconds = (
+        timeout if mode.name == "just-ask" and args.timeout is not None else None
+    )
+    deadline_armed = False
+
+    def _planned_panel() -> list[str]:
+        # The text panel this dispatch runs after the companion vision call, so admission
+        # reserves it up front: brainstorm persona slots; for the review board its exact
+        # `-m` roster, else the same availability-aware, reuse-padded selection the board
+        # dispatch makes (unavailable leading seats skipped; a `--task -m <one>` review
+        # runs that model as several role seats).
+        if is_brainstorm:
+            return list(brainstorm_pool(models))
+        if panel_mode or not board:
+            return list(models)
+        if bool(explicit_models) and not task_role_pad:
+            return [r.model for r in board]
+        pool, _ = select_pool_and_reserve_with_reuse(
+            board,
+            effective_pool_size,
+            lambda r: _chain_aware_available(r.model),
+            usage_percent=_usage_percent,
+        )
+        return [r.model for r in pool]
+
+    def _moderators() -> list[str]:
+        # --moderator is scoped to the modes that USE a moderator (quorum / brainstorm); a
+        # flat panel like just-ask has no `--moderator` on its parser, so read it
+        # defensively. No flag -> None -> pick_moderators falls back to the auto-pick
+        # chain (harmless: just-ask ignores the resolved moderators anyway).
+        moderator_arg = getattr(args, "moderator", None)
+        if moderator_arg:
+            moderator_arg = _expand_alias(moderator_arg)
+        return pick_moderators(moderator_arg, models) if panel_mode else []
+
+    def _moderator_seat() -> list[str]:
+        # The moderator a quorum/brainstorm runs after its panel, reserved with it.
+        return _moderators()[:1] if mode.name in ("brainstorm", "quorum") else []
+
+    def _vision_seat() -> list[str]:
+        # The model the vision fan-out will actually call first (it skips non-vision and
+        # unreachable models), so admission reserves that provider, not visual_models[0].
+        # None reachable: the pipeline fails closed without a call, so reserve no seat.
+        from .features.visual.compose import _ordered_vision_backends
+
+        return _ordered_vision_backends(list(visual_models or []))[:1]
+
     if visual_mode:
         # qa does NOT consume --visual: the tester drives a LIVE system and produces its OWN
         # proof (screenshots/logs), so an input image has no place in its prompt. Reject it
@@ -6825,27 +7034,35 @@ def _dispatch(argv: list[str] | None = None) -> int:
         if not panel_mode and not diff.strip():
             from .features.visual.visual_cli import run_visual_standalone
 
-            return run_visual_standalone(
-                args.visual,
-                before=args.before,
-                expect=args.expect,
-                intent=args.intent,
-                requested_checks=list(args.check),
-                models=visual_models,
-                no_ai=args.no_ai,
-                # Stage-2a cost-saver default ON; --no-local-model OR `local_model: false`
-                # in config.yaml disables it (CLI flag wins over config).
-                local_model=(not args.no_local_model)
-                and (config.get("local_model", True) is not False),
-                vision_timeout=args.vision_timeout,
-                as_json=args.json,
-                strict=args.strict,
-                # Per-project module discovery defaults to the CLI cwd (-C), NOT the
-                # process cwd, so `review visual shot.png -C <repo>` finds
-                # <repo>/.review/visual-modules.json (codex P2).
-                project=args.project or str(cwd),
-                effort_override=effort_override,
+            # One vision call (none with --no-ai): it still takes a host-wide run slot,
+            # as the external flock wrapper it replaces did (review-cli#614).
+            slot = (
+                contextlib.nullcontext()
+                if args.no_ai
+                else admission.run_slot(mode="visual", models=_vision_seat())
             )
+            with slot:
+                return run_visual_standalone(
+                    args.visual,
+                    before=args.before,
+                    expect=args.expect,
+                    intent=args.intent,
+                    requested_checks=list(args.check),
+                    models=visual_models,
+                    no_ai=args.no_ai,
+                    # Stage-2a cost-saver default ON; --no-local-model OR `local_model: false`
+                    # in config.yaml disables it (CLI flag wins over config).
+                    local_model=(not args.no_local_model)
+                    and (config.get("local_model", True) is not False),
+                    vision_timeout=args.vision_timeout,
+                    as_json=args.json,
+                    strict=args.strict,
+                    # Per-project module discovery defaults to the CLI cwd (-C), NOT the
+                    # process cwd, so `review visual shot.png -C <repo>` finds
+                    # <repo>/.review/visual-modules.json (codex P2).
+                    project=args.project or str(cwd),
+                    effort_override=effort_override,
+                )
 
         # COMPANION: a mode (or the default diff-review) runs WITH the image as context.
         # Validate the board BEFORE the (potentially paid) vision fan-out so an
@@ -6856,7 +7073,27 @@ def _dispatch(argv: list[str] | None = None) -> int:
         if rc is not None:
             return rc
         # Stage 2: the image is delivered to a vision model (the per-mode fan-out) unless
-        # --no-ai, and the grounded observation is folded into the mode prompt.
+        # --no-ai, and the grounded observation is folded into the mode prompt. The vision
+        # call already spends host + provider capacity, so the run's host-wide slot is
+        # taken HERE and held through the text panel that follows (review-cli#614). An
+        # explicit `just-ask --timeout N` is armed first so queue time counts toward N,
+        # and the slot reserves the full planned panel so admission is not checked
+        # against the 1-seat vision call alone.
+        if just_ask_deadline_seconds is not None:
+            deadline_armed = admission.hold_in_dispatch(
+                command_deadline(
+                    just_ask_deadline_seconds,
+                    command=f"review just-ask --timeout {just_ask_deadline_seconds}",
+                )
+            )
+        if not args.no_ai:
+            admission.hold_run_slot(
+                mode=mode.stats_mode,
+                models=_vision_seat(),
+                later_models=admission.routed(_planned_panel()),
+                final_models=admission.routed(_moderator_seat()),
+                task_code=task_code,
+            )
         visual_ctx = _call_with_task_env(
             task_code,
             lambda: build_mode_visual_context(
@@ -6901,14 +7138,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     def _with_visual_text(text: str) -> str:
         return _with_visual(text, visual_ctx)
 
-    # --moderator is scoped to the modes that USE a moderator (quorum / brainstorm); a flat
-    # panel like just-ask has no `--moderator` on its parser, so read it defensively. A mode
-    # with no moderator flag -> None -> pick_moderators falls back to the auto-pick chain
-    # (harmless: just-ask ignores the resolved moderators anyway).
-    moderator_arg = getattr(args, "moderator", None)
-    if moderator_arg:
-        moderator_arg = _expand_alias(moderator_arg)
-    moderators = pick_moderators(moderator_arg, models) if panel_mode else []
+    moderators = _moderators()
     ctx = ModeContext(
         args=args,
         models=models,
@@ -6956,6 +7186,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             repo_id=repo_id,
             diff_files=diff_files,
             diff_sha256=diff_sha256,
+            later_models=moderators[:1],
             **bs_roles_kw,
         )
 
@@ -6976,6 +7207,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             repo_id=repo_id,
             diff_files=diff_files,
             diff_sha256=diff_sha256,
+            direct_seats=True,
         )
 
     if mode.name not in ("review", "visual"):
@@ -6987,26 +7219,31 @@ def _dispatch(argv: list[str] | None = None) -> int:
             panel_roles_kw["models_after"] = lambda: panel_models
             panel_roles_kw["roles_after"] = lambda: panel_roles
 
-        def _run_panel_handler() -> int:
-            # review-cli#587: an explicit `just-ask --timeout N` is a hard wall-clock
-            # bound — every seat call dies at N, the command at N + the grace.
-            if mode.name == "just-ask" and args.timeout is not None:
-                with command_deadline(
-                    timeout, command=f"review just-ask --timeout {timeout}"
-                ):
-                    return mode.handler(ctx)
-            return mode.handler(ctx)
-
-        return _run_mode_with_stats(
-            mode.stats_mode,
-            models,
-            _run_panel_handler,
-            task_code=task_code,
-            repo_id=repo_id,
-            diff_files=diff_files,
-            diff_sha256=diff_sha256,
-            **panel_roles_kw,
+        # review-cli#587: an explicit `just-ask --timeout N` is a hard wall-clock bound —
+        # every seat call dies at N, the command at N + the grace. It is armed BEFORE the
+        # host-wide admission wait inside `_run_mode_with_stats` (review-cli#614), so time
+        # spent queued for a slot counts toward N too. A --visual companion armed it
+        # already, before its own admission wait; re-arming would push N back.
+        deadline = (
+            command_deadline(
+                just_ask_deadline_seconds,
+                command=f"review just-ask --timeout {just_ask_deadline_seconds}",
+            )
+            if just_ask_deadline_seconds is not None and not deadline_armed
+            else contextlib.nullcontext()
         )
+        with deadline:
+            return _run_mode_with_stats(
+                mode.stats_mode,
+                models,
+                lambda: mode.handler(ctx),
+                task_code=task_code,
+                repo_id=repo_id,
+                diff_files=diff_files,
+                diff_sha256=diff_sha256,
+                later_models=moderators[:1] if mode.name == "quorum" else None,
+                **panel_roles_kw,
+            )
 
     # The review mode. Validate the board now if it wasn't already (the no-visual path);
     # an all-malformed `board:` exits 2 before the panel runs. The --visual companion
@@ -7196,6 +7433,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 repo_id=repo_id,
                 diff_files=diff_files,
                 diff_sha256=diff_sha256,
+                needs_slot=mode.name != "review" or bool(diff.strip()),
             )
         finally:
             # Unconditional teardown (review-cli#548): the TUI must restore the terminal
@@ -7235,6 +7473,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         repo_id=repo_id,
         diff_files=diff_files,
         diff_sha256=diff_sha256,
+        needs_slot=mode.name != "review" or bool(diff.strip()),
     )
 
 

@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -33,6 +34,7 @@ from typing import Callable, Iterator
 from .config import _agentic
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
+from . import admission
 from .portable import lock_file, unlock_file
 from .process import (
     TIMEOUT_KIND_STALL,
@@ -40,6 +42,7 @@ from .process import (
     _run_streamed,
     _safe_log_header,
     git_repo_env,
+    run_deadline_remaining,
     strip_control_sequences,
     write_sidecar_log,
 )
@@ -257,6 +260,57 @@ def call_backend(
     *,
     effort: str | None = None,
 ) -> ReviewResult:
+    """Run one seat call while holding a slot of its provider's host-wide budget
+    (reviewlib.admission, review-cli#614); a 429/overload reply feeds back into that
+    budget. The per-call `timeout` starts only once the slot is held, and is capped to
+    the time left of an explicit `--timeout N`: an HTTP backend has no process for the
+    command deadline to kill, so queue time plus its call must not outrun N."""
+    with admission.seat_slot(model) as denied:
+        if denied is not None:
+            return _admission_skip_result(model, round_no, denied)
+        remaining = run_deadline_remaining()
+        if remaining is not None:
+            timeout = max(1, min(timeout, math.ceil(remaining)))
+        result = _call_backend_now(
+            backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
+        )
+    admission.note_result(model, result)
+    return result
+
+
+def _admission_skip_result(model: str, round_no: int, reason: str) -> ReviewResult:
+    """Synthetic rc=0 "unavailable" sentinel for a seat whose provider stayed saturated
+    past `admission.provider_wait_seconds`, so board/provider failover moves on to the
+    next provider or a reserve seat (same shape as `_usage_limit_skip_result`)."""
+    marker = _UNAVAILABLE_MARKERS[0]
+    stdout = f"{model} {marker} ({reason}).\n"
+    if len(stdout) > _UNAVAILABLE_MAX_LEN:
+        stdout = f"{marker} ({reason}).\n"[:_UNAVAILABLE_MAX_LEN]
+    command = "admission skip (provider saturated)"
+    _emit_rest_log(
+        provider_route_name(model),
+        command,
+        round_no=round_no,
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+    return ReviewResult(
+        model=model, command=command, returncode=0, stdout=stdout, stderr=""
+    )
+
+
+def _call_backend_now(
+    backend: Callable[..., ReviewResult],
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
+    *,
+    effort: str | None = None,
+) -> ReviewResult:
     if effort is None:
         return backend(model, prompt, diff, cwd, timeout, round_no)
     try:
@@ -319,9 +373,13 @@ def review_with_images(
                 spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
             )
             return _usage_limit_skip_result(model, round_no, reason, backend="claude")
-        result = review_claude_cli_with_images(
-            model, prompt, diff, cwd, timeout, round_no, images, effort=effort
-        )
+        with admission.seat_slot(model) as denied:
+            if denied is not None:
+                return _admission_skip_result(model, round_no, denied)
+            result = review_claude_cli_with_images(
+                model, prompt, diff, cwd, timeout, round_no, images, effort=effort
+            )
+        admission.note_result(model, result)
         reason = _chronic_unavailable_reason(result)
         if reason is not None:
             record_cooldown(model, reason, access_method="cli")

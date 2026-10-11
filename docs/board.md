@@ -208,10 +208,60 @@ disables it, and a value above **64** is clamped to that ceiling so a typo can't
 absurd number of children). A seat over the cap simply **waits** for a slot — it is never
 dropped, and its per-call timeout starts only once it actually spawns, so queueing on the
 cap can't falsely time it out. The common single-seat gate (`--pool 1`) and the default
-(light) pool of 2 are unaffected (both `<=` the cap). This is a *per-process* cap; a swarm
-of separate `review` processes also leans on the per-seat timeout (a stalled seat frees its
-slot fast) and on the slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort
-reserve** (review-cli#65).
+(light) pool of 2 are unaffected (both `<=` the cap). This is a *per-process* cap; ACROSS
+processes, host-wide admission (next paragraph) bounds how many reviews and seats run.
+
+**Host-wide admission (review-cli#614).** Reviews run in parallel up to what the machine
+and the AI providers can sustain, keeping a safety margin (`headroom`, default 20%). There
+is no fixed slot count and nothing to wrap `review` in — an old
+`flock -o /tmp/review-cli.lock review ...` wrapper still works but only serializes its own
+callers.
+
+- **Machine budget (per run).** A run starts only if `load average(1m) + estimates of runs
+  admitted in the last ramp_seconds + its own estimate <= (1 - headroom) × CPUs`, and the
+  same for RAM (`MemTotal − MemAvailable`). Runs older than `ramp_seconds` are already in
+  the load average and MemAvailable, so only young runs are added from their estimate. A
+  run's estimate is `base + per_seat × seats`; `per_seat` starts at the configured
+  `cpu_per_seat`/`mem_per_seat_mb` and, once 3 runs have been measured, becomes the p75 of
+  the last `learn_window` runs' measured process-tree peak RSS and average CPU (each run
+  samples its own tree while it holds its slot and appends to `costs.jsonl`). `min_slots`
+  runs always start; `max_slots` (0 = none) caps them.
+- **Provider budget (per seat call).** Each seat holds a slot of its provider (`anthropic`
+  for `claude:`/`omp:anthropic/`/fable, `openai` for codex, `zai`, `commandcode`, `xai`,
+  `opencode-go`, ...): `floor(max_concurrent × (1 − headroom))` (≥ 1) at once (default
+  `max_concurrent` 10) and, with `rpm`, `floor(rpm × (1 − headroom))` starts per minute. A
+  429/overload reply (`retry.is_throttle`) lowers that provider's limit to
+  `floor(current × throttle_backoff)` for `throttle_cooldown_seconds`; repeated throttles
+  keep lowering it. A seat still waiting after `provider_wait_seconds` returns the rc=0
+  unavailable sentinel, so the failover above moves it to the next provider in its chain or
+  to a reserve seat. The per-call timeout starts only once the slot is held. To keep that
+  wait rare, a run is admitted only while every provider it needs has room for its planned
+  seats next to the seats committed to runs already running.
+- **Queue.** Waiters are admitted strictly first-come-first-served (a global sequence number;
+  only the oldest live waiter may take a freed slot). While queued, stderr shows
+  `[review] admission: waiting — queue position 2/5, 4 running; host budget full on cpu
+  (...); ETA ~6m`. The wait counts neither toward the run's recorded duration nor toward the
+  internal 4h backstop. An explicit `just-ask --timeout N` stays wall-clock: a run still
+  queued at N exits 124 without starting a seat. A `--visual` companion run (vision call,
+  then the text panel) is admitted against its full panel up front. `review jobs`
+  (also `review jobs --slots [--json]`, bare `review status`) lists every running and
+  waiting review host-wide, the budget, the per-seat estimate, and each provider's seats in
+  use vs. its current limit; a detached job that is still queued shows `admission=waiting#P`.
+- **Crash safety.** Each lease is `<name>.lock` (flock held by its owner for life) plus
+  `<name>.json` in `$XDG_STATE_HOME/review-cli/admission`. The kernel releases a killed
+  holder's flock, so the next scan deletes its lease; a lease whose heartbeat is older than
+  `stale_lease_seconds` (a stopped/wedged owner) stops counting. The shared `registry.lock`
+  is held only for each admission decision and taken with a bounded non-blocking wait; its
+  holder records its pid and start time in it. A holder that is stopped (SIGSTOP) or gone
+  after `lock_stale_seconds` (default 30) has the lock file replaced by a fresh one, with a
+  loud `STALE registry.lock` warning; if that holder resumes, its next registry write sees
+  the replaced lock and redoes its decision instead of writing it. A still-running holder
+  is never broken; a waiter blocked past `lock_wait_seconds` (default 60) runs without
+  host-wide admission, unless an explicit `just-ask --timeout N` passes first (then it
+  stops at N without starting a seat).
+
+Every key, its `REVIEW_ADMISSION_*` env var and default (env > config > default) is listed in
+`review help config` (HOST-WIDE ADMISSION); `REVIEW_ADMISSION=0` turns admission off.
 
 **To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the

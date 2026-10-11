@@ -79,6 +79,9 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "HOME": home,
         "XDG_CONFIG_HOME": str(Path(home) / ".config"),
         "REVIEW_TASK_CODE": "SMOKE-1",
+        # A private admission registry (review-cli#614): smoke's own `review` runs must
+        # never queue behind (or count against) reviews really running on this host.
+        "REVIEW_ADMISSION_DIR": str(Path(home) / "admission"),
     }
     full_env.update(env or {})
     return full_env
@@ -858,6 +861,10 @@ _UNIT_FILES = [
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Host-wide admission control (review-cli#614): admission math, provider budget + 429
+    # feedback, FIFO, SIGKILL recovery and multi-process budget proofs, each test on its own
+    # temp registry dir.
+    ("test_admission.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_inseat_retry.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_brainstorm_diff.py", {}),
     ("test_brainstorm_dead_panel.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

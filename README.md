@@ -1162,8 +1162,8 @@ a fully-keyed environment):
 
 See **[docs/board.md](docs/board.md)** for the full mechanics: in-seat retry vs.
 reserve-replace, the cross-invocation cooldown's escalating window, Claude account rotation
-across multiple accounts, the memory-aware concurrency cap, and how `board:`/`models:` config
-precedence resolves.
+across multiple accounts, the memory-aware concurrency cap, host-wide parallel-review
+admission (no `flock` needed), and how `board:`/`models:` config precedence resolves.
 
 **Per-project lens overrides (review-cli#547):** drop `.review/lenses/<role>.md` at
 your repo's root (`<role>` is one of the known roles above) to teach a board role

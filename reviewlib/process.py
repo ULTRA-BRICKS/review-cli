@@ -211,6 +211,12 @@ def run_deadline_expired() -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
+def run_deadline_remaining() -> float | None:
+    """Seconds left before the armed command deadline (<= 0 once past); None if none."""
+    deadline = _active_run_deadline()
+    return None if deadline is None else deadline - time.monotonic()
+
+
 @dataclass
 class SeatCall:
     """One backend call made under a command deadline: what the timeout report says
