@@ -108,6 +108,75 @@ def test_min_slots_bypass_budget_and_max_slots_cap():
     assert not v.admit and "max_slots" in v.reason, v
 
 
+def test_memory_pressure_above_the_limit_waits_and_at_the_limit_admits():
+    cfg = A.Settings(min_slots=0, max_memory_pressure=10.0)
+    roomy = dict(cpus=100, load1=0.0, total=10_000.0, avail=10_000.0)
+    at = A.HostSnapshot(*roomy.values(), mem_pressure=10.0)
+    over = A.HostSnapshot(*roomy.values(), mem_pressure=10.01)
+    assert A.machine_verdict(cfg, at, [], 0, 0, now=0).admit
+    refused = A.machine_verdict(cfg, over, [], 0, 0, now=0)
+    assert not refused.admit and "memory pressure 10.0% > 10%" in refused.reason, (
+        refused
+    )
+    # no PSI on this platform -> no pressure check
+    assert A.machine_verdict(
+        cfg, A.HostSnapshot(*roomy.values()), [], 0, 0, now=0
+    ).admit
+    # 0 turns the check off
+    off = A.Settings(min_slots=0, max_memory_pressure=0)
+    stalled = A.HostSnapshot(*roomy.values(), mem_pressure=95.0)
+    assert A.machine_verdict(off, stalled, [], 0, 0, now=0).admit
+    # min_slots runs still always start, so a stalled host keeps making progress
+    floor = A.Settings(min_slots=1, max_memory_pressure=10.0)
+    assert A.machine_verdict(floor, stalled, [], 0, 0, now=0).admit
+    assert not A.machine_verdict(
+        floor, stalled, [{"admitted_at": 0}], 0, 0, now=1e4
+    ).admit
+
+
+def test_full_swap_alone_never_blocks_but_short_ram_or_stalls_do():
+    """Swap usage is deliberately not a signal: swap keeps stale pages for hours (on
+    2026-10-15 it sat 100% full with 28 GB MemAvailable and PSI 0, and a swap-% rule
+    refused every review). Admission is the only gate for reviews, so a host that is really
+    short — little MemAvailable, or tasks stalling on reclaim — must still be refused."""
+    cfg = A.Settings(min_slots=0, headroom=0.20, max_memory_pressure=10.0)
+    # 48 GB box, 28 GB available, no stalls: admitted whatever swap looks like
+    stale_swap = A.HostSnapshot(16, 5.7, 48_000.0, 28_000.0, mem_pressure=0.0)
+    assert A.machine_verdict(cfg, stale_swap, [], 0.1, 1_000, now=0).admit
+    # RAM really short (used 40 GB > the 38.4 GB budget): refused on memory
+    short = A.HostSnapshot(16, 5.7, 48_000.0, 8_000.0, mem_pressure=0.0)
+    v = A.machine_verdict(cfg, short, [], 0.1, 1_000, now=0)
+    assert not v.admit and v.reason == "memory", v
+    # roomy-looking MemAvailable but the kernel already stalls on reclaim: refused
+    thrash = A.HostSnapshot(16, 5.7, 48_000.0, 28_000.0, mem_pressure=35.0)
+    v = A.machine_verdict(cfg, thrash, [], 0.1, 1_000, now=0)
+    assert not v.admit and v.reason.startswith("memory pressure"), v
+
+
+def test_memory_pressure_probe_reads_psi_some_avg10():
+    with tempfile.TemporaryDirectory() as d:
+        psi = Path(d) / "memory"
+        psi.write_text(
+            "some avg10=12.34 avg60=2.21 avg300=1.30 total=275485664\n"
+            "full avg10=11.17 avg60=1.95 avg300=1.18 total=231751496\n"
+        )
+        assert A._memory_pressure(str(psi)) == 12.34
+        psi.write_text("garbage\n")
+        assert A._memory_pressure(str(psi)) is None
+        assert A._memory_pressure(str(Path(d) / "missing")) is None
+
+
+def test_max_memory_pressure_setting_precedence_and_range():
+    load = A.load_settings
+    assert load(config={}, env={}).max_memory_pressure == 10.0
+    cfg = {"admission": {"max_memory_pressure": 25}}
+    assert load(config=cfg, env={}).max_memory_pressure == 25.0
+    env = {"REVIEW_ADMISSION_MAX_MEMORY_PRESSURE": "5"}
+    assert load(config=cfg, env=env).max_memory_pressure == 5.0
+    bad = {"REVIEW_ADMISSION_MAX_MEMORY_PRESSURE": "150"}  # out of range -> config
+    assert load(config=cfg, env=bad).max_memory_pressure == 25.0
+
+
 def test_learned_seat_cost_replaces_config_after_three_runs():
     with tempfile.TemporaryDirectory() as d:
         cfg = _cfg(d, learn=True, cpu_base=0.0, mem_base_mb=0)
@@ -781,6 +850,112 @@ def test_waiters_are_admitted_fifo():
         _wait_all([first, *later])
         starts = [name for _ts, event, name in _events(log) if event == "start"]
         assert starts == ["a", "b", "c", "d"], starts
+
+
+def test_admitted_runs_record_queue_wait_and_review_jobs_summarizes_it():
+    """Every admitted run appends its queue wait and the reviews running once it started to
+    admissions.jsonl; the status block summarizes the last 24h (review-cli#633)."""
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "events.log"
+        env = dict(
+            REVIEW_ADMISSION_MAX_SLOTS="2",
+            FAKE_HOST=json.dumps(
+                {"cpus": 64, "load1": 0.0, "total": 1e6, "avail": 1e6}
+            ),
+        )
+        # unequal holds: a ends first and c takes its slot while b is still running
+        first = [
+            _spawn(d, log, name, hold, **env) for name, hold in (("a", 2.5), ("b", 6.0))
+        ]
+        while not log.exists() or len(log.read_text().splitlines()) < 2:
+            time.sleep(0.02)
+        third = _spawn(d, log, "c", 0.1, **env)  # both slots taken: c queues ~2 s
+        _wait_all([*first, third])
+        reg = Path(d) / "reg"
+        ledger = [
+            json.loads(line)
+            for line in (reg / "admissions.jsonl").read_text().splitlines()
+        ]
+        assert [r["running"] for r in ledger] == [1, 2, 2], ledger
+        assert [r["queued_seconds"] >= 1.0 for r in ledger] == [False, False, True], (
+            ledger
+        )
+        assert all(r["mode"] == "review" and r["seats"] == 1 for r in ledger), ledger
+        # an old record, garbled lines and non-finite numbers never count and never
+        # break the summary (json.loads accepts NaN/Infinity)
+        now = time.time()
+        with open(reg / "admissions.jsonl", "a") as fh:
+            fh.write(
+                '{"ts": 0, "queued_seconds": 999, "running": 9}\nnot json\n{"ts": "x"}\n'
+                f'{{"ts": {now}, "queued_seconds": Infinity, "running": 1}}\n'
+                f'{{"ts": {now}, "queued_seconds": NaN, "running": 1}}\n'
+                f'{{"ts": {now}, "queued_seconds": 1, "running": Infinity}}\n'
+                f'{{"ts": {now + 3600}, "queued_seconds": 500, "running": 7}}\n'
+            )
+        snap = A.status_snapshot(_cfg(str(reg)), probe=lambda: _host())
+        recent = snap["recent"]
+        assert recent["admitted"] == 3 and recent["queued"] == 1, recent
+        assert recent["peak_running"] == 2, recent
+        assert recent["wait_max_seconds"] >= 1.0 > recent["wait_p50_seconds"], recent
+        text = A.render_status(snap)
+        assert "last 24h: 3 admitted, 1 queued (wait p50 0s" in text, text
+        assert "peak 2 running at once" in text, text
+
+
+def test_ledger_is_count_capped_and_the_summary_says_when_it_was_trimmed():
+    """The ledger keeps a bounded number of records (constant cost per admission under
+    registry.lock); a window it no longer fully covers is reported, never passed off as
+    the whole 24h."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "costs.jsonl"
+        for ts in (0, 100, 100, 100, 100):  # 5 lines > 2 x keep triggers a trim
+            A._append_ledger(path, {"ts": ts}, keep=2)
+        assert [i["ts"] for i in A._load_jsonl(path)] == [100, 100]
+        now = time.time()
+        rec = lambda ts: {"ts": ts, "queued_seconds": 0, "running": 1}  # noqa: E731
+        saved = A._ADMISSIONS_KEEP
+        A._ADMISSIONS_KEEP = 3
+        try:
+            ledger = Path(d) / "admissions.jsonl"
+            ledger.write_text(
+                "".join(json.dumps(rec(now - 10)) + "\n" for _ in range(3))
+            )
+            trimmed = A.recent_admissions(Path(d), now)
+            assert trimmed["admitted"] == 3 and trimmed["complete"] is False, trimmed
+            snap = {"enabled": True, "headroom": 0.2, "dir": d, "recent": trimmed}
+            snap["host"] = {"cpus": 1, "load1": 0, "cpu_budget": 0.8}
+            assert "ledger trimmed" in A.render_status(snap)
+            with open(
+                ledger, "a"
+            ) as fh:  # a record older than the window: fully covered
+                fh.write(json.dumps(rec(now - 2 * 24 * 3600)) + "\n")
+            assert A.recent_admissions(Path(d), now)["complete"] is True
+        finally:
+            A._ADMISSIONS_KEEP = saved
+
+
+def test_status_shows_memory_pressure_against_its_limit():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, max_memory_pressure=10.0)
+        host = A.HostSnapshot(16, 1.0, 48_000.0, 20_000.0, mem_pressure=1.5)
+        snap = A.status_snapshot(cfg, probe=lambda: host)
+        assert snap["host"]["mem_pressure"] == 1.5
+        assert snap["host"]["max_memory_pressure"] == 10.0
+        assert "memory pressure 1.5%/10%" in A.render_status(snap)
+        assert snap["recent"] == {
+            "window_hours": 24.0,
+            "admitted": 0,
+            "queued": 0,
+            "peak_running": 0,
+            "complete": True,
+        }, snap["recent"]
+        # the documented `recent` key is there even before any run made the registry dir,
+        # and with admission switched off
+        empty = snap["recent"]
+        missing = A.status_snapshot(_cfg(str(Path(d) / "none")), probe=lambda: host)
+        assert missing["recent"] == empty, missing
+        off = A.status_snapshot(_cfg(d, enabled=False), probe=lambda: host)
+        assert off["recent"] == empty, off
 
 
 def test_review_diff_runs_queue_for_a_host_slot_end_to_end():

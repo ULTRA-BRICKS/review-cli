@@ -5280,7 +5280,10 @@ HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-
   themselves). A run is admitted, oldest waiter first (FIFO), only while
     load average(1m) + estimates of runs admitted < ramp_seconds ago + this run's estimate
       <= (1 - headroom) x CPU count, and
-    (MemTotal - MemAvailable) + the same estimates <= (1 - headroom) x MemTotal.
+    (MemTotal - MemAvailable) + the same estimates <= (1 - headroom) x MemTotal, and
+    memory-stall pressure (Linux PSI `some avg10`, /proc/pressure/memory) <=
+      max_memory_pressure percent (0 = no pressure check). Swap usage alone is not a
+      signal (stale swap pages linger for hours); real shortage shows in MemAvailable/PSI.
   A run's estimate is base + per_seat x seats; per_seat is learned (p75 of the last
   learn_window runs' measured process-tree peak RSS / avg CPU) once 3+ runs exist, else
   the configured defaults. min_slots runs always start; max_slots (0 = none) caps them.
@@ -5302,7 +5305,9 @@ HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-
   from an explicit just-ask --timeout N: a run still queued at N exits 124 without
   starting a seat. A --visual companion is admitted against its full text panel, not
   just the vision call. `review jobs` (or `review jobs --slots [--json]`)
-  and bare `review status` list running/waiting reviews, the budget and provider seats.
+  and bare `review status` list running/waiting reviews, the budget and provider seats,
+  plus the last 24h of admissions (admitted, queued, queue wait p50/p90/max, peak running
+  at once) from admissions.jsonl in the registry dir.
   config.yaml `admission:` key / env var (env > config > default):
     enabled                   REVIEW_ADMISSION                        default {adm.enabled}
     headroom                  REVIEW_ADMISSION_HEADROOM               default {adm.headroom}
@@ -5323,6 +5328,7 @@ HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-
     provider_wait_seconds     REVIEW_ADMISSION_PROVIDER_WAIT_SECONDS  default {adm.provider_wait_seconds} (0 = wait forever; queue time never counts toward the backstop)
     throttle_backoff          REVIEW_ADMISSION_THROTTLE_BACKOFF       default {adm.throttle_backoff}
     throttle_cooldown_seconds REVIEW_ADMISSION_THROTTLE_COOLDOWN_SECONDS default {adm.throttle_cooldown_seconds}
+    max_memory_pressure       REVIEW_ADMISSION_MAX_MEMORY_PRESSURE    default {adm.max_memory_pressure:g} (% PSI some avg10; 0 = off)
     providers                 REVIEW_ADMISSION_PROVIDERS="anthropic=12,zai=4/60" (name=max[/rpm])
     dir                       REVIEW_ADMISSION_DIR                    default $XDG_STATE_HOME/review-cli/admission
   Example:

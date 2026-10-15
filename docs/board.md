@@ -224,8 +224,14 @@ callers.
   run's estimate is `base + per_seat × seats`; `per_seat` starts at the configured
   `cpu_per_seat`/`mem_per_seat_mb` and, once 3 runs have been measured, becomes the p75 of
   the last `learn_window` runs' measured process-tree peak RSS and average CPU (each run
-  samples its own tree while it holds its slot and appends to `costs.jsonl`). `min_slots`
-  runs always start; `max_slots` (0 = none) caps them.
+  samples its own tree while it holds its slot and appends to `costs.jsonl`). It also waits
+  while the kernel's memory-stall pressure (Linux PSI `some avg10` in
+  `/proc/pressure/memory`) is above `max_memory_pressure` percent (default 10, 0 = off):
+  MemAvailable can look roomy while the host is already reclaiming, as on 2026-10-10/11.
+  Swap usage on its own is deliberately not a signal: swap keeps stale pages for hours (on
+  2026-10-15 it sat 100% full with 28 GB MemAvailable and PSI 0); a host that is really
+  short shows it in MemAvailable or PSI, and both refuse.
+  `min_slots` runs always start; `max_slots` (0 = none) caps them.
 - **Provider budget (per seat call).** Each seat holds a slot of its provider (`anthropic`
   for `claude:`/`omp:anthropic/`/fable, `openai` for codex, `zai`, `commandcode`, `xai`,
   `opencode-go`, ...): `floor(max_concurrent × (1 − headroom))` (≥ 1) at once (default
@@ -247,6 +253,11 @@ callers.
   (also `review jobs --slots [--json]`, bare `review status`) lists every running and
   waiting review host-wide, the budget, the per-seat estimate, and each provider's seats in
   use vs. its current limit; a detached job that is still queued shows `admission=waiting#P`.
+  Every admitted run appends its queue wait and the number of reviews running once it
+  started to `admissions.jsonl`; `review jobs` summarizes the last 24h from it (admitted,
+  queued, wait p50/p90/max, peak running at once — JSON key `recent`). The ledger keeps the
+  newest 5000 records (the busiest day so far had ~500 reviews); if a trim ever cuts into
+  the 24h window, `recent.complete` is false and the text line says so.
 - **Crash safety.** Each lease is `<name>.lock` (flock held by its owner for life) plus
   `<name>.json` in `$XDG_STATE_HOME/review-cli/admission`. The kernel releases a killed
   holder's flock, so the next scan deletes its lease; a lease whose heartbeat is older than

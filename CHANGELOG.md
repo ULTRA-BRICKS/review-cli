@@ -3,6 +3,23 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.47.0 — 2026-10-15
+
+- **Feat(admission): wait on memory-stall pressure and record every run's queue wait**
+  ([review-cli#633](https://git.hyperide.ai/ultrabricks/review-cli/issues/633), follow-up of
+  [#614](https://git.hyperide.ai/ultrabricks/review-cli/issues/614)). A run now also waits
+  while Linux PSI `some avg10` (`/proc/pressure/memory`) is above `max_memory_pressure`
+  percent (default 10, 0 = off; `admission.max_memory_pressure` /
+  `REVIEW_ADMISSION_MAX_MEMORY_PRESSURE`; the first `min_slots` runs still always start) —
+  the same signal the agent-tools
+  heavy-op-memory-gate hook refuses on, so that hook can leave reviews to this queue. Each
+  admitted run appends its queue wait and the number of reviews running once it started to
+  `admissions.jsonl`; `review jobs` / `review jobs --slots [--json]` show the last 24h
+  (admitted, queued, wait p50/p90/max, peak running at once; JSON key `recent`) and the
+  current memory pressure. Swap usage alone stays deliberately unweighted: stale swap pages
+  linger for hours (100% full next to 28 GB MemAvailable and PSI 0 on 2026-10-15); real
+  shortage shows in MemAvailable or PSI, and both refuse.
+
 ## 0.46.0 — 2026-10-10
 
 - **Feat(admission): run reviews in parallel up to machine and provider capacity with a

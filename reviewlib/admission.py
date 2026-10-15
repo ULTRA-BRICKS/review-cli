@@ -17,10 +17,16 @@ Two budgets, one shared lease registry:
   estimate is ``base + per_seat * seats``; ``per_seat`` comes from the config defaults until
   ``learn`` has at least 3 measured runs, then from the 75th percentile of the last
   ``learn_window`` runs (each run samples its own process tree's RSS and CPU time while it
-  holds its lease and appends the result to ``costs.jsonl``). ``min_slots`` runs are always
+  holds its lease and appends the result to ``costs.jsonl``). The run also waits while the
+  kernel reports memory-stall pressure (PSI ``some avg10`` in ``/proc/pressure/memory``)
+  above ``max_memory_pressure`` percent: MemAvailable can look roomy while the host is
+  already reclaiming (the 2026-10-10/11 thrash). ``min_slots`` runs are always
   admitted regardless of the machine budget (so a host busy with other work still makes
   progress) and ``max_slots`` (0 = none) is a hard ceiling on concurrent runs. Where
-  ``/proc/meminfo`` does not exist (macOS) only the CPU budget applies.
+  ``/proc/meminfo`` / ``/proc/pressure`` do not exist (macOS) only the CPU budget applies.
+
+  Each admitted run appends its queue wait to ``admissions.jsonl``, which ``review jobs``
+  summarizes (queued runs, wait percentiles, peak concurrency) for the last 24 hours.
 
 * PROVIDER budget (per model SEAT call). Each seat call holds a slot of its provider
   (``anthropic``, ``openai``, ``zai``, ``commandcode``, ...). The effective concurrency is
@@ -99,6 +105,7 @@ class Settings:
     provider_wait_seconds: int = 600
     throttle_backoff: float = 0.5
     throttle_cooldown_seconds: int = 300
+    max_memory_pressure: float = 10.0  # PSI `some avg10` percent; 0 = off
     providers: dict = field(default_factory=dict)  # name -> ProviderLimit
     dir: Path | None = None
 
@@ -186,6 +193,11 @@ _FIELDS: dict[str, tuple[str, Callable[[object], object], Callable[[object], boo
         "REVIEW_ADMISSION_THROTTLE_COOLDOWN_SECONDS",
         _parse_int,
         lambda v: v >= 0,
+    ),
+    "max_memory_pressure": (
+        "REVIEW_ADMISSION_MAX_MEMORY_PRESSURE",
+        _parse_float,
+        lambda v: 0.0 <= v <= 100.0,
     ),
 }
 ENV_DIR = "REVIEW_ADMISSION_DIR"
@@ -389,6 +401,7 @@ class HostSnapshot:
     load1: float
     mem_total_mb: float | None  # None when the platform does not expose it
     mem_available_mb: float | None
+    mem_pressure: float | None = None  # PSI `some avg10` percent; None = not exposed
 
 
 def probe_host() -> HostSnapshot:
@@ -409,7 +422,22 @@ def probe_host() -> HostSnapshot:
         pass
     if total is None or avail is None:
         total = avail = None
-    return HostSnapshot(cpus, load1, total, avail)
+    return HostSnapshot(cpus, load1, total, avail, _memory_pressure())
+
+
+def _memory_pressure(path: str = "/proc/pressure/memory") -> float | None:
+    """PSI `some avg10` of /proc/pressure/memory: the percent of the last 10 s in which some
+    task stalled on memory reclaim. None without PSI (macOS, CONFIG_PSI=n)."""
+    try:
+        with open(path, encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("some "):
+                    for part in line.split()[1:]:
+                        if part.startswith("avg10="):
+                            return float(part.split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 _PAGE_MB = (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096) / (
@@ -466,6 +494,9 @@ _BREAK_FILE = "registry.break.lock"
 _PROVIDERS_FILE = "providers.json"
 _COSTS_FILE = "costs.jsonl"
 _COSTS_KEEP = 200
+_ADMISSIONS_FILE = "admissions.jsonl"
+_ADMISSIONS_KEEP = 5000  # busiest day so far: ~500 reviews
+_ADMISSIONS_WINDOW_SECONDS = 24 * 3600
 _LOCK_BACKOFF_MIN = 0.01
 _LOCK_BACKOFF_MAX = 0.25
 
@@ -853,13 +884,18 @@ def seat_cost(cfg: Settings, root: Path) -> SeatCost:
                 max(0.0, (float(s.get("peak_rss_mb", 0)) - cfg.mem_base_mb) / seats)
             )
         if len(cpus) >= 3:
-            return SeatCost(_p75(cpus), _p75(mems), f"learned ({len(cpus)} runs)")
+            return SeatCost(
+                _percentile(cpus, 0.75),
+                _percentile(mems, 0.75),
+                f"learned ({len(cpus)} runs)",
+            )
     return SeatCost(cfg.cpu_per_seat, float(cfg.mem_per_seat_mb), "config")
 
 
-def _p75(values: list[float]) -> float:
+def _percentile(values: list[float], q: float) -> float:
+    """Nearest-rank percentile (`q` in 0..1) of a non-empty list."""
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(math.ceil(0.75 * len(ordered))) - 1)]
+    return ordered[max(0, min(len(ordered) - 1, int(math.ceil(q * len(ordered))) - 1))]
 
 
 def run_estimate(cfg: Settings, cost: SeatCost, seats: int) -> tuple[float, float]:
@@ -886,7 +922,8 @@ def machine_verdict(
     now: float,
 ) -> Verdict:
     """Would admitting one more run (estimate `est_cpu`/`est_mem_mb`) keep the host within
-    `(1 - headroom)` of capacity? `running` are the live, non-stale running run leases."""
+    `(1 - headroom)` of capacity, with memory-stall pressure at or below
+    `max_memory_pressure`? `running` are the live, non-stale running run leases."""
     usable = 1.0 - cfg.headroom
     young = [
         r for r in running if now - float(r.get("admitted_at") or 0) < cfg.ramp_seconds
@@ -919,6 +956,21 @@ def machine_verdict(
         return Verdict(False, "cpu", cpu_proj, cpu_budget, mem_proj, mem_budget)
     if mem_proj is not None and mem_budget is not None and mem_proj > mem_budget + eps:
         return Verdict(False, "memory", cpu_proj, cpu_budget, mem_proj, mem_budget)
+    pressure = host.mem_pressure
+    if (
+        cfg.max_memory_pressure
+        and pressure is not None
+        and pressure > cfg.max_memory_pressure
+    ):
+        return Verdict(
+            False,
+            f"memory pressure {pressure:.1f}% > {cfg.max_memory_pressure:g}% "
+            "(PSI some avg10: the host is already stalling on reclaim)",
+            cpu_proj,
+            cpu_budget,
+            mem_proj,
+            mem_budget,
+        )
     return Verdict(True, "", cpu_proj, cpu_budget, mem_proj, mem_budget)
 
 
@@ -1188,9 +1240,9 @@ class _Sampler(threading.Thread):
         )
 
 
-def _load_costs(root: Path) -> list[dict]:
+def _load_jsonl(path: Path) -> list[dict]:
     try:
-        lines = (root / _COSTS_FILE).read_text().splitlines()
+        lines = path.read_text().splitlines()
     except OSError:
         return []
     out = []
@@ -1204,6 +1256,25 @@ def _load_costs(root: Path) -> list[dict]:
     return out
 
 
+def _load_costs(root: Path) -> list[dict]:
+    return _load_jsonl(root / _COSTS_FILE)
+
+
+def _append_ledger(path: Path, item: dict, keep: int) -> None:
+    """Append one record to a registry ledger, trimming it to the last `keep` once it
+    passes twice that. The caller holds registry.lock and has fenced it. Counting lines
+    (no JSON parse) keeps the per-record cost small and bounded; only a trim parses."""
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(item) + "\n")
+    with open(path, "rb") as fh:
+        lines = sum(1 for _ in fh)
+    if lines > keep * 2:
+        items = _load_jsonl(path)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(i) + "\n" for i in items[-keep:]))
+        os.replace(tmp, path)
+
+
 def _record_cost(
     root: Path,
     cfg: Settings,
@@ -1214,29 +1285,41 @@ def _record_cost(
 ) -> None:
     if wall < 30 or seats <= 0:
         return  # a near-instant run (clean tree, early error) says nothing about seat cost
-    line = json.dumps(
-        {
-            "ts": time.time(),
-            "seats": seats,
-            "peak_rss_mb": round(peak_rss, 1),
-            "cpu_avg": round(cpu_avg, 3),
-            "seconds": round(wall, 1),
-        }
-    )
+    item = {
+        "ts": time.time(),
+        "seats": seats,
+        "peak_rss_mb": round(peak_rss, 1),
+        "cpu_avg": round(cpu_avg, 3),
+        "seconds": round(wall, 1),
+    }
     try:
         with _registry_locked(root, cfg):
-            path = root / _COSTS_FILE
             _fence(root)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-            costs = _load_costs(root)
-            if len(costs) > _COSTS_KEEP * 2:
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(
-                    "".join(json.dumps(c) + "\n" for c in costs[-_COSTS_KEEP:])
-                )
-                os.replace(tmp, path)
+            _append_ledger(root / _COSTS_FILE, item, _COSTS_KEEP)
     except OSError:
+        pass
+
+
+def _record_admission(root: Path, lease: Lease, now: float, running: int) -> None:
+    """One line per admitted run: how long it queued and how many reviews were running
+    host-wide once it started — the record `review jobs` summarizes. Called under
+    registry.lock right after the admission decision; never raises."""
+    try:
+        _append_ledger(
+            root / _ADMISSIONS_FILE,
+            {
+                "ts": now,
+                "mode": lease.data.get("mode"),
+                "task": lease.data.get("task"),
+                "seats": lease.data.get("seats"),
+                "queued_seconds": round(
+                    max(0.0, now - float(lease.data.get("enqueued_at", now))), 1
+                ),
+                "running": running,
+            },
+            _ADMISSIONS_KEEP,
+        )
+    except (OSError, TypeError, ValueError):
         pass
 
 
@@ -1454,6 +1537,7 @@ def _wait_for_run_admission(
                             if not provider_block:
                                 _fence(root)
                                 lease.update(state="running", admitted_at=now)
+                                _record_admission(root, lease, now, len(running) + 1)
                                 break
             except RegistryLost as exc:
                 _warn(str(exc))
@@ -1718,6 +1802,50 @@ def note_failure_text(model: str, text: str | None) -> None:
 # ── status ──────────────────────────────────────────────────────────────────────────────
 
 
+def recent_admissions(
+    root: Path | None, now: float, window: float = _ADMISSIONS_WINDOW_SECONDS
+) -> dict:
+    """Queue wait and achieved parallelism of the runs admitted in the last `window`
+    seconds, from admissions.jsonl. A run counts as queued once it waited 1 s or more (an
+    immediate admission records ~0). The ledger is count-capped (_ADMISSIONS_KEEP, far
+    above any day seen so far), so `complete` is False when it was trimmed past the
+    window's start and the counts cover only its newest records."""
+    waits: list[float] = []
+    peak = 0
+    records = _load_jsonl(root / _ADMISSIONS_FILE) if root is not None else []
+    oldest = math.inf
+    for item in records:
+        try:
+            ts = float(item["ts"])
+            wait = float(item["queued_seconds"])
+            running = int(item["running"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue  # a garbled or hand-edited line never breaks `review jobs`
+        if not (math.isfinite(ts) and math.isfinite(wait)) or wait < 0 or running < 0:
+            continue  # NaN/Infinity parse as floats; they would crash or skew the summary
+        oldest = min(oldest, ts)
+        if not 0 <= now - ts <= window:
+            continue  # older than the window, or future-dated (clock skew, hand edit)
+        waits.append(wait)
+        peak = max(peak, running)
+    summary: dict = {
+        "window_hours": round(window / 3600, 1),
+        "admitted": len(waits),
+        "queued": sum(1 for w in waits if w >= 1.0),
+        "peak_running": peak,
+        # fewer lines than a trim leaves -> never trimmed; else the oldest kept record
+        # must predate the window for the window to be fully covered
+        "complete": len(records) < _ADMISSIONS_KEEP or oldest <= now - window,
+    }
+    if waits:
+        summary.update(
+            wait_p50_seconds=_percentile(waits, 0.5),
+            wait_p90_seconds=_percentile(waits, 0.9),
+            wait_max_seconds=max(waits),
+        )
+    return summary
+
+
 def status_snapshot(
     cfg: Settings | None = None, probe: Callable[[], HostSnapshot] = probe_host
 ) -> dict:
@@ -1746,9 +1874,12 @@ def status_snapshot(
             "mem_budget_mb": None
             if host.mem_total_mb is None
             else round((1 - cfg.headroom) * host.mem_total_mb),
+            "mem_pressure": host.mem_pressure,
+            "max_memory_pressure": cfg.max_memory_pressure,
         },
         "runs": [],
         "providers": {},
+        "recent": recent_admissions(root, now),
     }
     if not cfg.enabled or root is None or not root.is_dir():
         return snap
@@ -1826,6 +1957,10 @@ def render_status(snap: dict) -> str:
     if h.get("mem_total_mb") is not None and h.get("mem_available_mb") is not None:
         used = h["mem_total_mb"] - h["mem_available_mb"]
         mem = f"; mem used {used / 1024:.1f}/{h['mem_budget_mb'] / 1024:.1f} GiB budget"
+    if h.get("mem_pressure") is not None:
+        limit = h.get("max_memory_pressure")
+        bound = f"/{limit:g}%" if limit else " (check off)"
+        mem += f"; memory pressure {h['mem_pressure']:.1f}%{bound}"
     lines.append(
         f"  host: load {h['load1']}/{h['cpu_budget']} cpu budget ({h['cpus']} cpus){mem}"
     )
@@ -1848,6 +1983,22 @@ def render_status(snap: dict) -> str:
             f"    {tag:<11} pid={r['pid']} mode={r['mode']} task={r['task'] or '-'} "
             f"seats={r['seats']} est={r['est_cpu']}cpu/{r['est_mem_mb']}MiB for {age}"
         )
+    recent = snap.get("recent")
+    if recent:
+        line = (
+            f"  last {recent['window_hours']:g}h: {recent['admitted']} admitted, "
+            f"{recent['queued']} queued"
+        )
+        if recent["admitted"]:
+            line += (
+                f" (wait p50 {_fmt_secs(recent['wait_p50_seconds'])}, "
+                f"p90 {_fmt_secs(recent['wait_p90_seconds'])}, "
+                f"max {_fmt_secs(recent['wait_max_seconds'])}); "
+                f"peak {recent['peak_running']} running at once"
+            )
+        if not recent.get("complete", True):
+            line += f" — ledger trimmed, only its newest {_ADMISSIONS_KEEP}+ records counted"
+        lines.append(line)
     if snap.get("providers"):
         lines.append("  provider seats (running/limit, waiting):")
         for name, p in snap["providers"].items():
