@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.49.0 — 2026-10-16
+
+- **Feat(omp): exclude omp Anthropic accounts and cap their usage**
+  ([review-cli#641](https://git.hyperide.ai/ultrabricks/review-cli/issues/641)). New
+  config.yaml key `omp_accounts:` for the `omp:anthropic/*` seats' account pool:
+  `exclude: [email, ...]` accounts are never used (no token is fetched for them), and an
+  account with an `omp usage` window at or above `max_usage_percent` (global, or per
+  account under `accounts: {email: {max_usage_percent: N}}`, which wins) is skipped until
+  that window resets; a model-tier window (Fable's 7-day) counts only for that tier, and
+  unknown usage never skips. Env overrides: `$REVIEW_OMP_ACCOUNTS_EXCLUDE` (comma-separated)
+  and `$REVIEW_OMP_MAX_USAGE_PERCENT`; a config value an env override replaces is not
+  checked. Emails match case-insensitively. When every account is excluded or over its
+  threshold, the seat fails without a model call and names each account and why, and
+  `review seats` shows the seat UNUSABLE with that reason. An invalid value fails the seat
+  with the problem instead of being ignored; an unreadable or empty agent.db with a policy
+  set, or a policy together with `$REVIEW_OMP_CLAUDE_PROFILES` (a profile's account is
+  unknown), fails rather than letting an excluded account answer, and while an exclude
+  list is set an account without a known email is skipped. `review seats` / `status` /
+  `doctor` (text and `--json`) show the policy and each account's `EXCLUDED` /
+  `OVER LIMIT (window, % >= threshold, resets at)` reason; the answer's `account:` line
+  lists the accounts the policy skipped.
+
 ## 0.48.0 — 2026-10-16
 
 - **Fix(omp): omp seats start inside the seat sandbox without `OMP_REAL_BIN`**

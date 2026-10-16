@@ -20,6 +20,10 @@ and moves on to the next one on a limit or login failure. Pinning, verified agai
 in its own db when needed), and an omp run whose agent dir holds NO stored credential uses
 `ANTHROPIC_OAUTH_TOKEN` and nothing else. With stored credentials present, omp ignores
 that variable, so a pinned attempt gets a fresh empty agent dir inside the seat sandbox.
+
+ACCOUNT POLICY (#641). config.yaml `omp_accounts:` (or its env overrides) names accounts a
+seat must never take and a usage threshold: an account whose `omp usage` window is at or
+above it waits for that window's reset (`AccountPolicy`).
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,13 +74,18 @@ class OmpAccount:
 
     def blocked_until_ms(self, omp_model: str | None) -> int | None:
         """When omp's block for `omp_model` on this account ends, None when not blocked."""
-        lowered = (omp_model or "").lower()
         ends = [
             until
             for scope, until in self.blocks
-            if not scope or scope.lower() in lowered
+            if tier_applies(scope or None, omp_model)
         ]
         return max(ends) if ends else None
+
+
+def tier_applies(tier: str | None, omp_model: str | None) -> bool:
+    """True when a block or usage window of model tier `tier` (None: shared by every
+    model) counts for `omp_model`: the tier name (e.g. "fable") occurs in the model id."""
+    return tier is None or tier.lower() in (omp_model or "").lower()
 
 
 def _identity_email(identity_key: object) -> str | None:
@@ -409,14 +419,20 @@ def access_token(launcher: OmpLauncher, account: OmpAccount) -> tuple[str | None
 
 @dataclass(frozen=True)
 class UsageWindow:
+    """One usage window from `omp usage`. `tier` names the model tier a scoped window
+    counts (e.g. "fable" for `Claude 7 Day (Fable)`); None for a window every model of the
+    account shares."""
+
     label: str
     used_fraction: float
     resets_at_ms: int | None
+    tier: str | None = None
 
 
 def usage_by_email(launcher: OmpLauncher) -> dict[str, list[UsageWindow]] | None:
     """Each Anthropic account's usage windows from `omp usage --json --provider
-    anthropic`, keyed by account email, or None when omp did not answer. A network read of
+    anthropic`, keyed by the lower-cased account email (look one up with `usage_of`), or
+    None when omp did not answer. A network read of
     the provider's usage endpoint (omp caches it); no model is called."""
     import json  # noqa: PLC0415
 
@@ -452,18 +468,360 @@ def usage_by_email(launcher: OmpLauncher) -> dict[str, list[UsageWindow]] | None
             if _finite_int(used) is None:
                 continue
             resets = window.get("resetsAt") if isinstance(window, dict) else None
+            scope = limit.get("scope")
+            tier = scope.get("tier") if isinstance(scope, dict) else None
             windows.append(
                 UsageWindow(
                     label=str(limit.get("label") or limit.get("id") or "?"),
                     used_fraction=float(used),
                     resets_at_ms=_finite_int(resets),
+                    tier=tier if isinstance(tier, str) and tier else None,
                 )
             )
-        out[email] = windows
+        # a second report for the same email adds its windows instead of replacing them
+        out.setdefault(email.lower(), []).extend(windows)
     return out
 
 
 def utc_stamp(epoch_ms: float) -> str:
     return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%MZ"
+    )
+
+
+# ---- the account policy (#641) ----------------------------------------------------------
+
+EXCLUDE_ENV = "REVIEW_OMP_ACCOUNTS_EXCLUDE"
+MAX_USAGE_ENV = "REVIEW_OMP_MAX_USAGE_PERCENT"
+_CONFIG_WHERE = "config.yaml omp_accounts"
+_POLICY_KEYS = ("accounts", "exclude", "max_usage_percent")
+
+
+@dataclass(frozen=True)
+class AccountPolicy:
+    """Which of omp's Anthropic accounts an omp:anthropic seat may take. `exclude` holds
+    lower-cased emails that are never taken. An account with a usage window at or above
+    its threshold (percent: its `per_account` entry, else `max_usage_percent`) waits for
+    that window's reset; unknown usage never skips. `problems` are invalid settings: while
+    one exists the pool is not used, because the intended exclusions cannot be trusted."""
+
+    exclude: tuple[str, ...] = ()
+    max_usage_percent: float | None = None
+    per_account: tuple[tuple[str, float], ...] = ()
+    problems: tuple[str, ...] = ()
+    exclude_source: str = ""
+    max_usage_source: str = ""
+
+    @property
+    def needs_usage(self) -> bool:
+        return self.max_usage_percent is not None or bool(self.per_account)
+
+    @property
+    def restricts(self) -> bool:
+        """True when the policy can refuse an account (or is invalid): omp must then not
+        pick an account on its own."""
+        return bool(self.exclude) or self.needs_usage or bool(self.problems)
+
+    def threshold_for(self, email: str | None) -> float | None:
+        key = (email or "").lower()
+        for name, percent in self.per_account:
+            if name == key:
+                return percent
+        return self.max_usage_percent
+
+    def is_excluded(self, account: OmpAccount) -> bool:
+        return bool(account.email) and account.email.lower() in self.exclude
+
+    def _over_limit(
+        self, account: OmpAccount, usage: list[UsageWindow] | None, now_ms: int
+    ) -> list[tuple[UsageWindow, float]]:
+        """(window, threshold) for each of `account`'s windows, any tier, at or above its
+        threshold that has not reset. The fraction is compared unrounded: 89.99% is
+        under a 90% threshold."""
+        threshold = self.threshold_for(account.email)
+        if threshold is None or not usage:
+            return []
+        return [
+            (w, threshold)
+            for w in usage
+            if w.used_fraction >= threshold / 100
+            and (w.resets_at_ms is None or w.resets_at_ms > now_ms)
+        ]
+
+    def skip_reason(
+        self,
+        account: OmpAccount,
+        usage: list[UsageWindow] | None,
+        omp_model: str | None,
+        now_ms: int,
+    ) -> str | None:
+        """Why a seat on `omp_model` must not take `account` now, else None. An account
+        without a known email cannot be checked against an exclude list, so it is skipped
+        while one is set. A tier window (e.g. Fable's, tier "fable") counts only for that
+        tier's models (`tier_applies`, as omp's own tier blocks do); `omp_model=None`
+        counts the shared windows only (`tier_over_limit` lists the tier ones)."""
+        if self.exclude and not account.email:
+            return f"EMAIL UNKNOWN (cannot be checked against {self.exclude_source})"
+        if self.is_excluded(account):
+            return f"EXCLUDED ({self.exclude_source})"
+        over = [
+            _window_text(w, threshold)
+            for w, threshold in self._over_limit(account, usage, now_ms)
+            if tier_applies(w.tier, omp_model)
+        ]
+        return "OVER LIMIT (" + "; ".join(over) + ")" if over else None
+
+    def tier_over_limit(
+        self, account: OmpAccount, usage: list[UsageWindow] | None, now_ms: int
+    ) -> tuple[str, ...]:
+        """`<tier> OVER LIMIT (...)` for each tier window at or above the threshold: the
+        account is skipped for that tier's models only. Empty for an excluded account."""
+        if self.is_excluded(account):
+            return ()
+        return tuple(
+            f"{w.tier} OVER LIMIT ({_window_text(w, threshold)})"
+            for w, threshold in self._over_limit(account, usage, now_ms)
+            if w.tier
+        )
+
+    def summary(self) -> str:
+        """One line: the exclude list and thresholds with where each came from."""
+        parts = [
+            f"exclude {', '.join(self.exclude)} ({self.exclude_source})"
+            if self.exclude
+            else "exclude none"
+        ]
+        parts.append(
+            f"max usage {_percent_text(self.max_usage_percent)}% ({self.max_usage_source})"
+            if self.max_usage_percent is not None
+            else "max usage none (accounts are used up to their limit)"
+        )
+        if self.per_account:
+            parts.append(
+                "per account "
+                + ", ".join(f"{e} {_percent_text(p)}%" for e, p in self.per_account)
+                + f" ({_CONFIG_WHERE}.accounts)"
+            )
+        return " · ".join(parts)
+
+
+def _window_text(window: UsageWindow, threshold: float) -> str:
+    resets = (
+        f"resets {utc_stamp(window.resets_at_ms)}"
+        if window.resets_at_ms is not None
+        else "reset time unknown"
+    )
+    return (
+        f"{window.label.removeprefix('Claude ')} "
+        f"{_percent_text(window.used_fraction * 100)}% "
+        f">= {_percent_text(threshold)}%, {resets}"
+    )
+
+
+def _percent_text(value: float) -> str:
+    rounded = round(value, 1)
+    return str(int(rounded)) if rounded == int(rounded) else str(rounded)
+
+
+def _percent(
+    value: object, where: str, *, allow_text: bool = False
+) -> tuple[float | None, str | None]:
+    """(percent, None) for a number in (0, 100], else (None, the problem). A numeric
+    string is accepted only with `allow_text` (an env value)."""
+    number: float | None = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+    elif isinstance(value, str) and allow_text:
+        try:
+            number = float(value.strip())
+        except ValueError:
+            number = None
+    if number is None or not math.isfinite(number) or not 0 < number <= 100:
+        return None, f"{where} must be a number above 0 and at most 100, got {value!r}"
+    return number, None
+
+
+def _is_email_token(value: object) -> bool:
+    """A configured account email: printable, no whitespace (it is printed into status
+    output, so control characters are refused)."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.isprintable()
+        and not any(ch.isspace() for ch in value)
+    )
+
+
+def _config_exclude(listed: object) -> tuple[tuple[str, ...], str | None]:
+    where = f"{_CONFIG_WHERE}.exclude"
+    if isinstance(listed, list) and all(
+        isinstance(e, str) and _is_email_token(e.strip()) for e in listed
+    ):
+        return tuple(dict.fromkeys(e.strip().lower() for e in listed)), None
+    return (), f"{where} must be a list of account emails, got {listed!r}"
+
+
+def _config_per_account(accounts: object) -> tuple[dict[str, float], list[str]]:
+    if not isinstance(accounts, dict):
+        return {}, [
+            f"{_CONFIG_WHERE}.accounts must map an email to settings, got {accounts!r}"
+        ]
+    out: dict[str, float] = {}
+    problems: list[str] = []
+    for email, entry in accounts.items():
+        if not isinstance(email, str) or not _is_email_token(email.strip()):
+            problems.append(f"{_CONFIG_WHERE}.accounts: {email!r} is not an email")
+            continue
+        where = f"{_CONFIG_WHERE}.accounts.{email.strip()}"
+        if not isinstance(entry, dict) or set(entry) != {"max_usage_percent"}:
+            problems.append(f"{where} must be {{max_usage_percent: N}}, got {entry!r}")
+            continue
+        percent, problem = _percent(
+            entry["max_usage_percent"], f"{where}.max_usage_percent"
+        )
+        if problem:
+            problems.append(problem)
+        else:
+            out[email.strip().lower()] = percent
+    return out, problems
+
+
+def account_policy(raw: object, env: Mapping[str, str]) -> AccountPolicy:
+    """The policy from config.yaml's `omp_accounts:` value `raw` (None when absent) and the
+    env overrides: `$REVIEW_OMP_ACCOUNTS_EXCLUDE` (comma-separated emails, at least one)
+    replaces the exclude list and `$REVIEW_OMP_MAX_USAGE_PERCENT` the global threshold;
+    a config value an env override replaces is not validated. Invalid values are collected
+    in `problems`, never silently dropped."""
+    problems: list[str] = []
+    exclude: tuple[str, ...] = ()
+    max_percent: float | None = None
+    per_account: dict[str, float] = {}
+    exclude_source = max_source = ""
+    env_tokens = [e.strip() for e in (env.get(EXCLUDE_ENV) or "").split(",") if e.strip()]
+    env_exclude = tuple(
+        dict.fromkeys(e.lower() for e in env_tokens if _is_email_token(e))
+    )
+    problems.extend(
+        f"${EXCLUDE_ENV}: {e!r} is not an email"
+        for e in env_tokens
+        if not _is_email_token(e)
+    )
+    env_max = (env.get(MAX_USAGE_ENV) or "").strip()
+    if raw is not None and not isinstance(raw, dict):
+        problems.append(f"{_CONFIG_WHERE} must be a mapping, got {raw!r}")
+    elif isinstance(raw, dict):
+        unknown = sorted(str(k) for k in raw if k not in _POLICY_KEYS)
+        if unknown:
+            problems.append(
+                f"{_CONFIG_WHERE}: unknown key {', '.join(unknown)} "
+                f"(known: {', '.join(_POLICY_KEYS)})"
+            )
+        if raw.get("exclude") is not None and not env_exclude:
+            exclude, problem = _config_exclude(raw["exclude"])
+            if problem:
+                problems.append(problem)
+            else:
+                exclude_source = f"{_CONFIG_WHERE}.exclude"
+        if raw.get("max_usage_percent") is not None and not env_max:
+            max_percent, problem = _percent(
+                raw["max_usage_percent"], f"{_CONFIG_WHERE}.max_usage_percent"
+            )
+            if problem:
+                problems.append(problem)
+            else:
+                max_source = f"{_CONFIG_WHERE}.max_usage_percent"
+        if raw.get("accounts") is not None:
+            per_account, account_problems = _config_per_account(raw["accounts"])
+            problems.extend(account_problems)
+    if env_exclude:
+        exclude, exclude_source = env_exclude, f"${EXCLUDE_ENV}"
+    if env_max:
+        max_percent, problem = _percent(env_max, f"${MAX_USAGE_ENV}", allow_text=True)
+        if problem:
+            problems.append(problem)
+        else:
+            max_source = f"${MAX_USAGE_ENV}"
+    return AccountPolicy(
+        exclude=exclude,
+        max_usage_percent=max_percent,
+        per_account=tuple(sorted(per_account.items())),
+        problems=tuple(problems),
+        exclude_source=exclude_source,
+        max_usage_source=max_source,
+    )
+
+
+def usage_of(
+    usage: dict[str, list[UsageWindow]] | None, account: OmpAccount
+) -> list[UsageWindow] | None:
+    """`account`'s windows from a `usage_by_email` map (keys are lower-cased emails)."""
+    if usage is None or not account.email:
+        return None
+    return usage.get(account.email.lower())
+
+
+def pool_refusal(
+    policy: AccountPolicy,
+    accounts: list[OmpAccount] | None,
+    db: Path,
+    usage: dict[str, list[UsageWindow]] | None,
+    omp_model: str | None,
+    now_ms: int,
+) -> tuple[str | None, list[OmpAccount], list[str]]:
+    """The account policy's verdict for a seat on `omp_model` over `accounts` (None: the
+    auth db `db` was unreadable): (why no account may be used, else None; the accounts
+    the seat may take; `<account>: <reason>` for each one it may not). With no refusal
+    and no accounts, omp picks the credential itself, which only an empty policy allows.
+    Shared by dispatch and `review seats` so both give the same reason."""
+    if policy.problems:
+        return _invalid_reason(policy), [], []
+    if not accounts:
+        if not policy.restricts:
+            return None, [], []
+        where = (
+            f"no readable omp auth db at {db}"
+            if accounts is None
+            else f"no omp {PROVIDER} OAuth account in {db} (omp would pick its own "
+            "credential)"
+        )
+        return (
+            f"cannot apply omp account settings ({policy.summary()}): {where}",
+            [],
+            [],
+        )
+    eligible: list[OmpAccount] = []
+    skipped: list[str] = []
+    for account in accounts:
+        why = policy.skip_reason(account, usage_of(usage, account), omp_model, now_ms)
+        if why is None:
+            eligible.append(account)
+        else:
+            skipped.append(f"{account.label}: {why}")
+    if not eligible:
+        reason = (
+            f"no omp {PROVIDER} account may be used ({len(accounts)}): "
+            + "; ".join(skipped)
+        )
+        return reason, [], skipped
+    return None, eligible, skipped
+
+
+def _invalid_reason(policy: AccountPolicy) -> str:
+    return (
+        f"invalid omp account settings, no omp {PROVIDER} account is used until they "
+        f"are fixed: {'; '.join(policy.problems)}"
+    )
+
+
+def profiles_reason(policy: AccountPolicy) -> str | None:
+    """Why `$REVIEW_OMP_CLAUDE_PROFILES` profiles must not serve an omp:anthropic seat
+    under `policy` (a profile's account is not known), None when the policy is empty."""
+    if policy.problems:
+        return _invalid_reason(policy)
+    if not policy.restricts:
+        return None
+    return (
+        f"omp account settings ({policy.summary()}) cannot be applied to "
+        "$REVIEW_OMP_CLAUDE_PROFILES profiles (their accounts are not known); unset one "
+        "of them"
     )

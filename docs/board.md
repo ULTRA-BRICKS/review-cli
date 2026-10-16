@@ -54,6 +54,16 @@ number of working reviewers even when models drop:
   when EVERY configured account is exhausted does the run emit the synthetic usage-limit
   skip, now naming every account it tried; a host with no registry behaves exactly as
   before.
+- **omp account policy (review-cli#641)** — config.yaml `omp_accounts:` limits which of
+  omp's Anthropic accounts the `omp:anthropic/*` seats take: `exclude:` emails are never
+  used, and an account with an `omp usage` window at or above `max_usage_percent` (global,
+  or per account under `accounts: {email: {max_usage_percent: N}}`) waits for that
+  window's reset; `$REVIEW_OMP_ACCOUNTS_EXCLUDE` / `$REVIEW_OMP_MAX_USAGE_PERCENT`
+  override. With every account excluded or over its threshold the seat fails naming each
+  account and why; an invalid setting, a policy with `$REVIEW_OMP_CLAUDE_PROFILES`, or a
+  policy with no account list to apply it to fails it too, and while an exclude list is
+  set an account without a known email is skipped. `review seats` shows the seat
+  UNUSABLE, the policy and each account's skip reason.
 - **Claude CLI -> omp twin (review-cli#594)** — every `claude:claude-X` seat has
   `omp:anthropic/claude-X` (the same model through omp's own, separately logged-in
   Anthropic accounts) as its next executor, and the reverse. When the Claude CLI fails on

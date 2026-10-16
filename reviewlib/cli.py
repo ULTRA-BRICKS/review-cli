@@ -1029,6 +1029,7 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     config = load_config()
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
     backends.configure_omp_bin(config.get("omp_bin"))
+    backends.configure_omp_accounts(config.get("omp_accounts"))
 
     try:
         sess = _sessions.find_session(ns.resume)
@@ -1986,6 +1987,7 @@ def _configured_board(config: dict) -> list[BoardReviewer]:
     BoardConfigError for a malformed `board:`."""
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
     backends.configure_omp_bin(config.get("omp_bin"))
+    backends.configure_omp_accounts(config.get("omp_accounts"))
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))
@@ -2012,12 +2014,24 @@ def _omp_usage_text(windows) -> str:
 
 def _omp_pool_json(state) -> dict:
     launcher = state.launcher
+    policy = state.policy
     return {
         "launcher": launcher.argv0 if launcher else None,
         "launcher_source": launcher.source if launcher else None,
         "real_bin": launcher.real_bin if launcher else None,
         "launcher_problem": state.launcher_problem,
         "auth_db": str(state.db),
+        "account_policy": {
+            "exclude": list(policy.exclude),
+            "exclude_source": policy.exclude_source or None,
+            "max_usage_percent": policy.max_usage_percent,
+            "max_usage_source": policy.max_usage_source or None,
+            "accounts": {
+                email: {"max_usage_percent": percent}
+                for email, percent in policy.per_account
+            },
+            "problems": list(policy.problems),
+        },
         "anthropic_accounts": None
         if state.accounts is None
         else [
@@ -2027,6 +2041,9 @@ def _omp_pool_json(state) -> dict:
                 "email": s.account.email,
                 "available": s.is_available(time.time()),
                 "availability": s.availability(time.time()),
+                "skip_reason": s.skip_reason,
+                "tier_over_limit": list(s.tier_over_limit),
+                "max_usage_percent": policy.threshold_for(s.account.email),
                 "omp_blocks": [
                     {"scope": scope, "until_ms": until}
                     for scope, until in s.account.blocks
@@ -2040,6 +2057,7 @@ def _omp_pool_json(state) -> dict:
                         "label": w.label,
                         "used_fraction": w.used_fraction,
                         "resets_at_ms": w.resets_at_ms,
+                        "tier": w.tier,
                     }
                     for w in s.usage
                 ],
@@ -2053,7 +2071,8 @@ def _omp_pool_lines(state) -> list[str]:
     """The `review status` section for omp:anthropic seats (review-cli#636/#637)."""
     lines = [
         "\nOMP ANTHROPIC ACCOUNTS (omp:anthropic/* seats try these one per attempt, "
-        "available first; next account on a rate limit or failed login)"
+        "available first; next account on a rate limit or failed login; EXCLUDED and "
+        "OVER LIMIT accounts are never tried)"
     ]
     launcher = state.launcher
     if launcher is None:
@@ -2067,13 +2086,25 @@ def _omp_pool_lines(state) -> list[str]:
         )
     else:
         lines.append(f"  launcher: {launcher.argv0} ({launcher.source})")
-    if state.accounts is None:
+    policy = state.policy
+    lines.append(f"  account policy: {policy.summary()}")
+    for problem in policy.problems:
         lines.append(
-            f"  no readable omp auth db at {state.db} -- omp picks the account"
+            f"  INVALID SETTING: {problem} -- omp:anthropic seats use no account "
+            "until it is fixed"
         )
-        return lines
     if not state.accounts:
-        lines.append(f"  none in {state.db} -- omp picks the account")
+        where = (
+            f"no readable omp auth db at {state.db}"
+            if state.accounts is None
+            else f"none in {state.db}"
+        )
+        then = (
+            "omp:anthropic seats fail: the account policy cannot be applied"
+            if policy.restricts
+            else "omp picks the account"
+        )
+        lines.append(f"  {where} -- {then}")
         return lines
     now = time.time()
     email_w = max(len(s.account.label) for s in state.accounts)
@@ -2107,8 +2138,8 @@ def _seat_status_report(*, as_json: bool) -> int:
         print(f"[review status] {exc}", file=sys.stderr, flush=True)
         return 2
     accounts = claude_accounts_state()
-    seats = [(r, seat_health(r.model, accounts)) for r in board]
     omp_pool = omp_pool_state()
+    seats = [(r, seat_health(r.model, accounts, omp_pool=omp_pool)) for r in board]
 
     if as_json:
         import json as _json
@@ -2217,16 +2248,19 @@ def _entities_subcommand(rest: list[str]) -> int:
 
     from .role_models import ROLE_FALLBACK_MODELS
     from .dashboard.tokenstats import compute_stat_report
-    from .seat_health import claude_accounts_state, seat_health
+    from .seat_health import claude_accounts_state, omp_pool_state, seat_health
 
     account_state = claude_accounts_state()
+    # review-cli#641: an omp seat (or a failover target on omp) the omp account policy
+    # leaves no account for is not available
+    omp_pool = omp_pool_state()
 
     harnesses: dict[str, dict] = {}
     models: list[dict] = []
     for r in board:
         harness = _entity_harness_for_model(r.model)
         provider = backends.effective_provider(r.model)
-        health = seat_health(r.model, account_state)
+        health = seat_health(r.model, account_state, omp_pool=omp_pool)
         entry = harnesses.setdefault(harness, {"providers": set(), "seats": 0})
         entry["providers"].add(provider)
         entry["seats"] += 1
@@ -5192,6 +5226,27 @@ CONFIG FILE
                        before the seat's sandbox replaces HOME (OMP_REAL_BIN, PI_INSTALL_DIR,
                        ~/.local/lib/omp/omp) and handed to it as OMP_REAL_BIN. Env
                        equivalent: REVIEW_OMP_BIN=/path/to/omp.
+    omp_accounts:      mapping     which of omp's Anthropic accounts omp:anthropic/* seats may
+                       take (`review seats` shows the policy and each account's reason):
+                         exclude: [you@example.com]   never used (no token is fetched)
+                         max_usage_percent: 90        an account with an `omp usage` window
+                                                      at or above it waits for that window's
+                                                      reset (a model-tier window, e.g.
+                                                      Fable's, counts only for that tier);
+                                                      unknown usage does not skip
+                         accounts: {{you@example.com: {{max_usage_percent: 95}}}}
+                                                      per-account threshold, wins over the
+                                                      global one
+                       Every account excluded or over its threshold -> the seat fails naming
+                       each account and why (`review seats` shows the seat UNUSABLE); an
+                       invalid value fails the seat with the problem (never ignored), and so
+                       does a policy together with $REVIEW_OMP_CLAUDE_PROFILES (a profile's
+                       account is unknown) or with no omp account list to apply it to. While
+                       `exclude` is set, an account without a known email is skipped. Env
+                       overrides, replacing the config value (which is then not checked):
+                       REVIEW_OMP_ACCOUNTS_EXCLUDE=a@x.com,b@y.com (at least one email)
+                       replaces `exclude`, REVIEW_OMP_MAX_USAGE_PERCENT=90 (not empty)
+                       `max_usage_percent`.
     timeout:           int         per-call timeout seconds for `review diff` (replaces the
                        configured/default request timeout; still overrideable
                        per-invocation by --timeout). Review/panel agent CLI backends treat
@@ -6290,6 +6345,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     config = load_config()
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
     backends.configure_omp_bin(config.get("omp_bin"))
+    backends.configure_omp_accounts(config.get("omp_accounts"))
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))

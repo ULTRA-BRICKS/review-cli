@@ -14,7 +14,8 @@ login failure (`claude_accounts.login_failure`, review-cli#596: `claude auth sta
 saying logged in while every call on the account failed). For the omp:anthropic seats
 (review-cli#637, `omp_pool_state`): the omp launcher, omp's Anthropic accounts and their
 rate-limit blocks from agent.db (read-only), the limits review-cli recorded per account,
-and each account's usage windows from `omp usage` (a usage read, not a model call). No
+and each account's usage windows from `omp usage` (a usage read, not a model call), with
+the account policy's skip reason per account (review-cli#641: EXCLUDED / OVER LIMIT). No
 model is called and no login is started.
 """
 
@@ -101,18 +102,25 @@ def claude_accounts_state() -> list[ClaudeAccount]:
 class OmpAccountState:
     """One of omp's Anthropic accounts as an omp:anthropic seat would see it
     (review-cli#637): omp's own rate-limit blocks (on `account`), a limit an earlier
-    review-cli call hit on it (`limited_until` UNIX time, `limited_reason`), and its usage
-    windows from `omp usage` (None when omp did not report them)."""
+    review-cli call hit on it (`limited_until` UNIX time, `limited_reason`), its usage
+    windows from `omp usage` (None when omp did not report them), and why the account
+    policy (review-cli#641) skips it for every model (`skip_reason`: EXCLUDED or a shared
+    window OVER LIMIT) or only for one model tier (`tier_over_limit`)."""
 
     account: omp_accounts.OmpAccount
     limited_until: float | None
     limited_reason: str | None
     usage: list[omp_accounts.UsageWindow] | None
+    skip_reason: str | None = None
+    tier_over_limit: tuple[str, ...] = ()
 
     def is_available(self, now: float) -> bool:
-        """Neither omp's shared-window block nor a review-cli limit is active."""
-        return self.account.blocked_until_ms(None) is None and (
-            self.limited_until is None or self.limited_until <= now
+        """Not skipped by the policy, and neither omp's shared-window block nor a
+        review-cli limit is active."""
+        return (
+            self.skip_reason is None
+            and self.account.blocked_until_ms(None) is None
+            and (self.limited_until is None or self.limited_until <= now)
         )
 
     def availability(self, now: float) -> str:
@@ -122,7 +130,7 @@ class OmpAccountState:
             for scope, until in self.account.blocks
             if scope
         ]
-        parts = []
+        parts = [self.skip_reason] if self.skip_reason else []
         if blocked_ms is not None:
             parts.append(
                 f"RATE-LIMITED until {omp_accounts.utc_stamp(blocked_ms)} (omp block)"
@@ -134,32 +142,45 @@ class OmpAccountState:
             )
         if not parts:
             parts.append("available")
-        return "; ".join(parts + scoped)
+        return "; ".join(parts + scoped + list(self.tier_over_limit))
 
 
 @dataclass(frozen=True)
 class OmpPoolState:
-    """The omp launcher an omp seat would run (or why none can run), and omp's Anthropic
-    accounts (None when agent.db cannot be read)."""
+    """The omp launcher an omp seat would run (or why none can run), the account policy
+    (review-cli#641), omp's Anthropic accounts (None when agent.db cannot be read) and
+    their `omp usage` windows by lower-cased email (None when omp did not answer)."""
 
     launcher: omp_accounts.OmpLauncher | None
     launcher_problem: str | None
     db: Path
     accounts: list[OmpAccountState] | None
+    policy: omp_accounts.AccountPolicy = omp_accounts.AccountPolicy()
+    usage: dict[str, list[omp_accounts.UsageWindow]] | None = None
+
+    def refusal(self, omp_model: str | None, now: float) -> str | None:
+        """Why a seat on `omp_model` would get no account from the pool under the policy
+        (`omp_accounts.pool_refusal`, the verdict dispatch acts on)."""
+        accounts = None if self.accounts is None else [s.account for s in self.accounts]
+        return omp_accounts.pool_refusal(
+            self.policy, accounts, self.db, self.usage, omp_model, int(now * 1000)
+        )[0]
 
 
 def omp_pool_state(*, now: float | None = None) -> OmpPoolState:
     """Read-only: agent.db (read-only), the cooldown store and `omp usage` (a usage read,
     no model call)."""
     moment = time.time() if now is None else now
+    now_ms = int(moment * 1000)
     try:
         launcher, problem = backends._omp_launcher(), None
     except RuntimeError as exc:
         launcher, problem = None, str(exc)
+    policy = backends._omp_account_policy()
     db = backends._omp_auth_db()
-    accounts = omp_accounts.anthropic_accounts(db, now_ms=int(moment * 1000))
+    accounts = omp_accounts.anthropic_accounts(db, now_ms=now_ms)
     if accounts is None:
-        return OmpPoolState(launcher, problem, db, None)
+        return OmpPoolState(launcher, problem, db, None, policy)
     usage = omp_accounts.usage_by_email(launcher) if launcher and accounts else None
     states = []
     for account in accounts:
@@ -168,15 +189,18 @@ def omp_pool_state(*, now: float | None = None) -> OmpPoolState:
             access_method=backends._OMP_ACCESS_METHOD,
             now=moment,
         )
+        windows = omp_accounts.usage_of(usage, account)
         states.append(
             OmpAccountState(
                 account=account,
                 limited_until=cooldown["until"] if cooldown else None,
                 limited_reason=cooldown["reason"] if cooldown else None,
-                usage=usage.get(account.email or "") if usage is not None else None,
+                usage=windows,
+                skip_reason=policy.skip_reason(account, windows, None, now_ms),
+                tier_over_limit=policy.tier_over_limit(account, windows, now_ms),
             )
         )
-    return OmpPoolState(launcher, problem, db, states)
+    return OmpPoolState(launcher, problem, db, states, policy, usage)
 
 
 def _cooldown_reason(model: str, now: float) -> str | None:
@@ -221,14 +245,40 @@ def _claude_cli_reason(accounts: list[ClaudeAccount]) -> str | None:
     return f"every registered Claude CLI account is logged out or failed its login: {states}"
 
 
-def _reason(model: str, accounts: list[ClaudeAccount], now: float) -> str | None:
+def _omp_pool_reason(
+    model: str, omp_pool: OmpPoolState | None, now: float
+) -> str | None:
+    """Why an omp seat on omp's Anthropic accounts gets no account under the account
+    policy (review-cli#641), else None (also for every other seat)."""
+    if omp_pool is None or backends.resolve_backend(model) is not backends.review_omp:
+        return None
+    canonical = _expand_alias(model)
+    omp_model = canonical.split(":", 1)[1] if ":" in canonical else None
+    if not backends._omp_selector_is_anthropic(omp_model):
+        return None
+    if backends._review_omp_claude_profiles() != [None]:
+        return backends._omp_profiles_policy_reason(omp_model)
+    return omp_pool.refusal(omp_model, now)
+
+
+def _reason(
+    model: str,
+    accounts: list[ClaudeAccount],
+    now: float,
+    omp_pool: OmpPoolState | None,
+) -> str | None:
     reason = backends.backend_unavailable_reason(model) or _cooldown_reason(model, now)
     if reason is None and _runs_through_claude_cli(model):
         reason = _claude_cli_reason(accounts)
-    return reason
+    return reason or _omp_pool_reason(model, omp_pool, now)
 
 
-def _substitute(model: str, accounts: list[ClaudeAccount], now: float) -> str | None:
+def _substitute(
+    model: str,
+    accounts: list[ClaudeAccount],
+    now: float,
+    omp_pool: OmpPoolState | None,
+) -> str | None:
     requested = _expand_alias(model).strip().lower()
     chain = provider_chain(
         model,
@@ -238,17 +288,23 @@ def _substitute(model: str, accounts: list[ClaudeAccount], now: float) -> str | 
     for candidate in chain:
         if candidate.strip().lower() == requested:
             continue
-        if _reason(candidate, accounts, now) is None:
+        if _reason(candidate, accounts, now, omp_pool) is None:
             return candidate
     return None
 
 
 def seat_health(
-    model: str, accounts: list[ClaudeAccount], *, now: float | None = None
+    model: str,
+    accounts: list[ClaudeAccount],
+    *,
+    now: float | None = None,
+    omp_pool: OmpPoolState | None = None,
 ) -> SeatHealth:
     """Why `model`'s seat cannot run right now (None when it can) and, if it cannot, the
-    executor its provider failover would hand the seat to (review-cli#594)."""
+    executor its provider failover would hand the seat to (review-cli#594). With
+    `omp_pool`, an omp:anthropic seat the account policy leaves no account for is
+    unusable too (review-cli#641)."""
     now = time.time() if now is None else now
-    reason = _reason(model, accounts, now)
-    substitute = _substitute(model, accounts, now) if reason else None
+    reason = _reason(model, accounts, now, omp_pool)
+    substitute = _substitute(model, accounts, now, omp_pool) if reason else None
     return SeatHealth(model=model, reason=reason, substitute=substitute)

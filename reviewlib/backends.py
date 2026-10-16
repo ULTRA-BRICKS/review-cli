@@ -1443,24 +1443,62 @@ def _omp_account_failure(result: ReviewResult) -> str | None:
     return None
 
 
+def _omp_pool_refusal(model: str, round_no: int, reason: str) -> ReviewResult:
+    """The seat's result when the account policy leaves no omp Anthropic account it may
+    take: no model is called, and the reason names every account and why."""
+    command = f"omp {omp_accounts.PROVIDER} account pool"
+    stderr = f"[review-cli] {reason}"
+    _emit_rest_log(
+        "omp", command, round_no=round_no, returncode=1, stdout="", stderr=stderr
+    )
+    return ReviewResult(
+        model=model,
+        command=command,
+        returncode=1,
+        stdout="",
+        stderr=stderr,
+        account=f"none answered -- {reason}",
+    )
+
+
 def _review_omp_with_anthropic_pool(
     model, omp_model, prompt, diff, cwd, timeout, round_no, effort
 ) -> ReviewResult:
     """Run an Anthropic-hosted omp seat on omp's own Anthropic accounts, one account per
     attempt (review-cli#637, see reviewlib.omp_accounts): accounts omp has not blocked and
     review-cli has not seen limited go first; a limit, quota or login failure moves on to
-    the next account. The result's `account` names the account that answered and any
-    that failed before it. No account in agent.db -> one unpinned run, omp picks."""
-    accounts = omp_accounts.anthropic_accounts(_omp_auth_db())
+    the next account. The account policy (review-cli#641, config.yaml `omp_accounts:`)
+    removes excluded accounts and accounts at or over their usage threshold before any
+    token is fetched. The result's `account` names the account that answered, any that
+    failed before it and any the policy skipped. No account in agent.db -> one unpinned
+    run, omp picks."""
+    policy = _omp_account_policy()
+    db = _omp_auth_db()
+    accounts = None if policy.problems else omp_accounts.anthropic_accounts(db)
+    # usage is read once per dispatch, and only when a non-excluded account could be
+    # over a threshold
+    usage = None
+    if (
+        accounts
+        and policy.needs_usage
+        and any(not policy.is_excluded(a) for a in accounts)
+    ):
+        usage = omp_accounts.usage_by_email(_omp_launcher())
+    refusal, eligible, skipped = omp_accounts.pool_refusal(
+        policy, accounts, db, usage, omp_model, int(time.time() * 1000)
+    )
+    if refusal is not None:
+        return _omp_pool_refusal(model, round_no, refusal)
     if not accounts:
         return _review_omp_once(
             model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile=None
         )
     launcher = _omp_launcher()
-    ordered = omp_accounts.dispatch_order(
-        accounts, omp_model, _omp_accounts_limited_until(accounts)
-    )
     total = len(accounts)
+    ordered = omp_accounts.dispatch_order(
+        eligible, omp_model, _omp_accounts_limited_until(eligible)
+    )
+    skipped_note = f"; skipped: {'; '.join(skipped)}" if skipped else ""
     failed: list[str] = []
     last_result: ReviewResult | None = None
     for account in ordered:
@@ -1501,7 +1539,7 @@ def _review_omp_with_anthropic_pool(
             note = served + (
                 f"; failed before it: {'; '.join(failed)}" if failed else ""
             )
-            return dataclasses.replace(result, account=note)
+            return dataclasses.replace(result, account=note + skipped_note)
         record_cooldown(
             key,
             failure,
@@ -1512,8 +1550,12 @@ def _review_omp_with_anthropic_pool(
         last_result = result
     assert (
         last_result is not None
-    )  # `ordered` is every account, and there is at least one
-    summary = f"every omp {omp_accounts.PROVIDER} account failed ({total}): {'; '.join(failed)}"
+    )  # `ordered` is every eligible account, and there is at least one
+    # counts the accounts tried; the ones the policy skipped are listed after them
+    summary = (
+        f"every omp {omp_accounts.PROVIDER} account failed ({len(ordered)}): "
+        f"{'; '.join(failed)}{skipped_note}"
+    )
     return dataclasses.replace(
         last_result,
         stderr=f"{last_result.stderr.rstrip()}\n[review-cli] {summary}".lstrip(),
@@ -1563,8 +1605,13 @@ def review_omp(
     # review-cli#637: an omp seat on omp's `anthropic` provider runs on omp's Anthropic
     # accounts one at a time (`_review_omp_with_anthropic_pool`). review-cli#168's
     # explicit `$REVIEW_OMP_CLAUDE_PROFILES` (separately logged-in omp profiles) still
-    # wins when set. Every other omp-hosted model (Kimi, MiMo, ...) dispatches once.
+    # wins when set, unless an account policy (review-cli#641) is set: a profile's
+    # account is unknown, so it could be an excluded one. Every other omp-hosted model
+    # (Kimi, MiMo, ...) dispatches once.
     if _omp_model_hosts_claude(omp_model):
+        refusal = _omp_profiles_policy_reason(omp_model)
+        if refusal is not None:
+            return _omp_pool_refusal(model, round_no, refusal)
         if _review_omp_claude_profiles() == [None] and _omp_selector_is_anthropic(
             omp_model
         ):
@@ -5067,6 +5114,33 @@ def configure_omp_bin(raw: object) -> None:
     """Set the per-process config.yaml `omp_bin:` value (a path; anything else unsets it)."""
     global _CONFIG_OMP_BIN
     _CONFIG_OMP_BIN = raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+# review-cli#641: config.yaml `omp_accounts:` (exclude list + usage thresholds for omp's
+# Anthropic accounts), set once by the CLI after load_config like `omp_bin:`; the env
+# overrides are read on every use (omp_accounts.account_policy).
+_CONFIG_OMP_ACCOUNTS: object = None
+
+
+def configure_omp_accounts(raw: object) -> None:
+    """Set the per-process config.yaml `omp_accounts:` value (validated on use)."""
+    global _CONFIG_OMP_ACCOUNTS
+    _CONFIG_OMP_ACCOUNTS = raw
+
+
+def _omp_account_policy() -> omp_accounts.AccountPolicy:
+    return omp_accounts.account_policy(_CONFIG_OMP_ACCOUNTS, os.environ)
+
+
+def _omp_profiles_policy_reason(omp_model: str | None) -> str | None:
+    """Why an `omp_model` seat on omp's Anthropic accounts must not run through
+    `$REVIEW_OMP_CLAUDE_PROFILES`: an account policy is set, and a profile's account is
+    not known. None when profiles are not set or no policy applies."""
+    if _review_omp_claude_profiles() == [None] or not _omp_selector_is_anthropic(
+        omp_model
+    ):
+        return None
+    return omp_accounts.profiles_reason(_omp_account_policy())
 
 
 def _omp_launcher() -> omp_accounts.OmpLauncher:

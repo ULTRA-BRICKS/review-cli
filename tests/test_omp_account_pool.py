@@ -137,6 +137,9 @@ def _pool_world(blocks: list[tuple[int, str, int]] = ()):
                 REVIEW_OMP_CLAUDE_PROFILES=None,
                 REVIEW_OMP_BIN=None,
                 OMP_REAL_BIN=None,
+                REVIEW_OMP_ACCOUNTS_EXCLUDE=None,
+                REVIEW_OMP_MAX_USAGE_PERCENT=None,
+                REVIEW_LOG_DIR=str(root / "logs"),
             ),
             _patched(backends, _which=lambda name: f"/fake/bin/{name}"),
         ):
@@ -471,8 +474,9 @@ exec "$REAL_OMP" "$@"
 
 def _fake_real_omp(path: Path) -> Path:
     """A fake real omp: `--version`, `token anthropic --account N` (prints tok-N),
-    `usage --json`, and `-p` runs that answer, or fail with omp's real 429 line for a
-    token listed in $FAKE_OMP_LIMITED. Every call is appended to $FAKE_OMP_LOG."""
+    `usage --json` ($FAKE_OMP_USAGE when set, else a fixed report), and `-p` runs that
+    answer, or fail with omp's real 429 line for a token listed in $FAKE_OMP_LIMITED.
+    Every call is appended to $FAKE_OMP_LOG."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"#!{sys.executable}\n"
@@ -491,6 +495,9 @@ def _fake_real_omp(path: Path) -> Path:
                 n = args[args.index("--account") + 1]
                 record(kind="token", account=n, home=os.environ.get("HOME"))
                 print("tok-" + n)
+                sys.exit(0)
+            if args[:1] == ["usage"] and os.environ.get("FAKE_OMP_USAGE"):
+                print(os.environ["FAKE_OMP_USAGE"])
                 sys.exit(0)
             if args[:1] == ["usage"]:
                 print(json.dumps({{"reports": [
@@ -795,6 +802,573 @@ def test_e2e_show_board_marks_omp_seats_skipped_when_the_wrapper_cannot_start():
     line = next((row for row in proc.stdout.splitlines() if _MODEL in row), None)
     assert line is not None, proc.stdout + proc.stderr
     assert "SKIPPED" in line, line
+
+
+# ---- the account policy: exclude list + usage threshold (#641) ----------------------
+
+
+@contextlib.contextmanager
+def _omp_accounts_config(raw):
+    """config.yaml `omp_accounts:` = `raw` for the duration (as the CLI would set it)."""
+    saved = backends._CONFIG_OMP_ACCOUNTS
+    backends.configure_omp_accounts(raw)
+    try:
+        yield
+    finally:
+        backends.configure_omp_accounts(saved)
+
+
+def _window(label: str, used: float, *, in_ms: int | None = 3_600_000, tier=None):
+    resets = None if in_ms is None else int(time.time() * 1000) + in_ms
+    return omp_accounts.UsageWindow(label, used, resets, tier)
+
+
+def _usage(per_email: dict):
+    reads: list[int] = []
+
+    def usage(launcher):
+        reads.append(1)
+        return per_email
+
+    usage.reads = reads
+    return usage
+
+
+def test_account_policy_reads_config_and_env_overrides_win():
+    raw = {
+        "exclude": ["A@Example.com"],
+        "max_usage_percent": 90,
+        "accounts": {"b@example.com": {"max_usage_percent": 95}},
+    }
+    policy = omp_accounts.account_policy(raw, {})
+    assert policy.problems == ()
+    assert policy.exclude == ("a@example.com",)
+    assert policy.exclude_source == "config.yaml omp_accounts.exclude"
+    assert policy.threshold_for("B@example.com") == 95, "per-account wins over global"
+    assert policy.threshold_for("c@example.com") == 90
+    env = {
+        omp_accounts.EXCLUDE_ENV: " x@y.z , ,X@y.z",
+        omp_accounts.MAX_USAGE_ENV: "80",
+    }
+    overridden = omp_accounts.account_policy(raw, env)
+    assert overridden.exclude == ("x@y.z",)
+    assert overridden.exclude_source == "$REVIEW_OMP_ACCOUNTS_EXCLUDE"
+    assert overridden.max_usage_percent == 80
+    assert overridden.max_usage_source == "$REVIEW_OMP_MAX_USAGE_PERCENT"
+    assert overridden.threshold_for("b@example.com") == 95
+    blank = omp_accounts.account_policy(
+        raw, {omp_accounts.EXCLUDE_ENV: " ", omp_accounts.MAX_USAGE_ENV: ""}
+    )
+    assert blank.exclude == ("a@example.com",) and blank.max_usage_percent == 90
+    assert not omp_accounts.account_policy(None, {}).restricts
+
+
+def test_account_policy_reports_every_invalid_value():
+    raw = {
+        "exclude": "a@example.com",
+        "max_usage_percent": "90%",
+        "accounts": {"b@example.com": {"max_usage_percent": 0}, "c@x": 95},
+        "max_usage": 90,
+    }
+    policy = omp_accounts.account_policy(raw, {})
+    text = "\n".join(policy.problems)
+    assert len(policy.problems) == 5, text
+    for needle in (
+        "unknown key max_usage",
+        "omp_accounts.exclude must be a list",
+        "omp_accounts.max_usage_percent must be a number",
+        "accounts.b@example.com.max_usage_percent must be a number",
+        "accounts.c@x must be {max_usage_percent: N}",
+    ):
+        assert needle in text, (needle, text)
+    assert policy.exclude == () and policy.max_usage_percent is None
+    assert policy.restricts, "an invalid policy must never let omp pick an account"
+    # an env override replaces the config value, so the config value is not judged; an
+    # invalid env value is reported itself
+    env = {omp_accounts.EXCLUDE_ENV: "z@z.z", omp_accounts.MAX_USAGE_ENV: "ninety"}
+    overridden = omp_accounts.account_policy(raw, env)
+    text = "\n".join(overridden.problems)
+    assert len(overridden.problems) == 4, text
+    assert (
+        "omp_accounts.exclude" not in text
+        and "omp_accounts.max_usage_percent" not in text
+    )
+    assert "$REVIEW_OMP_MAX_USAGE_PERCENT must be a number" in text, text
+    assert overridden.exclude == ("z@z.z",)
+    valid_env = omp_accounts.account_policy(
+        {"exclude": "a@x", "max_usage_percent": "90"},
+        {omp_accounts.EXCLUDE_ENV: "b@x", omp_accounts.MAX_USAGE_ENV: "80"},
+    )
+    assert valid_env.problems == () and valid_env.max_usage_percent == 80
+    for bad in (True, 101, -5, float("nan"), [90], "90"):
+        assert omp_accounts.account_policy({"max_usage_percent": bad}, {}).problems
+    assert omp_accounts.account_policy(["a@x"], {}).problems
+
+
+def test_env_exclude_without_an_email_keeps_the_config_list():
+    raw = {"exclude": ["secret@example.com"]}
+    for value in (",", " , ", " "):
+        policy = omp_accounts.account_policy(raw, {omp_accounts.EXCLUDE_ENV: value})
+        assert policy.exclude == ("secret@example.com",), (value, policy)
+        assert policy.exclude_source == "config.yaml omp_accounts.exclude"
+
+
+def test_skip_reason_threshold_reset_tier_and_unknown_usage():
+    now_ms = int(time.time() * 1000)
+    a = omp_accounts.OmpAccount(2, 1, "a@example.com")
+    b = omp_accounts.OmpAccount(3, 2, "b@example.com")
+    policy = omp_accounts.account_policy(
+        {
+            "exclude": ["c@example.com"],
+            "max_usage_percent": 90,
+            "accounts": {"b@example.com": {"max_usage_percent": 95}},
+        },
+        {},
+    )
+    over = policy.skip_reason(a, [_window("Claude 5 Hour", 0.9)], _SELECTOR, now_ms)
+    assert over is not None and over.startswith(
+        "OVER LIMIT (5 Hour 90% >= 90%, resets "
+    )
+    assert (
+        policy.skip_reason(a, [_window("Claude 5 Hour", 0.89)], _SELECTOR, now_ms)
+        is None
+    )
+    # compared unrounded: just under the threshold is under it
+    assert (
+        policy.skip_reason(
+            a, [_window("Claude 5 Hour", 0.899999999)], _SELECTOR, now_ms
+        )
+        is None
+    )
+    at_29 = omp_accounts.account_policy({"max_usage_percent": 29}, {})
+    assert at_29.skip_reason(a, [_window("Claude 5 Hour", 0.29)], None, now_ms)
+    reset = [_window("Claude 7 Day", 1.0, in_ms=-1000)]
+    assert policy.skip_reason(a, reset, _SELECTOR, now_ms) is None, (
+        "window already reset"
+    )
+    unknown_reset = policy.skip_reason(
+        a, [_window("Claude 7 Day", 0.95, in_ms=None)], None, now_ms
+    )
+    assert unknown_reset is not None and "reset time unknown" in unknown_reset
+    assert policy.skip_reason(a, None, _SELECTOR, now_ms) is None, "unknown usage"
+    assert (
+        policy.skip_reason(b, [_window("Claude 5 Hour", 0.92)], _SELECTOR, now_ms)
+        is None
+    )
+    fable = [_window("Claude 7 Day (Fable)", 0.97, tier="fable")]
+    assert policy.skip_reason(a, fable, _SELECTOR, now_ms) is None
+    assert policy.skip_reason(a, fable, "anthropic/claude-fable-5", now_ms) is not None
+    assert policy.tier_over_limit(a, fable, now_ms) == (
+        f"fable OVER LIMIT (7 Day (Fable) 97% >= 90%, resets "
+        f"{omp_accounts.utc_stamp(fable[0].resets_at_ms)})",
+    )
+    c = omp_accounts.OmpAccount(5, 3, "C@example.com")
+    assert policy.skip_reason(c, None, _SELECTOR, now_ms) == (
+        "EXCLUDED (config.yaml omp_accounts.exclude)"
+    )
+    assert policy.tier_over_limit(c, fable, now_ms) == ()
+
+
+def test_usage_reads_tiers_and_matches_emails_case_insensitively():
+    resets = int(time.time() * 1000) + 3_600_000
+    report = {
+        "reports": [
+            {
+                "provider": "anthropic",
+                "metadata": {"email": "User@Example.com"},
+                "limits": [
+                    {
+                        "label": "Claude 7 Day (Fable)",
+                        "scope": {"windowId": "7d", "tier": "fable"},
+                        "amount": {"usedFraction": 0.2},
+                        "window": {"resetsAt": resets},
+                    },
+                    {
+                        "label": "Claude 5 Hour",
+                        "scope": "malformed",
+                        "amount": {"usedFraction": 0.95},
+                        "window": {"resetsAt": resets},
+                    },
+                ],
+            }
+        ]
+    }
+    with tempfile.TemporaryDirectory() as d:
+        fake = Path(d) / "omp"
+        fake.write_text(f"#!/bin/sh\necho '{json.dumps(report)}'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        launcher = omp_accounts.OmpLauncher(
+            argv0=str(fake), real_bin=None, source="PATH"
+        )
+        usage = omp_accounts.usage_by_email(launcher)
+    assert usage == {
+        "user@example.com": [
+            omp_accounts.UsageWindow("Claude 7 Day (Fable)", 0.2, resets, "fable"),
+            omp_accounts.UsageWindow("Claude 5 Hour", 0.95, resets, None),
+        ]
+    }, usage
+    account = omp_accounts.OmpAccount(2, 1, "USER@example.COM")
+    policy = omp_accounts.account_policy({"max_usage_percent": 90}, {})
+    refusal, eligible, skipped = omp_accounts.pool_refusal(
+        policy, [account], Path("/x"), usage, _SELECTOR, int(time.time() * 1000)
+    )
+    assert eligible == [] and "OVER LIMIT (5 Hour 95% >= 90%" in skipped[0], skipped
+    assert refusal is not None and refusal.startswith(
+        "no omp anthropic account may be used (1): USER@example.COM: OVER LIMIT"
+    ), refusal
+
+
+def test_policy_fails_closed_without_emails_or_without_accounts():
+    now_ms = int(time.time() * 1000)
+    nameless = omp_accounts.OmpAccount(7, 1, None)
+    excluding = omp_accounts.account_policy({"exclude": ["a@example.com"]}, {})
+    capping = omp_accounts.account_policy({"max_usage_percent": 90}, {})
+    assert excluding.skip_reason(nameless, None, _SELECTOR, now_ms) == (
+        "EMAIL UNKNOWN (cannot be checked against config.yaml omp_accounts.exclude)"
+    )
+    assert capping.skip_reason(nameless, None, _SELECTOR, now_ms) is None
+    db = Path("/x/agent.db")
+    refusal, eligible, _ = omp_accounts.pool_refusal(
+        excluding, [], db, None, _SELECTOR, now_ms
+    )
+    assert eligible == [] and refusal is not None
+    assert "no omp anthropic OAuth account in /x/agent.db" in refusal, refusal
+    empty = omp_accounts.account_policy(None, {})
+    assert omp_accounts.pool_refusal(empty, [], db, None, _SELECTOR, now_ms) == (
+        None,
+        [],
+        [],
+    )
+
+
+def test_policy_emails_with_control_characters_are_refused():
+    forged = "ok@example.com\x1b[2JFORGED"
+    config = omp_accounts.account_policy(
+        {"exclude": [forged], "accounts": {forged: {"max_usage_percent": 90}}}, {}
+    )
+    env = omp_accounts.account_policy(
+        None, {omp_accounts.EXCLUDE_ENV: f"a@example.com,{forged}"}
+    )
+    for policy in (config, env):
+        assert policy.problems, policy
+        assert "\x1b" not in "".join(policy.problems), policy.problems
+        assert "\x1b" not in policy.summary()
+    assert len(config.problems) == 2 and config.exclude == ()
+    assert env.exclude == ("a@example.com",)
+
+
+def test_duplicate_usage_reports_for_one_email_keep_every_window():
+    report = {
+        "reports": [
+            {
+                "provider": "anthropic",
+                "metadata": {"email": "a@example.com"},
+                "limits": [{"label": "Claude 5 Hour", "amount": {"usedFraction": 0.95}}],
+            },
+            {
+                "provider": "anthropic",
+                "metadata": {"email": "A@example.com"},
+                "limits": [{"label": "Claude 7 Day", "amount": {"usedFraction": 0.1}}],
+            },
+        ]
+    }
+    with tempfile.TemporaryDirectory() as d:
+        fake = Path(d) / "omp"
+        fake.write_text(f"#!/bin/sh\necho '{json.dumps(report)}'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        launcher = omp_accounts.OmpLauncher(
+            argv0=str(fake), real_bin=None, source="PATH"
+        )
+        usage = omp_accounts.usage_by_email(launcher)
+    assert [w.label for w in usage["a@example.com"]] == ["Claude 5 Hour", "Claude 7 Day"]
+
+
+def test_pool_never_fetches_a_token_for_an_excluded_account():
+    calls: list = []
+    fetched: list = []
+    usage = _usage({})
+    with (
+        _pool_world(),
+        _omp_accounts_config({"exclude": ["a@example.com"]}),
+        _patched(backends, _review_omp_once=_fake_once(calls, set())),
+        _patched(omp_accounts, access_token=_fake_token(fetched), usage_by_email=usage),
+    ):
+        result = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+    assert fetched == [2] and calls == [(3, "tok-3")], (fetched, calls)
+    assert result.returncode == 0 and result.stdout == "answer from 3"
+    assert result.account == (
+        "b@example.com (omp anthropic account 2 of 2); skipped: a@example.com: "
+        "EXCLUDED (config.yaml omp_accounts.exclude)"
+    ), result.account
+    assert usage.reads == [], "no threshold -> no usage read"
+
+
+def test_pool_skips_an_account_over_its_threshold_reading_usage_once():
+    calls: list = []
+    fetched: list = []
+    usage = _usage(
+        {
+            "a@example.com": [_window("Claude 5 Hour", 0.95)],
+            "b@example.com": [_window("Claude 5 Hour", 0.1)],
+        }
+    )
+    with (
+        _pool_world(),
+        _omp_accounts_config({"max_usage_percent": 90}),
+        _patched(backends, _review_omp_once=_fake_once(calls, {3})),
+        _patched(omp_accounts, access_token=_fake_token(fetched), usage_by_email=usage),
+    ):
+        result = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+    # b is limited (429) and a is over its threshold: a is still never tried
+    assert fetched == [2] and calls == [(3, "tok-3")], (fetched, calls)
+    assert usage.reads == [1], usage.reads
+    assert result.returncode == 1
+    assert (
+        "every omp anthropic account failed (1): b@example.com: 429" in result.account
+    )
+    assert "skipped: a@example.com: OVER LIMIT (5 Hour 95% >= 90%" in result.account
+
+
+def test_pool_per_account_threshold_wins_and_env_beats_config():
+    calls: list = []
+    usage = _usage(
+        {
+            "a@example.com": [_window("Claude 7 Day", 0.92)],
+            "b@example.com": [_window("Claude 7 Day", 0.5)],
+        }
+    )
+    config = {
+        "exclude": ["b@example.com"],
+        "max_usage_percent": 90,
+        "accounts": {"a@example.com": {"max_usage_percent": 95}},
+    }
+    with (
+        _pool_world(),
+        _omp_accounts_config(config),
+        _patched(backends, _review_omp_once=_fake_once(calls, set())),
+        _patched(omp_accounts, access_token=_fake_token([]), usage_by_email=usage),
+    ):
+        first = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+        first_calls = list(calls)
+        calls.clear()
+        with _env(
+            REVIEW_OMP_ACCOUNTS_EXCLUDE="a@example.com",
+            REVIEW_OMP_MAX_USAGE_PERCENT="40",
+        ):
+            second = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+    assert first_calls == [(2, "tok-2")], "a@ at 92% is under its own 95% threshold"
+    assert first.returncode == 0
+    # env: exclude a@ instead of b@, and 40% puts b@ (50%) over the global threshold
+    assert calls == [], calls
+    assert second.returncode == 1
+    assert "a@example.com: EXCLUDED ($REVIEW_OMP_ACCOUNTS_EXCLUDE)" in second.stderr
+    assert "b@example.com: OVER LIMIT (7 Day 50% >= 40%" in second.stderr
+
+
+def test_pool_with_a_threshold_and_unknown_usage_skips_nothing():
+    calls: list = []
+    usage = _usage(None)
+    with (
+        _pool_world(),
+        _omp_accounts_config({"max_usage_percent": 90}),
+        _patched(backends, _review_omp_once=_fake_once(calls, set())),
+        _patched(omp_accounts, access_token=_fake_token([]), usage_by_email=usage),
+    ):
+        result = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+    assert usage.reads == [1] and calls == [(2, "tok-2")], (usage.reads, calls)
+    assert result.account == "a@example.com (omp anthropic account 1 of 2)"
+
+
+def test_status_pool_refusal_counts_a_tier_window_only_for_that_tier():
+    from reviewlib import seat_health
+
+    now = time.time()
+    a = omp_accounts.OmpAccount(2, 1, "a@example.com")
+    b = omp_accounts.OmpAccount(3, 2, "b@example.com")
+    policy = omp_accounts.account_policy(
+        {"max_usage_percent": 90, "exclude": ["b@example.com"]}, {}
+    )
+    usage = {"a@example.com": [_window("Claude 7 Day (Fable)", 0.95, tier="fable")]}
+    states = [
+        seat_health.OmpAccountState(x, None, None, omp_accounts.usage_of(usage, x))
+        for x in (a, b)
+    ]
+    pool = seat_health.OmpPoolState(
+        None, "no launcher", Path("/x"), states, policy, usage
+    )
+    with _env(REVIEW_OMP_CLAUDE_PROFILES=None):
+        sonnet = seat_health._omp_pool_reason(
+            "omp:anthropic/claude-sonnet-5", pool, now
+        )
+        fable = seat_health._omp_pool_reason("omp:anthropic/claude-fable-5", pool, now)
+        kimi = seat_health._omp_pool_reason("omp:kimi-code/k3", pool, now)
+    assert sonnet is None and kimi is None, (sonnet, kimi)
+    assert fable is not None and fable.startswith(
+        "no omp anthropic account may be used (2): a@example.com: OVER LIMIT "
+        "(7 Day (Fable) 95% >= 90%"
+    ), fable
+
+
+def test_pool_refuses_when_every_account_is_skipped_or_the_settings_are_invalid():
+    fetched: list = []
+    calls: list = []
+    usage = _usage({})
+    with (
+        _pool_world(),
+        _patched(backends, _review_omp_once=_fake_once(calls, set())),
+        _patched(omp_accounts, access_token=_fake_token(fetched), usage_by_email=usage),
+    ):
+        with _omp_accounts_config(
+            {"exclude": ["a@example.com", "b@example.com"], "max_usage_percent": 90}
+        ):
+            every = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+            with _env(REVIEW_OMP_CLAUDE_PROFILES="main"):
+                profiles = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+        with _omp_accounts_config({"exclude": "a@example.com"}):
+            invalid = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+        with (
+            _omp_accounts_config({"exclude": ["a@example.com"]}),
+            _env(OMP_AUTH_DB="/nonexistent/agent.db"),
+        ):
+            unreadable = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
+    assert fetched == [] and calls == [], (fetched, calls)
+    assert usage.reads == [], "every account excluded -> no usage read"
+    assert every.returncode == 1 and every.account.startswith("none answered")
+    assert (
+        "no omp anthropic account may be used (2): a@example.com: EXCLUDED "
+        "(config.yaml omp_accounts.exclude); b@example.com: EXCLUDED" in every.stderr
+    ), every.stderr
+    assert profiles.returncode == 1
+    assert (
+        "cannot be applied to $REVIEW_OMP_CLAUDE_PROFILES profiles" in profiles.stderr
+    )
+    assert invalid.returncode == 1
+    assert "omp_accounts.exclude must be a list of account emails" in invalid.stderr
+    assert unreadable.returncode == 1
+    assert "no readable omp auth db at /nonexistent/agent.db" in unreadable.stderr
+
+
+def _usage_report(**used: float) -> str:
+    resets = int(time.time() * 1000) + 3_600_000
+    return json.dumps(
+        {
+            "reports": [
+                {
+                    "provider": "anthropic",
+                    "metadata": {"email": f"{name}@example.com"},
+                    "limits": [
+                        {
+                            "label": "Claude 5 Hour",
+                            "amount": {"usedFraction": fraction},
+                            "window": {"resetsAt": resets},
+                        }
+                    ],
+                }
+                for name, fraction in used.items()
+            ]
+        }
+    )
+
+
+def _write_config(world, text: str) -> None:
+    path = world.home / ".config" / "review-cli" / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_e2e_config_excludes_an_account_and_seats_shows_the_reasons():
+    with _world() as world:
+        _write_config(
+            world,
+            "omp_accounts:\n  exclude: [a@example.com]\n  max_usage_percent: 90\n",
+        )
+        usage = _usage_report(a=0.95, b=0.1)
+        ask = world.review(
+            "just-ask",
+            "Say hi",
+            "--task",
+            "641",
+            "-m",
+            _MODEL,
+            "--timeout",
+            "60",
+            FAKE_OMP_USAGE=usage,
+        )
+        calls = world.calls()
+        seats = world.review("seats", FAKE_OMP_USAGE=usage)
+        as_json = world.review("doctor", "--json", FAKE_OMP_USAGE=usage)
+    out = ask.stdout + ask.stderr
+    assert ask.returncode == 0, out
+    assert "ANSWER served with tok-2" in ask.stdout, out
+    assert (
+        "account: b@example.com (omp anthropic account 2 of 2); skipped: a@example.com: "
+        "EXCLUDED (config.yaml omp_accounts.exclude)" in ask.stdout
+    ), out
+    assert [c["account"] for c in calls if c["kind"] == "token"] == ["2"], calls
+    assert [c["token"] for c in calls if c["kind"] == "run"] == ["tok-2"], calls
+    text = seats.stdout
+    assert seats.returncode == 0, text + seats.stderr
+    assert (
+        "account policy: exclude a@example.com (config.yaml omp_accounts.exclude) · "
+        "max usage 90% (config.yaml omp_accounts.max_usage_percent)" in text
+    ), text
+    a_line = next(line for line in text.splitlines() if "  a@example.com" in line)
+    b_line = next(line for line in text.splitlines() if "  b@example.com" in line)
+    assert "EXCLUDED (config.yaml omp_accounts.exclude)" in a_line, a_line
+    assert "available" in b_line, b_line
+    payload = json.loads(as_json.stdout)["omp"]
+    assert payload["account_policy"]["exclude"] == ["a@example.com"]
+    assert payload["account_policy"]["max_usage_percent"] == 90
+    accounts = {a["email"]: a for a in payload["anthropic_accounts"]}
+    assert accounts["a@example.com"]["skip_reason"].startswith("EXCLUDED")
+    assert accounts["a@example.com"]["available"] is False
+    assert accounts["b@example.com"]["skip_reason"] is None
+
+
+def test_e2e_every_account_skipped_fails_the_seat_and_seats_shows_over_limit():
+    with _world() as world:
+        _write_config(
+            world,
+            f'models:\n  - "{_MODEL}"\nomp_accounts:\n  max_usage_percent: 90\n',
+        )
+        usage = _usage_report(a=0.95, b=0.1)
+        env = {"FAKE_OMP_USAGE": usage, "REVIEW_OMP_ACCOUNTS_EXCLUDE": "b@example.com"}
+        ask = world.review(
+            "just-ask",
+            "Say hi",
+            "--task",
+            "641",
+            "-m",
+            _MODEL,
+            "--timeout",
+            "60",
+            **env,
+        )
+        calls = world.calls()
+        seats = world.review("seats", **env)
+        invalid = world.review("seats", REVIEW_OMP_MAX_USAGE_PERCENT="150")
+    out = ask.stdout + ask.stderr
+    assert ask.returncode != 0, out
+    assert (
+        "no omp anthropic account may be used (2): a@example.com: OVER LIMIT" in out
+    ), out
+    assert "b@example.com: EXCLUDED ($REVIEW_OMP_ACCOUNTS_EXCLUDE)" in out, out
+    assert [c for c in calls if c["kind"] in ("token", "run")] == [], calls
+    text = seats.stdout
+    seat_line = next(line for line in text.splitlines() if _MODEL in line)
+    assert (
+        "UNUSABLE: no omp anthropic account may be used (2): a@example.com: OVER LIMIT"
+        in seat_line
+    ), seat_line
+    a_line = next(line for line in text.splitlines() if "  a@example.com" in line)
+    assert "OVER LIMIT (5 Hour 95% >= 90%, resets " in a_line, a_line
+    assert "exclude b@example.com ($REVIEW_OMP_ACCOUNTS_EXCLUDE)" in text, text
+    invalid_seat = next(line for line in invalid.stdout.splitlines() if _MODEL in line)
+    assert "UNUSABLE: invalid omp account settings" in invalid_seat, invalid_seat
+    assert (
+        "INVALID SETTING: $REVIEW_OMP_MAX_USAGE_PERCENT must be a number above 0 and at "
+        "most 100, got '150'" in invalid.stdout
+    ), invalid.stdout
 
 
 if __name__ == "__main__":
