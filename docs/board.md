@@ -46,8 +46,11 @@ number of working reviewers even when models drop:
   first, then wrapping through the rest — via a per-call `CLAUDE_CONFIG_DIR`, skipping
   any account whose own harness window is exhausted and falling through to the next on a
   chronic-unavailable result or a failed login (logged out / OAuth expired,
-  review-cli#588). The omp-hosted Claude seat rotates the same way across
-  `$REVIEW_OMP_CLAUDE_PROFILES` (comma-separated, already-logged-in omp profiles). Only
+  review-cli#588). The omp-hosted Claude seats (`omp:anthropic/*`) rotate through omp's
+  own Anthropic accounts in `~/.omp/agent/agent.db`, one account per attempt, to the next
+  on a 429 rate limit or a failed login, and name the account that answered
+  (review-cli#637); `$REVIEW_OMP_CLAUDE_PROFILES` (comma-separated, already-logged-in omp
+  profiles) replaces that with a profile rotation when set. Only
   when EVERY configured account is exhausted does the run emit the synthetic usage-limit
   skip, now naming every account it tried; a host with no registry behaves exactly as
   before.

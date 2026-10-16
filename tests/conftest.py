@@ -91,6 +91,22 @@ def _isolate_claude_accounts_root(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_omp_accounts(tmp_path, monkeypatch):
+    """Default EVERY test to a missing omp agent.db and no omp launcher overrides
+    (review-cli#636/#637). An omp:anthropic seat reads its account list from the auth db
+    and fetches each account's token with `omp token`; against this developer machine's
+    real ~/.omp/agent/agent.db a suite would run real token commands and depend on which
+    accounts are logged in here. A test that wants accounts builds its own db and points
+    `OMP_AUTH_DB` at it."""
+    monkeypatch.setenv("OMP_AUTH_DB", str(tmp_path / "omp-agent" / "agent.db"))
+    for key in ("REVIEW_OMP_BIN", "OMP_REAL_BIN", "PI_INSTALL_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    saved = _backends._CONFIG_OMP_BIN
+    yield
+    _backends._CONFIG_OMP_BIN = saved
+
+
+@pytest.fixture(autouse=True)
 def _isolate_admission(tmp_path, monkeypatch):
     """Default EVERY test to host-wide admission OFF, with a throwaway registry dir
     (review-cli#614). Admission reads the REAL host load/memory and coordinates through a

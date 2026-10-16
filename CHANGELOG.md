@@ -3,6 +3,32 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.48.0 — 2026-10-16
+
+- **Fix(omp): omp seats start inside the seat sandbox without `OMP_REAL_BIN`**
+  ([review-cli#636](https://git.hyperide.ai/ultrabricks/review-cli/issues/636)). An omp
+  seat runs with HOME set to an empty sandbox dir, and the `omp` wrapper script on PATH
+  found its real binary as `$HOME/.local/lib/omp/omp`, so every omp seat exited 127. The
+  launcher is now resolved from the real environment before the sandbox exists: for a
+  wrapper script the real binary (`$OMP_REAL_BIN`, `$PI_INSTALL_DIR/omp`, then
+  `~/.local/lib/omp/omp`) is handed to the seat as `OMP_REAL_BIN`. A wrapper that refers
+  to HOME and still fails under a sandboxed HOME makes omp seats unusable before dispatch
+  (`SKIPPED` on `--show-board`, the wrapper's own message in `review status`) instead of an
+  exit 127 mid-run. `$REVIEW_OMP_BIN` / config.yaml `omp_bin:` override the omp a seat runs.
+- **Feat(omp): `omp:anthropic/*` seats rotate through omp's Anthropic accounts**
+  ([review-cli#637](https://git.hyperide.ai/ultrabricks/review-cli/issues/637)). The seat
+  reads the enabled Anthropic OAuth accounts from omp's agent.db (read-only; ids and
+  identities only) and pins each attempt to one of them: `omp token anthropic --account N`
+  for the token, passed as `ANTHROPIC_OAUTH_TOKEN` to an omp run whose agent dir is empty
+  (omp 18.8.1 ignores that variable while stored credentials exist). Accounts omp has
+  rate-limited (`auth_credential_blocks`) or review-cli saw limited (cooldown store, for
+  omp's `retry-after-ms`) go last; a 429 rate limit or a failed login moves on to the next
+  account. The output names the account that answered (`> [review-cli] account: ...`) and
+  the per-call log header carries `account=<email>`. Bare `review status` and the new
+  aliases `review seats` / `review doctor` list the omp launcher and each account's
+  availability (omp blocks, review-cli cooldowns, `omp usage` windows). A pinned run also
+  never reads the real agent dir's `mcp.json`.
+
 ## 0.47.0 — 2026-10-15
 
 - **Feat(admission): wait on memory-stall pressure and record every run's queue wait**

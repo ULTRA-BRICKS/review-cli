@@ -9,6 +9,7 @@ panel modes so streamed calls print their live-log path to stderr.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -34,7 +35,7 @@ from typing import Callable, Iterator
 from .config import _agentic
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
-from . import admission
+from . import admission, omp_accounts
 from .portable import lock_file, unlock_file
 from .process import (
     TIMEOUT_KIND_STALL,
@@ -92,6 +93,10 @@ class ReviewResult:
     # Empty on every direct call.
     served_by: str = ""
     substitution: str = ""
+    # The account that answered, for a seat that rotates through several accounts of one
+    # provider (omp's Anthropic accounts, review-cli#637): the account, and any that
+    # failed before it. Empty when the backend has a single implicit account.
+    account: str = ""
 
 
 def _which(name: str) -> str:
@@ -1397,6 +1402,125 @@ def _review_omp_with_account_fallback(
     return last_result
 
 
+def _omp_selector_is_anthropic(omp_model: str | None) -> bool:
+    """True when omp would serve `omp_model` from its `anthropic` provider: an
+    `anthropic/<model>` selector, or an unqualified Claude selector. A Claude model under
+    another provider (`some-proxy/claude-x`) is not served by the Anthropic accounts."""
+    if not omp_model or not _omp_model_hosts_claude(omp_model):
+        return False
+    head, sep, _rest = omp_model.partition("/")
+    return not sep or head.lower() == omp_accounts.PROVIDER
+
+
+def _omp_account_cooldown_key(account: omp_accounts.OmpAccount) -> str:
+    """The cooldown-store key a limited omp Anthropic account is recorded under."""
+    return f"omp-account:{omp_accounts.PROVIDER}:{account.credential_id}"
+
+
+def _omp_accounts_limited_until(
+    accounts: list[omp_accounts.OmpAccount],
+) -> dict[int, float]:
+    """credential id -> epoch seconds until which an earlier call saw that account
+    limited (the cooldown store, so it holds across review-cli processes)."""
+    out: dict[int, float] = {}
+    for account in accounts:
+        entry = active_cooldown(
+            _omp_account_cooldown_key(account), access_method=_OMP_ACCESS_METHOD
+        )
+        if entry is not None:
+            out[account.credential_id] = float(entry["until"])
+    return out
+
+
+def _omp_account_failure(result: ReviewResult) -> str | None:
+    """Why `result` means the account that ran it cannot answer now (a limit, a quota
+    notice, a failed login), else None -- the next account is then tried."""
+    limit = omp_accounts.limit_failure(result.returncode, result.stdout, result.stderr)
+    if limit is not None:
+        return limit
+    if _account_should_advance(result):
+        return _chronic_unavailable_reason(result) or _login_failure_line(result)
+    return None
+
+
+def _review_omp_with_anthropic_pool(
+    model, omp_model, prompt, diff, cwd, timeout, round_no, effort
+) -> ReviewResult:
+    """Run an Anthropic-hosted omp seat on omp's own Anthropic accounts, one account per
+    attempt (review-cli#637, see reviewlib.omp_accounts): accounts omp has not blocked and
+    review-cli has not seen limited go first; a limit, quota or login failure moves on to
+    the next account. The result's `account` names the account that answered and any
+    that failed before it. No account in agent.db -> one unpinned run, omp picks."""
+    accounts = omp_accounts.anthropic_accounts(_omp_auth_db())
+    if not accounts:
+        return _review_omp_once(
+            model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile=None
+        )
+    launcher = _omp_launcher()
+    ordered = omp_accounts.dispatch_order(
+        accounts, omp_model, _omp_accounts_limited_until(accounts)
+    )
+    total = len(accounts)
+    failed: list[str] = []
+    last_result: ReviewResult | None = None
+    for account in ordered:
+        served = (
+            f"{account.label} (omp {omp_accounts.PROVIDER} account "
+            f"{account.position} of {total})"
+        )
+        token, error = omp_accounts.access_token(launcher, account)
+        if token is None:
+            failed.append(f"{account.label}: {error}")
+            last_result = ReviewResult(
+                model=model,
+                command=f"omp token {omp_accounts.PROVIDER} --account {account.position}",
+                returncode=1,
+                stdout="",
+                stderr=f"[review-cli] omp account {served}: {error}",
+            )
+            continue
+        result = _review_omp_once(
+            model,
+            omp_model,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            round_no,
+            effort,
+            profile=None,
+            anthropic_account=account,
+            oauth_token=token,
+            launcher=launcher,
+        )
+        failure = _omp_account_failure(result)
+        key = _omp_account_cooldown_key(account)
+        if failure is None:
+            if result.returncode == 0:
+                clear_cooldown(key, access_method=_OMP_ACCESS_METHOD)
+            note = served + (
+                f"; failed before it: {'; '.join(failed)}" if failed else ""
+            )
+            return dataclasses.replace(result, account=note)
+        record_cooldown(
+            key,
+            failure,
+            access_method=_OMP_ACCESS_METHOD,
+            ttl_seconds=omp_accounts.retry_after_seconds(result.stdout, result.stderr),
+        )
+        failed.append(f"{account.label}: {failure}")
+        last_result = result
+    assert (
+        last_result is not None
+    )  # `ordered` is every account, and there is at least one
+    summary = f"every omp {omp_accounts.PROVIDER} account failed ({total}): {'; '.join(failed)}"
+    return dataclasses.replace(
+        last_result,
+        stderr=f"{last_result.stderr.rstrip()}\n[review-cli] {summary}".lstrip(),
+        account=f"none answered -- {summary}",
+    )
+
+
 def review_omp(
     model: str,
     prompt: str,
@@ -1436,11 +1560,17 @@ def review_omp(
         return ReviewResult(
             model=model, command=command, returncode=1, stdout="", stderr=str(exc)
         )
-    # review-cli#168: an omp-hosted Claude/Anthropic model has its own account-fallback
-    # axis (configured omp profiles, each a separate logged-in identity), independent of
-    # the direct claude:* CLI's account rotation. Every other omp-hosted model (Kimi,
-    # MiMo, ...) has exactly one identity today, so it dispatches once as before.
+    # review-cli#637: an omp seat on omp's `anthropic` provider runs on omp's Anthropic
+    # accounts one at a time (`_review_omp_with_anthropic_pool`). review-cli#168's
+    # explicit `$REVIEW_OMP_CLAUDE_PROFILES` (separately logged-in omp profiles) still
+    # wins when set. Every other omp-hosted model (Kimi, MiMo, ...) dispatches once.
     if _omp_model_hosts_claude(omp_model):
+        if _review_omp_claude_profiles() == [None] and _omp_selector_is_anthropic(
+            omp_model
+        ):
+            return _review_omp_with_anthropic_pool(
+                model, omp_model, prompt, diff, cwd, timeout, round_no, effort
+            )
         return _review_omp_with_account_fallback(
             model, omp_model, prompt, diff, cwd, timeout, round_no, effort
         )
@@ -1513,11 +1643,19 @@ def _review_omp_once(
     effort: str | None,
     profile: str | None,
     credential_id: int | None = None,
+    anthropic_account: omp_accounts.OmpAccount | None = None,
+    oauth_token: str | None = None,
+    launcher: omp_accounts.OmpLauncher | None = None,
 ) -> ReviewResult:
     """The actual omp dispatch (sandbox/cage/argv/env), extracted verbatim from
     `review_omp` (review-cli#168) so the outer function can pick which omp `--profile`
     or openai-codex credential to use before calling in — see `_omp_agent_dir`'s
-    `profile` parameter and `_OMP_CREDENTIAL_ID_ENV`."""
+    `profile` parameter and `_OMP_CREDENTIAL_ID_ENV`. With `oauth_token` (and the
+    `anthropic_account` it belongs to, review-cli#637) the run is pinned to that one
+    Anthropic account: its agent dir is an empty dir inside the sandbox, so omp has no
+    stored credential to pick and uses `ANTHROPIC_OAUTH_TOKEN` (see
+    reviewlib.omp_accounts)."""
+    launcher = launcher or _omp_launcher()
     command = (
         f"omp -p --no-session --tools {_OMP_READONLY_TOOLS}"
         + (f" --model {omp_model}" if omp_model else "")
@@ -1539,7 +1677,7 @@ def _review_omp_once(
         )
     )
     argv = [
-        _which("omp"),
+        launcher.argv0,
         "-p",
         "--no-session",
         "--no-extensions",
@@ -1582,6 +1720,7 @@ def _review_omp_once(
                 "XDG_CONFIG_HOME",
                 "PI_CODING_AGENT_DIR",
                 "OMP_PROFILE",
+                "ANTHROPIC_OAUTH_TOKEN",
                 _OMP_CREDENTIAL_ID_ENV,
             )
         }
@@ -1589,9 +1728,22 @@ def _review_omp_once(
         # instead of HOME must not escape the cage either (review of #174).
         env["HOME"] = str(home)
         env["XDG_CONFIG_HOME"] = str(home / ".config")
-        env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir(profile=profile))
+        # review-cli#636: a wrapper launcher finds its real binary through this, not
+        # through the sandbox HOME.
+        env.update(launcher.seat_env())
+        if oauth_token is not None:
+            agent_dir = box / "agent"
+            agent_dir.mkdir()
+            env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+            env["ANTHROPIC_OAUTH_TOKEN"] = oauth_token
+        else:
+            env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir(profile=profile))
         if credential_id is not None:
             env[_OMP_CREDENTIAL_ID_ENV] = str(credential_id)
+        header = f"omp -m {_safe_log_header(omp_model)}" if omp_model else None
+        if header and anthropic_account is not None:
+            # the account this call ran on, in the per-call log (review-cli#465/#637)
+            header += f" account={_safe_log_header(anthropic_account.label)}"
         proc = _run_streamed(
             argv,
             cwd=box,
@@ -1600,7 +1752,7 @@ def _review_omp_once(
             backend="omp",
             round_no=round_no,
             announce=_ANNOUNCE_LOGS,
-            header_argv0=f"omp -m {_safe_log_header(omp_model)}" if omp_model else None,
+            header_argv0=header,
             true_silence_timeout=true_silence_timeout_seconds(model),
         )
     _record_true_silence_if_needed(model, proc, access_method=_OMP_ACCESS_METHOD)
@@ -4904,6 +5056,37 @@ def _oc_provider_auth_available(provider: str) -> bool:
     return provider not in _OC_PROVIDER_ENV_VARS
 
 
+# review-cli#636: the omp an omp seat runs, when not the `omp` on PATH: $REVIEW_OMP_BIN,
+# else config.yaml `omp_bin:` (set once by the CLI after load_config, like
+# `configure_unpaid_providers`).
+_OMP_BIN_ENV = "REVIEW_OMP_BIN"
+_CONFIG_OMP_BIN: str | None = None
+
+
+def configure_omp_bin(raw: object) -> None:
+    """Set the per-process config.yaml `omp_bin:` value (a path; anything else unsets it)."""
+    global _CONFIG_OMP_BIN
+    _CONFIG_OMP_BIN = raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+def _omp_launcher() -> omp_accounts.OmpLauncher:
+    """The omp launcher an omp seat runs, resolved from the REAL environment before the
+    seat's sandbox exists (reviewlib.omp_accounts). Raises RuntimeError when there is no
+    omp or it cannot start under the sandbox HOME, so the seat is reported unusable."""
+    explicit, source = os.environ.get(_OMP_BIN_ENV, "").strip(), f"${_OMP_BIN_ENV}"
+    if not explicit and _CONFIG_OMP_BIN:
+        explicit, source = _CONFIG_OMP_BIN, "config.yaml omp_bin"
+    if explicit:
+        argv0 = os.path.abspath(os.path.expanduser(explicit))
+    else:
+        argv0, source = _which("omp"), "PATH"
+    launcher = omp_accounts.launcher_for(argv0, source=source)
+    problem = omp_accounts.launcher_problem(launcher)
+    if problem is not None:
+        raise RuntimeError(problem)
+    return launcher
+
+
 # Env var that overrides the omp auth db path in tests (mirrors OC_AUTH_FILE for the
 # opencode probe), so the availability tests never touch the real ~/.omp/agent/agent.db.
 _OMP_AUTH_DB_ENV = "OMP_AUTH_DB"
@@ -5241,8 +5424,13 @@ def backend_unavailable_reason(model: str) -> str | None:
             # unrunnable, so the probe reports unavailable instead of selecting a
             # backend that only fails (the raise is caught below → reason).
             resolve_backend_mode("omp", OMP_SUPPORTED_MODES, "cli")
-            _which("omp")
+            _omp_launcher()
             provider = _omp_provider_from_model(model)
+            if _omp_selector_is_anthropic(
+                model.split(":", 1)[1] if ":" in model else None
+            ):
+                # an unqualified `omp:claude-sonnet-5` runs on the anthropic accounts too
+                provider = omp_accounts.PROVIDER
             if _omp_auth_available(provider):
                 return None
             if provider is None:

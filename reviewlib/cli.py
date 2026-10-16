@@ -1026,7 +1026,9 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     complete) with actionable messages + meaningful exit codes."""
     from . import backends, sessions as _sessions
 
-    backends.configure_unpaid_providers(load_config().get("unpaid_providers"))
+    config = load_config()
+    backends.configure_unpaid_providers(config.get("unpaid_providers"))
+    backends.configure_omp_bin(config.get("omp_bin"))
 
     try:
         sess = _sessions.find_session(ns.resume)
@@ -1510,6 +1512,22 @@ def _job_exit_code(rec: dict) -> int:
     return 1  # unknown-terminated, or any unrecognized status
 
 
+def _seats_subcommand(verb: str, rest: list[str]) -> int:
+    """`review seats|doctor [--json]` -- the bare `review status` seat report."""
+    parser = argparse.ArgumentParser(
+        prog=f"review {verb}",
+        description=(
+            "Show which board seats can run right now and why the others cannot, each "
+            "Claude CLI account's login state, the omp launcher, and each omp Anthropic "
+            "account's availability and usage (read-only, no model is called). Same "
+            "report as a bare `review status`."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+    return _seat_status_report(as_json=ns.json)
+
+
 def _status_subcommand(rest: list[str]) -> int:
     """`review status <job-id> [--json] [--tail N]` — inspect one detached job.
 
@@ -1967,6 +1985,7 @@ def _configured_board(config: dict) -> list[BoardReviewer]:
     applied so availability and failover read the same as a real run. Raises
     BoardConfigError for a malformed `board:`."""
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
+    backends.configure_omp_bin(config.get("omp_bin"))
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))
@@ -1978,14 +1997,109 @@ def _configured_board(config: dict) -> list[BoardReviewer]:
     )
 
 
+def _omp_usage_text(windows) -> str:
+    """`5 Hour 10% · 7 Day 42%` -- a window at 100% also says when it resets."""
+    from .omp_accounts import utc_stamp
+
+    parts = []
+    for w in windows:
+        text = f"{w.label.removeprefix('Claude ')} {round(w.used_fraction * 100)}%"
+        if w.used_fraction >= 1 and w.resets_at_ms is not None:
+            text += f" (resets {utc_stamp(w.resets_at_ms)})"
+        parts.append(text)
+    return " · ".join(parts)
+
+
+def _omp_pool_json(state) -> dict:
+    launcher = state.launcher
+    return {
+        "launcher": launcher.argv0 if launcher else None,
+        "launcher_source": launcher.source if launcher else None,
+        "real_bin": launcher.real_bin if launcher else None,
+        "launcher_problem": state.launcher_problem,
+        "auth_db": str(state.db),
+        "anthropic_accounts": None
+        if state.accounts is None
+        else [
+            {
+                "position": s.account.position,
+                "credential_id": s.account.credential_id,
+                "email": s.account.email,
+                "available": s.is_available(time.time()),
+                "availability": s.availability(time.time()),
+                "omp_blocks": [
+                    {"scope": scope, "until_ms": until}
+                    for scope, until in s.account.blocks
+                ],
+                "limited_until": s.limited_until,
+                "limited_reason": s.limited_reason,
+                "usage": None
+                if s.usage is None
+                else [
+                    {
+                        "label": w.label,
+                        "used_fraction": w.used_fraction,
+                        "resets_at_ms": w.resets_at_ms,
+                    }
+                    for w in s.usage
+                ],
+            }
+            for s in state.accounts
+        ],
+    }
+
+
+def _omp_pool_lines(state) -> list[str]:
+    """The `review status` section for omp:anthropic seats (review-cli#636/#637)."""
+    lines = [
+        "\nOMP ANTHROPIC ACCOUNTS (omp:anthropic/* seats try these one per attempt, "
+        "available first; next account on a rate limit or failed login)"
+    ]
+    launcher = state.launcher
+    if launcher is None:
+        lines.append(
+            f"  launcher: none, omp: seats cannot start -- {state.launcher_problem}"
+        )
+    elif launcher.real_bin:
+        lines.append(
+            f"  launcher: {launcher.argv0} ({launcher.source}; wrapper, real binary "
+            f"{launcher.real_bin} passed to seats as OMP_REAL_BIN)"
+        )
+    else:
+        lines.append(f"  launcher: {launcher.argv0} ({launcher.source})")
+    if state.accounts is None:
+        lines.append(
+            f"  no readable omp auth db at {state.db} -- omp picks the account"
+        )
+        return lines
+    if not state.accounts:
+        lines.append(f"  none in {state.db} -- omp picks the account")
+        return lines
+    now = time.time()
+    email_w = max(len(s.account.label) for s in state.accounts)
+    for s in state.accounts:
+        usage = (
+            "usage unknown (omp usage did not answer)"
+            if s.usage is None
+            else _omp_usage_text(s.usage) or "no usage windows reported"
+        )
+        lines.append(
+            f"  {s.account.position}  {s.account.label.ljust(email_w)}  "
+            f"credential {s.account.credential_id:<3} {s.availability(now)}  [{usage}]"
+        )
+    return lines
+
+
 def _seat_status_report(*, as_json: bool) -> int:
     """Bare `review status` (review-cli#594): every board seat as usable or UNUSABLE with
     the reason (unpaid provider, missing CLI/login, an active cooldown, every Claude CLI
     account logged out or failed its last login) and the executor its failover would hand
     the seat to, plus each registered Claude CLI account's login state -- including a
     login failure a call recorded (review-cli#596) -- with the command that logs it back
-    in. Read-only: no model is called and no login is started."""
-    from .seat_health import claude_accounts_state, seat_health
+    in, and the omp launcher plus each omp Anthropic account's availability and usage
+    (review-cli#636/#637). `review seats` and `review doctor` print the same report.
+    Read-only: no model is called and no login is started."""
+    from .seat_health import claude_accounts_state, omp_pool_state, seat_health
 
     try:
         board = _configured_board(load_config())
@@ -1994,6 +2108,7 @@ def _seat_status_report(*, as_json: bool) -> int:
         return 2
     accounts = claude_accounts_state()
     seats = [(r, seat_health(r.model, accounts)) for r in board]
+    omp_pool = omp_pool_state()
 
     if as_json:
         import json as _json
@@ -2022,6 +2137,7 @@ def _seat_status_report(*, as_json: bool) -> int:
                 }
                 for a in accounts
             ],
+            "omp": _omp_pool_json(omp_pool),
             "admission": admission.status_snapshot(),
         }
         print(_json.dumps(payload, indent=2))
@@ -2065,6 +2181,7 @@ def _seat_status_report(*, as_json: bool) -> int:
         lines.append(
             f"  {marker} {a.name:<12} {(a.email or '(no email on disk)'):<28} {state}"
         )
+    lines.extend(_omp_pool_lines(omp_pool))
     lines.append("")
     lines.append(admission.render_status(admission.status_snapshot()))
     print("\n".join(lines))
@@ -4989,6 +5106,8 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "jobs",
         "status",
         "wait",
+        "seats",
+        "doctor",
     }
 )
 
@@ -5068,6 +5187,11 @@ CONFIG FILE
                        unavailable; every direct or oc: seat under them is skipped before
                        any backend process/API call. Env equivalent:
                        REVIEW_UNPAID_PROVIDERS=commandcode,fireworks.
+    omp_bin:           str         the omp executable omp: seats run instead of the `omp` on
+                       PATH. Rarely needed: a wrapper `omp` script's real binary is found
+                       before the seat's sandbox replaces HOME (OMP_REAL_BIN, PI_INSTALL_DIR,
+                       ~/.local/lib/omp/omp) and handed to it as OMP_REAL_BIN. Env
+                       equivalent: REVIEW_OMP_BIN=/path/to/omp.
     timeout:           int         per-call timeout seconds for `review diff` (replaces the
                        configured/default request timeout; still overrideable
                        per-invocation by --timeout). Review/panel agent CLI backends treat
@@ -5529,6 +5653,7 @@ def _subcommand_epilog() -> str:
             "\n  jobs        list detached (--detach) review jobs"
             "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`);"
             "\n              bare `status`: which board seats can run now, why not, and their substitute"
+            "\n  seats       = bare `status`: every seat, Claude CLI account and omp Anthropic account (alias: doctor)"
             "\n  wait        block until a detached job finishes (`wait <job-id>`)"
             "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
             "\n  install-skill / install-commit-hook / install-hook tg / register-module"
@@ -6047,6 +6172,10 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         return _status_subcommand(argv[1:])
     if argv and argv[0] == "wait":
         return _wait_subcommand(argv[1:])
+    # `review seats` / `review doctor` -- the bare `review status` seat report under the
+    # names people reach for when a seat will not run (review-cli#637).
+    if argv and argv[0] in ("seats", "doctor"):
+        return _seats_subcommand(argv[0], argv[1:])
     # `review stat` — detailed per-harness/per-model token-burn + health report parsed
     # from the real on-disk call logs. A bare MANAGEMENT subcommand (like task/dashboard/
     # sessions), NOT a fan-out mode.
@@ -6160,6 +6289,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
 
     config = load_config()
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
+    backends.configure_omp_bin(config.get("omp_bin"))
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))

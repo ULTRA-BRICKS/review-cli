@@ -750,6 +750,13 @@ _UNIT_FILES = [
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed
     # and a throwaway OMP_AUTH_DB; no real omp binary, no network.
     ("test_omp_backend.py", {}),
+    # omp seats under the sandbox HOME (review-cli#636) and omp's Anthropic account pool
+    # (review-cli#637): the wrapper's real binary handed over as OMP_REAL_BIN, a wrapper
+    # that cannot start reported unusable before dispatch, agent.db read read-only, one
+    # account per attempt, the next one after a 429, the account named in the output and
+    # in `review seats`. Unit tests patch attributes; the e2e runs bin/review against a
+    # fake omp wrapper + fake real binary + fake agent.db in a temp HOME.
+    ("test_omp_account_pool.py", {}),
     # review_omp's true-silence cooldown wiring (review-cli#235 omp half): mirrors
     # test_true_silence_cooldown_wiring.py's opencode coverage above -- recording AND
     # consulting an independent "omp" cooldown namespace, plus a real-subprocess,

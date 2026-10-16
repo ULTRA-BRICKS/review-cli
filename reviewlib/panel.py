@@ -307,6 +307,8 @@ def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
     parts = [f"## {result.model} [{status}]", f"`{result.command}`"]
     if result.substitution:
         parts.append(f"> [review-cli] substituted: {result.substitution}")
+    if result.account:
+        parts.append(f"> [review-cli] account: {result.account}")
     if body:
         parts.append(body)
         if check_evidence and clean_verdict_missing_evidence(body):

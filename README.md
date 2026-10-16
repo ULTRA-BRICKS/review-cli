@@ -789,7 +789,7 @@ review jobs --json
 review status 20260718T211853-0db637ed        # status + paths + a log tail
 review status 20260718T211853-0db637ed --json
 review status                                 # no job id: which board seats can run now,
-                                               # why not, and who answers for them
+                                               # why not, who answers (= `review seats`)
 review wait 20260718T211853-0db637ed          # block until it finishes (for a human /
                                                # unbounded caller — NOT for a capped subagent;
                                                # poll `review status` instead)
@@ -918,7 +918,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
 | `oc:xai/grok-4.6` / `grok` / `grok46` / `grok-4.6` | cli | Grok 4.6 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-12 seat. `grok45` pins `oc:xai/grok-4.5`. |
 | `omp:opencode-go/mimo-v2.5` / `mimo` / `mimo25` / `mimo-2.5` | cli | MiMo 2.5 via omp OpenCode Go (`MIMO_SEAT`, the default board's priority-13 `tests` reserve). The `oc:opencode/mimo-v2.5-free` catalog spelling is not DEFAULT-safe (`default_routes_live` False: provider `opencode` under `oc:` is unnamed and not in `_AGENTIC_ONLY_PROVIDERS`). Explicit `-m oc:opencode/mimo-v2.5-free` still works at runtime. |
-| `omp:anthropic/claude-sonnet-5` | cli | Claude Sonnet 5 through the omp harness (`OMP_CLAUDE_SEAT`, the default board's priority-8 `quality` reserve) — the SAME model as `claude:claude-sonnet-5` but a DIFFERENT auth path (omp's own profile-scoped agent dir/credentials, not the Claude Code CLI's `CLAUDE_CONFIG_DIR`/keychain), so it survives an outage hitting every `claude:*` seat's shared account. Rotates across the comma-separated `$REVIEW_OMP_CLAUDE_PROFILES` when set. |
+| `omp:anthropic/claude-sonnet-5` | cli | Claude Sonnet 5 through the omp harness (`OMP_CLAUDE_SEAT`, the default board's priority-8 `quality` reserve) — the SAME model as `claude:claude-sonnet-5` but a DIFFERENT auth path (omp's own Anthropic accounts, not the Claude Code CLI's `CLAUDE_CONFIG_DIR`/keychain), so it survives an outage hitting every `claude:*` seat's shared account. Rotates through omp's accounts (next on a 429, docs/board.md), or `$REVIEW_OMP_CLAUDE_PROFILES` when set. |
 | `omp:<provider>/<model>` / `omp` | cli | `omp -p --no-session --tools read,grep,glob --add-dir <repo> @<payloadfile>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 

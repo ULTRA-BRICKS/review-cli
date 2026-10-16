@@ -11,8 +11,11 @@ the seat cooldown store (a recorded quota, limit or silence cooldown), and — f
 that runs through the Claude CLI — each registered `~/.claude-accounts` account's login
 state (`claude_accounts.account_logged_in`, a local `claude auth status`) and its recorded
 login failure (`claude_accounts.login_failure`, review-cli#596: `claude auth status` kept
-saying logged in while every call on the account failed). No model is called and no login
-is started.
+saying logged in while every call on the account failed). For the omp:anthropic seats
+(review-cli#637, `omp_pool_state`): the omp launcher, omp's Anthropic accounts and their
+rate-limit blocks from agent.db (read-only), the limits review-cli recorded per account,
+and each account's usage windows from `omp usage` (a usage read, not a model call). No
+model is called and no login is started.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import backends, claude_accounts, seat_cooldown
+from . import backends, claude_accounts, omp_accounts, seat_cooldown
 from .config import _expand_alias
 from .provider_failover import provider_chain
 
@@ -92,6 +95,88 @@ def claude_accounts_state() -> list[ClaudeAccount]:
             )
         )
     return accounts
+
+
+@dataclass(frozen=True)
+class OmpAccountState:
+    """One of omp's Anthropic accounts as an omp:anthropic seat would see it
+    (review-cli#637): omp's own rate-limit blocks (on `account`), a limit an earlier
+    review-cli call hit on it (`limited_until` UNIX time, `limited_reason`), and its usage
+    windows from `omp usage` (None when omp did not report them)."""
+
+    account: omp_accounts.OmpAccount
+    limited_until: float | None
+    limited_reason: str | None
+    usage: list[omp_accounts.UsageWindow] | None
+
+    def is_available(self, now: float) -> bool:
+        """Neither omp's shared-window block nor a review-cli limit is active."""
+        return self.account.blocked_until_ms(None) is None and (
+            self.limited_until is None or self.limited_until <= now
+        )
+
+    def availability(self, now: float) -> str:
+        blocked_ms = self.account.blocked_until_ms(None)
+        scoped = [
+            f"{scope} blocked until {omp_accounts.utc_stamp(until)}"
+            for scope, until in self.account.blocks
+            if scope
+        ]
+        parts = []
+        if blocked_ms is not None:
+            parts.append(
+                f"RATE-LIMITED until {omp_accounts.utc_stamp(blocked_ms)} (omp block)"
+            )
+        if self.limited_until is not None and self.limited_until > now:
+            parts.append(
+                f"LIMITED until {omp_accounts.utc_stamp(self.limited_until * 1000)} "
+                f"(last review-cli call: {self.limited_reason})"
+            )
+        if not parts:
+            parts.append("available")
+        return "; ".join(parts + scoped)
+
+
+@dataclass(frozen=True)
+class OmpPoolState:
+    """The omp launcher an omp seat would run (or why none can run), and omp's Anthropic
+    accounts (None when agent.db cannot be read)."""
+
+    launcher: omp_accounts.OmpLauncher | None
+    launcher_problem: str | None
+    db: Path
+    accounts: list[OmpAccountState] | None
+
+
+def omp_pool_state(*, now: float | None = None) -> OmpPoolState:
+    """Read-only: agent.db (read-only), the cooldown store and `omp usage` (a usage read,
+    no model call)."""
+    moment = time.time() if now is None else now
+    try:
+        launcher, problem = backends._omp_launcher(), None
+    except RuntimeError as exc:
+        launcher, problem = None, str(exc)
+    db = backends._omp_auth_db()
+    accounts = omp_accounts.anthropic_accounts(db, now_ms=int(moment * 1000))
+    if accounts is None:
+        return OmpPoolState(launcher, problem, db, None)
+    usage = omp_accounts.usage_by_email(launcher) if launcher and accounts else None
+    states = []
+    for account in accounts:
+        cooldown = seat_cooldown.active_cooldown(
+            backends._omp_account_cooldown_key(account),
+            access_method=backends._OMP_ACCESS_METHOD,
+            now=moment,
+        )
+        states.append(
+            OmpAccountState(
+                account=account,
+                limited_until=cooldown["until"] if cooldown else None,
+                limited_reason=cooldown["reason"] if cooldown else None,
+                usage=usage.get(account.email or "") if usage is not None else None,
+            )
+        )
+    return OmpPoolState(launcher, problem, db, states)
 
 
 def _cooldown_reason(model: str, now: float) -> str | None:
