@@ -1,7 +1,7 @@
 """Provider-failover: keep a review seat alive by trying the SAME model across MULTIPLE
 providers, switching MID-REVIEW when a provider fails.
 
-WHY: a logical model (opus, glm-5.2, …) can be served by several providers/transports
+WHY: a logical model (opus, glm-5.3, …) can be served by several providers/transports
 (claude-direct vs opencode; z.ai vs opencode vs commandcode). When the provider a seat is
 running on fails DURING the review call — DNS/timeout/5xx/connection-reset/exit-nonzero —
 the seat must NOT abort and the board must NOT degrade: the CLI transparently switches that
@@ -45,10 +45,19 @@ from .config import _expand_alias
 #
 # opus leads with claude-DIRECT (NOT the opencode catch-all): a bare opus routed through
 # opencode is the exact agentic path observed to infra-fail; claude-direct is reliable and
-# opencode is only the fallback. glm-5.2 leads with z.ai direct, then opencode's zai
-# provider, then the commandcode gateway.
+# opencode is only the fallback. glm-5.3 leads with z.ai direct, then opencode's zai
+# provider, then the commandcode gateway; omp's zai provider (the default board's GLM seat,
+# review-cli#645) is listed last so it shares this chain without reordering the others.
 DEFAULT_PROVIDER_CHAINS: dict[str, tuple[str, ...]] = {
-    "opus": ("claude:claude-opus-4-8", "oc:anthropic/claude-opus-4-8"),
+    "opus": ("claude:claude-opus-5-5", "oc:anthropic/claude-opus-5-5"),
+    "glm-5.3": (
+        "zai:glm-5.3",
+        "oc:zai/glm-5.3",
+        "commandcode:zai-org/GLM-5.3",
+        "omp:zai/glm-5.3",
+    ),
+    # the pinned `opus48` / `glm52` aliases and configs naming them keep their chains
+    "opus-4-8": ("claude:claude-opus-4-8", "oc:anthropic/claude-opus-4-8"),
     "glm-5.2": ("zai:glm-5.2", "oc:zai/glm-5.2", "commandcode:zai-org/GLM-5.2"),
 }
 
@@ -124,7 +133,7 @@ def logical_key(model: str) -> str:
 def _base_chain(model: str, overrides: dict[str, list[str]] | None) -> list[str]:
     """The ordered provider list for `model`, with the REQUESTED spelling as the HEAD.
 
-    The requested concrete spelling always leads — an explicit `-m commandcode:zai-org/GLM-5.2`
+    The requested concrete spelling always leads — an explicit `-m commandcode:zai-org/GLM-5.3`
     (or a config board seat pinned to a specific provider) must be tried on THAT provider
     first, never silently reordered onto the default chain's head (which could hit a
     different billing/auth path). The remaining providers of the same logical model follow,
@@ -170,9 +179,9 @@ def _default_head(key: str, overrides: dict[str, list[str]] | None) -> str | Non
 def _requested_is_default_selection(
     model: str, expanded: str, overrides: dict[str, list[str]] | None
 ) -> bool:
-    """True iff `model` is a bare logical alias (`opus`, `glm52`) or the default provider
+    """True iff `model` is a bare logical alias (`opus`, `glm53`) or the default provider
     spelled out directly — as opposed to an EXPLICIT pin of a specific alternate concrete
-    provider (e.g. `-m commandcode:zai-org/GLM-5.2`). Only this default-selection case is
+    provider (e.g. `-m commandcode:zai-org/GLM-5.3`). Only this default-selection case is
     eligible for the last-working-cache reorder (codex P2 on review-cli#157: 'Keep explicit
     provider ahead of cache') — reordering an explicit pin behind a cached alternate would
     silently break its routing/billing/auth guarantee.
@@ -182,11 +191,11 @@ def _requested_is_default_selection(
     config `provider_chains:` override puts that alias's own head. Comparing the alias's
     canonical expansion against the (possibly REORDERED) override head would otherwise make
     a legitimate bare-alias request lose the reorder whenever an override's head differs
-    from the alias's canonical target (e.g. an override putting `oc:zai/glm-5.2` first while
-    `glm52` still canonically expands to `zai:glm-5.2`) — a real gap a review flagged.
+    from the alias's canonical target (e.g. an override putting `oc:zai/glm-5.3` first while
+    `glm53` still canonically expands to `zai:glm-5.3`) — a real gap a review flagged.
     Only when NO alias fired (`model == expanded`, a concrete spelling typed directly) do we
     fall back to comparing against the resolved default head, to still allow the head
-    spelled out literally (`-m zai:glm-5.2`) while excluding a genuine alternate pin."""
+    spelled out literally (`-m zai:glm-5.3`) while excluding a genuine alternate pin."""
     # Both sides normalized identically (strip + lower) before comparing — `_expand_alias`
     # itself does not strip, so comparing an unstripped `expanded` against a stripped
     # `model` could disagree on whitespace-padded input (review of #157, finding 3).
@@ -207,8 +216,8 @@ def is_default_provider_selection(
 
     A CALLER writing the last-working cache (`remember_working_provider`/
     `forget_working_provider`) must gate the write the SAME way `provider_chain` gates the
-    cache-reorder READ — otherwise a one-off explicit pin (`-m commandcode:zai-org/GLM-5.2`)
-    silently trains or clears the cache entry a later BARE alias request (`-m glm52`) reads,
+    cache-reorder READ — otherwise a one-off explicit pin (`-m commandcode:zai-org/GLM-5.3`)
+    silently trains or clears the cache entry a later BARE alias request (`-m glm53`) reads,
     rebiasing (or wiping) default routing based on a request that was never the default
     selection to begin with (review of #157: 'cache write isn't gated the way the read
     is'). Both `reviewlib.panel`'s board path and `reviewlib.modes.review`'s flat path use

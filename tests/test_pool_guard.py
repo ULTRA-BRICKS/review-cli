@@ -23,7 +23,10 @@ Plain-script harness (mirrors tests/test_failover_pool.py): each test_* is run b
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +45,39 @@ from reviewlib.pool_guard import (  # noqa: E402
 )
 
 
+@contextlib.contextmanager
+def _codex_home(config: str | None):
+    """A throwaway CODEX_HOME whose config.toml holds `config` (None = no file)."""
+    old = os.environ.get("CODEX_HOME")
+    with tempfile.TemporaryDirectory() as d:
+        if config is not None:
+            (Path(d) / "config.toml").write_text(config, encoding="utf-8")
+        os.environ["CODEX_HOME"] = d
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = old
+
+
+# The codex/Sol collapse below assumes the codex CLI's own default is Sol; pin it per test
+# so the result does not depend on the machine's ~/.codex.
+_SOL_CONFIG = f'model = "{SOL_SEAT.split(":", 1)[1]}"\n'
+
+try:
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _sol_codex_default():
+        with _codex_home(_SOL_CONFIG):
+            yield
+
+except ImportError:  # the standalone runner below pins it instead
+    pass
+
+
 # === injected availability harness ==============================================
 def _avail(live: set[str]):
     return lambda model: model in live
@@ -57,32 +93,32 @@ def _cand(label: str, why: str, board, pool_size: int) -> Candidate:
 
 
 LIVE_ALL = {
-    "claude:claude-opus-4-8",
+    "claude:claude-opus-5-5",
     "codex",
     "gemini:gemini-2.5-flash",
-    "oc:zai/glm-5.2",
-    "claude:claude-fable-5",
+    "oc:zai/glm-5.3",
+    "claude:claude-fable-5-1",
     SOL_SEAT,
 }
 DOWN_REASONS = {
-    "commandcode:moonshotai/Kimi-K2.7-Code": "commandcode: insufficient credits (provider marked unpaid)",
-    "commandcode:zai-org/GLM-5.2": "commandcode: insufficient credits (provider marked unpaid)",
+    "commandcode:moonshotai/Kimi-K3": "commandcode: insufficient credits (provider marked unpaid)",
+    "commandcode:zai-org/GLM-5.3": "commandcode: insufficient credits (provider marked unpaid)",
     "gemini:gemini-2.5-flash": "gemini: GEMINI_API_KEY not found",
 }
 DEFAULT_BOARD_SPEC = [
-    ("claude:claude-opus-4-8", "Opus"),
+    ("claude:claude-opus-5-5", "Opus"),
     ("codex", "Codex"),
     ("gemini:gemini-2.5-flash", "Gemini"),
-    ("oc:zai/glm-5.2", "GLM"),
-    ("commandcode:moonshotai/Kimi-K2.7-Code", "Kimi-cc"),
-    ("commandcode:zai-org/GLM-5.2", "GLM-cc"),
+    ("oc:zai/glm-5.3", "GLM"),
+    ("commandcode:moonshotai/Kimi-K3", "Kimi-cc"),
+    ("commandcode:zai-org/GLM-5.3", "GLM-cc"),
 ]
 
 
 # === happy path ==================================================================
 def test_selection_that_converges_proceeds():
     """All requested seats live and >= requested size -> PROCEED, no message."""
-    board = [("claude:claude-opus-4-8", "Opus"), ("codex", "Codex")]
+    board = [("claude:claude-opus-5-5", "Opus"), ("codex", "Codex")]
     d = evaluate_selection(
         user_board=board,
         requested_size=2,
@@ -100,7 +136,7 @@ def test_candidates_thunk_not_realized_on_proceed():
     """`candidates` may be a THUNK realized ONLY on the non-converge path — so a converging
     happy-path run never rebuilds the fallback boards (which re-resolve presets and can
     re-emit load_board stderr warnings). The thunk must NOT be called when PROCEED."""
-    board = [("claude:claude-opus-4-8", "Opus"), ("codex", "Codex")]
+    board = [("claude:claude-opus-5-5", "Opus"), ("codex", "Codex")]
 
     def _boom():
         raise AssertionError(
@@ -121,7 +157,7 @@ def test_candidates_thunk_not_realized_on_proceed():
 def test_default_path_with_enough_live_proceeds():
     """No -m / no --pool: proceeds as long as the board clears the convergence floor,
     even if fewer live than the nominal pool (the pool auto-shrinks)."""
-    live = {"claude:claude-opus-4-8", "codex"}  # only 2 of 6 live
+    live = {"claude:claude-opus-5-5", "codex"}  # only 2 of 6 live
     d = evaluate_selection(
         user_board=DEFAULT_BOARD_SPEC,
         requested_size=4,
@@ -138,9 +174,9 @@ def test_explicit_narrow_cannot_converge_proposes_only_fitting_options():
     """User -m picks 4 models, 2 are down -> live subset (2) < requested (4). Propose the
     fallbacks that CAN converge; a too-small preset that can't is filtered out."""
     user = [
-        ("claude:claude-opus-4-8", "Opus"),
+        ("claude:claude-opus-5-5", "Opus"),
         ("gemini:gemini-2.5-flash", "Gemini"),  # down
-        ("commandcode:moonshotai/Kimi-K2.7-Code", "Kimi-cc"),  # down
+        ("commandcode:moonshotai/Kimi-K3", "Kimi-cc"),  # down
         ("codex", "Codex"),
     ]
     default_cand = _cand(
@@ -151,7 +187,7 @@ def test_explicit_narrow_cannot_converge_proposes_only_fitting_options():
         "--preset dead",
         [
             ("gemini:gemini-2.5-flash", "Gemini"),
-            ("commandcode:zai-org/GLM-5.2", "GLM-cc"),
+            ("commandcode:zai-org/GLM-5.3", "GLM-cc"),
         ],
         2,
     )  # both down -> can't converge -> must be hidden
@@ -176,7 +212,7 @@ def test_explicit_narrow_cannot_converge_proposes_only_fitting_options():
 
 def test_proposal_annotates_every_seat_live_or_down_with_reason():
     """Each model list in a proposal shows per-seat live/down + reason (CTO refinement)."""
-    user = [("commandcode:moonshotai/Kimi-K2.7-Code", "Kimi-cc")]  # single, down
+    user = [("commandcode:moonshotai/Kimi-K3", "Kimi-cc")]  # single, down
     default_cand = _cand(
         "default", "drop -m and run the default board", DEFAULT_BOARD_SPEC, 4
     )
@@ -194,14 +230,14 @@ def test_proposal_annotates_every_seat_live_or_down_with_reason():
     assert "Kimi-cc" in d.text
     assert "insufficient credits" in d.text
     # live seats are marked distinctly from down seats
-    assert "claude:claude-opus-4-8" in d.text
+    assert "claude:claude-opus-5-5" in d.text
 
 
 # === branch 2: --pool N larger than live count ===================================
 def test_pool_larger_than_live_proposes_not_overriding():
     """--pool 6 but only 2 live -> propose NOT overriding the pool; show the default
     board option (which converges) with live/down annotations."""
-    live = {"claude:claude-opus-4-8", "codex"}
+    live = {"claude:claude-opus-5-5", "codex"}
     default_cand = _cand(
         "default",
         "don't pass --pool; the default pool size runs the live board",
@@ -226,7 +262,7 @@ def test_pool_larger_than_live_proposes_not_overriding():
 def test_default_cannot_converge_targeted_per_provider_error():
     """Fewer distinct live models than the floor, and NO candidate converges -> a targeted
     per-provider error enumerating each dead seat's reason + the live-model list."""
-    live = {"claude:claude-opus-4-8"}  # 1 live < MIN_CONVERGE_MODELS
+    live = {"claude:claude-opus-5-5"}  # 1 live < MIN_CONVERGE_MODELS
     default_cand = _cand("default", "default board", DEFAULT_BOARD_SPEC, 4)
     d = evaluate_selection(
         user_board=DEFAULT_BOARD_SPEC,
@@ -243,7 +279,7 @@ def test_default_cannot_converge_targeted_per_provider_error():
     assert "insufficient credits" in d.text
     assert "GEMINI_API_KEY" in d.text
     # still shows the current live list (Opus)
-    assert "claude:claude-opus-4-8" in d.text
+    assert "claude:claude-opus-5-5" in d.text
 
 
 def test_error_headline_uses_per_board_best_not_union_count():
@@ -253,7 +289,7 @@ def test_error_headline_uses_per_board_best_not_union_count():
     self-contradictory 'only 2 … need >= 2'. The headline must say 'at most 1 … need >= 2'."""
     # user board: only Opus live (1 distinct). Two presets, each with exactly one DIFFERENT
     # live model, so the union of live models is 2 but no single board reaches the floor.
-    user = [("claude:claude-opus-4-8", "Opus"), ("gemini:gemini-2.5-flash", "Gemini")]
+    user = [("claude:claude-opus-5-5", "Opus"), ("gemini:gemini-2.5-flash", "Gemini")]
     preset_a = _cand(
         "preset:a",
         "--preset a",
@@ -267,15 +303,15 @@ def test_error_headline_uses_per_board_best_not_union_count():
         "preset:b",
         "--preset b",
         [
-            ("oc:zai/glm-5.2", "GLM"),
-            ("commandcode:zai-org/GLM-5.2", "GLM-cc"),  # only GLM live
+            ("oc:zai/glm-5.3", "GLM"),
+            ("commandcode:zai-org/GLM-5.3", "GLM-cc"),  # only GLM live
         ],
         2,
     )
     live = {
-        "claude:claude-opus-4-8",
+        "claude:claude-opus-5-5",
         "codex",
-        "oc:zai/glm-5.2",
+        "oc:zai/glm-5.3",
     }  # 1 per board, 3 in union
     d = evaluate_selection(
         user_board=user,
@@ -318,7 +354,7 @@ def test_codex_and_sol_collapse_to_one_engine_for_viability():
     (>= floor) proposal; the guard must not present it as a real 2-model panel."""
     assert default_distinct_key("codex") == default_distinct_key(SOL_SEAT)
     user = [
-        ("commandcode:moonshotai/Kimi-K2.7-Code", "Kimi-cc")
+        ("commandcode:moonshotai/Kimi-K3", "Kimi-cc")
     ]  # single dead -> can't converge
     codex_sol_only = _cand(
         "preset:codexish",
@@ -404,20 +440,20 @@ def test_single_seat_board_floor_caps_to_board_size():
 
 
 def test_provider_variants_of_one_model_are_one_distinct_engine():
-    """The guard must agree with provider-failover on model identity: `zai:glm-5.2`,
-    `oc:zai/glm-5.2` and `commandcode:zai-org/GLM-5.2` are ONE engine (cross-PROVIDER
+    """The guard must agree with provider-failover on model identity: `zai:glm-5.3`,
+    `oc:zai/glm-5.3` and `commandcode:zai-org/GLM-5.3` are ONE engine (cross-PROVIDER
     collapse), and `opus` collapses with its oc: spelling too. This keeps the guard's
     'distinct live models' count consistent with what provider-failover treats as one model.
 
-    Consequence, mirroring codex/sol: an all-live `-m zai:glm-5.2,oc:zai/glm-5.2` is a
+    Consequence, mirroring codex/sol: an all-live `-m zai:glm-5.3,oc:zai/glm-5.3` is a
     1-engine request, not a 2-model panel. cli._evaluate_pool_or_bail sizes an -m request by
     the DISTINCT-engine count (`len({default_distinct_key(m)...})`), so it passes
     requested_size=1 here — and an all-live selection PROCEEDs (the guard never blocks a
     selection whose every seat is live; see test_deliberate_fully_live_narrow_selection)."""
     k = default_distinct_key
-    assert k("zai:glm-5.2") == k("oc:zai/glm-5.2") == k("commandcode:zai-org/GLM-5.2")
-    assert k("claude:claude-opus-4-8") == k("oc:anthropic/claude-opus-4-8")
-    user = [("zai:glm-5.2", "GLM-a"), ("oc:zai/glm-5.2", "GLM-b")]
+    assert k("zai:glm-5.3") == k("oc:zai/glm-5.3") == k("commandcode:zai-org/GLM-5.3")
+    assert k("claude:claude-opus-5-5") == k("oc:anthropic/claude-opus-5-5")
+    user = [("zai:glm-5.3", "GLM-a"), ("oc:zai/glm-5.3", "GLM-b")]
     requested = len({k(m) for m, _n in user})  # what cli passes: distinct engines == 1
     assert requested == 1
     default_cand = _cand("default", "default board", DEFAULT_BOARD_SPEC, 4)
@@ -426,7 +462,7 @@ def test_provider_variants_of_one_model_are_one_distinct_engine():
         requested_size=requested,
         explicit=True,
         candidates=[default_cand],
-        available=_avail(LIVE_ALL | {"zai:glm-5.2", "oc:zai/glm-5.2"}),
+        available=_avail(LIVE_ALL | {"zai:glm-5.3", "oc:zai/glm-5.3"}),
         reason=_reason(DOWN_REASONS),
     )
     assert d.kind == PROCEED, d.text
@@ -435,8 +471,8 @@ def test_provider_variants_of_one_model_are_one_distinct_engine():
 def test_distinct_key_keeps_other_models_separate():
     """The codex/sol collapse must NOT bleed into unrelated models."""
     keys = {
-        default_distinct_key("claude:claude-opus-4-8"),
-        default_distinct_key("claude:claude-fable-5"),
+        default_distinct_key("claude:claude-opus-5-5"),
+        default_distinct_key("claude:claude-fable-5-1"),
         default_distinct_key("gemini:gemini-2.5-flash"),
         default_distinct_key("codex"),
     }
@@ -520,7 +556,7 @@ def test_reuse_eligible_lets_one_live_model_fill_a_three_role_request():
     live model proceeds so dispatch can pad (review-cli#309)."""
     board = [
         (GROK_SEAT, "Grok"),
-        ("claude:claude-opus-4-8", "Opus"),
+        ("claude:claude-opus-5-5", "Opus"),
         ("codex:gpt-6-astra", "Astra"),
     ]
     live = {GROK_SEAT}
@@ -546,12 +582,51 @@ def test_reuse_eligible_lets_one_live_model_fill_a_three_role_request():
     assert allowed.kind == PROCEED, allowed.text
 
 
+def test_bare_codex_follows_the_cli_default_not_the_pin():
+    """review-cli#645: the codex CLI's own default decides what a bare `codex` is. A
+    machine still defaulting to the pre-bump gpt-5.6-sol collapses `codex` with
+    `gpt56sol`, not with the bumped `sol`; with no `model` it stays its own key. A
+    `model = ...` line inside a multi-line string is text, not the setting."""
+    from reviewlib.modes import qa
+
+    if qa._toml_loader() is None:  # 3.9/3.10 without tomli: see the fallback test
+        return
+    with _codex_home('model = "gpt-5.6-sol"\n[profiles.x]\nmodel = "other"\n'):
+        assert default_distinct_key("codex") == default_distinct_key("gpt56sol")
+        assert default_distinct_key("codex") != default_distinct_key("sol")
+    with _codex_home(
+        'developer_instructions = """\nmodel = \'gpt-6-astra\'\n"""\n'
+        'model = "gpt-6.1-sol"\n'
+    ):
+        assert default_distinct_key("codex") == default_distinct_key(SOL_SEAT)
+        assert default_distinct_key("codex") != default_distinct_key(ASTRA_SEAT)
+    with _codex_home('[profiles.x]\nmodel = "gpt-6.1-sol"\n'):
+        assert default_distinct_key("codex") == "codex"
+    with _codex_home(None):
+        assert default_distinct_key("codex") == "codex"
+
+
+def test_bare_codex_without_a_toml_parser_keeps_the_sol_assumption():
+    """On a host with no tomllib/tomli the guard cannot read the codex config, so a bare
+    `codex` keeps counting as SOL_SEAT's model, as before review-cli#645."""
+    from reviewlib.modes import qa
+
+    real = qa._toml_loader
+    qa._toml_loader = lambda: None
+    try:
+        with _codex_home('model = "gpt-5.6-sol"\n'):
+            assert default_distinct_key("codex") == default_distinct_key(SOL_SEAT)
+    finally:
+        qa._toml_loader = real
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
-                fn()
+                with _codex_home(_SOL_CONFIG):
+                    fn()
                 print(f"PASS {name}")
             except AssertionError as exc:
                 failures += 1

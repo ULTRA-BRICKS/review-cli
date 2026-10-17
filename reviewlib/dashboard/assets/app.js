@@ -38,7 +38,7 @@ const state = {
 // (tg-cli/emoji-icons/mini_<brand>.png), so a board model wears its REAL logo — not a unicode
 // emoji — across the whole HyperIDE ecosystem. Keys are lower-cased base families; resolveModel()
 // does exact-then-prefix matching (tg-cli's extractBaseModel logic) so suffixed ids
-// (`opus-4-8`, `glm-5.2`, `claude-fable-5`, `commandcode:Qwen/Qwen3.7-Max`, `zai:glm-5.2`) all
+// (`opus-5-5`, `glm-5.3`, `claude-fable-5-1`, `commandcode:Qwen/Qwen3.8-Max`, `zai:glm-5.3`) all
 // resolve to the right brand. A family with no dedicated logo maps to its closest brand: every
 // Anthropic seat (Opus/Fable/Sonnet/Haiku/Devin/Aider) → the Claude (Anthropic) logo; every
 // OpenAI seat (GPT/o1/o3/Codex) → the Codex (OpenAI) logo; Llama/Meta → Meta; xAI → Grok, etc.
@@ -62,9 +62,12 @@ const MODEL_LOGO = {
   o1: 'codex',
   gpt: 'codex',
   'gpt-5.6-sol': 'codex',
+  'gpt-6.1-sol': 'codex',
   sol: 'codex',
   'gpt-6-astra': 'codex',
   astra: 'codex',
+  'gpt-6-luna': 'codex',
+  luna: 'codex',
   // Google
   gemini: 'gemini',
   google: 'gemini',
@@ -95,7 +98,7 @@ const MODEL_LOGO = {
   windsurf: 'windsurf',
   // HyperIDE
   hyperide: 'hyperide',
-  // z.ai serves Zhipu's GLM — the board's priority-5 `tests` seat (zai:glm-5.2). The shipped
+  // z.ai serves Zhipu's GLM — the board's `security` reserve seat (omp:zai/glm-5.3). The shipped
   // GLM tile carries the brand wordmark so the seat reads as a real logo image alongside its
   // board siblings, not a bare monogram.
   glm: 'glm',
@@ -119,9 +122,12 @@ const MODEL_LABEL = {
   claude: 'Claude',
   codex: 'Codex',
   'gpt-5.6-sol': 'Sol',
+  'gpt-6.1-sol': 'Sol',
   sol: 'Sol',
   'gpt-6-astra': 'Astra',
   astra: 'Astra',
+  'gpt-6-luna': 'Luna',
+  luna: 'Luna',
   openai: 'OpenAI',
   gpt: 'GPT',
   gemini: 'Gemini',
@@ -130,7 +136,7 @@ const MODEL_LABEL = {
   kimi: 'Kimi',
   glm: 'GLM',
   zai: 'GLM',
-  'z.ai': 'GLM', // the raw backend name in the call logs (board id is `zai:glm-5.2`)
+  'z.ai': 'GLM', // the raw backend name in the call logs (direct board id e.g. `zai:glm-5.3`)
   chatglm: 'GLM',
   minimax: 'MiniMax',
   llama: 'Llama',

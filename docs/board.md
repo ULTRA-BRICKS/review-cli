@@ -103,7 +103,7 @@ disabled** — `--pool` only sizes the pool.
 every commandcode-routed seat (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide,
 leaving several roles (`performance`/`quality`/`security`/`tests`/`contracts`) with zero or
 one live seat — `quality`'s one live seat hit a real weekly quota exhaustion with nothing
-left to promote, hard-blocking a real PR's review-quorum gate. Decision: Terra and Sonnet
+left to promote, hard-blocking a real PR's review-quorum gate. Decision: Terra (Luna since review-cli#645) and Sonnet
 were added as genuinely distinct, already-paid `performance`/`quality` fallbacks on accounts
 the board already uses, and GLM was re-lensed off its now-redundant `quality` role onto
 `security`. `contracts`/`architect` remain single-seat roles (`tests` later gained a second,
@@ -118,10 +118,10 @@ Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra v
 CLI (Astra — GPT-6-Astra, pinned via `codex:gpt-6-astra` — is the #5 board seat as of
 review-cli#286, was #6 before Fable's demotion moved every subsequent seat up one slot; it
 replaced a bare `"codex"` seat that silently tracked the CLI's own default model),
-and Kimi/z.ai-GLM/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) — all run
+and Kimi/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) and z.ai-GLM through omp (`omp:zai/glm-5.3`) — all run
 read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
 always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
-**GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
+**GLM-cc** seat (`commandcode:zai-org/GLM-5.3` — opencode's `commandcode` provider does not
 register this GLM id, so the agentic form errors; the keyed-HTTP route is the one that
 reaches it). Both are read-only by construction (they POST only the diff).
 `review --show-board` shows each seat's live
@@ -291,12 +291,12 @@ Every key, its `REVIEW_ADMISSION_*` env var and default (env > config > default)
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
 highest priority. The role lens you attach to each model is independent of its priority.
 
-The GLM seat uses **the maintainer's z.ai subscription** (`glm-5.2`, the newest GLM)
-through opencode's `zai` provider, so it reviews agentically — not the diff-only z.ai
-REST call. It needs that provider configured in opencode (see Auth in the README); the
-other `oc:commandcode/…` seats
-reach the commandcode gateway the same way. opencode must be installed for the agentic
-seats; without it they fall back to the reserve.
+The GLM seat uses **the maintainer's z.ai subscription** (`glm-5.3`, the newest GLM)
+through omp's `zai` provider (`omp:zai/glm-5.3`, review-cli#645), so it reviews
+agentically — not the diff-only z.ai REST call. It needs omp installed with z.ai
+credentials; the `oc:commandcode/…` seats reach the commandcode gateway through opencode
+(see Auth in the README). A missing harness or credential makes the seat probe
+unavailable, and the reserve backfills it.
 
 ```bash
 review --show-board        # active default preset board (light); add --preset heavy to show Sol (Fable excluded)
@@ -371,15 +371,15 @@ exit) — it never silently falls back to the paid default board.
 # Priority order: the first 4 reachable models are the live pool; the rest are the
 # reserve that backfills a skipped/failed seat.
 board:
-  - { model: "claude:claude-fable-5",  role: architect, effort: xhigh }
-  - { model: "claude:claude-opus-4-8", role: correctness, effort: high }
+  - { model: "claude:claude-fable-5-1", role: architect, effort: xhigh }
+  - { model: "claude:claude-opus-5-5", role: correctness, effort: high }
   - { model: "codex:gpt-6-astra",      role: consistency, name: Astra, effort: high }
   # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
   # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
   # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
-  - { model: "oc:commandcode/moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
-  - { model: "oc:zai/glm-5.2",         role: quality }
-  - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
+  - { model: "oc:commandcode/moonshotai/Kimi-K3", role: performance, name: Kimi }
+  - { model: "oc:zai/glm-5.3",         role: quality }
+  - { model: "oc:commandcode/Qwen/Qwen3.8-Max", role: security, name: Qwen }
 ```
 
 **Optional heavyweight seats** (NOT enabled by default — the default/light preset stays at

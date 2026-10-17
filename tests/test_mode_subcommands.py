@@ -309,7 +309,7 @@ def test_visual_list_defaults_works_without_image():
         cli.load_config = saved_cfg
     assert rc == 0
     text = out.getvalue()
-    assert "claude:claude-opus-4-8" in text, text
+    assert "claude:claude-opus-5-5" in text, text
     assert "oc:zai/glm-4.5v" in text, text
 
 

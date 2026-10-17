@@ -130,7 +130,7 @@ _RETRY_FILENAME_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-.+-retry-\d+\.log$")
 # Header line: "[review-cli] RETRY-EVENT kind=<k> model=<m>[ attempt=N/M] delay=Ds exit=E".
 # `model` is matched non-greedily so the trailing fixed fields (delay=/exit=) anchor the
 # match even though a model string can itself contain spaces/brackets (e.g. the `promote`
-# kind's "Fable [architect]->commandcode:zai-org/GLM-5.2").
+# kind's "Fable [architect]->commandcode:zai-org/GLM-5.3").
 _RETRY_HEADER_RE = re.compile(
     r"^\[review-cli\] RETRY-EVENT kind=(?P<kind>\S+) model=(?P<model>.+?)"
     r"(?: attempt=\d+/\d+)? delay=(?P<delay>\d+(?:\.\d+)?)s exit=(?P<exit>\S+)\s*$"

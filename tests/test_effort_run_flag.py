@@ -311,8 +311,8 @@ def test_flat_failover_effort_follows_the_actually_dispatched_provider_route(
     executes, not the originally-requested route.
 
     `--effort opencode=high` exists to size the backend that RUNS (e.g. opencode seats are
-    agentic and want a bigger reasoning budget); after `zai:glm-5.2` fails over to
-    `oc:zai/glm-5.2`, the seat that actually runs IS an opencode seat, so it must get the
+    agentic and want a bigger reasoning budget); after `zai:glm-5.3` fails over to
+    `oc:zai/glm-5.3`, the seat that actually runs IS an opencode seat, so it must get the
     opencode-route effort, not the now-irrelevant zai-route one. This documents/locks the
     intended behavior (raised as a 'please confirm' item on review of #157)."""
     import reviewlib.modes.review as review_mod
@@ -321,7 +321,7 @@ def test_flat_failover_effort_follows_the_actually_dispatched_provider_route(
 
     def fake_backend(model, prompt, diff, cwd, timeout, round_no=0, *, effort=None):
         calls.append({"model": model, "effort": effort})
-        if model == "zai:glm-5.2":
+        if model == "zai:glm-5.3":
             return ReviewResult(
                 model=model, command="c", returncode=1, stdout="down", stderr=""
             )
@@ -335,7 +335,7 @@ def test_flat_failover_effort_follows_the_actually_dispatched_provider_route(
 
     override = parse_effort_flag(["opencode=high", "zai=low"])
     review_mod.mode_review(
-        ["zai:glm-5.2"],
+        ["zai:glm-5.3"],
         "prompt",
         "a diff",
         Path("."),
@@ -344,8 +344,8 @@ def test_flat_failover_effort_follows_the_actually_dispatched_provider_route(
         board=None,
         effort_override=override,
     )
-    assert calls[0] == {"model": "zai:glm-5.2", "effort": "low"}, calls
-    assert calls[1] == {"model": "oc:zai/glm-5.2", "effort": "high"}, calls
+    assert calls[0] == {"model": "zai:glm-5.3", "effort": "low"}, calls
+    assert calls[1] == {"model": "oc:zai/glm-5.3", "effort": "high"}, calls
 
 
 def test_board_review_path_applies_effort_override_for_direct_callers(monkeypatch):
@@ -443,7 +443,7 @@ def test_every_real_backend_accepts_effort():
         "opencode",
         "omp:kimi-code/k3",
         "commandcode:deepseek",
-        "zai:glm-5.2",
+        "zai:glm-5.3",
         "openrouter:anthropic/claude",
     ]
     for model in probe_models:

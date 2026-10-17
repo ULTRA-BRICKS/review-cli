@@ -47,7 +47,7 @@ from reviewlib.config import (  # noqa: E402
     LIGHT_PRESET_BOARD,
     SOL_SEAT,
     SONNET_SEAT,
-    TERRA_SEAT,
+    LUNA_SEAT,
     REVIEW_ROLES,
     VISUAL_MODELS,
     BoardConfigError,
@@ -91,64 +91,64 @@ def test_default_board_matches_directive_table():
     # Priority order (failover pool): strongest WORKING model first. Each seat keeps a
     # role/lens, but selection is by PRIORITY + availability, not role order.
     expected = [
-        ("codex:gpt-5.6-sol", "consistency", "Sol"),
-        ("claude:claude-opus-4-8", "correctness", "Opus"),
-        # Seat 3: GLM-5.2 via the Command Code gateway, directly under Opus.
+        ("codex:gpt-6.1-sol", "consistency", "Sol"),
+        ("claude:claude-opus-5-5", "correctness", "Opus"),
+        # Seat 3: GLM-5.3 via the Command Code gateway, directly under Opus.
         # DIFF-ONLY keyed HTTP (review_commandcode) — opencode's commandcode provider does
         # not register this GLM id, so the agentic form errors; read-only by construction.
         # Role `performance` (NOT correctness) so it doesn't duplicate Opus's lens.
-        ("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc"),
+        ("commandcode:zai-org/GLM-5.3", "performance", "GLM-cc"),
         # Seat 4 is the first reserve and preserves lens diversity when a top seat drops.
-        ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
+        ("oc:commandcode/moonshotai/Kimi-K3", "quality", "Kimi"),
         # Seat 5 is the agentic codex CLI route, pinned to GPT-6-Astra (ASTRA_SEAT) rather
         # than the bare `"codex"` seat this used to be (see config.py for rationale). Role
         # LEFT AS `consistency` (a duplicate of Sol's lens) by review-cli#382 -- an earlier
         # draft flipped it to `security`, but that left `consistency` with ZERO live
         # fallback anywhere on the board; see config.py's comment on this exact seat.
         ("codex:gpt-6-astra", "consistency", "Astra"),
-        # Seats 6-7 (review-cli#382): TERRA_SEAT/SONNET_SEAT, live fallbacks for the
+        # Seats 6-7 (review-cli#382): LUNA_SEAT/SONNET_SEAT, live fallbacks for the
         # `performance`/`quality` roles whose only prior seats (GLM-cc/Kimi) are disabled
         # whenever `unpaid_providers` includes `commandcode`. Placed right after Astra so
         # neither the raw top-4 nor DEFAULT_PRESET_BOARD's top-4 window picks up a
         # duplicate role in the common (nothing disabled) case.
-        ("codex:gpt-5.6-terra", "performance", "Terra"),
-        ("claude:claude-sonnet-5", "quality", "Sonnet"),
-        # Seat 7.5 (review-cli#168): OMP_CLAUDE_SEAT, the SAME claude-sonnet-5 model
+        ("codex:gpt-6-luna", "performance", "Luna"),
+        ("claude:claude-sonnet-5-5", "quality", "Sonnet"),
+        # Seat 7.5 (review-cli#168): OMP_CLAUDE_SEAT, the SAME claude-sonnet-5-5 model
         # dispatched through the omp harness instead of the direct claude CLI -- a
         # DIFFERENT auth path, so it survives an outage that takes out every claude:*
         # seat's shared account state.
-        ("omp:anthropic/claude-sonnet-5", "quality", "Sonnet-omp"),
+        ("omp:anthropic/claude-sonnet-5-5", "quality", "Sonnet-omp"),
         # Seats 4, 8-9 and 11 route through opencode (`oc:`) so they run AGENTICALLY (read the
         # repo read-only), not the diff-only commandcode/z.ai REST call (review-cli#24). Seats
-        # 6-7 (Terra/Sonnet, review-cli#382) run via the codex/claude CLIs, not opencode.
-        ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
+        # 6-7 (Luna/Sonnet, review-cli#382) run via the codex/claude CLIs, not opencode.
+        ("oc:commandcode/Qwen/Qwen3.8-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
-        # Seat 11 — Grok 4.6 via opencode's native `xai` provider, agentic (oauth-
+        # Seat 11 — Grok 4.7 via opencode's native `xai` provider, agentic (oauth-
         # authenticated, no diff-only fallback route exists for this provider). Sits
         # BEFORE the z.ai GLM last-resort seat so deep mid-run failover reaches a fast
         # reserve before paying GLM's #65 pathological-slowness cost. Role `security`
-        # (NOT `performance`, which already has a live paid fallback in Terra) — see the
+        # (NOT `performance`, which already has a live paid fallback in Luna) — see the
         # seat's own comment in `reviewlib/config.py`.
-        ("oc:xai/grok-4.6", "security", "Grok"),
-        # Seat 12 — MiMo 2.5 via omp OpenCode Go (review-cli#450). Live paid `tests`
+        ("oc:xai/grok-4.7", "security", "Grok"),
+        # Seat 12 — MiMo V2.6 Pro via omp OpenCode Go (review-cli#450). Live paid `tests`
         # fallback: DeepSeek is the only other tests seat and is commandcode (often
         # unpaid). Same rationale as GROK filling `security`. Sits AFTER Grok, BEFORE
         # the slow z.ai GLM last-resort, Fable stays LAST.
-        ("omp:opencode-go/mimo-v2.5", "tests", "MiMo"),
-        # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
+        ("omp:opencode-go/mimo-v2.6-pro", "tests", "MiMo"),
+        # GLM-5.3 via omp's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
         # under load, so it is promoted before only Fable — Qwen/DeepSeek/Gemini/Grok go first.
         # review-cli#382: role changed from `quality` (now covered by Sonnet above, which
         # doesn't share this seat's real-world quota fragility) to `security`.
-        ("oc:zai/glm-5.2", "security", "GLM"),
-        # Fable 5 (Anthropic flagship). DEMOTED from priority 1 to the very LAST seat
+        ("omp:zai/glm-5.3", "security", "GLM"),
+        # Fable 5.1 (Anthropic flagship). DEMOTED from priority 1 to the very LAST seat
         # (review-cli#fable-seat-reliability): confirmed 97.9-100% dispatch failure rate
         # (chronic session/usage-limit exhaustion) made priority 1 a near-certain-doomed
         # dispatch on every single default review. Worse than GLM's "merely slow" profile,
         # so it sits even later than GLM — still a reserve seat, not removed outright.
-        ("claude:claude-fable-5", "architect", "Fable"),
+        ("claude:claude-fable-5-1", "architect", "Fable"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
     assert got == expected, got
@@ -156,40 +156,41 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_is_priority_ordered():
     """The CTO's priority sketch (strongest-WORKING-model first): Sol, Opus,
-    GLM-5.2-via-commandcode, Kimi, Astra, Terra, Sonnet, Sonnet-omp, Qwen, DeepSeek,
-    Gemini, GLM-5.2-via-z.ai, Fable. Re-ranking = reordering
-    DEFAULT_BOARD; this pins the order. Seats 4, 9-10, and 12 are the AGENTIC opencode
-    (`oc:`) routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. Terra/Sonnet
+    GLM-5.3-via-commandcode, Kimi, Astra, Luna, Sonnet, Sonnet-omp, Qwen, DeepSeek,
+    Gemini, GLM-5.3-via-z.ai, Fable. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 4 and 9-10 are AGENTIC opencode (`oc:`)
+    routes (review-cli#24) and the z.ai GLM seat is the agentic omp route (review-cli#645);
+    the commandcode GLM at #3 is diff-only keyed HTTP. Luna/Sonnet
     (review-cli#382) are live fallbacks for performance/quality, inserted right after Astra.
     Sonnet-omp (review-cli#168) is the SAME Sonnet model via a different auth path,
     right after Sonnet. The z.ai GLM seat is DEPRIORITIZED to next-to-last (review-cli#65)
     — pathologically slow under load. Fable is LAST (review-cli#fable-seat-reliability) —
     a confirmed ~100% dispatch failure rate, worse than merely slow."""
     assert [r.model for r in DEFAULT_BOARD] == [
-        "codex:gpt-5.6-sol",
-        "claude:claude-opus-4-8",
-        "commandcode:zai-org/GLM-5.2",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex:gpt-6.1-sol",
+        "claude:claude-opus-5-5",
+        "commandcode:zai-org/GLM-5.3",
+        "oc:commandcode/moonshotai/Kimi-K3",
         "codex:gpt-6-astra",
-        "codex:gpt-5.6-terra",
-        "claude:claude-sonnet-5",
-        "omp:anthropic/claude-sonnet-5",
-        "oc:commandcode/Qwen/Qwen3.7-Max",
+        "codex:gpt-6-luna",
+        "claude:claude-sonnet-5-5",
+        "omp:anthropic/claude-sonnet-5-5",
+        "oc:commandcode/Qwen/Qwen3.8-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
-        "oc:xai/grok-4.6",
-        "omp:opencode-go/mimo-v2.5",
-        "oc:zai/glm-5.2",
-        "claude:claude-fable-5",
+        "oc:xai/grok-4.7",
+        "omp:opencode-go/mimo-v2.6-pro",
+        "omp:zai/glm-5.3",
+        "claude:claude-fable-5-1",
     ]
 
 
 def test_glm_commandcode_seat_sits_directly_under_opus():
-    """The CTO directive: GLM 5.2 via commandcode must sit IMMEDIATELY after Opus, so the
+    """The CTO directive: GLM 5.3 via commandcode must sit IMMEDIATELY after Opus, so the
     pool tries Opus first, then this GLM. Pin the adjacency by index so a future re-rank that
     pulls them apart trips here. Uses the canonical constant (one source of truth)."""
     models = [r.model for r in DEFAULT_BOARD]
-    opus_i = models.index("claude:claude-opus-4-8")
+    opus_i = models.index("claude:claude-opus-5-5")
     glm_i = models.index(GLM_COMMANDCODE_SEAT)
     assert glm_i == opus_i + 1, (opus_i, glm_i, models)
     # Opus sits immediately after Sol (priority 1), so GLM is priority 3 (index 2).
@@ -203,30 +204,30 @@ def test_fable_seat_is_last_resort_reserve():
     for the full rationale. Pinned by index (not just membership) so a future re-rank
     that accidentally moves it back up trips here."""
     models = [r.model for r in DEFAULT_BOARD]
-    assert models[-1] == "claude:claude-fable-5", models
-    fable = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-fable-5")
+    assert models[-1] == "claude:claude-fable-5-1", models
+    fable = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-fable-5-1")
     assert fable.display == "Fable"
     assert fable.role == "architect"
 
 
 def test_glm_commandcode_seat_is_the_canonical_constant():
-    """The seat's model string is GLM_COMMANDCODE_SEAT byte-exact, and it is the verified-
-    live commandcode gateway id (`zai-org/GLM-5.2`), not the z.ai-route `glm-5.2` id."""
-    assert GLM_COMMANDCODE_SEAT == "commandcode:zai-org/GLM-5.2"
+    """The seat's model string is GLM_COMMANDCODE_SEAT byte-exact, and it is the
+    commandcode gateway id (`zai-org/GLM-5.3`), not the z.ai-route `glm-5.3` id."""
+    assert GLM_COMMANDCODE_SEAT == "commandcode:zai-org/GLM-5.3"
     seat = next(r for r in DEFAULT_BOARD if r.model == GLM_COMMANDCODE_SEAT)
     assert seat.display == "GLM-cc"
 
 
 def test_grok_seat_is_the_canonical_constant_and_resolves_to_opencode():
-    """GROK_SEAT is byte-exact "oc:xai/grok-4.6" (pinned so the seat can't silently
+    """GROK_SEAT is byte-exact "oc:xai/grok-4.7" (pinned so the seat can't silently
     drift to a different spelling), sits on the board as "Grok", and resolves through
     review_opencode end-to-end (not the bare/colon xai forms, which are deliberately
     NOT routed anywhere — see test_bare_and_colon_xai_forms_are_not_routed)."""
-    assert GROK_SEAT == "oc:xai/grok-4.6"
+    assert GROK_SEAT == "oc:xai/grok-4.7"
     seat = next(r for r in DEFAULT_BOARD if r.model == GROK_SEAT)
     assert seat.display == "Grok"
     # `security`, not `performance` (review round 1 of #167, Fable): after review-cli#386
-    # `performance` already has a live paid fallback (Terra) while `security` is held
+    # `performance` already has a live paid fallback (Luna) while `security` is held
     # only by Qwen (unpaid/disabled) and the slow z.ai GLM seat.
     assert seat.role == "security"
     assert backends.resolve_backend(GROK_SEAT) is backends.review_opencode
@@ -235,24 +236,26 @@ def test_grok_seat_is_the_canonical_constant_and_resolves_to_opencode():
 
 
 def test_grok_aliases_resolve_to_the_canonical_seat():
-    """`grok` / `grok46` / `grok-4.6` expand to GROK_SEAT; `grok45` stays pinned to
-    Grok 4.5 and does not track GROK_SEAT."""
+    """`grok` / `grok47` / `grok-4.7` expand to GROK_SEAT; `grok46`/`grok-4.6` and
+    `grok45` stay pinned to their own releases and do not track GROK_SEAT."""
     from reviewlib.config import MODEL_ALIASES
 
     assert MODEL_ALIASES["grok"] == GROK_SEAT
-    assert MODEL_ALIASES["grok46"] == GROK_SEAT
-    assert MODEL_ALIASES["grok-4.6"] == GROK_SEAT
+    assert MODEL_ALIASES["grok47"] == GROK_SEAT
+    assert MODEL_ALIASES["grok-4.7"] == GROK_SEAT
+    assert MODEL_ALIASES["grok46"] == "oc:xai/grok-4.6"
+    assert MODEL_ALIASES["grok-4.6"] == "oc:xai/grok-4.6"
     assert MODEL_ALIASES["grok45"] == "oc:xai/grok-4.5"
     assert MODEL_ALIASES["grok45"] != GROK_SEAT
 
 
 def test_mimo_seat_is_the_canonical_constant_and_resolves_to_omp():
-    """MIMO_SEAT is byte-exact "omp:opencode-go/mimo-v2.5" (pinned so the seat can't
+    """MIMO_SEAT is byte-exact "omp:opencode-go/mimo-v2.6-pro" (pinned so the seat can't
     silently drift to a different spelling), sits on the board as "MiMo" with role
     `tests`, and resolves through review_omp (OpenCode Go via omp). DeepSeek is the
     only other tests seat and is commandcode (often unpaid); MIMO is the live paid
     tests fallback — same rationale as GROK filling security."""
-    assert MIMO_SEAT == "omp:opencode-go/mimo-v2.5"
+    assert MIMO_SEAT == "omp:opencode-go/mimo-v2.6-pro"
     seat = next(r for r in DEFAULT_BOARD if r.model == MIMO_SEAT)
     assert seat.display == "MiMo"
     assert seat.role == "tests"
@@ -262,12 +265,13 @@ def test_mimo_seat_is_the_canonical_constant_and_resolves_to_omp():
 
 
 def test_mimo_aliases_resolve_to_the_canonical_seat():
-    """`mimo` / `mimo25` / `mimo-2.5` expand to MIMO_SEAT."""
+    """`mimo` / `mimo26` expand to MIMO_SEAT; `mimo25` / `mimo-2.5` stay on MiMo 2.5."""
     from reviewlib.config import MODEL_ALIASES
 
     assert MODEL_ALIASES["mimo"] == MIMO_SEAT
-    assert MODEL_ALIASES["mimo25"] == MIMO_SEAT
-    assert MODEL_ALIASES["mimo-2.5"] == MIMO_SEAT
+    assert MODEL_ALIASES["mimo26"] == MIMO_SEAT
+    assert MODEL_ALIASES["mimo25"] == "omp:opencode-go/mimo-v2.5"
+    assert MODEL_ALIASES["mimo-2.5"] == "omp:opencode-go/mimo-v2.5"
 
 
 def test_oc_mimo_catalog_id_is_not_default_safe():
@@ -397,9 +401,9 @@ def test_selector_well_formedness_applies_to_named_providers_too():
     previously it ran only inside the `_AGENTIC_ONLY_PROVIDERS` branch, so a malformed
     default on a NAMED provider — blank model, double slash, colon contamination, no
     slash — sailed past the #25 anti-rot guard and would rot at runtime."""
-    assert backends.default_routes_live("oc:zai/glm-5.2") is True
+    assert backends.default_routes_live("oc:zai/glm-5.3") is True
     assert backends.default_routes_live("oc:zai/") is False
-    assert backends.default_routes_live("oc:zai//glm-5.2") is False
+    assert backends.default_routes_live("oc:zai//glm-5.3") is False
     assert backends.default_routes_live("oc:zai:glm/x") is False
     assert backends.default_routes_live("oc:commandcode") is False
     assert backends.default_routes_live("opencode:commandcode/deepseek/deepseek-v4-pro")
@@ -412,8 +416,8 @@ def test_transport_peel_is_shared_by_provider_and_guard():
     disagree on what counts as the transport prefix."""
     assert backends._OC_TRANSPORT_PREFIXES == ("oc:", "opencode:")
     assert backends._peel_oc_transport("oc:xai/grok-4.5") == "xai/grok-4.5"
-    assert backends._peel_oc_transport("opencode:zai/glm-5.2") == "zai/glm-5.2"
-    assert backends._peel_oc_transport("zai:glm-5.2") is None
+    assert backends._peel_oc_transport("opencode:zai/glm-5.3") == "zai/glm-5.3"
+    assert backends._peel_oc_transport("zai:glm-5.3") is None
     # Only ONE prefix is peeled: a doubled transport is not a valid selector.
     assert backends._peel_oc_transport("opencode:oc:xai/grok-4.5") == "oc:xai/grok-4.5"
     assert backends.default_routes_live("opencode:oc:xai/grok-4.5") is False
@@ -501,7 +505,7 @@ def test_glm_commandcode_seat_carries_performance_not_a_duplicate_role():
     (review of #57). It carries `performance`, so inserting this seat is a priority change,
     not a coverage loss."""
     glmcc = next(r for r in DEFAULT_BOARD if r.model == GLM_COMMANDCODE_SEAT)
-    opus = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-opus-4-8")
+    opus = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-opus-5-5")
     assert glmcc.role == "performance", glmcc.role
     assert glmcc.role != opus.role, (glmcc.role, opus.role)
 
@@ -519,7 +523,7 @@ def test_default_pool_roles_are_distinct_no_lens_lost():
 
 
 def test_default_board_has_fifteen_seats():
-    # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12);
+    # review-cli#382: LUNA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12);
     # GROK_SEAT (review-cli#165) makes it 13; MIMO_SEAT (review-cli#450) makes it 14;
     # OMP_CLAUDE_SEAT (review-cli#168) makes it 15.
     assert len(DEFAULT_BOARD) == 15, len(DEFAULT_BOARD)
@@ -531,11 +535,11 @@ def test_preset_boards_pin_model_order_pool_and_effort():
     assert DEFAULT_PRESET == "light"
     assert all(r.effort == "high" for r in DEFAULT_PRESET_BOARD)
     assert SOL_SEAT not in [r.model for r in DEFAULT_PRESET_BOARD]
-    assert "claude:claude-fable-5" not in [r.model for r in DEFAULT_PRESET_BOARD]
+    assert "claude:claude-fable-5-1" not in [r.model for r in DEFAULT_PRESET_BOARD]
     assert [r.model for r in DEFAULT_PRESET_BOARD[:4]] == [
-        "claude:claude-opus-4-8",
+        "claude:claude-opus-5-5",
         GLM_COMMANDCODE_SEAT,
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "oc:commandcode/moonshotai/Kimi-K3",
         ASTRA_SEAT,
     ]
     assert len({r.role for r in DEFAULT_PRESET_BOARD[:4]}) == 4
@@ -550,12 +554,12 @@ def test_preset_boards_pin_model_order_pool_and_effort():
     # pay for a seat with a confirmed ~100% dispatch failure rate. Kimi is promoted into the
     # xhigh top-4 in its place (Fable's old DEFAULT_BOARD slot is now the LAST index, so
     # dropping it doesn't shift anyone else's tier — see HEAVY_PRESET_BOARD's own comment).
-    assert "claude:claude-fable-5" not in [r.model for r in HEAVY_PRESET_BOARD]
+    assert "claude:claude-fable-5-1" not in [r.model for r in HEAVY_PRESET_BOARD]
     assert [(r.model, r.effort) for r in HEAVY_PRESET_BOARD[:4]] == [
         (SOL_SEAT, "xhigh"),
-        ("claude:claude-opus-4-8", "xhigh"),
+        ("claude:claude-opus-5-5", "xhigh"),
         (GLM_COMMANDCODE_SEAT, "xhigh"),
-        ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "xhigh"),
+        ("oc:commandcode/moonshotai/Kimi-K3", "xhigh"),
     ]
     assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
 
@@ -572,7 +576,7 @@ def test_preset_boards_pin_model_order_pool_and_effort():
     # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
     # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
     # bare say-so this actually asserts it.
-    terra_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == TERRA_SEAT)
+    terra_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == LUNA_SEAT)
     sonnet_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == SONNET_SEAT)
     assert terra_entry.effort == "max", terra_entry
     assert sonnet_entry.effort == "max", sonnet_entry
@@ -586,11 +590,11 @@ def test_package_facade_exports_preset_surface():
     assert reviewlib.LIGHT_PRESET_BOARD == LIGHT_PRESET_BOARD
     assert reviewlib.HEAVY_PRESET_BOARD == HEAVY_PRESET_BOARD
     assert reviewlib.SOL_SEAT == SOL_SEAT
-    # review-cli#382 (codex review finding, round 3): TERRA_SEAT/SONNET_SEAT must be
+    # review-cli#382 (codex review finding, round 3): LUNA_SEAT/SONNET_SEAT must be
     # re-exported through the facade too, like every other seat constant (SOL_SEAT/
-    # ASTRA_SEAT/FABLE_SEAT above) -- a caller doing `from reviewlib import TERRA_SEAT`
+    # ASTRA_SEAT/FABLE_SEAT above) -- a caller doing `from reviewlib import LUNA_SEAT`
     # got an ImportError before this was added to reviewlib/__init__.py.
-    assert reviewlib.TERRA_SEAT == TERRA_SEAT
+    assert reviewlib.LUNA_SEAT == LUNA_SEAT
     assert reviewlib.SONNET_SEAT == SONNET_SEAT
     assert reviewlib.preset_names() == ("default", "heavy", "light")
     assert reviewlib.preset_pool_size("light") == 2
@@ -619,13 +623,13 @@ def test_explicit_preset_board_overrides_config_board():
     board = load_board(cfg, preset="heavy")
     assert [r.model for r in board[:4]] == [
         SOL_SEAT,
-        "claude:claude-opus-4-8",
+        "claude:claude-opus-5-5",
         GLM_COMMANDCODE_SEAT,
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "oc:commandcode/moonshotai/Kimi-K3",
     ]
     assert all(r.effort == "xhigh" for r in board[:4])
     assert all(r.effort == "max" for r in board[4:])
-    assert "claude:claude-fable-5" not in [r.model for r in board]
+    assert "claude:claude-fable-5-1" not in [r.model for r in board]
 
 
 def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_effort():
@@ -650,10 +654,10 @@ def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_eff
 
 def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat():
     board = board_from_models(
-        ["claude:claude-fable-5", "custom:model"], {}, preset="light"
+        ["claude:claude-fable-5-1", "custom:model"], {}, preset="light"
     )
 
-    assert [r.model for r in board] == ["claude:claude-fable-5", "custom:model"]
+    assert [r.model for r in board] == ["claude:claude-fable-5-1", "custom:model"]
     assert board[0].role == "architect"
     assert board[0].effort == "medium"
     assert board[1].role == ""
@@ -856,7 +860,7 @@ def test_codex_backend_threads_effort_to_cli_config():
     assert result.returncode == 0
     assert "-c" in captured["argv"], captured
     assert 'model_reasoning_effort="xhigh"' in captured["argv"], captured
-    assert captured["header_argv0"] == "codex -m gpt-5.6-sol", captured
+    assert captured["header_argv0"] == "codex -m gpt-6.1-sol", captured
 
 
 def test_codex_backend_sanitizes_model_selector_in_log_header():
@@ -879,7 +883,7 @@ def test_codex_backend_sanitizes_model_selector_in_log_header():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_codex(
-            "codex:gpt-5.6-sol\n\u0085\u2028\u2029[review-cli] forged: codex",
+            "codex:gpt-6.1-sol\n\u0085\u2028\u2029[review-cli] forged: codex",
             "prompt",
             "+x",
             REPO_ROOT,
@@ -892,7 +896,7 @@ def test_codex_backend_sanitizes_model_selector_in_log_header():
     for ch in ("\n", "\u0085", "\u2028", "\u2029"):
         assert ch not in captured["header_argv0"], captured
     assert (
-        captured["header_argv0"] == "codex -m gpt-5.6-sol????[review-cli] forged: codex"
+        captured["header_argv0"] == "codex -m gpt-6.1-sol????[review-cli] forged: codex"
     ), captured
     assert any("\n" in arg for arg in captured["argv"]), captured
 
@@ -1135,7 +1139,7 @@ def test_direct_claude_cli_effort_adds_prompt_hint():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_claude_cli(
-            "claude:claude-opus-4-8",
+            "claude:claude-opus-5-5",
             "prompt",
             "+x",
             REPO_ROOT,
@@ -1156,10 +1160,10 @@ def test_direct_claude_cli_effort_adds_prompt_hint():
 def test_visual_models_have_separate_priority_from_review_board():
     """Visual review has its own priority list: Opus first, then GROK_SEAT, then
     vision-capable fallbacks, including a GLM vision model rather than the text-only
-    GLM-5.2 seat."""
-    assert VISUAL_MODELS[0] == "claude:claude-opus-4-8", VISUAL_MODELS
+    GLM-5.3 seat."""
+    assert VISUAL_MODELS[0] == "claude:claude-opus-5-5", VISUAL_MODELS
     assert VISUAL_MODELS[1] == GROK_SEAT, VISUAL_MODELS
-    assert "commandcode:zai-org/GLM-5.2" not in VISUAL_MODELS, VISUAL_MODELS
+    assert "commandcode:zai-org/GLM-5.3" not in VISUAL_MODELS, VISUAL_MODELS
     assert any(
         "glm-4.5v" in model.lower() or "glm-4.6v" in model.lower()
         for model in VISUAL_MODELS
@@ -1169,7 +1173,7 @@ def test_visual_models_have_separate_priority_from_review_board():
         or "kimi" in model.lower()
         or "glm-4." in model.lower()
         or "opus" in model.lower()
-        or "grok-4.6" in model.lower()
+        or "grok-4.7" in model.lower()
         or model == "gemini"
         for model in VISUAL_MODELS
     ), VISUAL_MODELS
@@ -1306,13 +1310,10 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     # Typo'd provider — caught in the flat form AND in BOTH agentic spellings (`oc:` and the
     # `opencode:` alias). The agentic case is the one a name-only `_match_named_backend(model)`
     # check would have missed; both transports are checked for symmetry.
-    assert backends.default_routes_live("comandcode:moonshotai/Kimi-K2.7-Code") is False
+    assert backends.default_routes_live("comandcode:moonshotai/Kimi-K3") is False
+    assert backends.default_routes_live("oc:comandcode/moonshotai/Kimi-K3") is False
     assert (
-        backends.default_routes_live("oc:comandcode/moonshotai/Kimi-K2.7-Code") is False
-    )
-    assert (
-        backends.default_routes_live("opencode:comandcode/moonshotai/Kimi-K2.7-Code")
-        is False
+        backends.default_routes_live("opencode:comandcode/moonshotai/Kimi-K3") is False
     )
     # A stale default whose id names no route at all.
     assert backends.default_routes_live("totally-bogus-model-xyz") is False
@@ -1328,14 +1329,12 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     assert backends.default_routes_live("gemini-api:gemini-2.5-flash") is False
     # ...but the spellings resolve_backend DOES match on the full id still pass.
     assert backends.default_routes_live("gemini:gemini-2.5-flash") is True
-    assert backends.default_routes_live("zai:glm-5.2") is True
+    assert backends.default_routes_live("zai:glm-5.3") is True
     # Mixed case: the guard lowercases exactly like resolve_backend, so a mixed-case id gets
     # the SAME verdict as its lowercase form (the guard must mirror the dispatcher, codex #49).
     assert backends.resolve_backend("Codex") is backends.resolve_backend("codex")
     assert backends.default_routes_live("Codex") is True
-    assert (
-        backends.default_routes_live("OC:Commandcode/moonshotai/Kimi-K2.7-Code") is True
-    )
+    assert backends.default_routes_live("OC:Commandcode/moonshotai/Kimi-K3") is True
     assert backends.default_routes_live("OC:Fireworks/x/y") is False  # dead, mixed case
     # Intentional flat-vs-agentic asymmetry: `oc:gemini-api/model` passes because the agentic
     # opencode transport DOES route an arbitrary `provider/model` (gemini-api is a real
@@ -1349,7 +1348,7 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     # The live defaults pass, via every transport spelling (flat, `oc:`, `opencode:`).
     assert backends.default_routes_live(KIMI_SEAT) is True
     assert backends.default_routes_live(_agentic(KIMI_SEAT)) is True
-    assert backends.default_routes_live("opencode:zai/glm-5.2") is True
+    assert backends.default_routes_live("opencode:zai/glm-5.3") is True
     assert backends.effective_provider(KIMI_SEAT) == "commandcode"
     assert backends.effective_provider(_agentic(KIMI_SEAT)) == "commandcode"
 
@@ -1360,15 +1359,14 @@ def test_effective_provider_peels_transport_and_splits_on_first_separator():
     the literal "opencode" transport. Covers the spellings the defaults actually use."""
     assert backends.effective_provider("codex") == "codex"
     assert (
-        backends.effective_provider("commandcode:moonshotai/Kimi-K2.7-Code")
-        == "commandcode"
+        backends.effective_provider("commandcode:moonshotai/Kimi-K3") == "commandcode"
     )
     assert (
-        backends.effective_provider("oc:commandcode/moonshotai/Kimi-K2.7-Code")
+        backends.effective_provider("oc:commandcode/moonshotai/Kimi-K3")
         == "commandcode"
     )
-    assert backends.effective_provider("opencode:zai/glm-5.2") == "zai"
-    assert backends.effective_provider("zai:glm-5.2") == "zai"
+    assert backends.effective_provider("opencode:zai/glm-5.3") == "zai"
+    assert backends.effective_provider("zai:glm-5.3") == "zai"
     assert backends.effective_provider("oc:fireworks/x/y") == "fireworks"
 
 
@@ -1424,7 +1422,7 @@ def test_every_named_provider_bare_token_is_recognized():
         assert backends._match_named_backend(token) is backend, token
     # And the live agentic z.ai/GLM board seat passes the full guard (not just
     # effective_provider) — the bare-token contract is what makes that work.
-    assert backends.default_routes_live("oc:zai/glm-5.2") is True
+    assert backends.default_routes_live("oc:zai/glm-5.3") is True
 
 
 def test_agentic_helper_rewrites_provider_seat_idempotent_and_canonical():
@@ -1437,16 +1435,16 @@ def test_agentic_helper_rewrites_provider_seat_idempotent_and_canonical():
     never splits into a `no_data` board row plus a separate `oc:` health row (review-cli#24,
     codex review). Double-wrapping can't produce a nonsense `oc:oc/...` id."""
     assert (
-        _agentic("commandcode:moonshotai/Kimi-K2.7-Code")
-        == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+        _agentic("commandcode:moonshotai/Kimi-K3")
+        == "oc:commandcode/moonshotai/Kimi-K3"
     )
-    assert _agentic("zai:glm-5.2") == "oc:zai/glm-5.2"
+    assert _agentic("zai:glm-5.3") == "oc:zai/glm-5.3"
     assert _agentic("codex") == "oc:codex"
     # Idempotent: wrapping an already-`oc:` seat is a no-op (no `oc:oc/...`).
-    assert _agentic("oc:zai/glm-5.2") == "oc:zai/glm-5.2"
+    assert _agentic("oc:zai/glm-5.3") == "oc:zai/glm-5.3"
     assert (
-        _agentic(_agentic("commandcode:Qwen/Qwen3.7-Max"))
-        == "oc:commandcode/Qwen/Qwen3.7-Max"
+        _agentic(_agentic("commandcode:Qwen/Qwen3.8-Max"))
+        == "oc:commandcode/Qwen/Qwen3.8-Max"
     )
     # Canonical: the `opencode:` alias is normalized to the canonical `oc:` spelling, so it
     # matches the dashboard's `oc:`-prefixed attribution of the same opencode run.
@@ -1462,19 +1460,19 @@ def test_default_pool_size_is_four():
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
     14-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
-    GLM-5.2-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
+    GLM-5.3-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
     moved from priority 1 to the very last reserve seat — see
     `test_default_board_matches_directive_table`'s comment for the full rationale)."""
     pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
     assert len(pool) == 4
     assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
     assert [r.model for r in pool] == [
-        "codex:gpt-5.6-sol",
-        "claude:claude-opus-4-8",
-        "commandcode:zai-org/GLM-5.2",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex:gpt-6.1-sol",
+        "claude:claude-opus-5-5",
+        "commandcode:zai-org/GLM-5.3",
+        "oc:commandcode/moonshotai/Kimi-K3",
     ]
-    # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
+    # The reserve is exactly the remainder (priority order): Astra, Luna/Sonnet
     # (review-cli#382 live fallbacks), Sonnet-omp (review-cli#168, same model different
     # auth path), the remaining opencode routes (review-cli#24), the diff-only Gemini,
     # Grok (agentic via opencode's native xai provider, directly BEFORE MiMo/the slow
@@ -1484,16 +1482,16 @@ def test_select_pool_default_picks_first_four_seats():
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
         "codex:gpt-6-astra",
-        "codex:gpt-5.6-terra",
-        "claude:claude-sonnet-5",
-        "omp:anthropic/claude-sonnet-5",
-        "oc:commandcode/Qwen/Qwen3.7-Max",
+        "codex:gpt-6-luna",
+        "claude:claude-sonnet-5-5",
+        "omp:anthropic/claude-sonnet-5-5",
+        "oc:commandcode/Qwen/Qwen3.8-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
-        "oc:xai/grok-4.6",
-        "omp:opencode-go/mimo-v2.5",
-        "oc:zai/glm-5.2",
-        "claude:claude-fable-5",
+        "oc:xai/grok-4.7",
+        "omp:opencode-go/mimo-v2.6-pro",
+        "omp:zai/glm-5.3",
+        "claude:claude-fable-5-1",
     ]
 
 
@@ -1518,7 +1516,7 @@ def test_select_pool_boundary_at_and_below_full_size():
     assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [
         r.model for r in DEFAULT_BOARD
     ]
-    dropped = "oc:zai/glm-5.2"
+    dropped = "omp:zai/glm-5.3"
     assert [r.model for r in select_pool(list(DEFAULT_BOARD), n - 1)] == [
         r.model for r in DEFAULT_BOARD if r.model != dropped
     ]
@@ -1549,33 +1547,32 @@ def test_select_pool_does_not_mutate_input():
     assert select_pool(src, 0) is not src
 
 
-def test_glm_seat_routes_agentically_via_opencode_zai_provider():
-    """The GLM seat must run AGENTICALLY via opencode's `zai` provider (review-cli#24), so
-    it reads the repo read-only instead of the diff-only z.ai REST call. resolve_backend(
-    oc:zai/glm-5.2) -> review_opencode, and the opencode model selector (after `oc:`) is
-    `zai/glm-5.2` — his z.ai subscription, glm-5.2 the newest GLM. This is the agentic form
-    of the diff-only `zai:glm-5.2` seat (`_agentic` flips the transport, keeps the id)."""
+def test_glm_seat_routes_agentically_via_omp_zai_provider():
+    """The GLM seat must run AGENTICALLY (review-cli#24), so it reads the repo read-only
+    instead of the diff-only z.ai REST call. Since review-cli#645 it is omp's `zai`
+    provider: resolve_backend(omp:zai/glm-5.3) -> review_omp, and the omp model selector
+    (after `omp:`) is `zai/glm-5.3` — his z.ai subscription, glm-5.3 the newest GLM, the
+    same id the diff-only `zai:glm-5.3` route POSTs."""
     seat = next(r for r in DEFAULT_BOARD if r.display == "GLM")
-    assert seat.model == "oc:zai/glm-5.2", seat.model
-    assert seat.model == _agentic("zai:glm-5.2"), seat.model
-    assert backends.resolve_backend(seat.model) is backends.review_opencode
-    # The opencode model selector (after stripping `oc:`) is the z.ai provider/model pair.
-    assert seat.model.split(":", 1)[1] == "zai/glm-5.2"
+    assert seat.model == "omp:zai/glm-5.3", seat.model
+    assert backends.resolve_backend(seat.model) is backends.review_omp
+    # The omp model selector (after stripping `omp:`) is the z.ai provider/model pair.
+    assert seat.model.split(":", 1)[1] == "zai/" + backends.ZAI_DEFAULT_MODEL
 
 
 def test_all_repo_capable_default_seats_are_agentic():
-    """review-cli#24 acceptance, as amended by the GLM-5.2-via-commandcode seat: every
+    """review-cli#24 acceptance, as amended by the GLM-5.3-via-commandcode seat: every
     DEFAULT_BOARD seat that HAS an agentic transport uses it (the codex CLI, opencode, the
     claude CLI, or omp) — not a stateless diff-only REST/keyed-HTTP call. Exactly TWO seats
     stay diff-only, each because NO agentic transport reaches them:
       * Gemini — a workspace-less REST API, no agentic CLI/opencode provider; and
-      * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 3) — opencode's `commandcode`
-        provider does NOT register this GLM id, so `oc:commandcode/zai-org/GLM-5.2` errors;
+      * GLM-cc (`commandcode:zai-org/GLM-5.3`, priority 3) — opencode's `commandcode`
+        provider does NOT register this GLM id, so `oc:commandcode/zai-org/GLM-5.3` errors;
         the keyed-HTTP route is the only one that reaches it (verified live).
 
     This still pins the agentic-by-default contract for the seats that CAN be agentic:
-    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Sol/Astra through the codex CLI,
-    the two Anthropic seats through claude, MiMo through omp (review-cli#450 — omp's
+    Kimi/Qwen/DeepSeek go through opencode (`oc:`), Sol/Astra through the codex CLI,
+    the two Anthropic seats through claude, MiMo and z.ai-GLM through omp (review-cli#450 — omp's
     read-only three-layer cage mounts the repo, so it is agentic, not diff-only, same as
     the codex/opencode/claude CLI transports). A future edit that silently reverts one of
     THOSE to the diff-only REST route fails here. (claude is agentic via its CLI path;
@@ -1624,13 +1621,13 @@ def test_install_skill_text_documents_agentic_default_board():
     assert "oc:commandcode/" in SKILL_MD, (
         "skill text must name the agentic oc: default seats"
     )
-    assert "oc:zai/glm-5.2" in SKILL_MD, SKILL_MD[:0]
+    assert "omp:zai/glm-5.3" in SKILL_MD, SKILL_MD[:0]
     # The keyed-HTTP section must be scoped to explicit `-m cc`/`-m glm`, not the default board.
     assert "diff-only" in low and "default board" in low
     assert "selected preset/board" in low
     assert "--preset heavy --pool 0" in SKILL_MD
     # review-cli#fable-seat-reliability: the heavy preset excludes Fable (~100%
-    # dispatch failure rate). review-cli#382 added TERRA_SEAT/SONNET_SEAT (11 built-ins),
+    # dispatch failure rate). review-cli#382 added LUNA_SEAT/SONNET_SEAT (11 built-ins),
     # review-cli#165 added GROK_SEAT (12), and review-cli#450 added MIMO_SEAT, so --pool 0
     # now covers 13 built-ins. Normalized whitespace (GLM review finding): matching the
     # raw string coupled this assertion to exactly where install.py's paragraph happens
@@ -2022,7 +2019,7 @@ def test_mixed_board_with_one_bad_role_fails_fast_not_silently_duplicated():
         "board": [
             {"model": "codex", "role": "correctness"},
             {"model": "gemini", "role": "securty"},  # typo: should be "security"
-            {"model": "claude:claude-opus-4-8", "role": "performance"},
+            {"model": "claude:claude-opus-5-5", "role": "performance"},
         ]
     }
     try:
@@ -2231,7 +2228,7 @@ def test_build_board_jobs_unknown_role_uses_generic_prompt():
 # === graceful skip of unavailable reviewers =====================================
 def test_unavailable_reviewers_are_skipped_not_crashed():
     board = list(DEFAULT_BOARD)
-    reachable = {"gemini", "oc:zai/glm-5.2"}  # only two reachable (GLM is now agentic)
+    reachable = {"gemini", "omp:zai/glm-5.3"}  # only two reachable (GLM is now agentic)
     with _AvailabilityPatch(reachable):
         jobs, skipped = build_board_jobs(board, DEFAULT_PROMPT, "+x")
     assert {j.model for j in jobs} == reachable
@@ -2373,7 +2370,7 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
 
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         calls.append((model, effort, prompt))
-        if model == "claude:claude-fable-5":
+        if model == "claude:claude-fable-5-1":
             return ReviewResult(
                 model=model,
                 command="fake",
@@ -2386,7 +2383,7 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
         )
 
     board = [
-        BoardReviewer("claude:claude-fable-5", "architect", "Fable", effort="xhigh"),
+        BoardReviewer("claude:claude-fable-5-1", "architect", "Fable", effort="xhigh"),
         BoardReviewer(SOL_SEAT, "consistency", "Sol", effort="medium"),
     ]
     import reviewlib.panel as panel
@@ -2394,7 +2391,7 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
     old_panel_resolve = panel.resolve_backend
     panel.resolve_backend = lambda _m: _fake_backend
     try:
-        with _AvailabilityPatch({"claude:claude-fable-5", SOL_SEAT}):
+        with _AvailabilityPatch({"claude:claude-fable-5-1", SOL_SEAT}):
             rc = review_mod.mode_review(
                 [],
                 DEFAULT_PROMPT,
@@ -2410,7 +2407,7 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
 
     assert rc == 0, rc
     assert [model for model, _effort, _prompt in calls] == [
-        "claude:claude-fable-5",
+        "claude:claude-fable-5-1",
         SOL_SEAT,
     ]
     assert [effort for _model, effort, _prompt in calls] == ["xhigh", "medium"]
@@ -2544,7 +2541,7 @@ def test_cli_explicit_models_override_config_models_and_board():
                 "name": "DeepSeek-cc",
             },
             {"model": "codex", "role": "consistency", "name": "Codex"},
-            {"model": "claude:claude-fable-5", "role": "architect", "name": "Fable"},
+            {"model": "claude:claude-fable-5-1", "role": "architect", "name": "Fable"},
         ],
     }
     backends.backend_available = lambda _m: True
@@ -2553,19 +2550,19 @@ def test_cli_explicit_models_override_config_models_and_board():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main(["diff", "--task", "TEST-1", "-m", "fable5", "-C", str(REPO_ROOT)])
+        cli.main(["diff", "--task", "TEST-1", "-m", "fable51", "-C", str(REPO_ROOT)])
         assert captured["board"] is not None, captured
-        assert {r.model for r in captured["board"]} == {"claude:claude-fable-5"}, (
+        assert {r.model for r in captured["board"]} == {"claude:claude-fable-5-1"}, (
             captured
         )
         first = captured["board"][0]
         assert (first.model, first.role, first.display) == (
-            "claude:claude-fable-5",
+            "claude:claude-fable-5-1",
             "architect",
             "Fable",
         ), captured
         assert len({r.role for r in captured["board"] if r.role}) >= 3, captured
-        assert captured["models"] == ["claude:claude-fable-5"], captured
+        assert captured["models"] == ["claude:claude-fable-5-1"], captured
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
@@ -2601,11 +2598,11 @@ def test_cli_explicit_models_are_not_sliced_by_pool():
     old_load_config = cli.load_config
     old_avail = backends.backend_available
     cli.load_config = lambda: {
-        "models": ["codex", "gemini", "claude:claude-fable-5"],
+        "models": ["codex", "gemini", "claude:claude-fable-5-1"],
         "board": [
             {"model": "codex", "role": "correctness", "name": "Codex"},
             {"model": "gemini", "role": "tests", "name": "Gemini"},
-            {"model": "claude:claude-fable-5", "role": "architect", "name": "Fable"},
+            {"model": "claude:claude-fable-5-1", "role": "architect", "name": "Fable"},
         ],
     }
     backends.backend_available = lambda _m: True
@@ -2622,7 +2619,7 @@ def test_cli_explicit_models_are_not_sliced_by_pool():
                 "-m",
                 "codex",
                 "-m",
-                "fable5",
+                "fable51",
                 "--pool",
                 "1",
                 "-C",
@@ -2631,11 +2628,11 @@ def test_cli_explicit_models_are_not_sliced_by_pool():
         )
         assert [r.model for r in captured["board"]] == [
             "codex",
-            "claude:claude-fable-5",
+            "claude:claude-fable-5-1",
         ], captured
         assert captured["pool_size"] == 2, captured
         assert captured["exact_board"] is True, captured
-        assert captured["models"] == ["codex", "claude:claude-fable-5"], captured
+        assert captured["models"] == ["codex", "claude:claude-fable-5-1"], captured
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
@@ -2673,7 +2670,7 @@ def test_cli_explicit_models_override_preset_and_config_models():
     cli.load_config = lambda: {
         "models": ["codex", "gemini"],
         "board": [
-            {"model": "claude:claude-opus-4-8", "role": "tests", "effort": "low"}
+            {"model": "claude:claude-opus-5-5", "role": "tests", "effort": "low"}
         ],
     }
     backends.backend_available = lambda _m: True
@@ -2692,17 +2689,17 @@ def test_cli_explicit_models_override_preset_and_config_models():
                 "-m",
                 "gemini",
                 "-m",
-                "claude:claude-opus-4-8",
+                "claude:claude-opus-5-5",
                 "--pool",
                 "1",
                 "-C",
                 str(REPO_ROOT),
             ]
         )
-        assert captured["models"] == ["gemini", "claude:claude-opus-4-8"], captured
+        assert captured["models"] == ["gemini", "claude:claude-opus-5-5"], captured
         assert [r.model for r in captured["board"]] == [
             "gemini",
-            "claude:claude-opus-4-8",
+            "claude:claude-opus-5-5",
         ], captured
         assert [r.effort for r in captured["board"]] == ["max", "xhigh"], captured
         assert captured["pool_size"] == 2, captured
@@ -2812,12 +2809,12 @@ def test_cli_leading_model_option_before_subcommand_is_honored():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main(["-m", "fable5", "-C", str(REPO_ROOT), "diff", "--task", "TEST-1"])
+        cli.main(["-m", "fable51", "-C", str(REPO_ROOT), "diff", "--task", "TEST-1"])
         assert captured["board"] is not None, captured
-        assert {r.model for r in captured["board"]} == {"claude:claude-fable-5"}, (
+        assert {r.model for r in captured["board"]} == {"claude:claude-fable-5-1"}, (
             captured
         )
-        assert captured["models"] == ["claude:claude-fable-5"], captured
+        assert captured["models"] == ["claude:claude-fable-5-1"], captured
         assert captured["cwd"] == REPO_ROOT, captured
     finally:
         _review_mod.mode_review = old_mode
@@ -3220,13 +3217,13 @@ def test_cli_light_and_heavy_presets_set_board_and_default_pool():
     # Sol now leads, with Kimi promoted into the vacated 4th xhigh slot.
     assert [r.model for r in heavy["board"][:4]] == [
         SOL_SEAT,
-        "claude:claude-opus-4-8",
+        "claude:claude-opus-5-5",
         GLM_COMMANDCODE_SEAT,
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "oc:commandcode/moonshotai/Kimi-K3",
     ]
     assert all(r.effort == "xhigh" for r in heavy["board"][:4])
     assert all(r.effort == "max" for r in heavy["board"][4:])
-    assert "claude:claude-fable-5" not in [r.model for r in heavy["board"]]
+    assert "claude:claude-fable-5-1" not in [r.model for r in heavy["board"]]
     assert heavy["pool_size"] == 4
 
 
@@ -3278,7 +3275,7 @@ def test_config_pool_key_sets_default_pool_size():
     """A config `pool:` int becomes the default pool size when no --pool is passed."""
     cap = _capture_review_with_config(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)],
-        {"models": ["codex", "claude:claude-opus-4-8", "oc:zai/glm-5.2"], "pool": 3},
+        {"models": ["codex", "claude:claude-opus-5-5", "oc:zai/glm-5.3"], "pool": 3},
     )
     assert cap["pool_size"] == 3, cap["pool_size"]
 
@@ -3287,7 +3284,7 @@ def test_explicit_pool_flag_overrides_config_pool():
     """An explicit `--pool N` wins over the config `pool:` default."""
     cap = _capture_review_with_config(
         ["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)],
-        {"models": ["codex", "claude:claude-opus-4-8", "oc:zai/glm-5.2"], "pool": 3},
+        {"models": ["codex", "claude:claude-opus-5-5", "oc:zai/glm-5.3"], "pool": 3},
     )
     assert cap["pool_size"] == 2, cap["pool_size"]
 
@@ -3358,13 +3355,13 @@ def test_cli_explicit_preset_overrides_config_board():
         # review-cli#fable-seat-reliability: Fable is excluded from the heavy preset.
         assert [r.model for r in captured["board"][:4]] == [
             SOL_SEAT,
-            "claude:claude-opus-4-8",
+            "claude:claude-opus-5-5",
             GLM_COMMANDCODE_SEAT,
-            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+            "oc:commandcode/moonshotai/Kimi-K3",
         ], captured
         assert captured["board"][0].effort == "xhigh", captured
         assert captured["pool_size"] == 4, captured
-        assert "claude:claude-fable-5" not in [r.model for r in captured["board"]]
+        assert "claude:claude-fable-5-1" not in [r.model for r in captured["board"]]
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
@@ -3521,7 +3518,7 @@ def test_show_board_explicit_model_is_exact():
     assert "source: explicit -m" in lines[0], lines
     assert "exact -m run = every LIVE listed seat is attempted" in lines[0], lines
     assert any("--pool` and reserve failover do not slice" in ln for ln in lines), lines
-    assert not any("claude:claude-opus-4-8" in ln for ln in seat_lines), lines
+    assert not any("claude:claude-opus-5-5" in ln for ln in seat_lines), lines
 
 
 def test_show_board_explicit_model_with_preset_keeps_exact_model_and_preset_effort_metadata():
@@ -3602,7 +3599,7 @@ def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
         os.environ["ANTHROPIC_BASE_URL"] = "https://api.commandcode.ai/provider"
         os.environ.pop("REVIEW_CLAUDE_MODE", None)
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
-        cfg = {"board": [{"model": "claude:claude-fable-5", "role": "tests"}]}
+        cfg = {"board": [{"model": "claude:claude-fable-5-1", "role": "tests"}]}
         with contextlib.redirect_stdout(buf):
             rc = cli._show_board(cfg, 1, REPO_ROOT)
     finally:
@@ -3614,7 +3611,7 @@ def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
                 os.environ[key] = value
     assert rc == 0, buf.getvalue()
     lines = buf.getvalue().splitlines()
-    row = next(line for line in lines if "claude:claude-fable-5" in line)
+    row = next(line for line in lines if "claude:claude-fable-5-1" in line)
     assert "SKIPPED (provider unpaid/disabled)" in row, row
 
 
@@ -3635,10 +3632,10 @@ def test_show_board_heavy_preset_displays_effort_values():
     here at all — Sol (the new #1) and Astra (still outside the xhigh top-4) stand
     in as the xhigh/max examples instead."""
     lines = _show_board_lines(4, preset="heavy")
-    assert not any("claude:claude-fable-5" in ln for ln in lines), lines
+    assert not any("claude:claude-fable-5-1" in ln for ln in lines), lines
     sol = next(ln for ln in lines if SOL_SEAT in ln)
     # Match the DISPLAY name ("Astra"), not the bare model string — "codex" is also a
-    # substring of both Sol's AND Astra's model ids (`codex:gpt-5.6-sol`,
+    # substring of both Sol's AND Astra's model ids (`codex:gpt-6.1-sol`,
     # `codex:gpt-6-astra`), which would false-match here.
     astra = next(ln for ln in lines if "Astra" in ln)
     assert "effort=xhigh" in sol, sol
@@ -3748,7 +3745,7 @@ def test_cli_list_defaults_reports_normalized_config_models(capfd=None):
     from reviewlib import cli
 
     old_load_config = cli.load_config
-    cli.load_config = lambda: {"models": ["codex, fable5", "  ", ""]}
+    cli.load_config = lambda: {"models": ["codex, fable51", "  ", ""]}
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -3757,8 +3754,8 @@ def test_cli_list_defaults_reports_normalized_config_models(capfd=None):
     finally:
         cli.load_config = old_load_config
     assert rc == 0, rc
-    # "codex, fable5" splits into two; blanks dropped; fable5 -> claude:claude-fable-5.
-    assert out == ["codex", "claude:claude-fable-5"], out
+    # "codex, fable51" splits into two; blanks dropped; fable51 -> claude:claude-fable-5-1.
+    assert out == ["codex", "claude:claude-fable-5-1"], out
 
 
 def test_cli_list_defaults_reports_config_board_without_models():
@@ -3796,7 +3793,7 @@ def test_cli_list_defaults_prefers_config_models_over_config_board():
     cli.load_config = lambda: {
         "models": ["codex", "gemini"],
         "board": [
-            {"model": "claude:claude-opus-4-8", "role": "correctness", "name": "Opus"},
+            {"model": "claude:claude-opus-5-5", "role": "correctness", "name": "Opus"},
         ],
     }
     try:
@@ -3850,7 +3847,7 @@ def test_brainstorm_list_defaults_prefers_brainstorm_models_and_ignores_config_b
         "brainstorm_models": ["gemini"],
         "models": ["codex"],
         "board": [
-            {"model": "claude:claude-opus-4-8", "role": "correctness", "name": "Opus"},
+            {"model": "claude:claude-opus-5-5", "role": "correctness", "name": "Opus"},
         ],
     }
     try:
@@ -4291,11 +4288,11 @@ def test_cli_recorded_task_exact_ship_min_roster_stays_at_own_size():
     though the roster already met the ship floor on its own."""
     captured = _capture_review_with_config(
         ["diff", "--task", "309", "-C", str(REPO_ROOT)],
-        {"models": ["codex", "gemini", "claude:claude-opus-4-8"]},
+        {"models": ["codex", "gemini", "claude:claude-opus-5-5"]},
     )
     board = captured["board"]
     assert board, captured
-    assert {r.model for r in board} <= {"codex", "gemini", "claude:claude-opus-4-8"}
+    assert {r.model for r in board} <= {"codex", "gemini", "claude:claude-opus-5-5"}
     assert len(board) == 3, [(r.model, r.role) for r in board]
     assert captured["pool_size"] == 3, captured
 
@@ -4337,16 +4334,16 @@ def test_cli_recorded_task_full_board_distinct_count_still_pads_duplicate_prefix
             "pool": 3,
             "board": [
                 {
-                    "model": "claude:claude-opus-4-8",
+                    "model": "claude:claude-opus-5-5",
                     "role": "correctness",
                     "name": "Opus",
                 },
                 {
-                    "model": "claude:claude-sonnet-5",
+                    "model": "claude:claude-sonnet-5-5",
                     "role": "correctness",
                     "name": "Sonnet",
                 },
-                {"model": "oc:xai/grok-4.6", "role": "security", "name": "Grok"},
+                {"model": "oc:xai/grok-4.7", "role": "security", "name": "Grok"},
                 {"model": "gemini", "role": "contracts", "name": "Gemini"},
             ],
         },
@@ -4659,9 +4656,9 @@ def test_cli_recorded_task_pool_zero_same_role_roster_pads_roles():
                 "board": [
                     {"model": "codex", "role": "correctness", "name": "A"},
                     {"model": "gemini", "role": "correctness", "name": "B"},
-                    {"model": "oc:xai/grok-4.6", "role": "correctness", "name": "C"},
+                    {"model": "oc:xai/grok-4.7", "role": "correctness", "name": "C"},
                     {
-                        "model": "claude:claude-opus-4-8",
+                        "model": "claude:claude-opus-5-5",
                         "role": "correctness",
                         "name": "D",
                     },
@@ -4688,7 +4685,7 @@ def test_cli_recorded_task_explicit_config_pool_wins_over_short_roster_pad():
     DEFAULT_POOL_SIZE fallback) must not clamp it back down to SHIP_MIN_ROLES."""
     captured = _capture_review_with_config(
         ["diff", "--task", "309", "-C", str(REPO_ROOT)],
-        {"models": ["codex", "gemini", "claude:claude-opus-4-8"], "pool": 5},
+        {"models": ["codex", "gemini", "claude:claude-opus-5-5"], "pool": 5},
     )
     assert captured["pool_size"] == 5, captured
 

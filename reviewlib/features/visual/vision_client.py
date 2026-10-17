@@ -197,9 +197,11 @@ _VISION_MODEL_HINTS = (
     "omni",
     "multimodal",
     "kimi-k2.7-code",
+    "kimi-k3",
     "glm-4.5v",
     "glm-4.6v",
     "grok-4.6",
+    "grok-4.7",
 )
 
 

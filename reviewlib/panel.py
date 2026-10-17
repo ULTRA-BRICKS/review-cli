@@ -565,7 +565,7 @@ class FailoverOutcome:
     usable: list[ReviewResult]
     target: int
     degraded: bool
-    # The BARE model ids (e.g. `zai:glm-5.2`, not the `"GLM [quality]"` label) of the
+    # The BARE model ids (e.g. `zai:glm-5.3`, not the `"GLM [quality]"` label) of the
     # seats that produced a usable verdict, in the order they completed. This is the
     # honest run-stats pool: a backfilled reserve appears here under its real model id,
     # so record_run keys the ETA/history on what actually ran, never a display label.
@@ -642,8 +642,12 @@ def run_board_with_failover(
     reserve_queue = list(reserve)
     # Lensed roles this board can speak to, in priority order of first appearance — the
     # order a missing role is filled in when the failed seat's own role is already covered.
-    role_order = list(dict.fromkeys(r.role for r in [*pool, *reserve] if _lensed(r.role)))
-    healthy: list[BoardReviewer] = []  # seats that produced a usable verdict (reuse pool)
+    role_order = list(
+        dict.fromkeys(r.role for r in [*pool, *reserve] if _lensed(r.role))
+    )
+    healthy: list[
+        BoardReviewer
+    ] = []  # seats that produced a usable verdict (reuse pool)
     failed_models: set[str] = set()
     reuse_counts: dict[str, int] = {}
     role_failures: dict[str, list[str]] = {}
@@ -696,7 +700,9 @@ def run_board_with_failover(
             # are queued below.
             round_pairs = list(zip(current, round_results, round_usable, strict=True))
             healthy.extend(reviewer for reviewer, _result, ok in round_pairs if ok)
-            failed_models.update(reviewer.model for reviewer, _result, ok in round_pairs if not ok)
+            failed_models.update(
+                reviewer.model for reviewer, _result, ok in round_pairs if not ok
+            )
             taken = set(usable_roles) | {
                 reviewer.role for reviewer, _result, ok in round_pairs if ok
             }
@@ -711,7 +717,9 @@ def run_board_with_failover(
                     usable_roles.append(reviewer.role)
                     _tally_ok(True)
                     if reporter is not None:
-                        reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=True)
+                        reporter.seat_status(
+                            _seat_role(reviewer.role), reviewer.model, "done", ok=True
+                        )
                     continue
                 # This seat failed — count it as a fail and backfill it. The replacement
                 # runs in the NEXT round.
@@ -721,7 +729,9 @@ def run_board_with_failover(
                         f"{reviewer.display} ({reviewer.model}): {_failure_reason(result)}"
                     )
                 if reporter is not None:
-                    reporter.seat_status(_seat_role(reviewer.role), reviewer.model, "done", ok=False)
+                    reporter.seat_status(
+                        _seat_role(reviewer.role), reviewer.model, "done", ok=False
+                    )
                 choice = _choose_backfill(
                     reviewer,
                     reserve_queue,
@@ -757,7 +767,9 @@ def run_board_with_failover(
                     # tty during an interactive run — review-cli#548).
                     reporter.event(f"[promote] {note}")
                     reporter.seat_status(
-                        _seat_role(promoted.role), promoted.model, "promoted-from-reserve"
+                        _seat_role(promoted.role),
+                        promoted.model,
+                        "promoted-from-reserve",
                     )
                 else:
                     print(f"[review-cli] {note}", file=sys.stderr, flush=True)
@@ -785,9 +797,7 @@ def run_board_with_failover(
     if len(covered) < role_target:
         # Name the roles the run was asked for first (the pool's own lenses), then the
         # rest of the board's order, until the shortfall is fully accounted for.
-        wanted = dict.fromkeys(
-            [r.role for r in pool if _lensed(r.role)] + role_order
-        )
+        wanted = dict.fromkeys([r.role for r in pool if _lensed(r.role)] + role_order)
         missing_roles = [role for role in wanted if role not in covered][
             : role_target - len(covered)
         ]
@@ -876,7 +886,9 @@ def mark_substitution(
     if not failed and any(c.strip().lower() == head for c in chain):
         return result
     if failed:
-        why = "; ".join(f"{model} unusable: {_failure_reason(r)}" for model, r in failed)
+        why = "; ".join(
+            f"{model} unusable: {_failure_reason(r)}" for model, r in failed
+        )
     else:
         why = f"{requested} not tried: " + (
             backend_unavailable_reason(requested) or "unavailable"
@@ -915,7 +927,9 @@ def _choose_backfill(
         target: str | None = failed.role
     else:
         target = next((role for role in role_order if role not in taken), None)
-    live = [i for i, seat in enumerate(reserve_queue) if seat.model not in failed_models]
+    live = [
+        i for i, seat in enumerate(reserve_queue) if seat.model not in failed_models
+    ]
     if target is None:
         if live:
             return reserve_queue.pop(live[0]), "reserve"
@@ -1205,7 +1219,9 @@ def run_panel_with_retry(
 
             def _on_recovered(attempt: int, budget: int) -> None:
                 reporter.seat_status(role, job.model, "running")
-                reporter.event(f"[retry] seat {label} recovered on retry {attempt}/{budget}")
+                reporter.event(
+                    f"[retry] seat {label} recovered on retry {attempt}/{budget}"
+                )
 
             return run_seat_with_retry(
                 label,
@@ -1223,8 +1239,8 @@ def run_panel_with_retry(
         #
         # The WRITE side must be gated the SAME way `provider_chain`'s cache-reorder READ is
         # (`is_default_provider_selection`): an explicit alternate pin (`-m
-        # commandcode:zai-org/GLM-5.2`) succeeding/failing must not train/clear the shared
-        # logical-key cache entry a later BARE alias request (`-m glm52`) reads — otherwise
+        # commandcode:zai-org/GLM-5.3`) succeeding/failing must not train/clear the shared
+        # logical-key cache entry a later BARE alias request (`-m glm53`) reads — otherwise
         # a one-off pin silently rebiases (or wipes) default routing (review of #157: "cache
         # write isn't gated the way the read is").
         cache_eligible = len(chain) > 1 and is_default_provider_selection(job.model)

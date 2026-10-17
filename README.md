@@ -910,15 +910,15 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 |-----------|-----------|--------------------------|
 | `codex` / `codex:<model>` | cli | `codex exec -s read-only --ephemeral` |
 | `claude` / `claude:<model>` | api \| cli | `claude --print` CLI, or the Anthropic-compatible Messages API |
-| `fable` / `fable5` | api \| cli | Alias for `claude:claude-fable-5` |
+| `fable` / `fable51` | api \| cli | Alias for `claude:claude-fable-5-1` |
 | `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-3.5-flash` by default) |
-| `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
+| `zai:<model>` / `glm` / `glm53` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
 | `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
-| `oc:xai/grok-4.6` / `grok` / `grok46` / `grok-4.6` | cli | Grok 4.6 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-12 seat. `grok45` pins `oc:xai/grok-4.5`. |
-| `omp:opencode-go/mimo-v2.5` / `mimo` / `mimo25` / `mimo-2.5` | cli | MiMo 2.5 via omp OpenCode Go (`MIMO_SEAT`, the default board's priority-13 `tests` reserve). The `oc:opencode/mimo-v2.5-free` catalog spelling is not DEFAULT-safe (`default_routes_live` False: provider `opencode` under `oc:` is unnamed and not in `_AGENTIC_ONLY_PROVIDERS`). Explicit `-m oc:opencode/mimo-v2.5-free` still works at runtime. |
-| `omp:anthropic/claude-sonnet-5` | cli | Claude Sonnet 5 through the omp harness (`OMP_CLAUDE_SEAT`, the default board's priority-8 `quality` reserve) — the SAME model as `claude:claude-sonnet-5` but a DIFFERENT auth path (omp's own Anthropic accounts, not the Claude Code CLI's `CLAUDE_CONFIG_DIR`/keychain), so it survives an outage hitting every `claude:*` seat's shared account. Rotates through omp's accounts (next on a 429, docs/board.md), or `$REVIEW_OMP_CLAUDE_PROFILES` when set. |
+| `oc:xai/grok-4.7` / `grok` / `grok47` / `grok-4.7` | cli | Grok 4.7 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-12 seat. `grok45` pins `oc:xai/grok-4.5`. |
+| `omp:opencode-go/mimo-v2.6-pro` / `mimo` / `mimo26` | cli | MiMo V2.6 Pro via omp OpenCode Go (`MIMO_SEAT`, the default board's priority-13 `tests` reserve). The `oc:opencode/mimo-v2.5-free` catalog spelling is not DEFAULT-safe (`default_routes_live` False: provider `opencode` under `oc:` is unnamed and not in `_AGENTIC_ONLY_PROVIDERS`). Explicit `-m oc:opencode/mimo-v2.5-free` still works at runtime. |
+| `omp:anthropic/claude-sonnet-5-5` | cli | Claude Sonnet 5.5 through the omp harness (`OMP_CLAUDE_SEAT`, the default board's priority-8 `quality` reserve) — the SAME model as `claude:claude-sonnet-5-5` but a DIFFERENT auth path (omp's own Anthropic accounts, not the Claude Code CLI's `CLAUDE_CONFIG_DIR`/keychain), so it survives an outage hitting every `claude:*` seat's shared account. Rotates through omp's accounts (next on a 429, docs/board.md), or `$REVIEW_OMP_CLAUDE_PROFILES` when set. |
 | `omp:<provider>/<model>` / `omp` | cli | `omp -p --no-session --tools read,grep,glob --add-dir <repo> @<payloadfile>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
@@ -976,7 +976,7 @@ authenticated via omp's own setup (`omp setup`), never a review-cli key.
 > provider. That has been **re-investigated and resolved**: with `commandcode` and `zai`
 > registered as opencode **custom providers** (`~/.config/opencode/opencode.json`, auth via
 > `opencode auth login`), the default board's Kimi/GLM/Qwen/DeepSeek seats now run
-> agentically through opencode (`oc:commandcode/…`, `oc:zai/glm-5.2`) like the rest of the
+> agentically (`oc:commandcode/…`, `omp:zai/glm-5.3`) like the rest of the
 > board. The raw keyed-HTTP `commandcode:`/`zai:` backends remain for explicit `-m cc` /
 > `-m glm` and config-board seats on hosts without opencode.
 
@@ -1098,10 +1098,10 @@ brainstorm_models:
 # Visual review uses a separate priority list from the text reviewer board.
 # Opus is tried first; GROK_SEAT is next; unavailable/unusable vision calls fall through.
 visual_models:
-  - claude:claude-opus-4-8
-  - oc:xai/grok-4.6
+  - claude:claude-opus-5-5
+  - oc:xai/grok-4.7
   - oc:zai/glm-4.5v
-  - oc:commandcode/moonshotai/Kimi-K2.7-Code
+  - oc:commandcode/moonshotai/Kimi-K3
   - gemini
 
 # Optional: skip every seat under providers whose subscription/billing is currently
@@ -1114,8 +1114,8 @@ visual_models:
 Run `review --list-defaults` to see the effective (normalized) models after config is
 applied.
 
-Code defaults (when no config file exists): `codex`, `gemini`,
-`commandcode:moonshotai/Kimi-K2.7-Code`.
+Code defaults (when no config file exists): `codex`, `gemini`, Kimi, Grok, MiMo
+(`DEFAULT_MODELS` in `reviewlib/config.py`).
 
 ---
 
@@ -1144,21 +1144,21 @@ a fully-keyed environment):
 
 | # | Tier | Reviewer | Backend | Role | Lens focus |
 |---|---|---|---|---|---|
-| 1 | pool | Sol | `codex:gpt-5.6-sol` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
-| 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
-| 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| 1 | pool | Sol | `codex:gpt-6.1-sol` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 2 | pool | Opus | `claude:claude-opus-5-5` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
+| 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.3` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.3 via the Command Code gateway; diff-only, read-only by construction) |
+| 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K3` | `quality` | readability, naming, duplication, code smells, idiom |
 | 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382) |
-| 6 | reserve | Terra | `codex:gpt-5.6-terra` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (a distinct, already-paid codex model — live `performance` fallback for GLM-cc, review-cli#382) |
-| 7 | reserve | Sonnet | `claude:claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (a distinct, already-paid Anthropic model — live `quality` fallback for Kimi, review-cli#382) |
-| 8 | reserve | Sonnet-omp | `omp:anthropic/claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (the SAME claude-sonnet-5 model through the omp harness — a different auth path than the direct `claude:` seat right above, so it survives a Claude-account-wide outage that takes out every `claude:*` seat sharing one account, review-cli#168) |
-| 9 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 6 | reserve | Luna | `codex:gpt-6-luna` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (a distinct, already-paid codex model — live `performance` fallback for GLM-cc, review-cli#382; Terra until #645) |
+| 7 | reserve | Sonnet | `claude:claude-sonnet-5-5` | `quality` | readability, naming, duplication, code smells, idiom (a distinct, already-paid Anthropic model — live `quality` fallback for Kimi, review-cli#382) |
+| 8 | reserve | Sonnet-omp | `omp:anthropic/claude-sonnet-5-5` | `quality` | readability, naming, duplication, code smells, idiom (the SAME Sonnet model through the omp harness — a different auth path than the direct `claude:` seat right above, so it survives a Claude-account-wide outage that takes out every `claude:*` seat sharing one account, review-cli#168) |
+| 9 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.8-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
 | 10 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 11 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
-| 12 | reserve | Grok | `oc:xai/grok-4.6` | `security` | injection, authz, secrets, unsafe deserialization, SSRF, path traversal (opencode's native xai provider, oauth-authenticated; agentic, no diff-only REST fallback exists; placed directly before the slow GLM seat so failover reaches it first, review-cli#165/#415) |
-| 13 | reserve | MiMo | `omp:opencode-go/mimo-v2.5` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage (OpenCode Go via omp; live paid `tests` fallback because DeepSeek is commandcode and often unpaid; `oc:opencode/mimo-v2.5-free` is not DEFAULT-safe, review-cli#450) |
-| 14 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
-| 15 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
+| 12 | reserve | Grok | `oc:xai/grok-4.7` | `security` | injection, authz, secrets, unsafe deserialization, SSRF, path traversal (opencode's native xai provider, oauth-authenticated; agentic, no diff-only REST fallback exists; placed directly before the slow GLM seat so failover reaches it first, review-cli#165/#415) |
+| 13 | reserve | MiMo | `omp:opencode-go/mimo-v2.6-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage (OpenCode Go via omp; live paid `tests` fallback because DeepSeek is commandcode and often unpaid; `oc:opencode/mimo-v2.5-free` is not DEFAULT-safe, review-cli#450) |
+| 14 | reserve | GLM | `omp:zai/glm-5.3` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription via omp; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
+| 15 | reserve (last, no preset) | Fable | `claude:claude-fable-5-1` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
 
 See **[docs/board.md](docs/board.md)** for the full mechanics: in-seat retry vs.
 reserve-replace, the cross-invocation cooldown's escalating window, Claude account rotation
@@ -1209,7 +1209,7 @@ by the startup probe and the seat is skipped gracefully (pool backfills from res
 not currently billed/entitled.
 
 Full per-backend reference — every env var, the shared `.env` file, z.ai's Coding-Plan
-endpoint requirement for `glm-5.2`, OpenRouter model-slug selection, and the
+endpoint requirement for `glm-5.3`, OpenRouter model-slug selection, and the
 opencode/omp startup-probe details — lives in **`review help config`**. Seat-level board
 history and the per-seat cooldown/retry mechanics live in
 [docs/board.md](docs/board.md).

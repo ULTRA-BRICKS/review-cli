@@ -53,7 +53,7 @@ def test_explicit_is_first_then_priority_then_panel():
         got = _panel.pick_moderators("oc:custom", ["codex", "gemini"])
         # explicit first, then MODERATOR_CANDIDATES (opus, codex, gemini), then panel[0]
         assert got[0] == "oc:custom", got
-        assert "claude:claude-opus-4-8" in got
+        assert "claude:claude-opus-5-5" in got
         assert "codex" in got and "gemini" in got
     finally:
         restore()
@@ -63,17 +63,17 @@ def test_opus_is_default_first_when_no_explicit():
     restore = _with_stubs(available=lambda m: True)
     try:
         got = _panel.pick_moderators(None, ["codex", "gemini"])
-        assert got[0] == "claude:claude-opus-4-8", got
+        assert got[0] == "claude:claude-opus-5-5", got
     finally:
         restore()
 
 
 def test_unavailable_candidates_are_filtered():
     # opus binary missing -> drops out; codex/gemini remain in priority order
-    restore = _with_stubs(available=lambda m: m != "claude:claude-opus-4-8")
+    restore = _with_stubs(available=lambda m: m != "claude:claude-opus-5-5")
     try:
         got = _panel.pick_moderators(None, ["oc:x"])
-        assert "claude:claude-opus-4-8" not in got, got
+        assert "claude:claude-opus-5-5" not in got, got
         assert got[0] == "codex", got
     finally:
         restore()
@@ -100,17 +100,17 @@ def test_run_moderator_returns_first_success_without_fallback():
     restore = _with_stubs(runner=runner)
     try:
         res = _panel.run_moderator(
-            ["claude:claude-opus-4-8", "codex"], "p", Path("."), 5
+            ["claude:claude-opus-5-5", "codex"], "p", Path("."), 5
         )
-        assert res.returncode == 0 and res.model == "claude:claude-opus-4-8"
-        assert calls == ["claude:claude-opus-4-8"], calls  # never touched the fallback
+        assert res.returncode == 0 and res.model == "claude:claude-opus-5-5"
+        assert calls == ["claude:claude-opus-5-5"], calls  # never touched the fallback
     finally:
         restore()
 
 
 def test_run_moderator_falls_back_on_nonzero_exit():
     def runner(model, prompt, cwd, timeout, diff="", round_no=0):
-        if model == "claude:claude-opus-4-8":
+        if model == "claude:claude-opus-5-5":
             return _result(
                 model, rc=124, out=""
             )  # timeout-like failure (dead moderator)
@@ -119,7 +119,7 @@ def test_run_moderator_falls_back_on_nonzero_exit():
     restore = _with_stubs(runner=runner)
     try:
         res = _panel.run_moderator(
-            ["claude:claude-opus-4-8", "codex"], "p", Path("."), 5
+            ["claude:claude-opus-5-5", "codex"], "p", Path("."), 5
         )
         assert res.returncode == 0 and res.model == "codex", res
         assert res.stdout == "recovered"
@@ -152,7 +152,7 @@ def test_run_moderator_falls_back_on_rc0_unavailable_sentinel():
     a genuine failure."""
 
     def runner(model, prompt, cwd, timeout, diff="", round_no=0):
-        if model == "claude:claude-fable-5":
+        if model == "claude:claude-fable-5-1":
             return _result(
                 model,
                 rc=0,
@@ -164,7 +164,7 @@ def test_run_moderator_falls_back_on_rc0_unavailable_sentinel():
     restore = _with_stubs(runner=runner)
     try:
         res = _panel.run_moderator(
-            ["claude:claude-fable-5", "codex"], "p", Path("."), 5
+            ["claude:claude-fable-5-1", "codex"], "p", Path("."), 5
         )
         assert res.model == "codex" and res.stdout == "a real moderator summary", res
     finally:

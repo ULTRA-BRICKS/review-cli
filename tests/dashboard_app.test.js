@@ -104,6 +104,20 @@ test('resolveModel: Sol seat resolves specifically, not generic GPT', () => {
   assert.equal(m.label, 'Sol');
 });
 
+test('resolveModel: current Sol and Luna seats resolve specifically, not generic GPT', () => {
+  // review-cli#645: the board moved to gpt-6.1-sol / gpt-6-luna; the old gpt-5.6-sol id
+  // above stays mapped for historical call logs.
+  for (const [raw, key, label] of [
+    ['codex:gpt-6.1-sol', 'gpt-6.1-sol', 'Sol'],
+    ['codex:gpt-6-luna', 'gpt-6-luna', 'Luna'],
+  ]) {
+    const m = resolveModel(raw);
+    assert.equal(m.key, key);
+    assert.equal(m.logo, 'codex');
+    assert.equal(m.label, label);
+  }
+});
+
 test('resolveModel: Astra seat resolves specifically, not generic GPT', () => {
   const m = resolveModel('codex:gpt-6-astra');
   assert.equal(m.key, 'gpt-6-astra');

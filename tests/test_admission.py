@@ -288,7 +288,7 @@ def test_note_result_feeds_429_back_into_the_provider_limit():
             REVIEW_ADMISSION_PROVIDERS="zai=10",
         ):
             A.note_result(
-                "oc:zai/glm-5.2", ReviewResult("m", "c", 1, "", "rate limit exceeded")
+                "oc:zai/glm-5.3", ReviewResult("m", "c", 1, "", "rate limit exceeded")
             )
             state = A._load_provider_state(Path(d))
             assert (
@@ -298,17 +298,17 @@ def test_note_result_feeds_429_back_into_the_provider_limit():
 
 def test_provider_key_maps_transports_to_vendors():
     cases = {
-        "claude:claude-opus-4-8": "anthropic",
-        "omp:anthropic/claude-sonnet-5": "anthropic",
-        "oc:anthropic/claude-opus-4-8": "anthropic",
+        "claude:claude-opus-5-5": "anthropic",
+        "omp:anthropic/claude-sonnet-5-5": "anthropic",
+        "oc:anthropic/claude-opus-5-5": "anthropic",
         "fable": "anthropic",
-        "codex:gpt-5.6-terra": "openai",
-        "omp:openai-codex/gpt-5.6-terra": "openai",
-        "oc:zai/glm-5.2": "zai",
-        "zai:glm-5.2": "zai",
+        "codex:gpt-6-luna": "openai",
+        "omp:openai-codex/gpt-6-luna": "openai",
+        "oc:zai/glm-5.3": "zai",
+        "zai:glm-5.3": "zai",
         "glm": "zai",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code": "commandcode",
-        "omp:opencode-go/mimo-v2.5": "opencode-go",
+        "oc:commandcode/moonshotai/Kimi-K3": "commandcode",
+        "omp:opencode-go/mimo-v2.6-pro": "opencode-go",
         "gemini": "google",
     }
     with _env(ANTHROPIC_BASE_URL=None):
@@ -318,9 +318,9 @@ def test_provider_key_maps_transports_to_vendors():
 
 def test_claude_through_a_gateway_spends_the_gateway_budget():
     with _env(ANTHROPIC_BASE_URL="https://api.commandcode.ai/provider"):
-        assert A.provider_key("claude:claude-opus-4-8") == "commandcode"
+        assert A.provider_key("claude:claude-opus-5-5") == "commandcode"
         assert A.provider_key("claude") == "commandcode"
-        assert A.provider_key("omp:anthropic/claude-sonnet-5") == "anthropic"
+        assert A.provider_key("omp:anthropic/claude-sonnet-5-5") == "anthropic"
 
 
 def test_vision_denied_at_the_command_deadline_is_a_timeout():
@@ -352,7 +352,7 @@ def test_resumed_brainstorm_takes_a_host_slot():
         session_id="abc123",
         path=Path("/nonexistent"),
         topic="t",
-        panel=["codex:gpt-5", "oc:zai/glm-5.2"],
+        panel=["codex:gpt-5", "oc:zai/glm-5.3"],
         moderator="",
         min_rounds=1,
         max_rounds=2,
@@ -391,7 +391,7 @@ def test_saturated_provider_seat_fails_over_after_wait_cap():
 
         def holder():
             with A.seat_slot(
-                "zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+                "zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
             ) as denied:
                 assert denied is None
                 held.set()
@@ -402,7 +402,7 @@ def test_saturated_provider_seat_fails_over_after_wait_cap():
         assert held.wait(5)
         started = time.monotonic()
         with A.seat_slot(
-            "oc:zai/glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+            "oc:zai/glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
         ) as denied:
             waited = time.monotonic() - started
         release.set()
@@ -411,7 +411,7 @@ def test_saturated_provider_seat_fails_over_after_wait_cap():
         assert 0.9 <= waited < 5, waited
         # once the holder is gone the provider admits again
         with A.seat_slot(
-            "zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+            "zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
         ) as denied:
             assert denied is None
 
@@ -427,7 +427,7 @@ def test_registry_os_error_mid_wait_fails_open_instead_of_crashing():
         release = threading.Event()
 
         def holder():
-            with A.seat_slot("zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")):
+            with A.seat_slot("zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")):
                 held.set()
                 release.wait(10)
 
@@ -447,7 +447,7 @@ def test_registry_os_error_mid_wait_fails_open_instead_of_crashing():
         timer.start()
         try:
             with A.seat_slot(
-                "zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+                "zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
             ) as denied:
                 assert denied is None
         finally:
@@ -467,7 +467,7 @@ def test_seat_queued_past_the_command_deadline_never_starts():
         held = threading.Event()
 
         def holder():
-            with A.seat_slot("zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")):
+            with A.seat_slot("zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")):
                 held.set()
                 time.sleep(1.0)
 
@@ -478,7 +478,7 @@ def test_seat_queued_past_the_command_deadline_never_starts():
         process.set_run_deadline(started + 0.5)
         try:
             with A.seat_slot(
-                "zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+                "zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
             ) as denied:
                 waited = time.monotonic() - started
         finally:
@@ -531,7 +531,7 @@ def test_run_waits_until_its_providers_have_room_for_its_seats():
         headroom=0.2, min_slots=1, providers={"anthropic": A.ProviderLimit(5)}
     )
     need = A.seats_by_provider(
-        ["claude:claude-opus-4-8", "omp:anthropic/claude-sonnet-5", "zai:glm"]
+        ["claude:claude-opus-5-5", "omp:anthropic/claude-sonnet-5-5", "zai:glm"]
     )
     assert need == {"anthropic": 2, "zai": 1}
     running = [{"provider_seats": {"anthropic": 2}}]  # limit floor(5*.8) = 4
@@ -679,7 +679,7 @@ def test_backend_alias_spellings_share_one_provider_budget():
         "gemini-api:gemini-2.5-flash": "google",
         "common-code:x": "commandcode",
         "common_code:x": "commandcode",
-        "z.ai:glm-5.2": "zai",
+        "z.ai:glm-5.3": "zai",
     }.items():
         assert A.provider_key(model) == want, (model, A.provider_key(model))
 
@@ -692,12 +692,12 @@ def test_slot_held_for_companion_vision_grows_for_the_panel_and_ends_with_dispat
             REVIEW_ADMISSION="1", REVIEW_ADMISSION_DIR=d, REVIEW_ADMISSION_LEARN="0"
         ):
             with A.dispatch_scope():
-                A.hold_run_slot(mode="review", models=["claude:claude-opus-4-8"])
+                A.hold_run_slot(mode="review", models=["claude:claude-opus-5-5"])
                 leases = list(Path(d).glob("run-*.json"))
                 assert len(leases) == 1
                 with A.run_slot(
                     mode="review",
-                    models=["claude:claude-opus-4-8", "oc:zai/glm-5.2", "codex:gpt"],
+                    models=["claude:claude-opus-5-5", "oc:zai/glm-5.3", "codex:gpt"],
                     cfg=cfg,
                     stream=sink,
                 ):
@@ -825,7 +825,7 @@ def test_concurrent_processes_never_exceed_provider_limit():
                 log,
                 f"s{i}",
                 0.6,
-                kind="zai:glm-5.2",
+                kind="zai:glm-5.3",
                 REVIEW_ADMISSION_PROVIDERS="zai=3",
             )
             for i in range(6)
@@ -1004,7 +1004,7 @@ def test_review_diff_runs_queue_for_a_host_slot_end_to_end():
             "-C",
             str(repo),
             "-m",
-            "claude:claude-opus-4-8",
+            "claude:claude-opus-5-5",
             "--no-tui",
         ]
         first = subprocess.Popen(
@@ -1229,7 +1229,7 @@ def test_just_ask_visual_timeout_bounds_the_queue_wait():
                     "--timeout",
                     "3",
                     "-m",
-                    "claude:claude-opus-4-8,codex:gpt-5,oc:zai/glm-5.2",
+                    "claude:claude-opus-5-5,codex:gpt-5,oc:zai/glm-5.3",
                     "-C",
                     str(REPO_ROOT),
                 ],
@@ -1309,10 +1309,10 @@ def test_empty_diff_review_does_not_queue_for_a_host_slot():
 
 
 def test_unqualified_omp_claude_selector_spends_the_anthropic_budget():
-    """`omp:claude-sonnet-5` runs through omp's Anthropic accounts like
-    `omp:anthropic/claude-sonnet-5`, so both spend one budget (review-cli#614)."""
-    assert A.provider_key("omp:claude-sonnet-5") == "anthropic"
-    assert A.provider_key("omp:anthropic/claude-sonnet-5") == "anthropic"
+    """`omp:claude-sonnet-5-5` runs through omp's Anthropic accounts like
+    `omp:anthropic/claude-sonnet-5-5`, so both spend one budget (review-cli#614)."""
+    assert A.provider_key("omp:claude-sonnet-5-5") == "anthropic"
+    assert A.provider_key("omp:anthropic/claude-sonnet-5-5") == "anthropic"
     assert A.provider_key("omp:kimi-code/k3") == "kimi-code"
 
 
@@ -1340,16 +1340,16 @@ def test_garbled_provider_state_never_crashes_admission_or_status():
         snap = A.status_snapshot(cfg, probe=lambda: _host())
         assert "zai" in snap["providers"], snap["providers"]
         with A.run_slot(
-            mode="review", models=["zai:glm-5.2"], cfg=cfg, stream=open(os.devnull, "w")
+            mode="review", models=["zai:glm-5.3"], cfg=cfg, stream=open(os.devnull, "w")
         ):
             with A.seat_slot(
-                "zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+                "zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
             ) as denied:
                 assert denied is None, denied
 
 
 def test_run_reserves_the_provider_its_failover_chain_dispatches_to():
-    """`zai:glm-5.2` with z.ai unavailable dispatches to its CommandCode fallback, so the
+    """`zai:glm-5.3` with z.ai unavailable dispatches to its CommandCode fallback, so the
     run reserves commandcode, not the provider it will never call (review-cli#614)."""
     from reviewlib import backends
 
@@ -1358,7 +1358,7 @@ def test_run_reserves_the_provider_its_failover_chain_dispatches_to():
     backends.backend_available = lambda m: A.provider_key(m) != "zai"
     backends.runtime_provider_marked_unpaid = lambda m: False
     try:
-        assert A.seats_by_provider(A.routed(["zai:glm-5.2"])) == {"commandcode": 1}
+        assert A.seats_by_provider(A.routed(["zai:glm-5.3"])) == {"commandcode": 1}
     finally:
         backends.backend_available = real_available
         backends.runtime_provider_marked_unpaid = real_unpaid
@@ -1415,7 +1415,7 @@ def test_moderator_after_a_companion_grows_the_held_lease():
             with A.run_slot(
                 mode="quorum",
                 models=["codex:gpt-5", "codex:gpt-5"],
-                later_models=["omp:anthropic/claude-opus-4-8"],
+                later_models=["omp:anthropic/claude-opus-5-5"],
             ):
                 lease = json.loads(next(Path(d).glob("run-*.json")).read_text())
         assert lease["provider_seats"].get("openai") == 2, lease
@@ -1443,7 +1443,7 @@ def test_rpm_start_is_stamped_after_a_contended_registry_lock():
         t.start()
         assert held.wait(5)
         threading.Timer(1.0, release.set).start()
-        with A.seat_slot("zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")) as d0:
+        with A.seat_slot("zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")) as d0:
             admitted = time.time()
         t.join(5)
         assert d0 is None, d0
@@ -1580,8 +1580,8 @@ def test_review_visual_companion_reserves_the_pool_dispatch_will_select():
                 board:
                   - { model: "codex:gpt-5", role: correctness }
                   - { model: "codex:gpt-5-mini", role: consistency }
-                  - { model: "zai:glm-5.2", role: quality }
-                  - { model: "oc:xai/grok-4.6", role: security }
+                  - { model: "zai:glm-5.3", role: quality }
+                  - { model: "oc:xai/grok-4.7", role: security }
                 """
             )
         )
@@ -1643,7 +1643,7 @@ def test_review_visual_companion_reserves_the_pool_dispatch_will_select():
 
 
 def test_standalone_visual_reserves_the_backend_vision_actually_calls():
-    """`review visual img -m zai:glm-5.2,codex:gpt-5`: GLM cannot see images, so the one
+    """`review visual img -m zai:glm-5.3,codex:gpt-5`: GLM cannot see images, so the one
     vision call goes to codex; admission must reserve openai, not zai (review-cli#614)."""
     sys.path.insert(0, str(REPO_ROOT / "tests"))
     import visual_fixtures as vf
@@ -1682,7 +1682,7 @@ def test_standalone_visual_reserves_the_backend_vision_actually_calls():
                     "visual",
                     str(vf.styled_render(tmp / "shot.png")),
                     "-m",
-                    "zai:glm-5.2,codex:gpt-5",
+                    "zai:glm-5.3,codex:gpt-5",
                     "-C",
                     str(tmp),
                 ],
@@ -1861,7 +1861,7 @@ def test_registry_contention_respects_the_command_deadline():
             started = time.monotonic()
             process.set_run_deadline(started + 0.5)
             with A.seat_slot(
-                "zai:glm-5.2", cfg=cfg, stream=open(os.devnull, "w")
+                "zai:glm-5.3", cfg=cfg, stream=open(os.devnull, "w")
             ) as denied:
                 waited = time.monotonic() - started
             assert denied and "--timeout reached" in denied, denied
@@ -1899,7 +1899,7 @@ def test_no_home_directory_runs_without_admission_instead_of_crashing():
                 mode="review", models=["fake"], cfg=cfg, stream=open(os.devnull, "w")
             ):
                 pass
-            with A.seat_slot("zai:glm-5.2", cfg=cfg) as denied:
+            with A.seat_slot("zai:glm-5.3", cfg=cfg) as denied:
                 assert denied is None, denied
             snap = A.status_snapshot(cfg, probe=lambda: _host())
             assert snap["runs"] == [] and snap["dir"].startswith("unavailable"), snap

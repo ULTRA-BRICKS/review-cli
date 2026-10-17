@@ -3,6 +3,46 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.51.0 — 2026-10-17
+
+- **Feat(models): bump board and alias pins to the newest models**
+  ([review-cli#645](https://git.hyperide.ai/ultrabricks/review-cli/issues/645)). The board,
+  flat default panel, visual list, moderator, role fallbacks, provider-failover chains and
+  generic aliases now name the current release of each model family:
+
+  | old | new |
+  |---|---|
+  | `claude:claude-opus-4-8` | `claude:claude-opus-5-5` |
+  | `claude:claude-sonnet-5` (and `omp:anthropic/claude-sonnet-5`) | `claude:claude-sonnet-5-5` (and `omp:anthropic/claude-sonnet-5-5`) |
+  | `claude:claude-fable-5` | `claude:claude-fable-5-1` |
+  | `codex:gpt-5.6-sol` | `codex:gpt-6.1-sol` |
+  | `codex:gpt-5.6-terra` (`TERRA_SEAT`, "Terra") | `codex:gpt-6-luna` (`LUNA_SEAT`, "Luna"; the Terra line has no GPT-6 successor, Luna is GPT-6's low-cost tier) |
+  | `codex:gpt-6-astra` | unchanged |
+  | `zai:glm-5.2` (`glm`, z.ai default model) | `zai:glm-5.3` |
+  | `commandcode:zai-org/GLM-5.2` | `commandcode:zai-org/GLM-5.3` |
+  | `oc:xai/grok-4.6` | `oc:xai/grok-4.7` (still on `VISUAL_MODELS`) |
+  | `omp:opencode-go/mimo-v2.5` | `omp:opencode-go/mimo-v2.6-pro` |
+  | `commandcode:moonshotai/Kimi-K2.7-Code` | `commandcode:moonshotai/Kimi-K3` |
+  | `commandcode:Qwen/Qwen3.7-Max` | `commandcode:Qwen/Qwen3.8-Max` |
+  | `deepseek/deepseek-v4-pro` | unchanged |
+  | board GLM seat `oc:zai/glm-5.2` | `omp:zai/glm-5.3` (omp's z.ai route) |
+
+  Generic aliases (`opus`, `sonnet`, `fable`, `sol`, `grok`, `mimo`, `glm`) follow the new
+  pins; new pinned aliases `opus55`, `sonnet55`, `fable51`, `gpt61sol`, `luna`/`gpt6luna`,
+  `grok47`/`grok-4.7`, `mimo26`, `glm53`. Version-numbered aliases keep their own release:
+  `opus48`, `sonnet5`, `fable5`, `gpt56sol`, `terra`/`gpt56terra`, `grok46`/`grok-4.6`,
+  `mimo25`/`mimo-2.5` and `glm52` still name the old models. The `glm-5.3` failover chain
+  is `zai:` → `oc:zai/` → `commandcode:` → `omp:zai/`. The dashboard keeps its labels for
+  the old ids (historical call logs) and adds the new ones; `reviewlib.TERRA_SEAT` is
+  renamed `reviewlib.LUNA_SEAT`. Evidence: omp's Anthropic route answered
+  `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-fable-5-1`, codex answered
+  `gpt-6.1-sol` and `gpt-6-luna`, and z.ai answered `glm-5.3` on 2026-10-17. The
+  `grok-4.7`, `mimo-v2.6-pro`, `Kimi-K3`, `Qwen3.8-Max` and `zai-org/GLM-5.3` ids come
+  from [models.dev](https://models.dev/api.json) (no xai / opencode-go / commandcode login
+  on the probing machine).
+- **Docs(help): ZAI_API_KEY also feeds omp:zai seats.** The `--show-board` footer and the
+  help config section no longer say ZAI_API_KEY only powers the diff-only `zai:` seat.
+
 ## 0.50.0 — 2026-10-17
 
 - **Feat(seats): `review seats` lists every harness login on the machine, and omp:zai

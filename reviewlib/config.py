@@ -46,75 +46,77 @@ DEFAULT_PROMPT = (
 # board can never drift back to the dead route — the staleness that motivated this fix
 # existed precisely because the Kimi seat was spelled independently in two places and only
 # the board was kept current (the flat panel rotted on the dead Fireworks route).
-KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
-SOL_SEAT = "codex:gpt-5.6-sol"
+KIMI_SEAT = "commandcode:moonshotai/Kimi-K3"
+SOL_SEAT = "codex:gpt-6.1-sol"
 # GPT-6-Astra ("Astra") is OpenAI's new flagship codex model — "our most capable model
 # for complex, demanding work" per the codex CLI's own model catalog. Explicitly PINNED
 # (like SOL_SEAT), rather than left as a bare `"codex"` seat that silently tracks
 # whatever ~/.codex/config.toml's own `model =` default happens to be today. The bare
 # `"codex"` seat used to sit at DEFAULT_BOARD's priority 5 and, because that config
-# default is currently `gpt-5.6-sol`, it was accidentally running the SAME model as
+# default was then `gpt-5.6-sol`, it was accidentally running the SAME model as
 # SOL_SEAT (priority 1) — a silent duplicate that gave the board zero extra model
 # coverage for a full seat. Pinning to Astra here fixes that: the board gets a genuinely
 # distinct model, and this seat no longer drifts if the operator's global codex default
 # changes.
 ASTRA_SEAT = "codex:gpt-6-astra"
-# GPT-5.6-Terra ("Terra") — review-cli#382: a THIRD, distinct codex model on the same
-# already-paid OpenAI/Codex account as SOL_SEAT/ASTRA_SEAT. Live `performance` fallback
-# for the disabled GLM_COMMANDCODE_SEAT. Pinned explicitly (not bare `"codex"`), same
-# anti-duplicate reason as ASTRA_SEAT above.
-TERRA_SEAT = "codex:gpt-5.6-terra"
-# claude-sonnet-5 ("Sonnet") — review-cli#382: a SECOND, distinct Anthropic model on the
+# GPT-6-Luna ("Luna") — a THIRD, distinct codex model on the same already-paid
+# OpenAI/Codex account as SOL_SEAT/ASTRA_SEAT. Live `performance` fallback for the
+# disabled GLM_COMMANDCODE_SEAT. Pinned explicitly (not bare `"codex"`), same
+# anti-duplicate reason as ASTRA_SEAT above. Added as TERRA_SEAT (`gpt-5.6-terra`) in
+# review-cli#382; review-cli#645 moved it to Luna, GPT-6's low-cost tier, because the
+# Terra line has no GPT-6 successor.
+LUNA_SEAT = "codex:gpt-6-luna"
+# claude-sonnet-5-5 ("Sonnet") — review-cli#382: a SECOND, distinct Anthropic model on the
 # same already-paid Claude account as Opus/FABLE_SEAT. Live `quality` fallback for Kimi
 # (commandcode) and the quota-fragile z.ai-GLM seat. `review stat` telemetry (2026-09-05):
 # dispatched cleanly 7/7 times historically, zero recorded failures — unlike FABLE_SEAT's
 # ~100% dispatch failure rate (see its own entry below).
-SONNET_SEAT = "claude:claude-sonnet-5"
-# OMP-hosted Claude ("Sonnet via omp") -- review-cli#168: the SAME claude-sonnet-5 model,
+SONNET_SEAT = "claude:claude-sonnet-5-5"
+# OMP-hosted Claude ("Sonnet via omp") -- review-cli#168: the SAME claude-sonnet-5-5 model,
 # dispatched through the omp harness (reviewlib.backends.review_omp) instead of the direct
 # `claude` CLI -- a genuinely DIFFERENT auth path (omp's own ANTHROPIC_API_KEY/
 # ANTHROPIC_OAUTH_TOKEN/profile-scoped agent dir, independent of Claude Code CLI's
 # CLAUDE_CONFIG_DIR/keychain), so it survives an outage that takes out every claude:*
 # seat's shared account state. Live `quality` fallback for both Kimi (commandcode) AND
 # Sonnet (claude: direct) -- see ROLE_FALLBACK_MODELS / DEFAULT_BOARD.
-OMP_CLAUDE_SEAT = "omp:anthropic/claude-sonnet-5"
+OMP_CLAUDE_SEAT = "omp:anthropic/claude-sonnet-5-5"
 # review-cli#fable-seat-reliability (GLM review finding): the single source of truth
 # for the Fable seat's model id — every sibling seat (KIMI_SEAT/SOL_SEAT/
 # GLM_COMMANDCODE_SEAT above) already has one; the Fable id was the one left as a
 # repeated literal across DEFAULT_BOARD's entry, DEFAULT_PRESET_BOARD's exclusion set,
 # and HEAVY_PRESET_BOARD's filter (three places that must never independently drift).
-FABLE_SEAT = "claude:claude-fable-5"
+FABLE_SEAT = "claude:claude-fable-5-1"
 
-# Canonical GLM-5.2-via-commandcode seat — the SINGLE source of truth for "GLM 5.2 routed
+# Canonical GLM-5.3-via-commandcode seat — the SINGLE source of truth for "GLM 5.3 routed
 # through the Command Code gateway" (as opposed to the z.ai-subscription route used by the
-# lower-priority `oc:zai/glm-5.2` seat). It is the priority-3 board seat, immediately after
+# lower-priority `omp:zai/glm-5.3` seat). It is the priority-3 board seat, immediately after
 # Opus (review-cli#fable-seat-reliability: was priority-4 before Fable's demotion moved
 # every subsequent seat up one slot). The wire id is byte-exact against the commandcode gateway
-# /models catalog (`zai-org/GLM-5.2`), verified live. This is DIFF-ONLY (a stateless keyed-
+# catalog (`zai-org/GLM-5.3`, from models.dev's commandcode listing — review-cli#645). This is DIFF-ONLY (a stateless keyed-
 # HTTP POST through review_commandcode, like Gemini): opencode's `commandcode` provider does
-# NOT register this model, so the agentic `oc:commandcode/zai-org/GLM-5.2` form errors — the
+# NOT register this model, so the agentic `oc:commandcode/zai-org/GLM-5.3` form errors — the
 # diff-only route is the one that actually reaches it. Read-only by construction (it POSTs
 # only the diff; no repo access, no tools, no exec), so it needs no `-s read-only` cage.
-GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.2"
+GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.3"
 
 # Canonical Grok seat — opencode's NATIVE `xai` provider (oauth-authenticated via
-# `opencode providers login`). `opencode models` lists `xai/grok-4.6`. Already
+# `opencode providers login`). models.dev's xai catalog lists `grok-4.7`. Already
 # agentic (`oc:` prefix) — unlike Kimi/GLM-cc/Qwen/DeepSeek, there is no
 # diff-only REST fallback because xai is not one of the commandcode/z.ai custom
 # gateways `_agentic()` derives from; it is a first-class opencode provider, so
 # the seat is spelled directly. Image→text capable: VISUAL_MODELS includes this
-# id and `_VISION_MODEL_HINTS` matches the `grok-4.6` substring (not a generic
+# id and `_VISION_MODEL_HINTS` matches the `grok-4.7` substring (not a generic
 # `grok`, which would also match grok-3).
-GROK_SEAT = "oc:xai/grok-4.6"
+GROK_SEAT = "oc:xai/grok-4.7"
 
-# Canonical MiMo 2.5 seat — OpenCode Go subscription via omp's opencode-go provider
-# (review-cli#450). Live `omp models find mimo-v2.5` selector is opencode-go/mimo-v2.5;
+# Canonical MiMo seat — OpenCode Go subscription via omp's opencode-go provider
+# (review-cli#450). The opencode-go selector is opencode-go/mimo-v2.6-pro (review-cli#645);
 # agentic through review_omp. The opencode CLI catalog spelling
 # `oc:opencode/mimo-v2.5-free` is NOT DEFAULT-safe (`default_routes_live` False:
 # provider `opencode` under `oc:` is not a named backend token and is not in
 # `_AGENTIC_ONLY_PROVIDERS`). Explicit `-m oc:opencode/mimo-v2.5-free` still works
 # at runtime. Not on VISUAL_MODELS.
-MIMO_SEAT = "omp:opencode-go/mimo-v2.5"
+MIMO_SEAT = "omp:opencode-go/mimo-v2.6-pro"
 
 
 def _agentic(seat: str) -> str:
@@ -159,49 +161,60 @@ DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT, GROK_SEAT, MIMO_SEAT)
 # pipeline selects the first reachable vision-capable backend, so a dead/paywalled Opus is
 # skipped automatically and the next vision seat is promoted.
 VISUAL_MODELS = (
-    "claude:claude-opus-4-8",
+    "claude:claude-opus-5-5",
     GROK_SEAT,
     "oc:zai/glm-4.5v",
-    "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+    "oc:commandcode/moonshotai/Kimi-K3",
     "gemini",
 )
 # Friendly aliases for claude models, expanded in _split_models() and the
-# default/config paths, so `-m fable5` == `-m claude:claude-fable-5`.
+# default/config paths, so `-m fable` == `-m claude:claude-fable-5-1`. Generic aliases
+# follow the current pin; version-numbered aliases keep naming their own release.
 MODEL_ALIASES = {
     # opus is a MODEL, not a backend token — bare `opus` used to fall through
     # `_match_named_backend` to the opencode catch-all (`opencode -m opus`), whose agentic
     # backend infra-fails and blocks review quorums. Pin it to the reliable claude-direct
     # provider. (Provider-failover's DEFAULT_PROVIDER_CHAINS then adds opencode as the
     # FAILOVER alternate, not the default.)
-    "opus": "claude:claude-opus-4-8",
+    "opus": "claude:claude-opus-5-5",
+    "opus55": "claude:claude-opus-5-5",
     "opus48": "claude:claude-opus-4-8",
     "fable": FABLE_SEAT,
-    "fable5": FABLE_SEAT,
+    "fable51": FABLE_SEAT,
+    "fable5": "claude:claude-fable-5",
     "sol": SOL_SEAT,
-    "gpt56sol": SOL_SEAT,
+    "gpt61sol": SOL_SEAT,
+    "gpt56sol": "codex:gpt-5.6-sol",
     # Astra falls through `_match_named_backend` to the opencode catch-all without this —
     # the same failure class documented on `opus` above. Pin it, like Sol.
     "astra": ASTRA_SEAT,
     "gpt6astra": ASTRA_SEAT,
-    # Terra falls through the same opencode catch-all without this — same class as
-    # opus/astra above. Pin it too (review-cli#382).
-    "terra": TERRA_SEAT,
-    "gpt56terra": TERRA_SEAT,
+    # Luna falls through the same opencode catch-all without this — same class as
+    # opus/astra above. Pin it too (review-cli#382 pinned Terra, review-cli#645 Luna).
+    "luna": LUNA_SEAT,
+    "gpt6luna": LUNA_SEAT,
+    "terra": "codex:gpt-5.6-terra",
+    "gpt56terra": "codex:gpt-5.6-terra",
     "sonnet": SONNET_SEAT,
-    "sonnet5": SONNET_SEAT,
+    "sonnet55": SONNET_SEAT,
+    "sonnet5": "claude:claude-sonnet-5",
     "grok": GROK_SEAT,
-    "grok46": GROK_SEAT,
-    "grok-4.6": GROK_SEAT,
-    # `grok45` is the Grok 4.5 spelling; it does not track GROK_SEAT.
+    "grok47": GROK_SEAT,
+    "grok-4.7": GROK_SEAT,
+    # `grok46`/`grok45` are the Grok 4.6/4.5 spellings; they do not track GROK_SEAT.
+    "grok46": "oc:xai/grok-4.6",
+    "grok-4.6": "oc:xai/grok-4.6",
     "grok45": "oc:xai/grok-4.5",
     "mimo": MIMO_SEAT,
-    "mimo25": MIMO_SEAT,
-    "mimo-2.5": MIMO_SEAT,
+    "mimo26": MIMO_SEAT,
+    "mimo25": "omp:opencode-go/mimo-v2.5",
+    "mimo-2.5": "omp:opencode-go/mimo-v2.5",
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
-    # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
+    # directly in resolve_backend (env ZAI_MODEL / glm-5.3 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
-    # `glm`/`glm52` point at the newest (glm-5.2), the rest pin older releases.
-    "glm": "zai:glm-5.2",
+    # `glm`/`glm53` point at the newest (glm-5.3), the rest pin older releases.
+    "glm": "zai:glm-5.3",
+    "glm53": "zai:glm-5.3",
     "glm52": "zai:glm-5.2",
     "glm51": "zai:glm-5.1",
     "glm47": "zai:glm-4.7",
@@ -229,7 +242,7 @@ QA_TIMEOUT_DEFAULT = 2700
 # and run_moderator() walks it at run time, so a candidate that passes the cheap
 # availability probe but dies at run time (e.g. an Anthropic-disabled model like
 # fable) never leaves the panel without a synthesis.
-MODERATOR_CANDIDATES = ("claude:claude-opus-4-8", "codex", "gemini")
+MODERATOR_CANDIDATES = ("claude:claude-opus-5-5", "codex", "gemini")
 
 
 def _expand_alias(model: str) -> str:
@@ -425,7 +438,7 @@ def lens_override_text(role: str, cwd: Path | None) -> str:
 class BoardReviewer:
     """One seat on the reviewer board: a backend model + its review role.
 
-    `model` is the backend string (e.g. `claude:claude-opus-4-8`,
+    `model` is the backend string (e.g. `claude:claude-opus-5-5`,
     `commandcode:deepseek/deepseek-v4-pro`). `role` is a key into REVIEW_ROLES;
     `display` is a short human name for the --show-board listing / result label.
     `role_lens` resolves the BUILT-IN lens text (empty string for a role that isn't a
@@ -490,10 +503,10 @@ class BoardReviewer:
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
-# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, GPT-6-Astra, GPT-5.6-Terra,
-# claude-sonnet-5, Qwen3.7-Max, deepseek-v4-pro, Gemini, glm-5.2-via-z.ai).
+# (fable-5-1, Sol, opus-5-5, GLM-5.3-via-gateway, Kimi-K3, GPT-6-Astra, GPT-6-Luna,
+# claude-sonnet-5-5, Qwen3.8-Max, deepseek-v4-pro, Gemini, glm-5.3-via-z.ai).
 #
-# review-cli#382: TERRA_SEAT/SONNET_SEAT were added as live `performance`/`quality`
+# review-cli#382: TERRA_SEAT (now LUNA_SEAT)/SONNET_SEAT were added as live `performance`/`quality`
 # fallbacks (unpaid_providers disabling commandcode left those roles with zero live
 # seats — full incident writeup in CHANGELOG.md), and the z.ai-GLM seat was re-lensed
 # `quality` -> `security`. Astra's pre-existing `consistency` role (a duplicate of Sol's)
@@ -507,18 +520,19 @@ class BoardReviewer:
 #
 # `pool: 2` (the `light` preset a bare `review diff` uses) can never show more than 2
 # roles at all — a deliberate cost choice. (The older `--preset heavy` limit — Sol/Opus/
-# Astra/Terra with `consistency` twice — is gone since review-cli#588 picks distinct roles
+# Astra/Luna with `consistency` twice — is gone since review-cli#588 picks distinct roles
 # first; see test_heavy_preset_double_failure_still_beats_pre_382_board.)
 #
 # AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
-# claude seats run via the agentic claude CLI; Sol/Astra/Terra via the codex CLI
-# (`codex exec -s read-only -C <cwd>`); Kimi/z.ai-GLM/Qwen/DeepSeek through opencode
-# (`oc:provider/model`, built by `_agentic()` from the diff-only constant) so they ALSO
+# claude seats run via the agentic claude CLI; Sol/Astra/Luna via the codex CLI
+# (`codex exec -s read-only -C <cwd>`); Kimi/Qwen/DeepSeek through opencode
+# (`oc:provider/model`, built by `_agentic()` from the diff-only constant) and z.ai-GLM
+# through omp (`omp:zai/...`), so they ALSO
 # run read-only inside `-C` and can open ANY project file — not just the diff in the
 # prompt. The board has a reserve, so an `oc:` seat that opencode can't reach on a given
 # host probes UNAVAILABLE and is backfilled (startup or mid-run failover) — the board
 # degrades gracefully rather than blocking. Two seats stay diff-only stateless HTTP calls:
-# Gemini (no agentic transport) and the GLM-5.2-via-commandcode seat
+# Gemini (no agentic transport) and the GLM-5.3-via-commandcode seat
 # (`GLM_COMMANDCODE_SEAT` — opencode's commandcode provider does not register this GLM id, so
 # the agentic form errors; the keyed-HTTP route is the one that reaches it). Both are read-
 # only by construction (they POST only the diff). The diff-only `commandcode:`/`zai:` REST
@@ -537,22 +551,22 @@ class BoardReviewer:
 DEFAULT_BOARD = (
     # priority 1 — Sol through Codex CLI.
     BoardReviewer(SOL_SEAT, "consistency", "Sol"),
-    # priority 2 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
-    BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-    # priority 3 — GLM-5.2 via the Command Code gateway (CTO directive: directly under Opus).
+    # priority 2 — Opus 5.5. Also the moderator (MODERATOR_CANDIDATES[0]).
+    BoardReviewer("claude:claude-opus-5-5", "correctness", "Opus"),
+    # priority 3 — GLM-5.3 via the Command Code gateway (CTO directive: directly under Opus).
     # DIFF-ONLY (keyed HTTP through review_commandcode, like Gemini): opencode's commandcode
-    # provider does NOT register `zai-org/GLM-5.2`, so the agentic `oc:commandcode/...` form
+    # provider does NOT register `zai-org/GLM-5.3`, so the agentic `oc:commandcode/...` form
     # errors — the diff-only route is the one that actually reaches it. Read-only by
     # construction (POSTs only the diff; no repo/tools/exec). Distinct from the lower-priority
-    # `oc:zai/glm-5.2` seat (same model FAMILY, different provider/transport: z.ai vs gateway).
+    # `omp:zai/glm-5.3` seat (same model FAMILY, different provider/transport: z.ai vs gateway).
     # ROLE: `performance` — NOT `correctness` (which would duplicate Opus's lens).
     BoardReviewer(GLM_COMMANDCODE_SEAT, "performance", "GLM-cc"),
-    # priority 4 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
+    # priority 4 — Kimi K3, AGENTIC through opencode (reads the repo). Same model id as
     # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
     # Kept at this exact position: both the raw top-4 (Sol/Opus/GLM-cc/Kimi) and
     # DEFAULT_PRESET_BOARD's top-4 (Opus/GLM-cc/Kimi/Astra) need it here to stay
     # 4-distinct-roles — see test_default_pool_roles_are_distinct_no_lens_lost /
-    # test_preset_boards_pin_model_order_pool_and_effort. TERRA_SEAT/SONNET_SEAT (below)
+    # test_preset_boards_pin_model_order_pool_and_effort. LUNA_SEAT/SONNET_SEAT (below)
     # are placed AFTER Astra, outside both windows, for the same reason.
     BoardReviewer(_agentic(KIMI_SEAT), "quality", "Kimi"),
     # priority 5 — Astra, the agentic codex CLI route (reads the whole repo), pinned via
@@ -563,9 +577,9 @@ DEFAULT_BOARD = (
     # test_glm_cc_unavailable_backfills_a_new_lens_not_astras_duplicate), so it acts as
     # Sol's same-role backfill.
     BoardReviewer(ASTRA_SEAT, "consistency", "Astra"),
-    # priority 6 — Terra (review-cli#382): live `performance` fallback, promoted whenever
-    # GLM-cc is unavailable.
-    BoardReviewer(TERRA_SEAT, "performance", "Terra"),
+    # priority 6 — Luna (review-cli#382 added it as Terra): live `performance` fallback,
+    # promoted whenever GLM-cc is unavailable.
+    BoardReviewer(LUNA_SEAT, "performance", "Luna"),
     # priority 7 — Sonnet (review-cli#382): live `quality` fallback for Kimi — the exact
     # role the 2026-09-05 z.ai-quota incident exposed (see CHANGELOG.md).
     BoardReviewer(SONNET_SEAT, "quality", "Sonnet"),
@@ -573,8 +587,8 @@ DEFAULT_BOARD = (
     # seat right above; live `quality` fallback that survives a Claude-account-wide
     # outage (every claude:* seat sharing one exhausted/paywalled account).
     BoardReviewer(OMP_CLAUDE_SEAT, "quality", "Sonnet-omp"),
-    # priority 8 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
-    BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
+    # priority 8 — Qwen3.8-Max, AGENTIC through opencode's commandcode provider (reads the repo).
+    BoardReviewer(_agentic("commandcode:Qwen/Qwen3.8-Max"), "security", "Qwen"),
     # priority 9 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(
         _agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"
@@ -585,23 +599,24 @@ DEFAULT_BOARD = (
     # above DEFAULT_BOARD) — it stays thin until commandcode/gemini are re-enabled or a
     # new paid seat is added.
     BoardReviewer("gemini", "contracts", "Gemini"),
-    # priority 11 — Grok 4.6 via opencode's native `xai` provider (agentic, reads the
+    # priority 11 — Grok 4.7 via opencode's native `xai` provider (agentic, reads the
     # repo). Placed BEFORE the deliberately-slow z.ai GLM reserve below: this seat's own
     # dogfooding review of its addition (`review diff` seat, round 1) flagged that
     # appending it AFTER GLM meant deep mid-run failover always paid GLM's #65
     # pathological-slowness cost before ever reaching Grok, defeating the point of having
     # a faster reserve. ROLE `security`, not `performance`: after review-cli#382/#386
-    # `performance` already has a live paid fallback (Terra) while `security` is held only
+    # `performance` already has a live paid fallback (Luna) while `security` is held only
     # by Qwen (commandcode — unpaid/disabled machine-wide) and the slow, quota-fragile GLM
     # seat below, so this fast, live, oauth-backed reserve is the lens that was missing.
     BoardReviewer(GROK_SEAT, "security", "Grok"),
-    # priority 12 — MiMo 2.5 via omp OpenCode Go (review-cli#450). Live paid `tests`
+    # priority 12 — MiMo V2.6 Pro via omp OpenCode Go (review-cli#450). Live paid `tests`
     # fallback: DeepSeek (priority 9) is the only other tests seat and is commandcode
     # (often unpaid). Same rationale as GROK filling `security`. The
     # `oc:opencode/mimo-v2.5-free` catalog spelling is NOT DEFAULT-safe.
     BoardReviewer(MIMO_SEAT, "tests", "MiMo"),
-    # priority 13 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
-    # opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of the reserve
+    # priority 13 — GLM-5.3 (his z.ai subscription, the newest GLM), AGENTIC through
+    # omp's `zai` provider (review-cli#645; opencode's `oc:zai/` route before that).
+    # DELIBERATELY DEPRIORITIZED to the bottom of the reserve
     # (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load, so
     # promoting it onto the failover critical path stalls the pool's path to a verdict.
     # It stays on the board (still backfills when every faster reserve is also
@@ -611,8 +626,8 @@ DEFAULT_BOARD = (
     # from `quality` to `security`: Sonnet now covers `quality` more reliably, freeing this
     # live-but-fragile seat to backfill `security` (whose only other seat, Qwen, is
     # disabled) instead of duplicating Sonnet.
-    BoardReviewer(_agentic("zai:glm-5.2"), "security", "GLM"),
-    # priority 14 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
+    BoardReviewer("omp:zai/glm-5.3", "security", "GLM"),
+    # priority 14 (LAST-RESORT reserve) — Fable 5.1 (Anthropic flagship). DEMOTED from
     # priority 1 to LAST (review-cli#fable-seat-reliability, 2026-08): `review stat`
     # telemetry showed a 97.9-100% dispatch failure rate (chronic session/usage-limit
     # exhaustion on the account it runs through — being priority 1 made it the FIRST
@@ -660,8 +675,8 @@ DEFAULT_PRESET_BOARD = tuple(
 # tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
 # first ordering and the resulting seat-count invariant self-documenting (14 seats as of
 # review-cli#168's OMP_CLAUDE_SEAT on top of review-cli#450's MIMO_SEAT, review-cli#165's
-# GROK_SEAT and review-cli#382's TERRA_SEAT/SONNET_SEAT — first 4 get `xhigh` effort: Sol, Opus,
-# GLM-cc, Kimi (unchanged from before #382 — TERRA_SEAT/SONNET_SEAT were inserted at raw
+# GROK_SEAT and review-cli#382's TERRA_SEAT (now LUNA_SEAT)/SONNET_SEAT — first 4 get `xhigh` effort: Sol, Opus,
+# GLM-cc, Kimi (unchanged from before #382 — the Luna/Sonnet seats were inserted at raw
 # priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the
 # rest get `max`).
 _heavy_eligible_seats = tuple(r for r in DEFAULT_BOARD if r.model != FABLE_SEAT)
@@ -1300,7 +1315,7 @@ def _display_name(model: str) -> str:
     """A short, human-friendly label for a board reviewer derived from its model
     string — used when config.yaml omits an explicit name. Takes the last path
     segment of the provider id (so `commandcode:deepseek/deepseek-v4-pro` -> the
-    provider tail, `claude:claude-opus-4-8` -> `claude-opus-4-8`)."""
+    provider tail, `claude:claude-opus-5-5` -> `claude-opus-5-5`)."""
     tail = model.split(":", 1)[1] if ":" in model else model
     return tail.rsplit("/", 1)[-1]
 
@@ -1496,7 +1511,7 @@ def load_board(
 
     A `board:` key in config.yaml (a list of `{model | capability, role[, name]}`
     mappings) overrides the built-in default preset. A seat names its model EITHER
-    literally (`model: claude:claude-opus-4-8`) OR by CAPABILITY resolved from the
+    literally (`model: claude:claude-opus-5-5`) OR by CAPABILITY resolved from the
     shared `models.yaml` manifest (`capability: vision` / `capability: role:reasoning`,
     rig-cli#8) — the latter degrades to "skip this entry with a warning" when the
     manifest isn't reachable, so a manifest-less host still runs its literal seats.

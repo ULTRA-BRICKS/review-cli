@@ -206,7 +206,7 @@ def _claude_api_model(model: str) -> str:
     return (
         model.split(":", 1)[1]
         if ":" in model
-        else os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+        else os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")
     )
 
 
@@ -1038,7 +1038,7 @@ def review_opencode(
     # `oc:` and `opencode:` prefixes here (config.py's own `_agentic` docstring calls
     # this pair "both spellings" deliberately), but the cooldown store and
     # model_behavior registry are keyed by the raw, un-normalized `model` string —
-    # `oc:zai/glm-5.2` and `opencode:zai/glm-5.2` would build SEPARATE cooldown/
+    # `oc:zai/glm-5.3` and `opencode:zai/glm-5.3` would build SEPARATE cooldown/
     # behavior histories for what the board/dashboard treat as the SAME canonical
     # seat. `_agentic` is idempotent+canonical for an already-agentic id (returns
     # `oc:...` unchanged, rewrites `opencode:...` to it) — reused here rather than
@@ -1053,9 +1053,9 @@ def review_opencode(
     # load-bearing invariant a caller several layers up already depends on:
     # `reviewlib/modes/review.py`'s flat-diff path builds `by_model = {result.model:
     # result for result in results}` and then looks up `by_model[model]` for each
-    # ORIGINAL requested model string. `review diff -m opencode:zai/glm-5.2` would
-    # dispatch with `models = ["opencode:zai/glm-5.2"]`, get back a result whose
-    # `.model` was rewritten to `"oc:zai/glm-5.2"`, and KeyError on the lookup —
+    # ORIGINAL requested model string. `review diff -m opencode:zai/glm-5.3` would
+    # dispatch with `models = ["opencode:zai/glm-5.3"]`, get back a result whose
+    # `.model` was rewritten to `"oc:zai/glm-5.3"`, and KeyError on the lookup —
     # crashing a basic, real CLI invocation. The correct fix keeps EVERY returned
     # `ReviewResult.model` as the caller's own `model` string, unchanged — `canonical_
     # model` is scoped to internal lookups only (`active_cooldown`, `record_cooldown`/
@@ -1277,7 +1277,7 @@ _OMP_ACCESS_METHOD = "omp"
 
 def _omp_model_hosts_claude(omp_model: str | None) -> bool:
     """True when the `omp:<selector>` model string names an Anthropic/Claude model
-    (review-cli#168's omp-engine account axis) -- e.g. `anthropic/claude-sonnet-5` or
+    (review-cli#168's omp-engine account axis) -- e.g. `anthropic/claude-sonnet-5-5` or
     any selector containing "claude"."""
     if not omp_model:
         return False
@@ -1301,7 +1301,7 @@ def _review_omp_claude_profiles() -> list[str | None]:
 
 def _omp_model_hosts_openai_codex(omp_model: str | None) -> bool:
     """True when the `omp:<selector>` model string names an openai-codex model
-    (review-cli#168 omp-engine account axis) -- e.g. `openai-codex/gpt-5.6-terra`."""
+    (review-cli#168 omp-engine account axis) -- e.g. `openai-codex/gpt-6-luna`."""
     if not omp_model:
         return False
     return omp_model.lower().startswith("openai-codex/")
@@ -2180,7 +2180,7 @@ def _parse_openai_choice(payload: object) -> str:
     type-guarded so a wrong shape yields "" instead of raising AttributeError/
     TypeError/IndexError out of the backend (those would crash the whole run).
 
-    REASONING MODELS (e.g. z.ai glm-5.2) return `message.content` (the final answer)
+    REASONING MODELS (e.g. z.ai glm-5.3) return `message.content` (the final answer)
     PLUS `message.reasoning_content` (the chain of thought). We read `content` for the
     review text. When `content` is empty/missing but `reasoning_content` is present —
     a reasoning model with a low output-token budget can spend it all on reasoning and
@@ -2473,16 +2473,17 @@ def _openai_compatible_request(
 
 
 # z.ai (Zhipu / GLM) — OpenAI-compatible /chat/completions, Bearer-keyed.
-# DEFAULT base is the GLM Coding Plan endpoint (/api/coding/paas/v4): only that
-# endpoint serves the flagship glm-5.2 (the STANDARD /api/paas/v4 endpoint tops out
-# at glm-5.1 on its /models catalog). So a Coding-Plan key gets glm-5.2 out of the
-# box; a standard-plan user overrides the base via ZAI_BASE_URL=https://api.z.ai/api/paas/v4
-# (and picks a model their plan serves, e.g. ZAI_MODEL=glm-5.1). glm-5.2 is a
-# REASONING model — it returns message.reasoning_content alongside message.content;
+# DEFAULT base is the GLM Coding Plan endpoint (/api/coding/paas/v4): when glm-5.2 was
+# the default, only that endpoint served the flagship (the STANDARD /api/paas/v4 endpoint
+# topped out at glm-5.1 on its /models catalog). The default is now glm-5.3, which
+# answered on the Coding-Plan endpoint on 2026-10-17 (review-cli#645). A standard-plan
+# user overrides the base via ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+# (and picks a model their plan serves, e.g. ZAI_MODEL=glm-5.1). The GLM-5 line is
+# REASONING models — they return message.reasoning_content alongside message.content;
 # _parse_openai_choice reads content and falls back to reasoning_content if content
 # is empty (a low output budget can leave only the reasoning).
 ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
-ZAI_DEFAULT_MODEL = "glm-5.2"
+ZAI_DEFAULT_MODEL = "glm-5.3"
 
 
 def _zai_key() -> str:
@@ -4219,6 +4220,12 @@ def _claude_cli_env() -> dict[str, str]:
     return env
 
 
+def _claude_cli_log_header(claude_model: str | None) -> str | None:
+    """`claude --model <id>` for the call log, so the dashboard attributes the call to the
+    model that ran (review-cli#645: `-m opus48` and the default Opus share the binary)."""
+    return f"claude --model {_safe_log_header(claude_model)}" if claude_model else None
+
+
 def review_claude_cli(
     model: str,
     prompt: str,
@@ -4257,6 +4264,7 @@ def review_claude_cli(
         round_no=round_no,
         announce=_ANNOUNCE_LOGS,
         true_silence_timeout=true_silence_timeout_seconds(model),
+        header_argv0=_claude_cli_log_header(claude_model),
     )
     # Belt-and-suspenders: strip any terminal control noise the CLI still leaked into the
     # pipe (a stray escape sequence) so it can never corrupt the parsed
@@ -4314,6 +4322,7 @@ def review_claude_cli_with_images(
             round_no=round_no,
             announce=_ANNOUNCE_LOGS,
             true_silence_timeout=true_silence_timeout_seconds(model),
+            header_argv0=_claude_cli_log_header(claude_model),
         )
     # The TemporaryDirectory context deleted tmp; remove the trust entry that
     # _ensure_workspace_trusted seeded so dead /tmp/review-cli-claude-images-* paths
@@ -4446,7 +4455,7 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
     if lowered in ("gemini", "gemini-api") or lowered.startswith("gemini:"):
         return review_gemini
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP. `zai`/`glm` plus `zai:<model>`
-    # (e.g. zai:glm-5.2). `glm:` prefix also routes here.
+    # (e.g. zai:glm-5.3). `glm:` prefix also routes here.
     if lowered in ("zai", "z.ai", "zhipu", "glm") or lowered.startswith(
         ("zai:", "z.ai:", "glm:", "zhipu:")
     ):
@@ -4488,7 +4497,7 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
     # an unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
     if (
-        lowered in ("claude", "claude-fable-5")
+        lowered in ("claude", "claude-fable-5", "claude-fable-5-1")
         or lowered.startswith("claude:")
         or lowered.startswith("fable")
     ):
@@ -4538,7 +4547,7 @@ def _oc_selector_is_well_formed(selector: str, provider: str) -> bool:
     to the effective `provider` (so a colon-contaminated `xai:grok/model` — whose provider
     peels as `xai` on the colon — or `zai:/glm` fails, while `gemini-api/...` still matches
     its canonical `gemini`), no whitespace anywhere, and no empty `/`-separated segment
-    (rejects `zai//glm-5.2`, an interior `deepseek//v4` and a trailing `grok-4.5/` alike).
+    (rejects `zai//glm-5.3`, an interior `deepseek//v4` and a trailing `grok-4.5/` alike).
 
     Whitespace is REJECTED, never canonicalised away (review round 2, GH-165, Codex): the
     selector is forwarded to `opencode -m` verbatim by `review_opencode`, so a
@@ -4556,8 +4565,8 @@ def effective_provider(model: str) -> str:
     """The EFFECTIVE underlying provider of a model id, peeling the `oc:`/`opencode:`
     AGENTIC-transport prefix so the real provider — not "opencode" — is what's checked.
 
-    `oc:commandcode/moonshotai/Kimi-K2.7-Code` -> `commandcode`; `oc:fireworks/x` ->
-    `fireworks`; `zai:glm-5.2` -> `zai`; a bare `codex` -> `codex`. Lower-cased. The #25
+    `oc:commandcode/moonshotai/Kimi-K3` -> `commandcode`; `oc:fireworks/x` ->
+    `fireworks`; `zai:glm-5.3` -> `zai`; a bare `codex` -> `codex`. Lower-cased. The #25
     guard needs this because an `oc:` seat is just a transport: the dead-provider check must
     look THROUGH the `oc:` prefix at the provider underneath — otherwise a dead
     `oc:fireworks/...` default reads as the opencode transport and the rot slips past."""
@@ -4621,6 +4630,7 @@ _PROVIDER_ALIASES = {
     "cc": "commandcode",
     "gemini-api": "gemini",
     "claude-fable-5": "claude",
+    "claude-fable-5-1": "claude",
     "z.ai": "zai",
     "zhipu": "zai",
     "glm": "zai",
@@ -5434,7 +5444,7 @@ def default_routes_live(model: str) -> bool:
     if selector is not None:
         # Agentic transport: the full id matched only the opencode branch. Every `oc:` id
         # — named provider or not — must be the exact `provider/model` selector opencode's
-        # CLI wants (an `oc:zai/` or `oc:zai//glm-5.2` default would otherwise pass the
+        # CLI wants (an `oc:zai/` or `oc:zai//glm-5.3` default would otherwise pass the
         # named-provider half and rot at runtime), AND the provider under the transport
         # must itself be a named backend or a documented agentic-only one.
         if not _oc_selector_is_well_formed(selector, provider):
@@ -5584,7 +5594,7 @@ def backend_unavailable_reason(model: str) -> str | None:
             if _omp_selector_is_anthropic(
                 model.split(":", 1)[1] if ":" in model else None
             ):
-                # an unqualified `omp:claude-sonnet-5` runs on the anthropic accounts too
+                # an unqualified `omp:claude-sonnet-5-5` runs on the anthropic accounts too
                 provider = omp_accounts.PROVIDER
             if _omp_auth_available(provider):
                 return None

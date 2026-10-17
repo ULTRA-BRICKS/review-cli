@@ -688,7 +688,7 @@ def resolved_tester_model(models: "list[str] | None" = None) -> "str | None":
 
     Precedence mirrors the backend resolution: ``REVIEW_QA_TESTER_MODEL`` env (the documented
     primary) > a ``-m claude:<model>`` / ``-m codex:<model>`` SUFFIX matching the resolved
-    backend > ``None`` (the backend default). So ``review qa -m claude:claude-opus-4-8`` runs
+    backend > ``None`` (the backend default). So ``review qa -m claude:claude-opus-5-5`` runs
     the claude tester ON opus instead of silently dropping the suffix (review-cli#60), and
     ``REVIEW_QA_TESTER=codex REVIEW_QA_TESTER_MODEL=gpt-5.5`` pins codex's model. A suffix on a
     `-m` whose backend is NOT the resolved one (e.g. `-m codex:x` while the env forces claude)
@@ -731,7 +731,7 @@ def validate_tester_choice(models: "list[str] | None" = None) -> None:
                 f"-m {m!r} names {head!r}, which qa cannot use as a tester. "
                 f"qa supports only: {', '.join(_SUPPORTED_TESTERS)} (opencode is not in v1)."
             )
-        # A model SUFFIX (`-m claude:claude-opus-4-8`) IS forwarded to the spawn now
+        # A model SUFFIX (`-m claude:claude-opus-5-5`) IS forwarded to the spawn now
         # (review-cli#60): `claude --model <m>` / `codex -m <m>`. A suffix on a supported backend
         # is valid; a suffix on an unsupported one is already rejected by the head check above.
 
@@ -748,7 +748,7 @@ def _spawn_claude_writeexec(
     to bring a SUT up and drive it.
 
     ``model`` (review-cli#60): when given, ``--model <model>`` pins the tester's model (e.g.
-    ``review qa -m claude:claude-opus-4-8``); ``None`` uses claude's own default model.
+    ``review qa -m claude:claude-opus-5-5``); ``None`` uses claude's own default model.
 
     Permission mode. A headless agent cannot answer an interactive tool-approval prompt, so a
     mode that still GATES bash (``acceptEdits`` auto-accepts only file edits) denies the
@@ -1232,7 +1232,7 @@ def _build_outcome(
     verdict = _honor_pass_only_with_cases(verdict, cases_run)
     verdict = _reconcile_pass_with_case_tally(verdict, cases)
     verdict = _downgrade_on_backend_failure(verdict, proc.returncode)
-    # The recorded model: the forwarded suffix (`claude:claude-opus-4-8` -> `claude-opus-4-8`)
+    # The recorded model: the forwarded suffix (`claude:claude-opus-5-5` -> `claude-opus-5-5`)
     # when one was passed, else the backend's own default label. Keeps the run-stats/report
     # honest about which model actually ran (review-cli#60).
     model = model or ("codex" if backend == "codex" else "claude")

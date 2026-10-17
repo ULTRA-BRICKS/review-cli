@@ -75,8 +75,8 @@ _DEFAULT_BEHAVIOR = ModelBehavior(
 )
 
 # Per-model overrides. Keyed by the SAME model identifier string review-cli uses
-# elsewhere (board seat / cooldown-store key, e.g. "oc:zai/glm-5.2", "claude:claude-
-# fable-5") so a lookup never needs a second normalization step. Intentionally starts
+# elsewhere (board seat / cooldown-store key, e.g. "omp:zai/glm-5.3", "claude:claude-
+# fable-5-1") so a lookup never needs a second normalization step. Intentionally starts
 # empty of specific overrides beyond the mechanism itself — this repo's own code
 # currently has no VERIFIED per-model silent-thinking data (the "5min" figure that
 # review-cli#153/#159/#179's zai/glm watchdog folklore referenced was never actually

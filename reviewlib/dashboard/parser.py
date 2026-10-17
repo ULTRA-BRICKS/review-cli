@@ -146,9 +146,11 @@ _PAYWALL_SENTINEL = "currentlyunavailable"
 _CF_BLOCK_MARKER = "error code: 1010"
 # z.ai / GLM bad-key stderr marker.
 _BAD_KEY_MARKER = '{"error":"bad key"}'
-# `claude` backend header argv0 carries NO model id (Fable and Opus share the `claude`
-# binary), so the model is inferred from the body sentinel: a paywall body = Fable, any
-# other = Opus. These are the two board claude seats.
+# CLI-mode header argv0 is EXACTLY `claude --model <id>` (written by review_claude_cli
+# since review-cli#645). Logs from older installs carry only the binary path, which
+# Fable and Opus share, so for those the model is inferred from the body sentinel: a
+# paywall body = Fable, any other = Opus -- the two claude seats those installs ran.
+_CLAUDE_CLI_MODEL_RE = re.compile(r"^claude --model\s+(?P<model>\S+)")
 _CLAUDE_FABLE_MODEL = "claude:claude-fable-5"
 _CLAUDE_OPUS_MODEL = "claude:claude-opus-4-8"
 # Backend-name -> board model id for backends with no per-call selector in argv0.
@@ -925,7 +927,7 @@ class Session:
         """The distinct recorded invocation lines (``argv0``) for this session, in order.
 
         The prompt/diff is redacted from the logs, so ``argv0`` (the backend command/endpoint,
-        e.g. ``z.ai API glm-5.2``) is the only durable "what was run" a non-brainstorm session
+        e.g. ``z.ai API glm-5.3``) is the only durable "what was run" a non-brainstorm session
         has; surfacing it lets the Prompts panel / panel rows show the invocation instead of a
         bare "redacted" note. Order-preserving de-dup (one entry per distinct seat)."""
         return list(
@@ -2065,6 +2067,9 @@ def model_id_for_call(call: "CallLog") -> str:
         m = _CLAUDE_API_MODEL_RE.match(call.argv0)
         if m:
             return f"claude:{m.group('model')}"
+        m = _CLAUDE_CLI_MODEL_RE.match(call.argv0)
+        if m:
+            return f"claude:{m.group('model')}"
         # review-cli#326: precomputed on the full untruncated body (see classify_call).
         if call.is_paywall:
             return _CLAUDE_FABLE_MODEL
@@ -2144,7 +2149,7 @@ def _fallback_seat_for(model_id: str) -> dict | None:
     depends on which roles the run already covers; this static hint cannot see that.)
 
     `model_id` is a `model_id_for_call` result, which shares the built-in board id scheme exactly
-    (e.g. `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`), so the exact match below
+    (e.g. `commandcode:moonshotai/Kimi-K3`, `zai:glm-5.3`), so the exact match below
     resolves every BOARD seat's fallback; an off-board model (e.g. `opencode`) correctly has
     none. Iterates the CACHED board tuple directly (no per-call rebuild — glm review finding 5)."""
     board = _board_models_cached()

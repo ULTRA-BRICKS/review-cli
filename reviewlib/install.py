@@ -173,11 +173,12 @@ or set `REVIEW_UNPAID_PROVIDERS=commandcode,fireworks`.
 `review --show-board` lists the seats in priority order with their pool/reserve/unavail
 tier and availability.
 
-The default repo-capable gateway seats are agentic `oc:` routes, not diff-only REST:
-`oc:commandcode/moonshotai/Kimi-K2.7-Code`, `oc:commandcode/Qwen/Qwen3.7-Max`,
-`oc:commandcode/deepseek/deepseek-v4-pro`, `oc:zai/glm-5.2`, `oc:xai/grok-4.6` (Grok,
-via opencode's native xai provider — no diff-only REST fallback exists for it), and
-`omp:opencode-go/mimo-v2.5` (MiMo 2.5 via omp OpenCode Go; agentic `omp:` route).
+The default repo-capable gateway seats are agentic `oc:`/`omp:` routes, not diff-only REST:
+`oc:commandcode/moonshotai/Kimi-K3`, `oc:commandcode/Qwen/Qwen3.8-Max`,
+`oc:commandcode/deepseek/deepseek-v4-pro`, `omp:zai/glm-5.3` (GLM via omp's z.ai
+provider), `oc:xai/grok-4.7` (Grok, via opencode's native xai provider — no diff-only
+REST fallback exists for it), and `omp:opencode-go/mimo-v2.6-pro` (MiMo V2.6 Pro via
+omp OpenCode Go; agentic `omp:` route).
 The `oc:opencode/mimo-v2.5-free` catalog spelling is not DEFAULT-safe. The
 keyed-HTTP `commandcode:` / `zai:` routes remain for explicit `-m cc` / `-m glm` and
 custom config.
@@ -227,15 +228,15 @@ shape `REVIEW_<BACKEND>_MODE` (the one PR #8 introduced for claude):
 ## Keyed HTTP backends: z.ai (GLM) and commandcode
 OpenAI-compatible `POST /chat/completions` REST backends — **diff-only** (no workspace),
 no CLI, just a key. NOTE: the DEFAULT board's Kimi/GLM/Qwen/DeepSeek seats are now the
-**agentic** `oc:commandcode/...` / `oc:zai/glm-5.2` opencode routes (they read the repo and
-authenticate via opencode, not these keys). These keyed-HTTP backends back the **explicit**
+**agentic** `oc:commandcode/...` opencode routes and the `omp:zai/glm-5.3` omp route (they read the repo and
+authenticate via opencode/omp, not these keys). These keyed-HTTP backends back the **explicit**
 `-m cc` / `-m glm` invocations and `commandcode:`/`zai:` config-board seats:
-- **z.ai (Zhipu / GLM)**: `-m zai` / `-m glm` (newest, glm-5.2) — or a pinned id
-  `-m glm52`/`-m glm51`/`-m glm47`/`-m glm46`; `-m zai:<model>` for an explicit one.
+- **z.ai (Zhipu / GLM)**: `-m zai` / `-m glm` (newest, glm-5.3) — or a pinned id
+  `-m glm53`/`-m glm52`/`-m glm51`/`-m glm47`/`-m glm46`; `-m zai:<model>` for an explicit one.
   Key: `ZAI_API_KEY` (or `ZHIPU_API_KEY`). Base/model override: `ZAI_BASE_URL` /
   `ZAI_MODEL`. DEFAULT base is the GLM Coding-Plan endpoint
-  `https://api.z.ai/api/coding/paas/v4` (the only one that serves glm-5.2; the
-  standard `…/api/paas/v4` tops out at glm-5.1), default model `glm-5.2`. Standard-plan
+  `https://api.z.ai/api/coding/paas/v4` (it serves glm-5.3; the
+  standard `…/api/paas/v4` topped out at glm-5.1), default model `glm-5.3`. Standard-plan
   users set `ZAI_BASE_URL=https://api.z.ai/api/paas/v4` and a model their plan serves.
 - **commandcode**: `-m commandcode` (alias `-m cc`; `-m commandcode:<model>` for an
   explicit model). Hits Command Code's Provider API

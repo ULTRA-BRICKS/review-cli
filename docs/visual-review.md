@@ -69,7 +69,7 @@ exception**: its CLI is broken, so the Gemini vision call stays on the REST API 
 model on whatever backend you pick — review never silently uses a text-only model to "verify"
 an image. (For router backends like opencode, that means selecting a vision model explicitly,
 e.g. `oc:<provider>/<vision-model>`.) Visual defaults are separate from the text reviewer
-board: Opus is tried first, then GROK_SEAT (`oc:xai/grok-4.6`), then vision-capable
+board: Opus is tried first, then GROK_SEAT (`oc:xai/grok-4.7`), then vision-capable
 fallbacks including GLM vision (`oc:zai/glm-4.5v`). If Opus is unavailable at runtime,
 review skips to the next visual backend instead of failing while a fallback exists.
 Override with `visual_models:` in

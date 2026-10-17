@@ -269,7 +269,7 @@ def test_build_outcome_records_forwarded_model():
     pass_tail = "## QA RESULTS\nCASES: 1 run, 1 passed, 0 failed, 0 blocked\nVERDICT: PASS\n"
     proc = sp.CompletedProcess(args=["x"], returncode=0, stdout=pass_tail, stderr="")
     # A forwarded model is recorded verbatim.
-    assert ex._build_outcome(proc, backend="claude", wall=1.0, model="claude-opus-4-8").model == "claude-opus-4-8"
+    assert ex._build_outcome(proc, backend="claude", wall=1.0, model="claude-opus-5-5").model == "claude-opus-5-5"
     assert ex._build_outcome(proc, backend="codex", wall=1.0, model="gpt-5.5").model == "gpt-5.5"
     # No forwarded model -> the backend's default label (the pre-#60 behavior).
     assert ex._build_outcome(proc, backend="claude", wall=1.0).model == "claude"
@@ -335,7 +335,7 @@ def test_backend_resolution_honors_m_hint_and_env_precedence():
     os.environ.pop("REVIEW_QA_TESTER", None)
     try:
         assert ex.resolved_tester_backend(["codex"]) == "codex"
-        assert ex.resolved_tester_backend(["claude:claude-opus-4-8"]) == "claude"
+        assert ex.resolved_tester_backend(["claude:claude-opus-5-5"]) == "claude"
         assert ex.resolved_tester_backend(["gemini"]) == "claude"  # unknown → default
         assert ex.resolved_tester_backend(None) == "claude"
         # env wins over the -m hint:
@@ -527,9 +527,9 @@ def test_claude_spawn_forwards_model_flag():
     _b._ensure_workspace_trusted = lambda _cwd: None  # type: ignore[assignment]
     _b._remove_workspace_trust = lambda _cwd: None  # type: ignore[assignment]
     try:
-        ex._spawn_claude_writeexec("prompt", Path("/tmp/review-qa-wt-x"), 60, "claude-opus-4-8")
+        ex._spawn_claude_writeexec("prompt", Path("/tmp/review-qa-wt-x"), 60, "claude-opus-5-5")
         argv = captured["argv"]
-        assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-opus-4-8", argv
+        assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-opus-5-5", argv
         # Plain `claude --print` surface: no retired-wrapper flags, and the variadic
         # `--allowedTools <tools...>` list is closed by `--output-format` (else the tool
         # names would leak into the positional prompt slot).
@@ -586,8 +586,8 @@ def test_is_ephemeral_qa_worktree_predicate():
 
 
 def test_suffixed_tester_is_accepted_and_forwarded():
-    """A model SUFFIX on the qa tester (`-m claude:claude-opus-4-8`, or an alias like `fable`
-    that expands to `claude:claude-fable-5`) is now ACCEPTED, and `resolved_tester_model`
+    """A model SUFFIX on the qa tester (`-m claude:claude-opus-5-5`, or an alias like `fable`
+    that expands to `claude:claude-fable-5-1`) is now ACCEPTED, and `resolved_tester_model`
     extracts the model so the spawn forwards `--model`/`-m` (review-cli#60)."""
     from reviewlib.config import _split_models
 
@@ -597,20 +597,20 @@ def test_suffixed_tester_is_accepted_and_forwarded():
     os.environ.pop("REVIEW_QA_TESTER_MODEL", None)
     try:
         # A supported backend WITH a suffix validates (no raise).
-        ex.validate_tester_choice(_split_models(["claude:claude-opus-4-8"]))
+        ex.validate_tester_choice(_split_models(["claude:claude-opus-5-5"]))
         ex.validate_tester_choice(_split_models(["codex:gpt-5.5"]))
         ex.validate_tester_choice(_split_models(["claude"]))  # bare seat still fine
         # The suffix is resolved to the concrete model, and the backend matches.
-        opus = _split_models(["claude:claude-opus-4-8"])
+        opus = _split_models(["claude:claude-opus-5-5"])
         assert ex.resolved_tester_backend(opus) == "claude"
-        assert ex.resolved_tester_model(opus) == "claude-opus-4-8"
+        assert ex.resolved_tester_model(opus) == "claude-opus-5-5"
         codex_m = _split_models(["codex:gpt-5.5"])
         assert ex.resolved_tester_backend(codex_m) == "codex"
         assert ex.resolved_tester_model(codex_m) == "gpt-5.5"
-        # The `fable` alias expands to claude:claude-fable-5 and forwards that model.
+        # The `fable` alias expands to claude:claude-fable-5-1 and forwards that model.
         fable = _split_models(["fable"])
         assert ex.resolved_tester_backend(fable) == "claude"
-        assert ex.resolved_tester_model(fable) == "claude-fable-5"
+        assert ex.resolved_tester_model(fable) == "claude-fable-5-1"
         # A bare seat (no suffix) forwards NO model (backend default).
         assert ex.resolved_tester_model(_split_models(["claude"])) is None
         # An UNSUPPORTED backend (even with a suffix) is still rejected.
@@ -639,7 +639,7 @@ def test_resolved_tester_model_precedence():
     try:
         # Env model wins over the -m suffix.
         os.environ["REVIEW_QA_TESTER_MODEL"] = "env-model"
-        assert ex.resolved_tester_model(_split_models(["claude:claude-opus-4-8"])) == "env-model"
+        assert ex.resolved_tester_model(_split_models(["claude:claude-opus-5-5"])) == "env-model"
         os.environ.pop("REVIEW_QA_TESTER_MODEL")
         # Env forces claude; a codex:<model> suffix does NOT apply (backend mismatch).
         os.environ["REVIEW_QA_TESTER"] = "claude"

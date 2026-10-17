@@ -23,7 +23,7 @@ from reviewlib.config import (  # noqa: E402
     REVIEW_ROLES,
     SOL_SEAT,
     SONNET_SEAT,
-    TERRA_SEAT,
+    LUNA_SEAT,
     _expand_alias,
     load_board,
 )
@@ -49,62 +49,62 @@ def test_every_review_role_has_bare_fallback_models():
 
 
 def test_fallback_lists_are_the_published_identity():
-    assert ROLE_FALLBACK_MODELS["architect"] == ("claude-fable-5", "claude-opus-4-8")
-    assert ROLE_FALLBACK_MODELS["correctness"] == ("claude-opus-4-8", "gpt-6-astra")
-    assert ROLE_FALLBACK_MODELS["consistency"] == ("gpt-5.6-sol", "gpt-6-astra")
-    assert ROLE_FALLBACK_MODELS["performance"] == ("zai-org/GLM-5.2", "gpt-5.6-terra")
+    assert ROLE_FALLBACK_MODELS["architect"] == ("claude-fable-5-1", "claude-opus-5-5")
+    assert ROLE_FALLBACK_MODELS["correctness"] == ("claude-opus-5-5", "gpt-6-astra")
+    assert ROLE_FALLBACK_MODELS["consistency"] == ("gpt-6.1-sol", "gpt-6-astra")
+    assert ROLE_FALLBACK_MODELS["performance"] == ("zai-org/GLM-5.3", "gpt-6-luna")
     assert ROLE_FALLBACK_MODELS["quality"] == (
-        "moonshotai/Kimi-K2.7-Code",
-        "claude-sonnet-5",
-        "claude-sonnet-5-omp",
+        "moonshotai/Kimi-K3",
+        "claude-sonnet-5-5",
+        "claude-sonnet-5-5-omp",
     )
     assert ROLE_FALLBACK_MODELS["security"] == (
-        "Qwen/Qwen3.7-Max",
-        "grok-4.6",
-        "glm-5.2",
+        "Qwen/Qwen3.8-Max",
+        "grok-4.7",
+        "glm-5.3",
     )
     assert ROLE_FALLBACK_MODELS["tests"] == (
         "deepseek/deepseek-v4-pro",
-        "gpt-5.6-terra",
+        "gpt-6-luna",
     )
     assert ROLE_FALLBACK_MODELS["contracts"] == ("gemini", "gpt-6-astra")
 
 
 def test_seat_for_model_maps_bare_ids_and_passes_prefixed_through():
     assert seat_for_model("gpt-6-astra") == "codex:gpt-6-astra"
-    assert seat_for_model("claude-opus-4-8") == "claude:claude-opus-4-8"
-    assert seat_for_model("grok-4.6") == "oc:xai/grok-4.6"
-    assert seat_for_model("glm-5.2") == "zai:glm-5.2"
+    assert seat_for_model("claude-opus-5-5") == "claude:claude-opus-5-5"
+    assert seat_for_model("grok-4.7") == "oc:xai/grok-4.7"
+    assert seat_for_model("glm-5.3") == "zai:glm-5.3"
     assert seat_for_model("gemini") == "gemini"
     assert seat_for_model("codex:gpt-6-astra") == "codex:gpt-6-astra"
-    assert seat_for_model("claude:claude-opus-4-8") == "claude:claude-opus-4-8"
+    assert seat_for_model("claude:claude-opus-5-5") == "claude:claude-opus-5-5"
 
 
 def test_seat_for_model_sync_pins_config_constants():
-    assert seat_for_model("gpt-5.6-sol") == SOL_SEAT
+    assert seat_for_model("gpt-6.1-sol") == SOL_SEAT
     assert seat_for_model("gpt-6-astra") == ASTRA_SEAT
-    assert seat_for_model("gpt-5.6-terra") == TERRA_SEAT
-    assert seat_for_model("claude-fable-5") == FABLE_SEAT
-    assert seat_for_model("claude-sonnet-5") == SONNET_SEAT
-    assert seat_for_model("grok-4.6") == GROK_SEAT
-    assert seat_for_model("moonshotai/Kimi-K2.7-Code") == KIMI_SEAT
-    assert not seat_for_model("moonshotai/Kimi-K2.7-Code").startswith("oc:")
-    assert seat_for_model("zai-org/GLM-5.2") == GLM_COMMANDCODE_SEAT
+    assert seat_for_model("gpt-6-luna") == LUNA_SEAT
+    assert seat_for_model("claude-fable-5-1") == FABLE_SEAT
+    assert seat_for_model("claude-sonnet-5-5") == SONNET_SEAT
+    assert seat_for_model("grok-4.7") == GROK_SEAT
+    assert seat_for_model("moonshotai/Kimi-K3") == KIMI_SEAT
+    assert not seat_for_model("moonshotai/Kimi-K3").startswith("oc:")
+    assert seat_for_model("zai-org/GLM-5.3") == GLM_COMMANDCODE_SEAT
 
 
 def test_load_board_resolves_bare_model_to_harness_seat():
     board = load_board({"board": [{"model": "gpt-6-astra", "role": "consistency"}]})
     assert board[0].model == "codex:gpt-6-astra"
     prefixed = load_board(
-        {"board": [{"model": "claude:claude-opus-4-8", "role": "correctness"}]}
+        {"board": [{"model": "claude:claude-opus-5-5", "role": "correctness"}]}
     )
-    assert prefixed[0].model == "claude:claude-opus-4-8"
+    assert prefixed[0].model == "claude:claude-opus-5-5"
 
 
 def test_expand_alias_opus_and_bare_opus_id():
-    assert _expand_alias("opus") == "claude:claude-opus-4-8"
-    assert _expand_alias("claude-opus-4-8") == "claude:claude-opus-4-8"
-    assert _expand_alias("glm") == "zai:glm-5.2"
+    assert _expand_alias("opus") == "claude:claude-opus-5-5"
+    assert _expand_alias("claude-opus-5-5") == "claude:claude-opus-5-5"
+    assert _expand_alias("glm") == "zai:glm-5.3"
     assert _expand_alias("gemini") == "gemini"
     assert _expand_alias("commandcode") == "commandcode"
     assert _expand_alias("codex") == "codex"
@@ -138,18 +138,27 @@ def test_show_board_includes_fallback_section():
     assert "Fallbacks per role" in out
     for role in REVIEW_ROLES:
         assert role in out, role
-    assert "claude:claude-opus-4-8" in out
-    assert "oc:xai/grok-4.6" in out
+    assert "claude:claude-opus-5-5" in out
+    assert "oc:xai/grok-4.7" in out
 
 
 def test_bare_model_id_strips_harness_prefix():
     assert (
-        bare_model_id("oc:commandcode/moonshotai/Kimi-K2.7-Code")
-        == "moonshotai/Kimi-K2.7-Code"
+        bare_model_id("oc:commandcode/moonshotai/Kimi-K3")
+        == "moonshotai/Kimi-K3"
     )
-    assert bare_model_id("codex:gpt-5.6-sol") == "gpt-5.6-sol"
+    assert bare_model_id("codex:gpt-6.1-sol") == "gpt-6.1-sol"
     assert bare_model_id("gemini") == "gemini"
 
+
+
+def test_previous_generation_bare_ids_keep_their_harness():
+    """review-cli#645: a config still naming a pre-bump bare id must not fall through to
+    the opencode catch-all; it resolves to the harness it ran on before."""
+    assert _expand_alias("claude-opus-4-8") == "claude:claude-opus-4-8"
+    assert _expand_alias("gpt-5.6-sol") == "codex:gpt-5.6-sol"
+    assert _expand_alias("claude-sonnet-5-omp") == "omp:anthropic/claude-sonnet-5"
+    assert _expand_alias("glm-5.2") == "zai:glm-5.2"
 
 if __name__ == "__main__":
     failures = 0

@@ -827,10 +827,10 @@ def test_classify_call_true_silence_cooldown_skip_is_not_paywall():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         true_silence_skip_body = _bounded_cooldown_skip_body(
-            "oc:zai/glm-5.2", "true-silence timeout", 1800
+            "oc:zai/glm-5.3", "true-silence timeout", 1800
         )
         quota_skip_body = _bounded_cooldown_skip_body(
-            "claude:claude-fable-5", "session limit / usage credits", 1800
+            "claude:claude-fable-5-1", "session limit / usage credits", 1800
         )
         true_silence_skip = p.parse_call_log(
             _write_call_log(
@@ -839,7 +839,7 @@ def test_classify_call_true_silence_cooldown_skip_is_not_paywall():
                 "opencode",
                 0,
                 true_silence_skip_body,
-                argv0="opencode -m zai/glm-5.2 (seat-cooldown skip)",
+                argv0="opencode -m zai/glm-5.3 (seat-cooldown skip)",
                 exit_code=0,
             )
         )
@@ -1200,7 +1200,7 @@ def test_emit_rest_log_swallows_encoding_errors_best_effort():
             # UnicodeEncodeError. _emit_rest_log must swallow it and return normally.
             backends._emit_rest_log(
                 "z.ai",
-                "z.ai API glm-5.2",
+                "z.ai API glm-5.3",
                 round_no=0,
                 returncode=0,
                 stdout="finding: \ud800 broken char",
@@ -1840,7 +1840,9 @@ def test_scan_log_dir_entries_reuses_name_list_when_dir_mtime_unchanged():
         ld = Path(d)
         stamp = "20260601T100000_000000"
         path = _write_call_log(ld, stamp, "codex", 0, "partial output so far\n")
-        quiet = os.stat(ld).st_mtime - 60  # a directory nobody created/deleted in for a while
+        quiet = (
+            os.stat(ld).st_mtime - 60
+        )  # a directory nobody created/deleted in for a while
         os.utime(ld, (quiet, quiet))
         p.os.scandir = _counting_scandir
         try:
@@ -1940,7 +1942,9 @@ def test_load_sessions_days_window_skips_old_stamped_files():
         old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
         body = "[review-cli] codex: /usr/bin/fake (args redacted)\nok\n[review-cli] EXIT 0\n"
         for i in range(n_old):
-            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(body, encoding="utf-8")
+            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(
+                body, encoding="utf-8"
+            )
         for i in range(n_recent):
             recent_dt = newest - timedelta(minutes=i)
             stamp = recent_dt.strftime("%Y%m%dT%H%M%S") + "_000000"
@@ -1995,7 +1999,9 @@ def test_load_sessions_without_days_keeps_all_history():
         old_stamp = (newest - timedelta(days=200)).strftime("%Y%m%dT%H%M%S")
         body = "[review-cli] codex: /usr/bin/fake (args redacted)\nok\n[review-cli] EXIT 0\n"
         for i in range(n_old):
-            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(body, encoding="utf-8")
+            (ld / f"{old_stamp}_{i:06d}Z-codex-r0.log").write_text(
+                body, encoding="utf-8"
+            )
         for i in range(n_recent):
             recent_dt = newest - timedelta(minutes=i)
             stamp = recent_dt.strftime("%Y%m%dT%H%M%S") + "_000000"
@@ -2457,7 +2463,7 @@ def test_panel_session_surfaces_recorded_invocations_as_prompt():
             "z.ai",
             0,
             "ok\n",
-            argv0="z.ai API glm-5.2",
+            argv0="z.ai API glm-5.3",
             exit_code=0,
         )
         _write_call_log(
@@ -2466,7 +2472,7 @@ def test_panel_session_surfaces_recorded_invocations_as_prompt():
             "gemini",
             0,
             "ok\n",
-            argv0="z.ai API glm-5.2",
+            argv0="z.ai API glm-5.3",
             exit_code=0,
         )  # duplicate invocation string
         sessions = p.load_sessions(ld, gap_seconds=90)
@@ -2474,13 +2480,13 @@ def test_panel_session_surfaces_recorded_invocations_as_prompt():
         s = sessions[0]
         assert s.mode == "panel", s.mode
         # Distinct, order-preserving, de-duplicated invocation lines.
-        assert s.invocations == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], (
+        assert s.invocations == ["/opt/homebrew/bin/codex", "z.ai API glm-5.3"], (
             s.invocations
         )
         # And the summary exposes them for the UI (was missing entirely before).
         summ = s.to_summary()
         assert summ["topic"] is None, "a panel run has no brainstorm topic"
-        assert summ["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], (
+        assert summ["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.3"], (
             summ
         )
         # An empty argv0 is never surfaced as a blank invocation.
@@ -2510,7 +2516,7 @@ def test_error_recovery_recovered_when_a_clean_call_follows_in_session():
             "opencode",
             0,
             "[stderr] error code: 1010\n",
-            argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/Qwen/Qwen3.7-Max",
+            argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/Qwen/Qwen3.8-Max",
             exit_code=403,
         )
         _write_call_log(
@@ -2526,7 +2532,7 @@ def test_error_recovery_recovered_when_a_clean_call_follows_in_session():
         errs = s.errors
         assert len(errs) == 1, errs
         e = errs[0]
-        assert e["model"] == "oc:commandcode/Qwen/Qwen3.7-Max", e
+        assert e["model"] == "oc:commandcode/Qwen/Qwen3.8-Max", e
         assert e["health_class"] == p.HEALTH_BLOCKED, e
         assert e["recovery"] == "recovered", (
             e
@@ -2551,12 +2557,12 @@ def test_error_recovery_unrecovered_when_no_clean_call():
             "z.ai",
             0,
             '[stderr] {"error":"bad key"}\n',
-            argv0="z.ai API glm-5.2",
+            argv0="z.ai API glm-5.3",
             exit_code=401,
         )
         s = p.load_sessions(ld, gap_seconds=90)[0]
         e = s.errors[0]
-        assert e["model"] == "zai:glm-5.2", e
+        assert e["model"] == "zai:glm-5.3", e
         assert e["health_class"] == p.HEALTH_AUTH, e
         assert e["recovery"] == "unrecovered", e
 
@@ -2587,11 +2593,11 @@ def test_error_recovery_does_not_overclaim_from_an_earlier_round_success():
             "z.ai",
             3,
             '[stderr] {"error":"bad key"}\n',
-            argv0="z.ai API glm-5.2",
+            argv0="z.ai API glm-5.3",
             exit_code=401,
         )
         s = p.load_sessions(ld, gap_seconds=90)[0]
-        glm_err = next(e for e in s.errors if e["model"] == "zai:glm-5.2")
+        glm_err = next(e for e in s.errors if e["model"] == "zai:glm-5.3")
         assert glm_err["recovery"] == "unrecovered", glm_err
 
 
@@ -2620,7 +2626,7 @@ def test_error_recovery_recovered_by_parallel_panel_sibling_same_round():
             "commandcode",
             0,
             "[stderr] error code: 1010\n",
-            argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+            argv0="commandcode API moonshotai/Kimi-K3",
             exit_code=403,
         )
         s = p.load_sessions(ld, gap_seconds=90)[0]
@@ -2637,7 +2643,9 @@ def test_fallback_seat_prefers_same_role_and_is_none_for_last_seat():
 
     assert DEFAULT_BOARD[0].model == SOL_SEAT
     fb = p._fallback_seat_for(SOL_SEAT)
-    assert fb is not None and fb["model"] == ASTRA_SEAT and fb["role"] == "consistency", fb
+    assert (
+        fb is not None and fb["model"] == ASTRA_SEAT and fb["role"] == "consistency"
+    ), fb
     assert p._fallback_seat_for(DEFAULT_BOARD[-1].model) is None, (
         "the lowest-priority seat has no fallback"
     )
@@ -2648,7 +2656,7 @@ def test_fallback_seat_prefers_same_role_and_is_none_for_last_seat():
 
 def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     """(glm review finding 2/6) The id `model_id_for_call` returns for a real gateway call (e.g.
-    `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`) is EXACTLY a built-in board seat id,
+    `commandcode:moonshotai/Kimi-K3`, `zai:glm-5.3`) is EXACTLY a built-in board seat id,
     so `_fallback_seat_for` resolves a real fallback seat — NOT None — for the in-production
     failing-seat case. Pin it so a board re-id can't silently make every fallback hint blank."""
     from reviewlib.dashboard import parser as p
@@ -2711,11 +2719,11 @@ def test_call_to_dict_carries_resolved_model_for_the_detail_chip():
             "commandcode",
             0,
             "x\n",
-            argv0="commandcode API Qwen/Qwen3.7-Max",
+            argv0="commandcode API Qwen/Qwen3.8-Max",
             exit_code=0,
         )
         c = p.parse_call_log(path)
-        assert c.to_dict()["model"] == "commandcode:Qwen/Qwen3.7-Max", c.to_dict()
+        assert c.to_dict()["model"] == "commandcode:Qwen/Qwen3.8-Max", c.to_dict()
 
 
 def test_stats_exposes_priority_ordered_board():
@@ -2751,7 +2759,7 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
                 "z.ai",
                 0,
                 "ok\n",
-                argv0="z.ai API glm-5.2",
+                argv0="z.ai API glm-5.3",
                 exit_code=0,
             )
             from reviewlib.dashboard import server
@@ -2774,7 +2782,7 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
                 assert runs[0]["mode"] == "panel", runs[0]
                 assert runs[0]["invocations"] == [
                     "/opt/homebrew/bin/codex",
-                    "z.ai API glm-5.2",
+                    "z.ai API glm-5.3",
                 ], runs[0]
             finally:
                 httpd.shutdown()
@@ -3303,7 +3311,9 @@ def test_get_derived_never_caches_a_retry_fallback_result_under_a_foreign_genera
         cache._fingerprint = (1, 1.0, 1)
         cache._generation = 3
         orig_ensure_fresh = cache._ensure_fresh
-        cache._ensure_fresh = lambda gap, *, force, days=7.0: None  # never installs gap=30
+        cache._ensure_fresh = lambda gap, *, force, days=7.0: (
+            None
+        )  # never installs gap=30
         try:
             value = cache.get_derived(
                 30.0, "stats", lambda sessions: f"stats-for-{len(sessions)}-sessions"
@@ -3527,7 +3537,7 @@ def test_compute_stats_by_dimension_covers_non_brainstorm_calls():
     `by_dimension` must cover every mode via the static board model->lens map, so a plain
     `review diff`/quorum call — the vast majority of real traffic — shows a real
     per-dimension (correctness/performance/consistency/...) pass/fail breakdown instead of
-    nothing. codex:gpt-5.6-sol (SOL_SEAT) is DEFAULT_BOARD's priority-1 seat, role
+    nothing. codex:gpt-6.1-sol (SOL_SEAT) is DEFAULT_BOARD's priority-1 seat, role
     "consistency"."""
     from reviewlib.dashboard import parser as p
 
@@ -3540,7 +3550,7 @@ def test_compute_stats_by_dimension_covers_non_brainstorm_calls():
             "codex",
             0,
             "looks good\n",
-            argv0="codex -m gpt-5.6-sol",
+            argv0="codex -m gpt-6.1-sol",
             exit_code=0,
         )
         sessions = p.load_sessions(ld)
@@ -3607,7 +3617,7 @@ def test_compute_stats_by_dimension_counts_exit_0_paywall_as_a_failure(monkeypat
         "_board_models_cached",
         lambda: (
             {
-                "model": p._CLAUDE_FABLE_MODEL,
+                "model": "claude:claude-fable-5-1",
                 "role": "architect",
                 "display": "Fable",
                 "priority": 1,
@@ -3627,8 +3637,6 @@ def test_compute_stats_by_dimension_counts_exit_0_paywall_as_a_failure(monkeypat
         assert dim["ok_rate"] == 0.0
 
 
-
-
 # --- per-model health classifier (Models & roles tab) -----------------------
 #
 # These cover the dashboard's per-model health view + the problematic-count badge. Each
@@ -3639,7 +3647,9 @@ def test_compute_stats_by_dimension_counts_exit_0_paywall_as_a_failure(monkeypat
 # wrapper into Fable (paywall) vs Opus.
 
 
-def _fable_paywall_log(log_dir: Path, stamp: str) -> Path:
+def _fable_paywall_log(
+    log_dir: Path, stamp: str, argv0: str = "claude --model claude-fable-5-1"
+) -> Path:
     # The on-disk Fable body has interior whitespace collapsed (the logger strips it), so
     # the sentinel reads `currentlyunavailable`. EXIT is 0 — the body, not the code, is the
     # failure signal.
@@ -3649,19 +3659,21 @@ def _fable_paywall_log(log_dir: Path, stamp: str) -> Path:
         "claude",
         0,
         "ClaudeFable5iscurrentlyunavailable.Learnmore:\nhttps://www.anthropic.com/news/fable\n",
-        argv0="/Users/x/.local/bin/claude",
+        argv0=argv0,
         exit_code=0,
     )
 
 
-def _opus_ok_log(log_dir: Path, stamp: str) -> Path:
+def _opus_ok_log(
+    log_dir: Path, stamp: str, argv0: str = "claude --model claude-opus-5-5"
+) -> Path:
     return _write_call_log(
         log_dir,
         stamp,
         "claude",
         0,
         "## Findings\n1. A real, substantive review verdict about the diff.\n",
-        argv0="/Users/x/.local/bin/claude",
+        argv0=argv0,
         exit_code=0,
     )
 
@@ -3681,7 +3693,7 @@ def test_classify_paywall_auth_blocked_timeout_empty_ok():
                 "z.ai",
                 0,
                 '[stderr] {"error":"bad key"}\n',
-                argv0="z.ai API glm-5.2",
+                argv0="z.ai API glm-5.3",
                 exit_code=401,
             )
         )
@@ -3693,7 +3705,7 @@ def test_classify_paywall_auth_blocked_timeout_empty_ok():
                 "commandcode",
                 0,
                 "[stderr] error code: 1010\n",
-                argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+                argv0="commandcode API moonshotai/Kimi-K3",
                 exit_code=403,
             )
         )
@@ -3706,7 +3718,7 @@ def test_classify_paywall_auth_blocked_timeout_empty_ok():
                 0,
                 "partial\n[stderr] commandcode API request failed: timed out\n"
                 "[review-cli] TIMEOUT after 10s — partial output above]\n",
-                argv0="commandcode API Qwen/Qwen3.7-Max",
+                argv0="commandcode API Qwen/Qwen3.8-Max",
                 exit_code=124,
             )
         )
@@ -3718,7 +3730,7 @@ def test_classify_paywall_auth_blocked_timeout_empty_ok():
                 "z.ai",
                 0,
                 "[reasoning_content — no final answer returned]\n\nprompt_tokens=0 output_tokens=0\n",
-                argv0="z.ai API glm-5.2",
+                argv0="z.ai API glm-5.3",
                 exit_code=0,
             )
         )
@@ -3751,7 +3763,7 @@ def test_real_output_with_zero_usage_fallback_is_ok_not_empty():
                 0,
                 "## Findings\n1. A real, substantive review verdict about the diff.\n"
                 "\n\ninput_tokens=0 output_tokens=0\n",
-                argv0="Anthropic API claude-opus-4-8",
+                argv0="Anthropic API claude-opus-5-5",
                 exit_code=0,
             )
         )
@@ -3767,7 +3779,7 @@ def test_real_output_with_zero_usage_fallback_is_ok_not_empty():
                 "claude",
                 0,
                 "input_tokens=0 output_tokens=0\n",
-                argv0="Anthropic API claude-opus-4-8",
+                argv0="Anthropic API claude-opus-5-5",
                 exit_code=0,
             )
         )
@@ -3789,7 +3801,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
                 "opencode",
                 0,
                 "x\n",
-                argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code",
+                argv0="opencode -m commandcode/moonshotai/Kimi-K3",
                 exit_code=0,
             )
         )
@@ -3811,7 +3823,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
                 "opencode",
                 0,
                 "x\n",
-                argv0="opencode -m zai/glm-5.2",
+                argv0="opencode -m zai/glm-5.3",
                 exit_code=0,
             )
         )
@@ -3824,7 +3836,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
                 "commandcode",
                 0,
                 "x\n",
-                argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+                argv0="commandcode API moonshotai/Kimi-K3",
                 exit_code=0,
             )
         )
@@ -3835,7 +3847,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
                 "z.ai",
                 0,
                 "x\n",
-                argv0="z.ai API glm-5.2",
+                argv0="z.ai API glm-5.3",
                 exit_code=0,
             )
         )
@@ -3881,7 +3893,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
                 "codex",
                 0,
                 "x\n",
-                argv0="codex -m gpt-5.6-sol",
+                argv0="codex -m gpt-6.1-sol",
                 exit_code=0,
             )
         )
@@ -3904,25 +3916,25 @@ def test_model_attribution_splits_shared_backends_and_claude():
         opus = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
 
         # opencode seats attribute to the `oc:provider/model` board id.
-        assert p.model_id_for_call(kimi) == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+        assert p.model_id_for_call(kimi) == "oc:commandcode/moonshotai/Kimi-K3"
         assert (
             p.model_id_for_call(deepseek) == "oc:commandcode/deepseek/deepseek-v4-pro"
         )
-        assert p.model_id_for_call(glm) == "oc:zai/glm-5.2"
+        assert p.model_id_for_call(glm) == "oc:zai/glm-5.3"
         # The diff-only REST backends still split into their gateway model ids.
-        assert p.model_id_for_call(kimi_rest) == "commandcode:moonshotai/Kimi-K2.7-Code"
-        assert p.model_id_for_call(glm_rest) == "zai:glm-5.2"
+        assert p.model_id_for_call(kimi_rest) == "commandcode:moonshotai/Kimi-K3"
+        assert p.model_id_for_call(glm_rest) == "zai:glm-5.3"
         # OpenRouter splits per slug (the `/` and any `:variant` survive intact).
         assert (
             p.model_id_for_call(or_claude) == "openrouter:anthropic/claude-3.5-sonnet"
         )
         assert p.model_id_for_call(or_gpt) == "openrouter:openai/gpt-4o:beta"
         assert p.model_id_for_call(codex) == "codex"
-        assert p.model_id_for_call(sol) == "codex:gpt-5.6-sol"
+        assert p.model_id_for_call(sol) == "codex:gpt-6.1-sol"
         assert p.model_id_for_call(astra) == "codex:gpt-6-astra"
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
-        assert p.model_id_for_call(fable) == "claude:claude-fable-5"
-        assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(fable) == "claude:claude-fable-5-1"
+        assert p.model_id_for_call(opus) == "claude:claude-opus-5-5"
 
 
 def test_opencode_call_attributes_to_oc_board_seat_and_matches_default_board():
@@ -3986,7 +3998,7 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
                 "claude",
                 0,
                 "## Findings\n1. A real verdict from Fable via the API.\n",
-                argv0="Anthropic API claude-fable-5",
+                argv0="Anthropic API claude-fable-5-1",
                 exit_code=0,
             )
         )
@@ -3998,16 +4010,16 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
                 "claude",
                 0,
                 "## Findings\n1. A real verdict from Opus via the API.\n",
-                argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com",
+                argv0="Anthropic API claude-opus-5-5 @ https://api.anthropic.com",
                 exit_code=0,
             )
         )
-        # CLI mode (claude): argv0 has no model, so the body sentinel still decides.
+        # CLI mode (claude) since review-cli#645: argv0 names the model.
         opus_cli = p.parse_call_log(_opus_ok_log(ld, "20260601T100800_000000"))
-        # CLI mode where the `claude` binary PATH itself contains `API ` (e.g. installed
-        # under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read `Tools/claude`
-        # as the model; the anchored `^Anthropic API ` match must NOT, so this still falls
-        # through to the body sentinel (paywall=Fable / else Opus).
+        # A pre-#645 CLI log where the `claude` binary PATH itself contains `API ` (e.g.
+        # installed under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read
+        # `Tools/claude` as the model; the anchored `^Anthropic API ` match must NOT, so this
+        # still falls through to the body sentinel (paywall=Fable 5 / else Opus 4.8).
         opus_cli_apipath = p.parse_call_log(
             _write_call_log(
                 ld,
@@ -4031,9 +4043,9 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
             )
         )
 
-        assert p.model_id_for_call(fable_api) == "claude:claude-fable-5"
-        assert p.model_id_for_call(opus_api) == "claude:claude-opus-4-8"
-        assert p.model_id_for_call(opus_cli) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(fable_api) == "claude:claude-fable-5-1"
+        assert p.model_id_for_call(opus_api) == "claude:claude-opus-5-5"
+        assert p.model_id_for_call(opus_cli) == "claude:claude-opus-5-5"
         assert p.model_id_for_call(opus_cli_apipath) == "claude:claude-opus-4-8"
         assert p.model_id_for_call(fable_cli_apipath) == "claude:claude-fable-5"
 
@@ -4143,18 +4155,19 @@ def test_compute_model_health_covers_board_and_flags_problematic():
                 "opencode",
                 0,
                 "[stderr] error code: 1010\n",
-                argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code",
+                argv0="opencode -m commandcode/moonshotai/Kimi-K3",
                 exit_code=403,
             )
-        # GLM (agentic opencode via the zai provider) — 3 auth failures => problematic.
+        # GLM (agentic omp via the zai provider, review-cli#645) — 3 auth failures =>
+        # problematic.
         for i in range(3):
             _write_call_log(
                 ld,
                 f"20260601T1100{i:02d}_000000",
-                "opencode",
+                "omp",
                 0,
                 '[stderr] {"error":"bad key"}\n',
-                argv0="opencode -m zai/glm-5.2",
+                argv0="omp -m zai/glm-5.3",
                 exit_code=401,
             )
         # k3 review finding (review-cli#286, round 3): Fable is now in NO preset
@@ -4183,12 +4196,12 @@ def test_compute_model_health_covers_board_and_flags_problematic():
 
         # Every built-in board model is represented, even no-data seats.
         for board_id in (
-            "claude:claude-opus-4-8",
+            "claude:claude-opus-5-5",
             ASTRA_SEAT,
-            "claude:claude-fable-5",
-            "codex:gpt-5.6-sol",
-            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-            "oc:zai/glm-5.2",
+            "claude:claude-fable-5-1",
+            "codex:gpt-6.1-sol",
+            "oc:commandcode/moonshotai/Kimi-K3",
+            "omp:zai/glm-5.3",
         ):
             assert board_id in health, board_id
         # Astra had no calls (only bare `codex` calls were logged above) => no_data,
@@ -4196,16 +4209,16 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         assert health[ASTRA_SEAT]["status"] == "no_data"
         assert health[ASTRA_SEAT]["problematic"] is False
 
-        assert health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["problematic"] is True
+        assert health["oc:commandcode/moonshotai/Kimi-K3"]["problematic"] is True
         assert (
-            health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["dominant_class"]
+            health["oc:commandcode/moonshotai/Kimi-K3"]["dominant_class"]
             == p.HEALTH_BLOCKED
         )
-        assert health["oc:zai/glm-5.2"]["problematic"] is True
-        assert health["oc:zai/glm-5.2"]["dominant_class"] == p.HEALTH_AUTH
-        assert health["claude:claude-fable-5"]["problematic"] is True
-        assert health["claude:claude-fable-5"]["dominant_class"] == p.HEALTH_PAYWALL
-        assert health["claude:claude-fable-5"]["on_board"] is True
+        assert health["omp:zai/glm-5.3"]["problematic"] is True
+        assert health["omp:zai/glm-5.3"]["dominant_class"] == p.HEALTH_AUTH
+        assert health["claude:claude-fable-5-1"]["problematic"] is True
+        assert health["claude:claude-fable-5-1"]["dominant_class"] == p.HEALTH_PAYWALL
+        assert health["claude:claude-fable-5-1"]["on_board"] is True
         # Bare `codex` is an OFF-BOARD observed row now (union of board + observed
         # models, parser.py) -- pin that explicitly so a future regression that drops
         # this union can't hide behind an unrelated key.
@@ -4213,8 +4226,8 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         assert health["codex"]["problematic"] is False
         assert health["codex"]["ok_rate"] == 1.0
         # Opus had no calls => no_data, not problematic.
-        assert health["claude:claude-opus-4-8"]["status"] == "no_data"
-        assert health["claude:claude-opus-4-8"]["problematic"] is False
+        assert health["claude:claude-opus-5-5"]["status"] == "no_data"
+        assert health["claude:claude-opus-5-5"]["problematic"] is False
 
         # Badge count includes problematic built-in board models, including heavy seats.
         assert stats["problematic_count"] == 3
@@ -4269,7 +4282,7 @@ def test_model_health_empty_log_dir_is_graceful():
         assert all(m["status"] == "no_data" for m in stats["model_health"])
         assert {m["model"] for m in stats["model_health"]} >= {
             ASTRA_SEAT,
-            "oc:zai/glm-5.2",
+            "omp:zai/glm-5.3",
         }
 
 
@@ -4308,7 +4321,7 @@ def test_blocked_marker_in_body_not_just_stderr_is_blocked():
                 "commandcode",
                 0,
                 "error code: 1010\n",
-                argv0="commandcode API Qwen/Qwen3.7-Max",
+                argv0="commandcode API Qwen/Qwen3.8-Max",
                 exit_code=1,
             )
         )
@@ -4636,7 +4649,7 @@ def test_claude_api_mode_emits_a_sidecar_log():
         try:
             urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
             result = backends.review_claude_api(
-                "claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=2
+                "claude:claude-opus-5-5", "review", "", Path(logd), 30, round_no=2
             )
         finally:
             urllib.request.urlopen = old_urlopen
@@ -4668,7 +4681,7 @@ def test_claude_api_missing_key_still_emits_a_sidecar():
         try:
             backends._anthropic_api_config = lambda: None
             result = backends.review_claude_api(
-                "claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=0
+                "claude:claude-opus-5-5", "review", "", Path(logd), 30, round_no=0
             )
         finally:
             backends._anthropic_api_config = old_cfg
@@ -5971,6 +5984,49 @@ def test_sse_baseline_snapshot_is_taken_before_first_byte_no_lost_event():
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
 
 
+def test_selectorless_claude_cli_logs_keep_the_pre_645_models():
+    """review-cli#645: since 0.51.0 every CLI call logs `claude --model <id>`, so a log
+    with only the binary path was written by an older install and ran Opus 4.8 / Fable 5,
+    whatever its date (an install upgraded late still wrote such logs after the bump)."""
+    from reviewlib.dashboard import parser as p
+
+    legacy = "/Users/x/.local/bin/claude"
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        fable = p.parse_call_log(
+            _fable_paywall_log(ld, "20261120T000000_000000", legacy)
+        )
+        opus = p.parse_call_log(_opus_ok_log(ld, "20261120T000001_000000", legacy))
+    assert p.model_id_for_call(fable) == "claude:claude-fable-5"
+    assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
+
+
+def test_claude_cli_log_header_names_the_model_and_wins_over_the_date():
+    """review-cli#645: CLI calls log `claude --model <id>`, so a pinned `-m opus48` run
+    after the board bump is still attributed to Opus 4.8, not the date's default."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    assert backends._claude_cli_log_header("claude-opus-4-8") == (
+        "claude --model claude-opus-4-8"
+    )
+    assert backends._claude_cli_log_header(None) is None
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pinned = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20261101T100000_000000",
+                "claude",
+                0,
+                "## Findings\nok\n",
+                argv0="claude --model claude-opus-4-8",
+                exit_code=0,
+            )
+        )
+    assert p.model_id_for_call(pinned) == "claude:claude-opus-4-8"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
@@ -6028,8 +6084,12 @@ def test_scan_log_dir_entries_does_not_cache_a_listing_taken_in_the_dir_mtime_ti
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        keep = _write_call_log(ld, "20260601T100000_000000", "codex", 0, "a\n", exit_code=0)
-        gone = _write_call_log(ld, "20260601T100001_000000", "codex", 0, "b\n", exit_code=0)
+        keep = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, "a\n", exit_code=0
+        )
+        gone = _write_call_log(
+            ld, "20260601T100001_000000", "codex", 0, "b\n", exit_code=0
+        )
         tick = os.stat(ld).st_mtime
         assert p._scan_log_dir_entries(ld).total_count == 2
         gone.unlink()

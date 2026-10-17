@@ -465,8 +465,8 @@ def _flat_seat_with_provider_failover(
     `dispatch` is called with the CONCRETE provider spelling for each attempt (not the
     original `model`), so a per-provider `--effort <route>=<level>` override
     (`_seat_effort`/`EffortOverride.effort_for`, keyed on the backend ROUTE) resolves against
-    whichever provider is ACTUALLY running at that attempt — e.g. after `zai:glm-5.2` fails
-    over to `oc:zai/glm-5.2`, an `--effort opencode=high` override applies (the seat now
+    whichever provider is ACTUALLY running at that attempt — e.g. after `zai:glm-5.3` fails
+    over to `oc:zai/glm-5.3`, an `--effort opencode=high` override applies (the seat now
     genuinely runs the opencode route) while a `--effort zai=high` override no longer does.
     This is intentional (raised as a 'please confirm' item on review of #157): a route-keyed
     override exists to size whichever backend executes, not the originally-requested route.
@@ -483,8 +483,8 @@ def _flat_seat_with_provider_failover(
     The last-working-cache WRITE (`remember_working_provider`/`forget_working_provider`) is
     gated the SAME way `provider_chain`'s cache-reorder READ is
     (`is_default_provider_selection`): an explicit alternate pin (`-m
-    commandcode:zai-org/GLM-5.2`) succeeding/failing must not train/clear the shared
-    logical-key cache entry a later BARE alias request (`-m glm52`) reads (review of #157:
+    commandcode:zai-org/GLM-5.3`) succeeding/failing must not train/clear the shared
+    logical-key cache entry a later BARE alias request (`-m glm53`) reads (review of #157:
     'cache write isn't gated the way the read is')."""
     from ..provider_failover import (
         forget_working_provider,
@@ -527,7 +527,9 @@ def _flat_seat_with_provider_failover(
             if cache_eligible:
                 remember_working_provider(model, provider_model)
             # review-cli#594: name the stand-in executor (e.g. omp for a dead Claude CLI).
-            substituted = mark_substitution(result, model, provider_model, failed, chain)
+            substituted = mark_substitution(
+                result, model, provider_model, failed, chain
+            )
             return replace(substituted, model=model)
         last = result
         failed.append((provider_model, result))
@@ -1065,7 +1067,7 @@ def _report_pool_shortfall(
     alias-expands) this is usually still accurate (the chain probe is strictly
     weaker-or-equal to this re-probe for a CONCRETE spelling, so a seat that failed the
     former usually fails the latter too, with a real reason). Narrow exception (k3
-    review finding, round 4): a bare-ALIAS board seat (e.g. `glm52`, not `oc:zai/glm-5.2`)
+    review finding, round 4): a bare-ALIAS board seat (e.g. `glm53`, not `oc:zai/glm-5.3`)
     re-probes the unexpanded alias, which can miss an unpaid-provider mark or resolve to
     a different backend than the chain actually tried -- "reason unknown" (or a
     misleading reason) is reachable for that specific shape, not fully dead code. (2) a

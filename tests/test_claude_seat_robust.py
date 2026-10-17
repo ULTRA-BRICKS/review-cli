@@ -245,8 +245,10 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
         round_no,
         announce,
         true_silence_timeout=None,
+        header_argv0=None,
     ):
         captured["argv"] = argv
+        captured["header_argv0"] = header_argv0
         captured["env"] = env
         captured["timeout"] = timeout
         captured["backend"] = backend
@@ -283,6 +285,8 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     assert captured["env"]["TERM"] == "dumb"
     assert captured["timeout"] == 30
     assert captured["backend"] == "claude"
+    # review-cli#645: the call log names the model, so the dashboard can attribute it.
+    assert captured["header_argv0"] == "claude --model claude-opus-4-8"
     # The reported command reflects the `claude --print` invocation.
     assert "claude --print" in res.command
 
@@ -304,8 +308,10 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
         round_no,
         announce,
         true_silence_timeout=None,
+        header_argv0=None,
     ):
         captured["argv"] = argv
+        captured["header_argv0"] = header_argv0
         captured["cwd"] = Path(cwd)
         captured["input_text"] = input_text
         captured["timeout"] = timeout
@@ -351,6 +357,7 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
     assert root not in trusted
     assert add_dir in trusted
     assert captured["timeout"] == 30
+    assert captured["header_argv0"] == "claude --model claude-opus-4-8"
     assert "=== RAW VISUAL ATTACHMENT ===" in captured["input_text"]
     assert "image @refs" in res.command
     assert res.stdout == "I saw the pixels"

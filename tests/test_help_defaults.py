@@ -15,6 +15,7 @@ Driven through the real top-level parser's help text. The config-cascade case is
 HOME to a temp dir (CONFIG_PATH = ~/.config/review-cli/config.yaml resolves via Path.home())
 so it never reads the developer's real config.
 """
+
 from __future__ import annotations
 
 import os
@@ -119,6 +120,7 @@ def test_brainstorm_model_default_reflects_brainstorm_models():
     finally:
         cli.load_config = saved
     assert "brainstorm_models" in line, line
+    # `fable5` is a version-pinned alias: it keeps naming Fable 5, not the current pin.
     assert "fable5" in line or "claude:claude-fable-5" in line, line
 
 
@@ -127,26 +129,29 @@ def test_moderator_help_shows_the_autopick_chain():
     # on those subcommands — assert the concrete auto-pick chain there, not the bare phrasing.
     text = _mode_help("quorum")
     assert "--moderator" in text
-    assert "claude:claude-opus-4-8" in text, text
+    assert "claude:claude-opus-5-5" in text, text
     assert "codex" in text and "gemini" in text, text
 
 
-def test_config_help_documents_grok46_aliases():
-    """`review help config` names grok/grok46/grok-4.6 -> GROK_SEAT and pins grok45
-    to Grok 4.5, matching MODEL_ALIASES."""
+def test_config_help_documents_grok_aliases():
+    """`review help config` names grok/grok47/grok-4.7 -> GROK_SEAT and pins
+    grok46/grok-4.6 and grok45 to their own releases, matching MODEL_ALIASES."""
     text = cli._help_topic_config()
+    assert "grok47" in text, text
+    assert "grok-4.7" in text, text
+    assert "oc:xai/grok-4.7" in text, text
     assert "grok46" in text, text
-    assert "grok-4.6" in text, text
     assert "oc:xai/grok-4.6" in text, text
     assert "grok45" in text, text
     assert "oc:xai/grok-4.5" in text, text
 
 
 def test_config_help_documents_mimo_aliases():
-    """`review help config` names mimo/mimo25/mimo-2.5 -> MIMO_SEAT."""
+    """`review help config` names mimo/mimo26 -> MIMO_SEAT and the mimo25/mimo-2.5 pins."""
     text = cli._help_topic_config()
     assert "mimo" in text, text
-    assert "mimo25" in text, text
+    assert "mimo26" in text, text
+    assert "omp:opencode-go/mimo-v2.6-pro" in text, text
     assert "mimo-2.5" in text, text
     assert "omp:opencode-go/mimo-v2.5" in text, text
 
@@ -155,9 +160,11 @@ def test_numeric_defaults_are_concrete():
     # --pool / --timeout are global (top-level); --vision-timeout is a visual flag scoped to
     # the subcommands. Assert each shows its concrete numeric default on the right surface.
     top = _top_level_help()
-    assert "default 4" in top, top              # --pool
+    assert "default 4" in top, top  # --pool
     assert "1200" in top and "240" in top, top  # --timeout (review / panel)
-    assert "default 60" in _mode_help("diff"), _mode_help("diff")  # --vision-timeout (visual)
+    assert "default 60" in _mode_help("diff"), _mode_help(
+        "diff"
+    )  # --vision-timeout (visual)
 
 
 def test_preset_help_recommends_when_to_use_each_preset():
@@ -217,8 +224,19 @@ def _option_strings(parser_help: str) -> str:
 
 
 # --- Subcommand-only options belong in the SUBCOMMAND help, not the global list (ROADMAP). -
-VISUAL_FLAGS = ("--visual", "--before", "--intent", "--expect", "--check", "--json",
-                "--strict", "--no-ai", "--no-local-model", "--vision-timeout", "--project")
+VISUAL_FLAGS = (
+    "--visual",
+    "--before",
+    "--intent",
+    "--expect",
+    "--check",
+    "--json",
+    "--strict",
+    "--no-ai",
+    "--no-local-model",
+    "--vision-timeout",
+    "--project",
+)
 VISUAL_SUBCOMMAND_FLAGS = tuple(flag for flag in VISUAL_FLAGS if flag != "--visual")
 
 
@@ -246,18 +264,33 @@ def test_visual_help_example_includes_required_task_code():
 
 
 def test_prompt_is_scoped_to_the_diff_review():
-    assert "--prompt" not in _option_strings(_top_level_help()), "prompt leaked to global"
-    assert "--prompt" in _option_strings(_mode_help("diff")), "diff review needs --prompt"
+    assert "--prompt" not in _option_strings(_top_level_help()), (
+        "prompt leaked to global"
+    )
+    assert "--prompt" in _option_strings(_mode_help("diff")), (
+        "diff review needs --prompt"
+    )
     for sub in ("just-ask", "quorum", "brainstorm"):
-        assert "--prompt" not in _option_strings(_mode_help(sub)), (sub, "must not have --prompt")
+        assert "--prompt" not in _option_strings(_mode_help(sub)), (
+            sub,
+            "must not have --prompt",
+        )
 
 
 def test_moderator_is_scoped_to_panel_modes():
-    assert "--moderator" not in _option_strings(_top_level_help()), "moderator leaked to global"
+    assert "--moderator" not in _option_strings(_top_level_help()), (
+        "moderator leaked to global"
+    )
     for sub in ("quorum", "brainstorm"):
-        assert "--moderator" in _option_strings(_mode_help(sub)), (sub, "panel mode needs --moderator")
+        assert "--moderator" in _option_strings(_mode_help(sub)), (
+            sub,
+            "panel mode needs --moderator",
+        )
     for sub in ("diff", "just-ask"):
-        assert "--moderator" not in _option_strings(_mode_help(sub)), (sub, "must not have --moderator")
+        assert "--moderator" not in _option_strings(_mode_help(sub)), (
+            sub,
+            "must not have --moderator",
+        )
 
 
 def test_subcommand_only_flags_set_covers_every_mode_only_flag():
@@ -290,8 +323,17 @@ def test_subcommand_only_flags_set_covers_every_mode_only_flag():
 
 def test_global_help_lists_only_truly_global_options():
     opts = _option_strings(_top_level_help())
-    for flag in ("-m, --model", "-C, --cwd", "--task", "-o, --output", "--timeout",
-                 "--list-defaults", "--show-board", "--preset", "--pool"):
+    for flag in (
+        "-m, --model",
+        "-C, --cwd",
+        "--task",
+        "-o, --output",
+        "--timeout",
+        "--list-defaults",
+        "--show-board",
+        "--preset",
+        "--pool",
+    ):
         assert flag in opts, (flag, "missing from the global option list")
     # The mode/diff-source-only flags must NOT be global.
     for flag in ("--diff", "--staged", "--prompt", "--moderator"):
@@ -308,7 +350,10 @@ def test_help_end_to_end_via_cli_shows_model_default():
 
         proc = subprocess.run(
             [sys.executable, str(REPO_ROOT / "bin" / "review"), "--help"],
-            capture_output=True, text=True, timeout=60, env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
         )
         assert proc.returncode == 0, (proc.returncode, proc.stderr)
         assert "preset reviewer board" in proc.stdout, proc.stdout

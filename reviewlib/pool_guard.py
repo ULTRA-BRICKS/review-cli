@@ -31,8 +31,10 @@ what's degraded, never an opaque non-convergence.
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .config import SOL_SEAT, _expand_alias
@@ -54,29 +56,42 @@ PROCEED = "proceed"
 PROPOSE = "propose"
 UNSATISFIED = "unsatisfied"
 
-# A bare `codex` model string uses the codex CLI's OWN default (`~/.codex/config.toml`'s
-# `model =`), which today happens to be gpt-5.6-sol — the SAME model SOL_SEAT pins
-# explicitly. That equivalence is a fact about the codex CLI's local default, not about
-# DEFAULT_BOARD (whose priority-5 seat is now pinned to ASTRA_SEAT, gpt-6-astra, a
-# genuinely distinct model — see config.py). It still matters here because a user can
-# type `-m codex,sol` directly: without this collapse that would count as a 2-model
-# panel when it's one engine reviewed twice. For DISTINCT-engine counting the two must
-# collapse to one. Only these two collapse; every other `codex:<model>` (including
-# ASTRA_SEAT) stays its own key.
-_CODEX_ENGINE_KEY = "codex-engine"
-_CODEX_SOL_EQUIVALENTS = frozenset({"codex", SOL_SEAT.lower()})
+
+# A bare `codex` model string uses the codex CLI's OWN default (`$CODEX_HOME/config.toml`'s
+# top-level `model =`), so it is the same engine as an explicit `codex:<that model>` --
+# e.g. `-m codex,sol` is one engine reviewed twice when the local default is Sol. The
+# default is read from the CLI's user config because a pin bump in review-cli
+# (review-cli#645) does not change what the user's codex CLI runs. A file without a
+# `model` (or none at all) leaves a bare `codex` its own key. On a 3.9/3.10 host with no
+# TOML parser the guard keeps its earlier assumption that the default is SOL_SEAT's model.
+# A trusted project's own `.codex/config.toml` override is not consulted.
+def _codex_default_model() -> str | None:
+    from .modes.qa import _toml_loader
+
+    loads = _toml_loader()
+    if loads is None:
+        return SOL_SEAT.split(":", 1)[1]
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    try:
+        model = loads((home / "config.toml").read_text(encoding="utf-8")).get("model")
+    except (OSError, UnicodeDecodeError, ValueError):  # TOMLDecodeError is a ValueError
+        return None
+    if not isinstance(model, str):
+        return None
+    return model.strip() or None
 
 
 def default_distinct_key(model: str) -> str:
-    """Canonical key for counting DISTINCT reviewer engines. Collapses codex/Sol (same
-    underlying model) AND provider-variants of one logical model (via provider_failover's
-    logical_key — so `zai:glm-5.2`, `oc:zai/glm-5.2`, `commandcode:zai-org/GLM-5.2` are ONE
-    engine, and `opus`/`oc:anthropic/claude-opus-4-8` collapse too). This keeps the guard's
-    'distinct live models' count consistent with what provider-failover treats as one model,
-    so `-m zai:glm-5.2,oc:zai/glm-5.2` is correctly seen as one engine, not a 2-model panel."""
-    m = _expand_alias(model).lower()
-    if m in _CODEX_SOL_EQUIVALENTS:
-        return _CODEX_ENGINE_KEY
+    """Canonical key for counting DISTINCT reviewer engines. Collapses a bare `codex` onto
+    the codex CLI's configured default model AND provider-variants of one logical model
+    (via provider_failover's logical_key — so `zai:glm-5.3`, `omp:zai/glm-5.3`,
+    `oc:zai/glm-5.3`, `commandcode:zai-org/GLM-5.3` are ONE engine, and
+    `opus`/`oc:anthropic/claude-opus-5-5` collapse too). This keeps the guard's 'distinct
+    live models' count consistent with what provider-failover treats as one model, so
+    `-m zai:glm-5.3,oc:zai/glm-5.3` is correctly seen as one engine, not a 2-model panel."""
+    if _expand_alias(model).strip().lower() == "codex":
+        default = _codex_default_model()
+        return logical_key(f"codex:{default}") if default else "codex"
     return logical_key(model)
 
 

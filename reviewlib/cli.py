@@ -1681,6 +1681,7 @@ _HARNESS_ARG_ALIASES = {
     "zai": "z.ai",
     "zhipu": "z.ai",
     "glm": "z.ai",
+    "glm53": "z.ai",
     "glm52": "z.ai",
     "glm51": "z.ai",
     "glm47": "z.ai",
@@ -5265,9 +5266,15 @@ CONFIG FILE
     admission:         mapping     host-wide parallelism budget (headroom, per-seat cost,
                        min/max slots, per-provider limits, ...). See HOST-WIDE ADMISSION
                        below for every key, its REVIEW_ADMISSION_* env var and default.
-  Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
-  `glm` -> zai:glm-5.2, `cc` -> commandcode, `grok`/`grok46`/`grok-4.6` -> oc:xai/grok-4.6,
-  `grok45` -> oc:xai/grok-4.5, `mimo`/`mimo25`/`mimo-2.5` -> omp:opencode-go/mimo-v2.5).
+  Model ids accept the friendly aliases. Generic names follow the current pin
+  (`opus` -> claude:claude-opus-5-5, `sonnet` -> claude:claude-sonnet-5-5,
+  `fable` -> claude:claude-fable-5-1, `sol` -> codex:gpt-6.1-sol, `luna` -> codex:gpt-6-luna,
+  `glm` -> zai:glm-5.3, `cc` -> commandcode, `grok`/`grok47`/`grok-4.7` -> oc:xai/grok-4.7,
+  `mimo`/`mimo26` -> omp:opencode-go/mimo-v2.6-pro). Version-numbered aliases keep their
+  own release: `opus48` -> claude:claude-opus-4-8, `fable5` -> claude:claude-fable-5,
+  `glm52` -> zai:glm-5.2, `grok46`/`grok-4.6` -> oc:xai/grok-4.6,
+  `grok45` -> oc:xai/grok-4.5, `mimo25`/`mimo-2.5` -> omp:opencode-go/mimo-v2.5,
+  `terra`/`gpt56terra` -> codex:gpt-5.6-terra.
 
 SELECTION CASCADE, by mode:
   review diff           : explicit -m requested models  >  explicit --preset  >
@@ -5317,7 +5324,7 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
   Shared .env:  ~/.config/review-cli/.env   (override with $GEMINI_ENV_FILE)
   Env vars:
     GEMINI_API_KEY (or GOOGLE_API_KEY)  — gemini seat.
-    ZAI_API_KEY    (or ZHIPU_API_KEY)   — z.ai / GLM seat.
+    ZAI_API_KEY    (or ZHIPU_API_KEY)   — z.ai / GLM: the diff-only zai: seat, and omp:zai/* seats when omp stores no zai credential.
     COMMANDCODE_API_KEY                 — commandcode seats (a `user_...` token ONLY).
     OPENROUTER_API_KEY                  — diff-only OpenRouter aggregator seat (`-m openrouter:<model>`).
     ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (+ optional ANTHROPIC_BASE_URL) — claude API.
@@ -5436,24 +5443,24 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     seat availability) but never logs or transmits the credential value anywhere —
     opencode is what actually sends it, at call time.
   AGENTIC board seats authenticate via the AGENT's own config, not a review-cli env var:
-    Kimi/Qwen/DeepSeek/GLM (oc:commandcode/... / oc:zai/glm-5.2) and Grok (oc:xai/...)
+    Kimi/Qwen/DeepSeek (oc:commandcode/...) and Grok (oc:xai/...)
     all go through opencode's OWN provider config (`opencode auth login` /
     `opencode providers login`; ~/.config/opencode/opencode.json) — COMMANDCODE_API_KEY
-    and ZAI_API_KEY above do NOT cover them; those two env vars only gate the separate
-    diff-only `-m cc` / `-m glm` keyed-HTTP path. omp seats (omp:<provider>/<model>,
-    incl. MIMO_SEAT omp:opencode-go/mimo-v2.5) authenticate via `omp setup`
-    (`omp token <provider>` shows the stored credential); the startup probe reads omp's
-    auth db read-only. Exception: omp:zai/* and omp:openrouter/* seats also run on
-    ZAI_API_KEY (or ZHIPU_API_KEY) / OPENROUTER_API_KEY from the env or
+    and ZAI_API_KEY above do NOT cover them; COMMANDCODE_API_KEY only gates the diff-only
+    `-m cc` path. omp seats (omp:<provider>/<model>, incl. MIMO_SEAT
+    omp:opencode-go/mimo-v2.6-pro and the GLM seat omp:zai/glm-5.3) authenticate via
+    `omp setup` (`omp token <provider>` shows the stored credential); the startup probe
+    reads omp's auth db read-only. Exception: omp:zai/* and omp:openrouter/* seats also
+    run on ZAI_API_KEY (or ZHIPU_API_KEY) / OPENROUTER_API_KEY from the env or
     ~/.config/review-cli/.env, which review-cli hands the seat (review-cli#646), so
     `-m omp:zai/<model>` is an agentic GLM seat on the same key as `-m glm`.
     `review seats` lists every login it found per harness. Either way a missing binary
     or missing provider auth is caught at
     startup and the seat is skipped gracefully (pool backfills from reserve) rather than
     failing the run.
-  z.ai / GLM Coding-Plan endpoint: `glm-5.2` (the flagship) is served only from the
+  z.ai / GLM Coding-Plan endpoint: `glm-5.3` (the flagship) answers on the
     Coding-Plan base URL https://api.z.ai/api/coding/paas/v4 (review's default); the
-    standard https://api.z.ai/api/paas/v4 endpoint tops out at `glm-5.1`. Override with
+    standard https://api.z.ai/api/paas/v4 endpoint topped out at `glm-5.1`. Override with
     ZAI_BASE_URL for a standard-plan key; an explicit `zai:<model>` suffix wins over
     ZAI_MODEL, which alone only affects a bare `-m zai` invocation.
   OPENROUTER_API_KEY (an sk-or-v1-... token): diff-only `-m openrouter:<model>`
@@ -7919,11 +7926,13 @@ def _show_board(
         print(
             "Unavailable reviewers drop out and are backfilled from the reserve; the "
             "board degrades gracefully only if the reserve is exhausted. The default "
-            "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek/Grok, codex, claude) need their CLI "
-            "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
+            "agentic seats (`oc:…` Kimi/Qwen/DeepSeek/Grok, `omp:…` GLM/MiMo/Sonnet-omp, "
+            "codex, claude) need their CLI on PATH — `oc:` seats need the `opencode` binary "
+            "plus its own provider auth "
             "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
-            "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
-            "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)"
+            "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY powers only the diff-only "
+            "`commandcode:` backend for `-m cc`; ZAI_API_KEY powers the diff-only `zai:` "
+            "backend for `-m glm` and omp:zai/* seats that have no omp zai login.)"
         )
     if overridden_roles:
         overridden_list = ", ".join(

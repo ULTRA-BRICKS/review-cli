@@ -52,10 +52,10 @@ from reviewlib.panel import (  # noqa: E402
 from reviewlib.provider_failover import provider_chain  # noqa: E402
 from reviewlib.seat_cooldown import record_cooldown  # noqa: E402
 
-_OPUS_CLI = "claude:claude-opus-4-8"
-_OPUS_OMP = "omp:anthropic/claude-opus-4-8"
-_SONNET_CLI = "claude:claude-sonnet-5"
-_SONNET_OMP = "omp:anthropic/claude-sonnet-5"
+_OPUS_CLI = "claude:claude-opus-5-5"
+_OPUS_OMP = "omp:anthropic/claude-opus-5-5"
+_SONNET_CLI = "claude:claude-sonnet-5-5"
+_SONNET_OMP = "omp:anthropic/claude-sonnet-5-5"
 _AUTH_EXPIRED = (
     "Failed to authenticate: OAuth session expired and could not be refreshed"
 )
@@ -145,7 +145,7 @@ class _FakeExecutors:
 def test_board_claude_seat_with_expired_login_answers_through_omp_under_its_own_role():
     pool = [
         BoardReviewer(_OPUS_CLI, "correctness", "Opus"),
-        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+        BoardReviewer("codex:gpt-6-luna", "consistency", "Codex"),
     ]
     reserve = [BoardReviewer(_OPUS_OMP, "correctness", "Opus-omp")]
     with _FakeExecutors({_OPUS_CLI: (1, _AUTH_EXPIRED)}) as fx:
@@ -200,14 +200,14 @@ def test_a_last_working_cache_reorder_is_not_reported_as_a_substitution():
     """Nothing failed and the seat's own executor is still in its chain: the cache just put
     the alternate first. That is routing, so no `substituted:` line and the seat keeps its
     own model for the quorum."""
-    seat = [BoardReviewer("zai:glm-5.2", "quality", "GLM")]
+    seat = [BoardReviewer("zai:glm-5.3", "quality", "GLM")]
     with _FakeExecutors({}) as fx:
-        fx.cache.write_text(json.dumps({"glm-5.2": "oc:zai/glm-5.2"}), encoding="utf-8")
+        fx.cache.write_text(json.dumps({"glm-5.3": "oc:zai/glm-5.3"}), encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
             outcome = run_board_with_failover(seat, [], "Review this.", "+x", REPO_ROOT, 5)
-    assert fx.dispatched == ["oc:zai/glm-5.2"], fx.dispatched
+    assert fx.dispatched == ["oc:zai/glm-5.3"], fx.dispatched
     assert "substituted" not in format_result(outcome.usable[0])
-    assert outcome.usable_models == ["zai:glm-5.2"], outcome.usable_models
+    assert outcome.usable_models == ["zai:glm-5.3"], outcome.usable_models
 
 
 def test_task_role_slots_each_count_once_when_every_claude_slot_is_substituted():
@@ -238,9 +238,9 @@ def test_every_claude_cli_model_falls_to_its_omp_twin_before_other_routes():
         )
 
     assert chain(_SONNET_CLI) == [_SONNET_CLI, _SONNET_OMP]
-    assert chain("claude:claude-fable-5") == [
-        "claude:claude-fable-5",
-        "omp:anthropic/claude-fable-5",
+    assert chain("claude:claude-fable-5-1") == [
+        "claude:claude-fable-5-1",
+        "omp:anthropic/claude-fable-5-1",
     ]
     # omp (a proven multi-account route) comes before the opencode anthropic route.
     assert chain(_OPUS_CLI)[:2] == [_OPUS_CLI, _OPUS_OMP]
@@ -265,7 +265,7 @@ def _seat_health_world():
     config = {
         "models": [
             _OPUS_CLI,
-            "oc:xai/grok-4.6",
+            "oc:xai/grok-4.7",
             "commandcode:deepseek/deepseek-v4-pro",
             _SONNET_OMP,
         ],
@@ -298,7 +298,7 @@ def _seat_health_world():
             )
         )
         record_cooldown(
-            "oc:xai/grok-4.6",
+            "oc:xai/grok-4.7",
             "Error: You have run out of credits",
             access_method="opencode",
         )
@@ -320,7 +320,7 @@ def test_bare_review_status_names_why_each_seat_cannot_run_and_its_substitute():
     opus = _line_with(text, _OPUS_CLI)
     assert "every registered Claude CLI account is logged out" in opus, opus
     assert _OPUS_OMP in opus, opus
-    grok = _line_with(text, "oc:xai/grok-4.6")
+    grok = _line_with(text, "oc:xai/grok-4.7")
     assert "cooling down" in grok and "run out of credits" in grok, grok
     assert "unpaid" in _line_with(text, "commandcode:deepseek/deepseek-v4-pro")
     assert "usable" in _line_with(text, _SONNET_OMP)

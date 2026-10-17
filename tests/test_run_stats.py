@@ -1183,7 +1183,7 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
 
     # Sol (priority #1 in the heavy pool of 4, now that Fable is excluded) fails;
     # everything else succeeds.
-    resolver = _stub_resolve_backend({"codex:gpt-5.6-sol": 1})
+    resolver = _stub_resolve_backend({"codex:gpt-6.1-sol": 1})
     r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
     assert r["_rc"] == 0, r
     assert r["mode"] == "review"
@@ -1192,13 +1192,13 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     # is Sol/Opus/GLM-cc/Kimi post-exclusion), so a regression where Kimi also silently
     # failed and the NEXT reserve backfilled instead would pass a partial `in`-only check.
     assert set(r["models"]) == {
-        "claude:claude-opus-4-8",
-        "commandcode:zai-org/GLM-5.2",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "claude:claude-opus-5-5",
+        "commandcode:zai-org/GLM-5.3",
+        "oc:commandcode/moonshotai/Kimi-K3",
         ASTRA_SEAT,  # the promoted reserve (#5, post-exclusion), by its real id
     }, r
-    assert "claude:claude-fable-5" not in r["models"], r
-    assert "codex:gpt-5.6-sol" not in r["models"], r  # the failed seat, not backfilled
+    assert "claude:claude-fable-5-1" not in r["models"], r
+    assert "codex:gpt-6.1-sol" not in r["models"], r  # the failed seat, not backfilled
     assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
     assert "promoting reserve" in r["_stderr"]  # failover actually fired
 
@@ -1209,7 +1209,7 @@ def test_cli_failover_exhausted_reserve_reuses_the_only_healthy_seat():
     run succeeds with a full pool of DISTINCT roles, all from that model."""
     from reviewlib.config import DEFAULT_BOARD
 
-    ok = {"claude:claude-opus-4-8"}
+    ok = {"claude:claude-opus-5-5"}
     resolver = _stub_resolve_backend(
         {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
     )
@@ -2027,7 +2027,7 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
         os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
         os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
         try:
-            # codex passed once; oc:zai/glm-5.2 was ATTEMPTED (recorded, even though the
+            # codex passed once; oc:zai/glm-5.3 was ATTEMPTED (recorded, even though the
             # overall run failed) and is separately in an active cooldown right now —
             # exactly the HYP-1295 shape (a failed model still shows up in the run's
             # `models` list even though it didn't itself pass).
@@ -2043,7 +2043,7 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
             _stats.record_run(
                 task_code=TASK,
                 mode="review",
-                models=["codex", "oc:zai/glm-5.2"],
+                models=["codex", "oc:zai/glm-5.3"],
                 duration_seconds=1.0,
                 ok_count=1,
                 fail_count=1,
@@ -2059,10 +2059,10 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
             # a plain timeout does not currently start a cooldown (round-4 review
             # finding, k3 — see seat_cooldown.py's own docstring).
             _sc.record_cooldown(
-                "oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode"
+                "oc:zai/glm-5.3", "timed out", now=fixed_now, access_method="opencode"
             )
             _sc.record_cooldown(
-                "oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode"
+                "oc:zai/glm-5.3", "timed out", now=fixed_now, access_method="opencode"
             )
             # Round-4 review finding (k3): a model that's genuinely cooling down but was
             # NEVER attempted for THIS task code must still be excluded — the scoping
@@ -2071,7 +2071,7 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
             # attempted_models filter and listed every cooling seat machine-wide would
             # otherwise pass the suite unnoticed.
             _sc.record_cooldown(
-                "claude:claude-fable-5",
+                "claude:claude-fable-5-1",
                 "session limit",
                 now=fixed_now,
                 access_method="cli",
@@ -2081,15 +2081,15 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
             assert result["passed"] is False
             assert "stalled_models" in result
             stalled = {s["model"]: s for s in result["stalled_models"]}
-            assert "oc:zai/glm-5.2" in stalled
-            assert stalled["oc:zai/glm-5.2"]["reason"] == "timed out"
-            assert stalled["oc:zai/glm-5.2"]["consecutive_failures"] == 2
-            assert stalled["oc:zai/glm-5.2"]["remaining_seconds"] > 0
+            assert "oc:zai/glm-5.3" in stalled
+            assert stalled["oc:zai/glm-5.3"]["reason"] == "timed out"
+            assert stalled["oc:zai/glm-5.3"]["consecutive_failures"] == 2
+            assert stalled["oc:zai/glm-5.3"]["remaining_seconds"] > 0
             # codex isn't cooling down at all — must not be listed as stalled.
             assert "codex" not in stalled
-            # claude:claude-fable-5 IS cooling down but was never part of this task's
+            # claude:claude-fable-5-1 IS cooling down but was never part of this task's
             # history — must not leak into this task's stalled_models either.
-            assert "claude:claude-fable-5" not in stalled
+            assert "claude:claude-fable-5-1" not in stalled
         finally:
             if saved_cd_file is None:
                 os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
@@ -5471,14 +5471,14 @@ def test_cli_check_short_prints_stalled_model_line_review_cli_221():
             _stats.record_run(
                 task_code=TASK,
                 mode="review",
-                models=["codex", "oc:zai/glm-5.2"],
+                models=["codex", "oc:zai/glm-5.3"],
                 duration_seconds=1.0,
                 ok_count=1,
                 fail_count=1,
                 passed=False,
             )
             _sc.record_cooldown(
-                "oc:zai/glm-5.2",
+                "oc:zai/glm-5.3",
                 "timed out",
                 now=time.time(),
                 ttl_seconds=1800.0,
@@ -5490,7 +5490,7 @@ def test_cli_check_short_prints_stalled_model_line_review_cli_221():
             assert rc != 0, rc
             text = out.getvalue()
             assert "review bar NOT met" in text
-            assert "stalled: oc:zai/glm-5.2" in text
+            assert "stalled: oc:zai/glm-5.3" in text
             assert "timed out" in text
         finally:
             if saved_cd_file is None:

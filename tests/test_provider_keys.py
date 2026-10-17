@@ -43,9 +43,10 @@ sys.path.insert(0, str(REPO_ROOT))
 import reviewlib.backends as backends  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     ASTRA_SEAT,
+    FABLE_SEAT,
+    LUNA_SEAT,
     SOL_SEAT,
     SONNET_SEAT,
-    TERRA_SEAT,
     BoardReviewer,
     split_pool_reserve,
     _expand_alias,
@@ -187,16 +188,17 @@ def test_existing_routes_unchanged():
     # The new prefixes must not steal codex/gemini/claude/opencode routing.
     assert backends.resolve_backend("codex") is backends.review_codex
     assert backends.resolve_backend("gemini") is backends.review_gemini
-    assert backends.resolve_backend("claude:claude-fable-5") is backends.review_claude
+    assert backends.resolve_backend("claude:claude-fable-5-1") is backends.review_claude
     assert backends.resolve_backend("oc:fireworks/x") is backends.review_opencode
     # An unknown model still defaults to opencode (unchanged behaviour).
     assert backends.resolve_backend("totally-unknown") is backends.review_opencode
 
 
 def test_aliases_expand():
-    # `glm` and `glm52` point at the NEWEST GLM (glm-5.2, reachable on the Coding-Plan
+    # `glm` and `glm53` point at the NEWEST GLM (glm-5.3, reachable on the Coding-Plan
     # endpoint); the rest pin specific older releases.
-    assert _expand_alias("glm") == "zai:glm-5.2"
+    assert _expand_alias("glm") == "zai:glm-5.3"
+    assert _expand_alias("glm53") == "zai:glm-5.3"
     assert _expand_alias("glm52") == "zai:glm-5.2"
     assert _expand_alias("glm51") == "zai:glm-5.1"
     assert _expand_alias("glm47") == "zai:glm-4.7"
@@ -206,20 +208,30 @@ def test_aliases_expand():
     assert _expand_alias("commandcode") == "commandcode"
     assert _expand_alias("commoncode") == "commandcode"
     assert _expand_alias("cc") == "commandcode"
-    # Pre-existing aliases survive.
+    # Generic aliases follow the current pin; version-numbered ones keep their release.
+    assert _expand_alias("fable") == FABLE_SEAT == "claude:claude-fable-5-1"
+    assert _expand_alias("fable51") == FABLE_SEAT
     assert _expand_alias("fable5") == "claude:claude-fable-5"
+    assert _expand_alias("opus") == "claude:claude-opus-5-5"
+    assert _expand_alias("opus55") == "claude:claude-opus-5-5"
+    assert _expand_alias("opus48") == "claude:claude-opus-4-8"
     # Sol/Astra: pinned so a bare `-m sol`/`-m astra` doesn't fall through
     # `_match_named_backend` to the opencode catch-all (the same failure class `opus`
     # was pinned against, config.py's MODEL_ALIASES comment).
-    assert _expand_alias("sol") == SOL_SEAT
-    assert _expand_alias("gpt56sol") == SOL_SEAT
+    assert _expand_alias("sol") == SOL_SEAT == "codex:gpt-6.1-sol"
+    assert _expand_alias("gpt61sol") == SOL_SEAT
+    assert _expand_alias("gpt56sol") == "codex:gpt-5.6-sol"
     assert _expand_alias("astra") == ASTRA_SEAT
     assert _expand_alias("gpt6astra") == ASTRA_SEAT
-    # Terra/Sonnet (review-cli#382): pinned for the same reason as Sol/Astra above.
-    assert _expand_alias("terra") == TERRA_SEAT
-    assert _expand_alias("gpt56terra") == TERRA_SEAT
-    assert _expand_alias("sonnet") == SONNET_SEAT
-    assert _expand_alias("sonnet5") == SONNET_SEAT
+    # Luna (Terra's successor seat, review-cli#645)/Sonnet (review-cli#382): pinned for the
+    # same reason as Sol/Astra above. `terra` keeps naming GPT-5.6-Terra.
+    assert _expand_alias("luna") == LUNA_SEAT == "codex:gpt-6-luna"
+    assert _expand_alias("gpt6luna") == LUNA_SEAT
+    assert _expand_alias("terra") == "codex:gpt-5.6-terra"
+    assert _expand_alias("gpt56terra") == "codex:gpt-5.6-terra"
+    assert _expand_alias("sonnet") == SONNET_SEAT == "claude:claude-sonnet-5-5"
+    assert _expand_alias("sonnet55") == SONNET_SEAT
+    assert _expand_alias("sonnet5") == "claude:claude-sonnet-5"
 
 
 # === z.ai request shape (OpenAI-compatible, NOT gemini contents/parts) ===========
@@ -237,7 +249,7 @@ def test_zai_request_is_openai_shape():
             res = backends.review_zai("zai", "say hi", "", REPO_ROOT, 30)
         finally:
             urllib.request.urlopen = old_open
-    # Default endpoint = the GLM Coding-Plan base (serves glm-5.2) + /chat/completions.
+    # Default endpoint = the GLM Coding-Plan base (serves glm-5.3) + /chat/completions.
     assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", (
         captured["url"]
     )
@@ -245,7 +257,7 @@ def test_zai_request_is_openai_shape():
     # OpenAI request shape — NOT the gemini contents/parts shape.
     body = captured["body"]
     assert "messages" in body and "contents" not in body, body
-    assert body["model"] == "glm-5.2", (
+    assert body["model"] == "glm-5.3", (
         body
     )  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
     assert body["messages"][0]["role"] == "user"
@@ -313,7 +325,7 @@ def test_zai_result_model_is_requested_string_not_provider_id():
     assert res.model == "zai", res.model
     assert res2.model == "zai:glm-4.5", res2.model
     # The api_model still appears in the command label (the resolved id).
-    assert "glm-5.2" in res.command  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
+    assert "glm-5.3" in res.command  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
     assert "glm-4.5" in res2.command
 
 
@@ -414,11 +426,11 @@ def test_commandcode_base_url_and_model_override():
 
 
 def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
-    """The priority-3 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
-    byte-exact gateway model id `zai-org/GLM-5.2` — INCLUDING the embedded slash. The id has
+    """The priority-3 GLM-5.3 board seat (`commandcode:zai-org/GLM-5.3`) must POST the
+    byte-exact gateway model id `zai-org/GLM-5.3` — INCLUDING the embedded slash. The id has
     TWO `/`-free segments around a single `/` plus the `commandcode:` provider prefix, so a
     naive split could truncate it; this pins that `review_commandcode` strips ONLY the
-    provider prefix (`split(":", 1)[1]`) and sends the whole `zai-org/GLM-5.2` selector. The
+    provider prefix (`split(":", 1)[1]`) and sends the whole `zai-org/GLM-5.3` selector. The
     'byte-exact against the gateway /models catalog' claim in the board comments/CHANGELOG is
     only load-bearing if the wire actually carries it (review of #57)."""
     captured: dict = {}
@@ -431,11 +443,11 @@ def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
         os.environ.pop("COMMANDCODE_MODEL", None)
         try:
             backends.review_commandcode(
-                "commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10
+                "commandcode:zai-org/GLM-5.3", "q", "", REPO_ROOT, 10
             )
         finally:
             urllib.request.urlopen = old_open
-    assert captured["body"]["model"] == "zai-org/GLM-5.2", captured["body"]
+    assert captured["body"]["model"] == "zai-org/GLM-5.3", captured["body"]
     # And it goes to the default Command Code gateway, not z.ai's host.
     assert (
         captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions"
@@ -447,7 +459,7 @@ def test_commandcode_glm_seat_id_beats_commandcode_model_env():
     that exports `COMMANDCODE_MODEL` (a legitimate override for the bare `-m cc` path) can NOT
     silently hijack the default-board seat into POSTing a different model. `review_commandcode`
     only consults `COMMANDCODE_MODEL` for a BARE `commandcode` id (no suffix); a suffixed seat
-    like `commandcode:zai-org/GLM-5.2` takes `model.split(':',1)[1]` unconditionally. This pins
+    like `commandcode:zai-org/GLM-5.3` takes `model.split(':',1)[1]` unconditionally. This pins
     the production case (env PRESENT, NOT popped) — refuting the concern that the seat's
     byte-exact id could be overridden by env on a real host (review of #57)."""
     captured: dict = {}
@@ -461,11 +473,11 @@ def test_commandcode_glm_seat_id_beats_commandcode_model_env():
         os.environ.pop("COMMANDCODE_BASE_URL", None)
         try:
             backends.review_commandcode(
-                "commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10
+                "commandcode:zai-org/GLM-5.3", "q", "", REPO_ROOT, 10
             )
         finally:
             urllib.request.urlopen = old_open
-    assert captured["body"]["model"] == "zai-org/GLM-5.2", captured["body"]
+    assert captured["body"]["model"] == "zai-org/GLM-5.3", captured["body"]
     # The env value did NOT leak into the wire payload.
     assert captured["body"]["model"] != "deepseek/deepseek-v4-flash", captured["body"]
 
@@ -587,14 +599,14 @@ def test_zai_does_not_send_thinking_field():
     assert "thinking" not in captured["body"], captured["body"]
 
 
-# === coding-endpoint default + reasoning-model handling (glm-5.2) ================
+# === coding-endpoint default + reasoning-model handling (glm-5.3) ================
 def test_zai_default_base_url_is_the_coding_plan_endpoint():
     """The DEFAULT z.ai base must be the GLM Coding-Plan endpoint (the only one that
-    serves the flagship glm-5.2). A standard-plan user overrides via ZAI_BASE_URL."""
+    serves the flagship glm-5.3). A standard-plan user overrides via ZAI_BASE_URL."""
     assert backends.ZAI_DEFAULT_BASE_URL == "https://api.z.ai/api/coding/paas/v4", (
         backends.ZAI_DEFAULT_BASE_URL
     )
-    assert backends.ZAI_DEFAULT_MODEL == "glm-5.2", backends.ZAI_DEFAULT_MODEL
+    assert backends.ZAI_DEFAULT_MODEL == "glm-5.3", backends.ZAI_DEFAULT_MODEL
     # End-to-end: bare `zai` with no overrides hits the coding endpoint.
     captured: dict = {}
     payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
@@ -632,7 +644,7 @@ def test_zai_base_url_env_overrides_to_standard_endpoint():
 
 
 def test_zai_reasoning_content_fallback_when_content_empty():
-    """REASONING MODEL (glm-5.2): a 2xx whose message.content is empty/missing but
+    """REASONING MODEL (glm-5.3): a 2xx whose message.content is empty/missing but
     carries message.reasoning_content must NOT fail-closed as "no assistant content".
     Surface the reasoning text (rc=0) so a low-output-budget reasoning reply is usable."""
     cases = (
@@ -845,7 +857,12 @@ def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty
         ("", {"promptTokenCount": 1234}, 1, (1234, 0)),
         # Non-string `text` parts are not content -- never stringified into a verdict.
         (None, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
-        ({"nested": 1}, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+        (
+            {"nested": 1},
+            {"promptTokenCount": 1234, "candidatesTokenCount": 3},
+            1,
+            (1234, 3),
+        ),
         (["a"], {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
     )
     for text, usage, rc, expected in cases:
@@ -868,7 +885,13 @@ def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty
             assert "None" not in res.stdout, res
     # `{"candidates": []}` -- the exact shape Codex flagged -- must also fail closed.
     old_open = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen({}, {"candidates": [], "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}})
+    urllib.request.urlopen = _fake_urlopen(
+        {},
+        {
+            "candidates": [],
+            "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0},
+        },
+    )
     with _EnvSandbox():
         os.environ["GEMINI_API_KEY"] = "k"
         try:
@@ -897,7 +920,9 @@ def test_anthropic_api_applies_the_same_usage_validity_rule():
         with _EnvSandbox():
             os.environ["ANTHROPIC_API_KEY"] = "k"
             try:
-                res = backends.review_claude_api("claude:claude-opus-4-8", "q", "+x", REPO_ROOT, 10)
+                res = backends.review_claude_api(
+                    "claude:claude-opus-5-5", "q", "+x", REPO_ROOT, 10
+                )
             finally:
                 urllib.request.urlopen = old_open
         assert res.returncode == rc, (text, usage, res)
@@ -1235,7 +1260,7 @@ def test_payment_preflight_ignores_transient_network_failures():
             urllib.request.urlopen = _ok
             assert (
                 backends._provider_payment_preflight_unavailable_reason(
-                    "commandcode:moonshotai/Kimi-K2.7-Code"
+                    "commandcode:moonshotai/Kimi-K3"
                 )
                 is None
             )
@@ -1378,7 +1403,7 @@ def test_commandcode_chat_billing_marker_caches_provider_skip_for_next_seat():
                 "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
             )
             second = backends.review_commandcode(
-                "commandcode:Qwen/Qwen3.7-Max", "q", "", REPO_ROOT, 10
+                "commandcode:Qwen/Qwen3.8-Max", "q", "", REPO_ROOT, 10
             )
         finally:
             urllib.request.urlopen = old_open
@@ -1409,7 +1434,7 @@ def test_commandcode_model_subscription_denial_only_caches_that_model():
                 "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
             )
             different_model = backends.review_commandcode(
-                "commandcode:Qwen/Qwen3.7-Max", "q", "", REPO_ROOT, 10
+                "commandcode:Qwen/Qwen3.8-Max", "q", "", REPO_ROOT, 10
             )
         finally:
             urllib.request.urlopen = old_open
@@ -1440,7 +1465,7 @@ def test_commandcode_chat_nonbilling_http_400_does_not_cache_provider_skip():
                 "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
             )
             second = backends.review_commandcode(
-                "commandcode:Qwen/Qwen3.7-Max", "q", "", REPO_ROOT, 10
+                "commandcode:Qwen/Qwen3.8-Max", "q", "", REPO_ROOT, 10
             )
         finally:
             urllib.request.urlopen = old_open
@@ -1486,7 +1511,7 @@ def test_successful_payment_preflight_does_not_overwrite_existing_provider_denia
 
         try:
             reason = backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:Qwen/Qwen3.7-Max"
+                "commandcode:Qwen/Qwen3.8-Max"
             )
         finally:
             urllib.request.urlopen = old_open
@@ -1592,7 +1617,7 @@ def test_payment_preflight_success_is_cached_for_dispatch():
             )
             assert (
                 backends.provider_preflight_result(
-                    "commandcode:moonshotai/Kimi-K2.7-Code",
+                    "commandcode:moonshotai/Kimi-K3",
                     backend="commandcode",
                     command="commandcode API y",
                 )
@@ -1814,7 +1839,7 @@ def test_payment_preflight_denial_is_cached_for_provider_key_url():
                 "commandcode:deepseek/deepseek-v4-pro"
             )
             second = backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:moonshotai/Kimi-K2.7-Code"
+                "commandcode:moonshotai/Kimi-K3"
             )
         finally:
             urllib.request.urlopen = old_open
@@ -1933,8 +1958,8 @@ def test_oc_zai_requires_opencode_auth_not_zai_rest_key():
                 os.environ["OC_AUTH_FILE"] = str(Path(tmp) / "auth.json")
                 os.environ["OC_CONFIG_FILE"] = str(Path(tmp) / "opencode.json")
                 os.environ["ZAI_API_KEY"] = "direct-rest-key-only"
-                assert backends.backend_available("zai:glm-5.2") is True
-                assert backends.backend_available("oc:zai/glm-5.2") is False
+                assert backends.backend_available("zai:glm-5.3") is True
+                assert backends.backend_available("oc:zai/glm-5.3") is False
     finally:
         backends._which = old_which
 
@@ -2066,14 +2091,14 @@ def test_unpaid_provider_uses_canonical_zai_aliases():
     """Every accepted z.ai/Zhipu/GLM spelling must hit the same payment gate."""
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
-        assert backends.effective_provider("z.ai:glm-5.2") == "zai"
-        assert backends.effective_provider("zhipu:glm-5.2") == "zai"
-        assert backends.effective_provider("glm:glm-5.2") == "zai"
-        assert backends.effective_provider("oc:z.ai/glm-5.2") == "zai"
-        assert backends.provider_marked_unpaid("z.ai:glm-5.2") is True
-        assert backends.provider_marked_unpaid("zhipu:glm-5.2") is True
-        assert backends.provider_marked_unpaid("glm:glm-5.2") is True
-        assert backends.backend_available("oc:z.ai/glm-5.2") is False
+        assert backends.effective_provider("z.ai:glm-5.3") == "zai"
+        assert backends.effective_provider("zhipu:glm-5.3") == "zai"
+        assert backends.effective_provider("glm:glm-5.3") == "zai"
+        assert backends.effective_provider("oc:z.ai/glm-5.3") == "zai"
+        assert backends.provider_marked_unpaid("z.ai:glm-5.3") is True
+        assert backends.provider_marked_unpaid("zhipu:glm-5.3") is True
+        assert backends.provider_marked_unpaid("glm:glm-5.3") is True
+        assert backends.backend_available("oc:z.ai/glm-5.3") is False
 
 
 def test_unpaid_provider_uses_canonical_gemini_and_claude_aliases():
@@ -2086,9 +2111,9 @@ def test_unpaid_provider_uses_canonical_gemini_and_claude_aliases():
 
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
-        assert backends.effective_provider("claude-fable-5") == "claude"
+        assert backends.effective_provider("claude-fable-5-1") == "claude"
         assert backends.effective_provider("fable5") == "claude"
-        assert backends.provider_marked_unpaid("claude-fable-5") is True
+        assert backends.provider_marked_unpaid("claude-fable-5-1") is True
         assert backends.provider_marked_unpaid("fable5") is True
 
 
@@ -2121,7 +2146,7 @@ def test_zai_unpaid_provider_does_not_post():
         os.environ["ZAI_API_KEY"] = "zai_present"
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
         try:
-            res = backends.review_zai("zai:glm-5.2", "q", "", REPO_ROOT, 10)
+            res = backends.review_zai("zai:glm-5.3", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
     assert res.returncode == 1, res
@@ -2142,7 +2167,7 @@ def test_zai_unpaid_alias_provider_does_not_post():
         os.environ["ZAI_API_KEY"] = "zai_present"
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
         try:
-            res = backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
+            res = backends.review_zai("z.ai:glm-5.3", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
     assert res.returncode == 1, res
@@ -2161,22 +2186,22 @@ def test_unpaid_provider_logs_use_model_specific_headers():
             os.environ["REVIEW_UNPAID_PROVIDERS"] = (
                 "zai,commandcode,openrouter,claude,gemini"
             )
-            backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
+            backends.review_zai("z.ai:glm-5.3", "q", "", REPO_ROOT, 10)
             backends.review_commandcode(
                 "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
             )
             backends.review_openrouter(
                 "openrouter:anthropic/claude-3.5-sonnet", "q", "", REPO_ROOT, 10
             )
-            backends.review_claude("claude:claude-fable-5", "q", "", REPO_ROOT, 10)
+            backends.review_claude("claude:claude-fable-5-1", "q", "", REPO_ROOT, 10)
             backends.review_gemini("gemini:gemini-3.5-flash", "q", "", REPO_ROOT, 10)
         finally:
             backends._emit_rest_log = old_emit
     assert emitted == [
-        ("z.ai", "z.ai API glm-5.2"),
+        ("z.ai", "z.ai API glm-5.3"),
         ("commandcode", "commandcode API deepseek/deepseek-v4-pro"),
         ("openrouter", "openrouter API anthropic/claude-3.5-sonnet"),
-        ("claude", "Anthropic API claude-fable-5"),
+        ("claude", "Anthropic API claude-fable-5-1"),
         ("gemini", "Gemini API gemini-3.5-flash"),
     ]
 
@@ -2256,7 +2281,7 @@ def test_unpaid_provider_log_failure_still_returns_skip_result():
     with _EnvSandbox():
         try:
             os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
-            res = backends.review_zai("zai:glm-5.2", "q", "", REPO_ROOT, 10)
+            res = backends.review_zai("zai:glm-5.3", "q", "", REPO_ROOT, 10)
         finally:
             backends._emit_rest_log = old_emit
     assert res.returncode == 1, res
@@ -2273,7 +2298,7 @@ def test_claude_with_images_unpaid_provider_does_not_spawn_cli():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
         try:
             res = backends.review_with_images(
-                "claude:claude-opus-4-8",
+                "claude:claude-opus-5-5",
                 "q",
                 "",
                 REPO_ROOT,
@@ -3266,15 +3291,12 @@ def test_unavailable_reason_for_unpaid_provider_names_the_provider():
         try:
             backends.configure_unpaid_providers(["commandcode"])
             reason = backends.backend_unavailable_reason(
-                "commandcode:moonshotai/Kimi-K2.7-Code"
+                "commandcode:moonshotai/Kimi-K3"
             )
             assert reason is not None
             assert "commandcode" in reason
             assert "unpaid" in reason.lower()
-            assert (
-                backends.backend_available("commandcode:moonshotai/Kimi-K2.7-Code")
-                is False
-            )
+            assert backends.backend_available("commandcode:moonshotai/Kimi-K3") is False
         finally:
             backends._CONFIG_UNPAID_PROVIDERS = saved
 

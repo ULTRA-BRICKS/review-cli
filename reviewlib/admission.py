@@ -363,15 +363,15 @@ def canonical_provider(name: str) -> str:
 
 def provider_key(model: str) -> str:
     """The provider budget a seat's model spends: `omp:anthropic/x` -> anthropic,
-    `claude:claude-opus-4-8` -> anthropic (or the Anthropic-compatible gateway
-    ANTHROPIC_BASE_URL points at, e.g. commandcode), `oc:zai/glm-5.2` -> zai,
+    `claude:claude-opus-5-5` -> anthropic (or the Anthropic-compatible gateway
+    ANTHROPIC_BASE_URL points at, e.g. commandcode), `oc:zai/glm-5.3` -> zai,
     `codex:gpt` -> openai, `omp:opencode-go/mimo` -> opencode-go."""
     lowered = model.strip().lower()
     for prefix in ("omp:", "oc:", "opencode:"):
         if lowered.startswith(prefix):
             rest = lowered[len(prefix) :]
             if prefix == "omp:" and "/" not in rest:
-                # an unqualified omp selector (`omp:claude-sonnet-5`) is served by the
+                # an unqualified omp selector (`omp:claude-sonnet-5-5`) is served by the
                 # same account pool its qualified spelling names
                 from .backends import _omp_model_hosts_claude
 

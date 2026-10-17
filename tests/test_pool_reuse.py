@@ -106,20 +106,20 @@ def test_hard_cooldown_single_reachable_seat_pads_across_distinct_roles_task_cli
     # request must still cover 3 DISTINCT board roles by reusing the one
     # live seat, not collapse to a single role.
     board = [
-        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
-        BoardReviewer("oc:zai/glm-5.2", "quality", "GLM"),
-        BoardReviewer("claude:claude-sonnet-5", "quality", "Sonnet"),
-        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+        BoardReviewer("claude:claude-opus-5-5", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-6-luna", "consistency", "Codex"),
+        BoardReviewer("oc:zai/glm-5.3", "quality", "GLM"),
+        BoardReviewer("claude:claude-sonnet-5-5", "quality", "Sonnet"),
+        BoardReviewer("claude:claude-fable-5-1", "architect", "Fable"),
     ]
-    only_codex = lambda r: r.model == "codex:gpt-5.6-terra"  # noqa: E731
+    only_codex = lambda r: r.model == "codex:gpt-6-luna"  # noqa: E731
     # usage_percent given but every model comfortably under_limit — proves
     # this is the RAW-unavailability path, not the near-usage-limit one.
     result = select_pool_with_reuse(
         board, 3, available=only_codex, usage_percent=_usage({})
     )
     assert len(result) == 3
-    assert {r.model for r in result} == {"codex:gpt-5.6-terra"}
+    assert {r.model for r in result} == {"codex:gpt-6-luna"}
     roles = [r.role for r in result]
     assert len(set(roles)) == 3  # 3 distinct roles, not 1
     assert roles[0] == "consistency"  # codex keeps its own role first
@@ -151,8 +151,8 @@ def test_real_default_board_duplicate_roles_never_dispatch_byte_identical_seats(
     # onto that SAME role — that would dispatch the same model under the same role/lens
     # twice, a pure-cost duplicate the "N distinct lenses" contract forbids (k3 review
     # finding, review-cli#205 round 3).
-    glm_cc = next(r for r in DEFAULT_BOARD if r.model == "commandcode:zai-org/GLM-5.2")
-    terra = next(r for r in DEFAULT_BOARD if r.model == "codex:gpt-5.6-terra")
+    glm_cc = next(r for r in DEFAULT_BOARD if r.model == "commandcode:zai-org/GLM-5.3")
+    terra = next(r for r in DEFAULT_BOARD if r.model == "codex:gpt-6-luna")
     assert glm_cc.role == "performance" and terra.role == "performance"
     usage_percent = _usage(
         {
@@ -442,11 +442,11 @@ def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_13
     from reviewlib.modes import review as review_mod
 
     board = [
-        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
-        BoardReviewer("oc:zai/glm-5.2", "quality", "GLM"),
-        BoardReviewer("claude:claude-sonnet-5", "quality", "Sonnet"),
-        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+        BoardReviewer("claude:claude-opus-5-5", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-6-luna", "consistency", "Codex"),
+        BoardReviewer("oc:zai/glm-5.3", "quality", "GLM"),
+        BoardReviewer("claude:claude-sonnet-5-5", "quality", "Sonnet"),
+        BoardReviewer("claude:claude-fable-5-1", "architect", "Fable"),
     ]
 
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
@@ -466,7 +466,7 @@ def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_13
     # Only Codex is reachable — the exact production incident: Opus/Sonnet/Fable/GLM
     # in session-limit cooldown (a hard `available()` False, not a usage_percent
     # threshold).
-    review_mod.backend_available = lambda model: model == "codex:gpt-5.6-terra"
+    review_mod.backend_available = lambda model: model == "codex:gpt-6-luna"
     outcome_sink: list = []
     try:
         rc = review_mod.mode_review(
@@ -489,7 +489,7 @@ def test_mode_review_board_pads_hard_cooldown_pool_to_distinct_roles_task_cli_13
     assert len(outcome_sink) == 1
     outcome = outcome_sink[0]
     assert len(outcome.usable) == 3
-    assert set(outcome.usable_models) == {"codex:gpt-5.6-terra"}
+    assert set(outcome.usable_models) == {"codex:gpt-6-luna"}
     assert len(set(outcome.usable_roles)) == 3  # 3 distinct roles, not 1
 
 
@@ -557,7 +557,7 @@ def test_ensure_min_distinct_roles_repairs_every_role_less_seat_without_collisio
     board = [
         BoardReviewer(model="my-custom", role="", display="Custom", effort="high"),
         BoardReviewer(
-            model="claude:claude-opus-4-8",
+            model="claude:claude-opus-5-5",
             role="correctness",
             display="Opus",
             effort="high",

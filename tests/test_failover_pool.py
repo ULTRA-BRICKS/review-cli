@@ -68,7 +68,7 @@ from reviewlib.config import (  # noqa: E402
     LIGHT_PRESET_BOARD,
     SOL_SEAT,
     SONNET_SEAT,
-    TERRA_SEAT,
+    LUNA_SEAT,
     BoardReviewer,
     _agentic,
     preset_pool_size,
@@ -86,7 +86,7 @@ _COMMANDCODE_AND_GEMINI_SEATS = frozenset(
     {
         GLM_COMMANDCODE_SEAT,
         _agentic(KIMI_SEAT),
-        _agentic("commandcode:Qwen/Qwen3.7-Max"),
+        _agentic("commandcode:Qwen/Qwen3.8-Max"),
         _agentic("commandcode:deepseek/deepseek-v4-pro"),
         "gemini",
     }
@@ -167,7 +167,9 @@ def test_unusable_on_unavailable_sentinel_body():
         "Claude Fable 5 is currently unavailable. "
         "Learn more: https://www.anthropic.com/news/fable-mythos-access"
     )
-    assert not result_is_usable(ReviewResult("claude:claude-fable-5", "c", 0, body, ""))
+    assert not result_is_usable(
+        ReviewResult("claude:claude-fable-5-1", "c", 0, body, "")
+    )
 
 
 def test_usable_long_review_mentioning_availability_is_not_misclassified():
@@ -210,9 +212,9 @@ def test_startup_failover_skips_unavailable_top_seat():
     available = {r.model for r in board if r.model != SOL_SEAT}
     pool, reserve = split_pool_reserve(board, 4, _avail(available))
     assert [r.model for r in pool] == [
-        "claude:claude-opus-4-8",
-        "commandcode:zai-org/GLM-5.2",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "claude:claude-opus-5-5",
+        "commandcode:zai-org/GLM-5.3",
+        "oc:commandcode/moonshotai/Kimi-K3",
         ASTRA_SEAT,
     ], [r.model for r in pool]
     # Sol is NOT in the pool nor the reserve — it's unavailable.
@@ -227,7 +229,7 @@ def test_fable_unavailability_is_noop_for_default_pool_roles():
     pool seat, not a backfill) -- the pool is Sol/Opus/GLM-cc/Kimi either way, still
     four distinct lenses: consistency/correctness/performance/quality."""
     board = list(DEFAULT_BOARD)
-    available = {r.model for r in board if r.model != "claude:claude-fable-5"}
+    available = {r.model for r in board if r.model != "claude:claude-fable-5-1"}
     pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
     roles = [r.role for r in pool]
     assert len(set(roles)) == 4, roles
@@ -247,12 +249,14 @@ def test_glm_cc_unavailable_backfills_a_new_lens_not_astras_duplicate():
     models = [r.model for r in pool]
     assert models == [
         SOL_SEAT,
-        "claude:claude-opus-4-8",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        TERRA_SEAT,
+        "claude:claude-opus-5-5",
+        "oc:commandcode/moonshotai/Kimi-K3",
+        LUNA_SEAT,
     ], models
     roles = [r.role for r in pool]
-    assert sorted(roles) == ["consistency", "correctness", "performance", "quality"], roles
+    assert sorted(roles) == ["consistency", "correctness", "performance", "quality"], (
+        roles
+    )
     assert reserve[0].model == ASTRA_SEAT, [r.model for r in reserve]
 
 
@@ -270,7 +274,7 @@ def test_heavy_preset_double_failure_still_beats_pre_382_board():
     pool_size = preset_pool_size("heavy")
     available = {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS
 
-    expected_pool_models = [SOL_SEAT, "claude:claude-opus-4-8", TERRA_SEAT, SONNET_SEAT]
+    expected_pool_models = [SOL_SEAT, "claude:claude-opus-5-5", LUNA_SEAT, SONNET_SEAT]
     expected_roles = ["consistency", "correctness", "performance", "quality"]
 
     # commandcode/gemini disabled only -- the routine incident precursor.
@@ -278,17 +282,17 @@ def test_heavy_preset_double_failure_still_beats_pre_382_board():
     assert [r.model for r in pool] == expected_pool_models
     assert [r.role for r in pool] == expected_roles
     reserve_models = [r.model for r in reserve]
-    assert reserve_models[0] == ASTRA_SEAT and "oc:zai/glm-5.2" in reserve_models
+    assert reserve_models[0] == ASTRA_SEAT and "omp:zai/glm-5.3" in reserve_models
 
     # The z.ai GLM seat ALSO down, mirroring the real incident shape exactly.
-    available_double_failure = available - {"oc:zai/glm-5.2"}
+    available_double_failure = available - {"omp:zai/glm-5.3"}
     pool_double_failure, reserve_double_failure = split_pool_reserve(
         board, pool_size, _avail(available_double_failure)
     )
     assert [r.model for r in pool_double_failure] == expected_pool_models
     assert reserve_double_failure and reserve_double_failure[0].model == ASTRA_SEAT
 
-    # Pre-#382 comparison (drop TERRA_SEAT/SONNET_SEAT -- the two seats #382 added -- and
+    # Pre-#382 comparison (drop LUNA_SEAT/SONNET_SEAT -- the two seats #382 added -- and
     # GROK_SEAT/MIMO_SEAT/OMP_CLAUDE_SEAT, which review-cli#165/#450/#168 added on top of
     # #382 and which are likewise available reserves here): the equivalent double failure
     # left only Sol/Opus/Astra available (3, one seat short of the pool, with
@@ -297,7 +301,7 @@ def test_heavy_preset_double_failure_still_beats_pre_382_board():
         r
         for r in board
         if r.model
-        not in {TERRA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT, OMP_CLAUDE_SEAT}
+        not in {LUNA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT, OMP_CLAUDE_SEAT}
     ]
     pre_382_available = {
         r.model for r in pre_382_board if r.model in available_double_failure
@@ -324,13 +328,13 @@ def test_light_preset_double_failure_pool_unchanged_but_reserve_deepens():
     board = list(LIGHT_PRESET_BOARD)
     pool_size = preset_pool_size("light")
     available_double_failure = (
-        {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS - {"oc:zai/glm-5.2"}
+        {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS - {"omp:zai/glm-5.3"}
     )
 
     pool, reserve = split_pool_reserve(
         board, pool_size, _avail(available_double_failure)
     )
-    assert [r.model for r in pool] == ["claude:claude-opus-4-8", ASTRA_SEAT]
+    assert [r.model for r in pool] == ["claude:claude-opus-5-5", ASTRA_SEAT]
     assert [r.role for r in pool] == ["correctness", "consistency"]
     reserve_models = [r.model for r in reserve]
     # GROK_SEAT (review-cli#165) and MIMO_SEAT (review-cli#450) are live reserves behind
@@ -338,21 +342,21 @@ def test_light_preset_double_failure_pool_unchanged_but_reserve_deepens():
     # agentic/oauth routes the commandcode/gemini disable and the z.ai GLM outage never
     # touch.
     assert reserve_models == [
-        TERRA_SEAT,
+        LUNA_SEAT,
         SONNET_SEAT,
         OMP_CLAUDE_SEAT,
         GROK_SEAT,
         MIMO_SEAT,
     ]
 
-    # Pre-#382 comparison: same board minus TERRA_SEAT/SONNET_SEAT (and GROK_SEAT/
+    # Pre-#382 comparison: same board minus LUNA_SEAT/SONNET_SEAT (and GROK_SEAT/
     # MIMO_SEAT/OMP_CLAUDE_SEAT, added later still) -- the dispatched pool is
     # byte-identical, but the reserve was empty (nothing left to backfill Opus/Astra).
     pre_382_board = [
         r
         for r in board
         if r.model
-        not in {TERRA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT, OMP_CLAUDE_SEAT}
+        not in {LUNA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT, OMP_CLAUDE_SEAT}
     ]
     pre_382_available = {
         r.model for r in pre_382_board if r.model in available_double_failure
@@ -389,8 +393,8 @@ def test_startup_only_two_available_pool_shrinks_no_phantom():
     """Fewer available seats than the pool size -> the pool is just the available ones
     (no phantom seat), reserve empty."""
     board = list(DEFAULT_BOARD)
-    pool, reserve = split_pool_reserve(board, 4, _avail({"oc:zai/glm-5.2", "gemini"}))
-    assert {r.model for r in pool} == {"oc:zai/glm-5.2", "gemini"}
+    pool, reserve = split_pool_reserve(board, 4, _avail({"omp:zai/glm-5.3", "gemini"}))
+    assert {r.model for r in pool} == {"omp:zai/glm-5.3", "gemini"}
     assert reserve == []
 
 
@@ -443,27 +447,27 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     board = list(DEFAULT_BOARD)
     by_model = {r.model: r for r in board}
     pool = [
-        by_model["claude:claude-fable-5"],
+        by_model["claude:claude-fable-5-1"],
         by_model[SOL_SEAT],
-        by_model["claude:claude-opus-4-8"],
+        by_model["claude:claude-opus-5-5"],
         by_model[GLM_COMMANDCODE_SEAT],
     ]
     reserve = [r for r in board if r.model not in {p.model for p in pool}]
-    assert pool[0].model == "claude:claude-fable-5"  # Fable IS selected in this pool
+    assert pool[0].model == "claude:claude-fable-5-1"  # Fable IS selected in this pool
     fable_body = (
         "Claude Fable 5 is currently unavailable. "
         "Learn more: https://www.anthropic.com/news/fable-mythos-access"
     )
-    with _FakeBackends({"claude:claude-fable-5": (0, fable_body)}):
+    with _FakeBackends({"claude:claude-fable-5-1": (0, fable_body)}):
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
     assert len(outcome.usable) == 4
     assert not outcome.degraded
-    assert "claude:claude-fable-5" not in outcome.usable_models
+    assert "claude:claude-fable-5-1" not in outcome.usable_models
     assert set(outcome.usable_models) == {
-        "codex:gpt-5.6-sol",
-        "claude:claude-opus-4-8",
-        "commandcode:zai-org/GLM-5.2",
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex:gpt-6.1-sol",
+        "claude:claude-opus-5-5",
+        "commandcode:zai-org/GLM-5.3",
+        "oc:commandcode/moonshotai/Kimi-K3",
     }, outcome.usable_models
 
 
@@ -559,15 +563,15 @@ def test_midrun_reserve_seat_is_relensed_onto_the_missing_role():
 # The roster from ~/.config/review-cli/config.yaml on 2026-09-29 (commandcode seats are
 # unpaid and never reachable, so they are left out here as the startup probe drops them).
 _ALEX_ROSTER = [
-    BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-    BoardReviewer("omp:openai-codex/gpt-5.6-terra", "consistency", "Codex-omp"),
-    BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
-    BoardReviewer("oc:zai/glm-5.2", "quality", "GLM"),
-    BoardReviewer("claude:claude-sonnet-5", "quality", "Sonnet"),
-    BoardReviewer("oc:xai/grok-4.6", "security", "Grok"),
-    BoardReviewer("omp:anthropic/claude-opus-4-8", "correctness", "Opus-omp"),
-    BoardReviewer("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc-last"),
-    BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    BoardReviewer("claude:claude-opus-5-5", "correctness", "Opus"),
+    BoardReviewer("omp:openai-codex/gpt-6-luna", "consistency", "Codex-omp"),
+    BoardReviewer("codex:gpt-6-luna", "consistency", "Codex"),
+    BoardReviewer("oc:zai/glm-5.3", "quality", "GLM"),
+    BoardReviewer("claude:claude-sonnet-5-5", "quality", "Sonnet"),
+    BoardReviewer("oc:xai/grok-4.7", "security", "Grok"),
+    BoardReviewer("omp:anthropic/claude-opus-5-5", "correctness", "Opus-omp"),
+    BoardReviewer("commandcode:zai-org/GLM-5.3", "performance", "GLM-cc-last"),
+    BoardReviewer("claude:claude-fable-5-1", "architect", "Fable"),
 ]
 
 
@@ -580,12 +584,15 @@ def test_replay_2026_09_29_sme_463_keeps_three_distinct_roles():
     pool, reserve = split_pool_reserve(board, 3, _avail({r.model for r in board}))
     assert [r.display for r in pool] == ["Opus", "Codex-omp", "GLM"]
     dead = {
-        "claude:claude-opus-4-8": (1, "Failed to authenticate: OAuth session expired"),
-        "claude:claude-sonnet-5": (1, "Failed to authenticate: OAuth session expired"),
-        "claude:claude-fable-5": (1, "Failed to authenticate: OAuth session expired"),
-        "omp:openai-codex/gpt-5.6-terra": (1, "The usage limit has been reached"),
-        "codex:gpt-5.6-terra": (1, "401 Unauthorized: token_revoked"),
-        "oc:xai/grok-4.6": (1, "Error: You have run out of credits"),
+        "claude:claude-opus-5-5": (1, "Failed to authenticate: OAuth session expired"),
+        "claude:claude-sonnet-5-5": (
+            1,
+            "Failed to authenticate: OAuth session expired",
+        ),
+        "claude:claude-fable-5-1": (1, "Failed to authenticate: OAuth session expired"),
+        "omp:openai-codex/gpt-6-luna": (1, "The usage limit has been reached"),
+        "codex:gpt-6-luna": (1, "401 Unauthorized: token_revoked"),
+        "oc:xai/grok-4.7": (1, "Error: You have run out of credits"),
     }
     with _FakeBackends(dead):
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
@@ -600,7 +607,7 @@ def test_replay_2026_09_29_stt_106_single_healthy_model_fills_three_roles():
     healthy model now reviews the missing lenses too: 3 distinct roles, one model."""
     board = list(_ALEX_ROSTER)
     pool, reserve = split_pool_reserve(board, 3, _avail({r.model for r in board}))
-    healthy = "omp:anthropic/claude-opus-4-8"
+    healthy = "omp:anthropic/claude-opus-5-5"
     dead = {r.model: (1, "Error: seat down") for r in board if r.model != healthy}
     with _FakeBackends(dead):
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)

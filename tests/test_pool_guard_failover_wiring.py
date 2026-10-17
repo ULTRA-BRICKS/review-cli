@@ -94,11 +94,11 @@ class _PatchBackends:
 
 
 def test_guard_proceeds_when_only_a_failover_alternate_is_live():
-    """glm52 -> zai:glm-5.2 (down, no key) -> oc:zai/glm-5.2 (live). The guard must NOT
+    """glm53 -> zai:glm-5.3 (down, no key) -> oc:zai/glm-5.3 (live). The guard must NOT
     bail just because the head spelling is unavailable."""
 
     def _available(model: str) -> bool:
-        return model == "oc:zai/glm-5.2"
+        return model == "oc:zai/glm-5.3"
 
     def _reason(model: str) -> str | None:
         return None if _available(model) else f"{model}: no key configured"
@@ -108,8 +108,8 @@ def test_guard_proceeds_when_only_a_failover_alternate_is_live():
             config={},
             config_models=[],
             config_has_board=False,
-            user_seats=(("glm52", "glm52"),),
-            explicit_models=["glm52"],
+            user_seats=(("glm53", "glm53"),),
+            explicit_models=["glm53"],
             pool_arg=None,
             default_pool=1,
         )
@@ -128,8 +128,8 @@ def test_guard_still_bails_when_every_provider_in_the_chain_is_down():
             config={},
             config_models=[],
             config_has_board=False,
-            user_seats=(("glm52", "glm52"),),
-            explicit_models=["glm52"],
+            user_seats=(("glm53", "glm53"),),
+            explicit_models=["glm53"],
             pool_arg=None,
             default_pool=1,
         )
@@ -154,8 +154,8 @@ def test_guard_synthesizes_a_reason_when_the_head_reason_is_blank():
                 config={},
                 config_models=[],
                 config_has_board=False,
-                user_seats=(("glm52", "glm52"),),
-                explicit_models=["glm52"],
+                user_seats=(("glm53", "glm53"),),
+                explicit_models=["glm53"],
                 pool_arg=None,
                 default_pool=1,
             )
@@ -177,7 +177,7 @@ def test_guard_bails_on_one_live_seat_against_the_real_default_board_without_the
     board_seats = tuple((r.model, r.display) for r in DEFAULT_BOARD)
 
     def _available(model: str) -> bool:
-        return model == "codex:gpt-5.6-terra"
+        return model == "codex:gpt-6-luna"
 
     with _PatchBackends(
         available=_available, reason=lambda m: f"{m}: session-limit cooldown"
@@ -206,7 +206,7 @@ def test_guard_proceeds_on_one_live_seat_against_the_real_default_board_with_reu
     assert any(r.role for r in DEFAULT_BOARD), "sanity: DEFAULT_BOARD carries role metadata"
 
     def _available(model: str) -> bool:
-        return model == "codex:gpt-5.6-terra"
+        return model == "codex:gpt-6-luna"
 
     with _PatchBackends(
         available=_available, reason=lambda m: f"{m}: session-limit cooldown"
@@ -360,10 +360,10 @@ def test_chain_aware_available_agrees_with_the_guard_on_a_head_down_alternate_li
     (tests/test_provider_failover.py) proves the REAL dispatch split honors it end to end."""
 
     def _available(model: str) -> bool:
-        return model == "oc:zai/glm-5.2"
+        return model == "oc:zai/glm-5.3"
 
     with _PatchBackends(available=_available, reason=lambda _m: None):
-        assert cli._chain_aware_available("zai:glm-5.2") is True, (
+        assert cli._chain_aware_available("zai:glm-5.3") is True, (
             "a live failover alternate must count as available"
         )
         assert cli._chain_aware_available("codex") is False, (

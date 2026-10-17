@@ -19,6 +19,7 @@ Proves:
     not reachable; Gemini selectable iff its key resolves;
   * Gemini stays the REST-key exception and honors $GEMINI_MODEL.
 """
+
 from __future__ import annotations
 
 import json
@@ -39,15 +40,21 @@ _IMG = vc.encode_image(_IMG_BYTES)
 def _blocks():
     return [
         vc.VisionBlock(kind="text", text="verify this"),
-        vc.VisionBlock(kind="image", label="after", media_type="image/png", data_base64=_IMG),
+        vc.VisionBlock(
+            kind="image", label="after", media_type="image/png", data_base64=_IMG
+        ),
     ]
 
 
 def _before_after_blocks():
     return [
         vc.VisionBlock(kind="text", text="verify this"),
-        vc.VisionBlock(kind="image", label="before", media_type="image/png", data_base64=_IMG),
-        vc.VisionBlock(kind="image", label="after", media_type="image/png", data_base64=_IMG),
+        vc.VisionBlock(
+            kind="image", label="before", media_type="image/png", data_base64=_IMG
+        ),
+        vc.VisionBlock(
+            kind="image", label="after", media_type="image/png", data_base64=_IMG
+        ),
     ]
 
 
@@ -55,7 +62,13 @@ def _before_after_blocks():
 # visual CLI dispatch calls through `_run_cli`). Captures the argv/stdin and returns a
 # canned CompletedProcess. The codex path also writes its verdict to the `-o` file, so the
 # fake honors `--output-schema`/`-o` by writing the canned JSON there. -----------------
-def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write_output_file: str | None = None):
+def _patch_runner(
+    capture: dict,
+    *,
+    stdout: str = "",
+    returncode: int = 0,
+    write_output_file: str | None = None,
+):
     """Monkeypatch reviewlib.process._run_streamed (the seam `_run_cli` uses). Returns the
     old function so the caller can restore it."""
     import shutil
@@ -64,8 +77,17 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
     import reviewlib.process as process
 
     def fake(
-        argv, *, cwd, input_text=None, env=None, timeout=1200, backend="backend",
-        round_no=0, announce=False, idle_floor=None, timeout_mode="idle",
+        argv,
+        *,
+        cwd,
+        input_text=None,
+        env=None,
+        timeout=1200,
+        backend="backend",
+        round_no=0,
+        announce=False,
+        idle_floor=None,
+        timeout_mode="idle",
     ):
         argv = list(argv)
         capture["argv"] = argv
@@ -98,14 +120,20 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
         if write_output_file is not None and "-o" in argv:
             out_path = Path(argv[argv.index("-o") + 1])
             out_path.write_text(write_output_file, encoding="utf-8")
-        return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=""
+        )
 
     old = process._run_streamed
     old_which = shutil.which
     old_fireworks_key = os.environ.get("FIREWORKS_API_KEY")
     old_preflight = backends._provider_payment_preflight_unavailable_reason
     process._run_streamed = fake
-    shutil.which = lambda name: f"/fake/bin/{name}" if name in ("codex", "claude", "opencode") else old_which(name)
+    shutil.which = lambda name: (
+        f"/fake/bin/{name}"
+        if name in ("codex", "claude", "opencode")
+        else old_which(name)
+    )
     backends._provider_payment_preflight_unavailable_reason = lambda _model: None
     os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     return old, old_which, old_fireworks_key, old_preflight
@@ -157,14 +185,20 @@ def test_codex_cli_attaches_image_and_parses_output_schema():
         write_output_file='{"verdict":"keep","confidence":0.95,"selection_present":true}',
     )
     try:
-        v = vc.call_ai_vision("codex", blocks=_blocks(), output_schema=vc.build_output_schema(["selection_present"]))
+        v = vc.call_ai_vision(
+            "codex",
+            blocks=_blocks(),
+            output_schema=vc.build_output_schema(["selection_present"]),
+        )
     finally:
         _restore_runner(old)
     argv = cap["argv"]
     assert argv[0] == "codex" and argv[1] == "exec", argv
     # Image attached via -i, and the staged file held the real PNG bytes.
     assert "-i" in argv, "codex must attach the image with -i"
-    assert _staged_image_bytes(cap, "-i") == _IMG_BYTES, "the -i image was not the staged screenshot"
+    assert _staged_image_bytes(cap, "-i") == _IMG_BYTES, (
+        "the -i image was not the staged screenshot"
+    )
     # Forced structured output via --output-schema + -o, and the verdict read from -o.
     assert "--output-schema" in argv and "-o" in argv
     assert v.available and v.verdict == "keep" and v.confidence == 0.95
@@ -189,7 +223,9 @@ def test_claude_cli_references_image_and_enables_read():
     is ENABLED (vision needs to load the file). `--output-format json` wraps the answer;
     the verdict is the `result` field."""
     cap: dict = {}
-    wrapper = json.dumps({"type": "result", "result": '{"verdict":"rollback","confidence":0.8}'})
+    wrapper = json.dumps(
+        {"type": "result", "result": '{"verdict":"rollback","confidence":0.8}'}
+    )
     old = _patch_runner(cap, stdout=wrapper)
     try:
         v = vc.call_ai_vision("claude:claude-fable-5", blocks=_blocks())
@@ -204,7 +240,10 @@ def test_claude_cli_references_image_and_enables_read():
     assert "--tools" in argv and argv[argv.index("--tools") + 1] == "Read"
     assert "--json-schema" in argv
     assert "--no-session-persistence" in argv
-    assert "--permission-mode" in argv and argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert (
+        "--permission-mode" in argv
+        and argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    )
     assert "--strict-mcp-config" in argv
     assert "--disable-slash-commands" in argv
     assert "--safe-mode" in argv
@@ -223,7 +262,9 @@ def test_claude_cli_references_image_and_enables_read():
 def test_claude_cli_parses_bare_json_when_not_wrapped():
     """If claude returns the JSON directly (not wrapped), the parser still extracts it."""
     cap: dict = {}
-    old = _patch_runner(cap, stdout='Here is the verdict:\n{"verdict":"keep","confidence":0.91}\nDone.')
+    old = _patch_runner(
+        cap, stdout='Here is the verdict:\n{"verdict":"keep","confidence":0.91}\nDone.'
+    )
     try:
         v = vc.call_ai_vision("claude:opus", blocks=_blocks())
     finally:
@@ -262,16 +303,28 @@ def test_opencode_is_vision_capable():
 
 
 def test_grok_seat_is_vision_and_generic_grok_is_not():
-    """GROK_SEAT (grok-4.6) is vision-capable; a generic `grok` hint would also
-    match grok-3, so the allowlist is the `grok-4.6` substring only."""
+    """GROK_SEAT (grok-4.7) is vision-capable, and so is the pinned grok-4.6; a generic
+    `grok` hint would also match grok-3, so the allowlist names the versions only."""
     from reviewlib.config import GROK_SEAT
 
+    assert GROK_SEAT == "oc:xai/grok-4.7"
     assert vc._opencode_model_is_vision(GROK_SEAT) is True
     assert vc._opencode_model_is_vision("oc:xai/grok-4.6") is True
     assert vc._opencode_model_is_vision("oc:xai/grok-4.5") is False
     assert vc._opencode_model_is_vision("oc:xai/grok-3") is False
+    assert "grok-4.7" in vc._VISION_MODEL_HINTS
     assert "grok-4.6" in vc._VISION_MODEL_HINTS
     assert "grok" not in vc._VISION_MODEL_HINTS
+
+
+def test_visual_kimi_seat_is_vision():
+    """VISUAL_MODELS' Kimi entry moved to Kimi-K3 (review-cli#645; image input per
+    models.dev's commandcode listing) and must still pass the opencode vision gate."""
+    from reviewlib.config import VISUAL_MODELS
+
+    kimi = next(m for m in VISUAL_MODELS if "Kimi" in m)
+    assert kimi == "oc:commandcode/moonshotai/Kimi-K3"
+    assert vc._opencode_model_is_vision(kimi) is True
 
 
 # === routing / capability ========================================================
@@ -292,13 +345,17 @@ def test_all_four_routes_live_dispatch_wired():
     now (the CTO correction — it routes to vision models via the CLI)."""
     for route in ("claude", "codex", "opencode", "gemini"):
         cap = vc._CAPABILITIES[route]
-        assert cap.vision and cap.live_dispatch is True, f"{route} live dispatch must be wired"
+        assert cap.vision and cap.live_dispatch is True, (
+            f"{route} live dispatch must be wired"
+        )
 
 
 def test_schema_includes_module_fields():
     schema = vc.build_output_schema(["selection_present", "unstyled"])
     props = schema["properties"]
-    assert "selection_present" in props and props["selection_present"]["type"] == "boolean"
+    assert (
+        "selection_present" in props and props["selection_present"]["type"] == "boolean"
+    )
     assert "unstyled" in props
     assert "verdict" in schema["required"] and "confidence" in schema["required"]
     # Active module fields must be REQUIRED so the model can't omit them (codex P2).
@@ -318,7 +375,12 @@ def test_schema_instruction_lists_keys_and_verdict_enum():
 # === structured-output parse (shared by all routes) ==============================
 def test_parse_structured_valid():
     v = vc.parse_structured(
-        {"verdict": "keep", "confidence": 0.9, "note": "looks fine", "selection_present": True},
+        {
+            "verdict": "keep",
+            "confidence": 0.9,
+            "note": "looks fine",
+            "selection_present": True,
+        },
         backend="codex",
     )
     assert v.available and v.verdict == "keep"
@@ -329,7 +391,9 @@ def test_parse_structured_valid():
 def test_parse_structured_invalid_enum_yields_none():
     v = vc.parse_structured({"verdict": "definitely-fine", "confidence": 1.0})
     assert v.available is True
-    assert v.verdict is None, "an invalid verdict enum must marshal to None so policy fails closed"
+    assert v.verdict is None, (
+        "an invalid verdict enum must marshal to None so policy fails closed"
+    )
 
 
 def test_extract_first_json_object_from_prose_and_fences():
@@ -337,11 +401,17 @@ def test_extract_first_json_object_from_prose_and_fences():
     prose, or inside a ```json fence."""
     bare = vc._extract_first_json_object('{"verdict":"keep","confidence":0.9}')
     assert bare and bare["verdict"] == "keep"
-    prose = vc._extract_first_json_object('Sure! Here:\n{"verdict":"rollback","confidence":0.5} — done')
+    prose = vc._extract_first_json_object(
+        'Sure! Here:\n{"verdict":"rollback","confidence":0.5} — done'
+    )
     assert prose and prose["verdict"] == "rollback"
-    fenced = vc._extract_first_json_object('```json\n{"verdict":"repair","confidence":0.4}\n```')
+    fenced = vc._extract_first_json_object(
+        '```json\n{"verdict":"repair","confidence":0.4}\n```'
+    )
     assert fenced and fenced["verdict"] == "repair"
-    nested = vc._extract_first_json_object('{"verdict":"keep","confidence":0.9,"defects":[{"x":1}]}')
+    nested = vc._extract_first_json_object(
+        '{"verdict":"keep","confidence":0.9,"defects":[{"x":1}]}'
+    )
     assert nested and nested["defects"] == [{"x": 1}]
     assert vc._extract_first_json_object("no json at all here") is None
 
@@ -359,7 +429,14 @@ def test_safe_confidence_fails_closed():
 
 
 def test_parse_structured_malformed_list_fields_fail_closed():
-    v = vc.parse_structured({"verdict": "keep", "confidence": 0.9, "defects": 1, "observed_change_regions": "nope"})
+    v = vc.parse_structured(
+        {
+            "verdict": "keep",
+            "confidence": 0.9,
+            "defects": 1,
+            "observed_change_regions": "nope",
+        }
+    )
     assert v.verdict == "keep"
     assert v.defects == []
     assert v.observed_change_regions == []
@@ -376,7 +453,9 @@ def test_cli_no_parseable_json_fails_closed_to_human_review():
     """A CLI that returns prose with no JSON verdict → available=True/verdict=None so the
     policy engine fails closed to human_review (never a silent keep)."""
     cap: dict = {}
-    old = _patch_runner(cap, stdout="I could not determine a verdict from the image.", returncode=0)
+    old = _patch_runner(
+        cap, stdout="I could not determine a verdict from the image.", returncode=0
+    )
     try:
         v = vc.call_ai_vision("codex", blocks=_blocks())
     finally:
@@ -390,12 +469,16 @@ def test_cli_nonzero_exit_fails_closed_even_with_keep_in_stdout():
     CLI can still print a parseable `{"verdict":"keep"}` to stdout, which must never be
     trusted (codex high finding)."""
     cap: dict = {}
-    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.99}', returncode=1)
+    old = _patch_runner(
+        cap, stdout='{"verdict":"keep","confidence":0.99}', returncode=1
+    )
     try:
         v = vc.call_ai_vision("claude:opus", blocks=_blocks())
     finally:
         _restore_runner(old)
-    assert v.available is True and v.verdict is None, "non-zero exit must not trust a keep in stdout"
+    assert v.available is True and v.verdict is None, (
+        "non-zero exit must not trust a keep in stdout"
+    )
     assert "non-zero" in (v.error or "")
 
 
@@ -422,12 +505,16 @@ def test_text_opencode_model_not_selected_for_vision():
     old_which = shutil.which
     old_key = os.environ.get("FIREWORKS_API_KEY")
     old_preflight = _patch_preflight_allow()
-    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    shutil.which = lambda name: (
+        "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    )
     os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     vc.vision_backend_available = old  # use the real function under test
     try:
         text_default = "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo"
-        assert vc.vision_backend_available(text_default) is False, "text opencode model must be unreachable for vision"
+        assert vc.vision_backend_available(text_default) is False, (
+            "text opencode model must be unreachable for vision"
+        )
         assert vc.select_vision_backend([text_default]) is None
         # A vision-looking opencode model IS reachable.
         assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is True
@@ -446,14 +533,21 @@ def test_opencode_vision_allowlist_env_override():
     import shutil
 
     old_which = shutil.which
-    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    shutil.which = lambda name: (
+        "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    )
     old_env = os.environ.get("REVIEW_OPENCODE_VISION_MODELS")
     old_key = os.environ.get("FIREWORKS_API_KEY")
     old_preflight = _patch_preflight_allow()
     os.environ["REVIEW_OPENCODE_VISION_MODELS"] = "kimi-k2p6-turbo"
     os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     try:
-        assert vc.vision_backend_available("oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo") is True
+        assert (
+            vc.vision_backend_available(
+                "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo"
+            )
+            is True
+        )
     finally:
         shutil.which = old_which
         _restore_preflight(old_preflight)
@@ -476,7 +570,9 @@ def test_opencode_vision_requires_provider_auth_for_known_providers():
     old_key = os.environ.pop("FIREWORKS_API_KEY", None)
     old_auth = os.environ.get("OC_AUTH_FILE")
     old_config = os.environ.get("OC_CONFIG_FILE")
-    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    shutil.which = lambda name: (
+        "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    )
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["OC_AUTH_FILE"] = str(Path(tmp) / "auth.json")
         os.environ["OC_CONFIG_FILE"] = str(Path(tmp) / "opencode.json")
@@ -505,7 +601,9 @@ def test_opencode_zai_vision_requires_opencode_auth_not_zai_rest_key():
     old_zai_key = os.environ.get("ZAI_API_KEY")
     old_auth = os.environ.get("OC_AUTH_FILE")
     old_config = os.environ.get("OC_CONFIG_FILE")
-    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    shutil.which = lambda name: (
+        "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    )
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["OC_AUTH_FILE"] = str(Path(tmp) / "auth.json")
         os.environ["OC_CONFIG_FILE"] = str(Path(tmp) / "opencode.json")
@@ -535,7 +633,9 @@ def test_unpaid_opencode_provider_not_selected_for_vision():
 
     old_env = os.environ.get("REVIEW_UNPAID_PROVIDERS")
     old_which = shutil.which
-    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    shutil.which = lambda name: (
+        "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    )
     os.environ["REVIEW_UNPAID_PROVIDERS"] = "fireworks"
     try:
         assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is False
@@ -589,7 +689,9 @@ def test_opencode_vision_missing_binary_does_not_run_payment_preflight():
         return old_which(name)
 
     def _network_should_not_run(*_args, **_kwargs):
-        raise AssertionError("visual payment preflight ran before opencode binary check")
+        raise AssertionError(
+            "visual payment preflight ran before opencode binary check"
+        )
 
     shutil.which = _no_opencode
     urllib.request.urlopen = _network_should_not_run
@@ -638,16 +740,24 @@ def test_unpaid_claude_gateway_visual_call_does_not_spawn_runner():
 
     saved_env = {
         key: os.environ.get(key)
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "REVIEW_UNPAID_PROVIDERS")
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "REVIEW_UNPAID_PROVIDERS",
+        )
     }
     old_runner = process._run_streamed
     old_which = shutil.which
 
     def _boom(*args, **kwargs):  # pragma: no cover - asserted by not raising
-        raise AssertionError("visual Claude runner spawned despite unpaid CommandCode gateway")
+        raise AssertionError(
+            "visual Claude runner spawned despite unpaid CommandCode gateway"
+        )
 
     process._run_streamed = _boom
-    shutil.which = lambda name: "/usr/bin/claude" if name == "claude" else old_which(name)
+    shutil.which = lambda name: (
+        "/usr/bin/claude" if name == "claude" else old_which(name)
+    )
     os.environ["ANTHROPIC_API_KEY"] = "user_x"
     os.environ["ANTHROPIC_BASE_URL"] = "https://api.commandcode.ai/provider"
     os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
@@ -711,13 +821,21 @@ def test_cli_missing_required_module_field_fails_closed():
     claude/opencode only get the prompt instruction, so we validate OUTSIDE the model."""
     cap: dict = {}
     # claude returns a keep but OMITS the required `unstyled` module field.
-    wrapper = json.dumps({"type": "result", "result": '{"verdict":"keep","confidence":0.99}'})
+    wrapper = json.dumps(
+        {"type": "result", "result": '{"verdict":"keep","confidence":0.99}'}
+    )
     old = _patch_runner(cap, stdout=wrapper)
     try:
-        v = vc.call_ai_vision("claude:opus", blocks=_blocks(), output_schema=vc.build_output_schema(["unstyled"]))
+        v = vc.call_ai_vision(
+            "claude:opus",
+            blocks=_blocks(),
+            output_schema=vc.build_output_schema(["unstyled"]),
+        )
     finally:
         _restore_runner(old)
-    assert v.available is True and v.verdict is None, "missing required module field must fail closed"
+    assert v.available is True and v.verdict is None, (
+        "missing required module field must fail closed"
+    )
     assert "required schema" in (v.error or "") and "unstyled" in (v.error or "")
 
 
@@ -725,9 +843,15 @@ def test_cli_nonboolean_required_module_field_fails_closed():
     """A required boolean module field returned as a non-boolean (e.g. "yes") fails closed:
     a truthy string must NOT be coerced into a module pass."""
     cap: dict = {}
-    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9,"unstyled":"false"}')
+    old = _patch_runner(
+        cap, stdout='{"verdict":"keep","confidence":0.9,"unstyled":"false"}'
+    )
     try:
-        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks(), output_schema=vc.build_output_schema(["unstyled"]))
+        v = vc.call_ai_vision(
+            "oc:fireworks/qwen2-vl",
+            blocks=_blocks(),
+            output_schema=vc.build_output_schema(["unstyled"]),
+        )
     finally:
         _restore_runner(old)
     assert v.available is True and v.verdict is None
@@ -737,9 +861,15 @@ def test_cli_nonboolean_required_module_field_fails_closed():
 def test_cli_valid_required_module_field_passes_validation():
     """When the required module field IS present and correctly typed, the verdict parses."""
     cap: dict = {}
-    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9,"unstyled":false}')
+    old = _patch_runner(
+        cap, stdout='{"verdict":"keep","confidence":0.9,"unstyled":false}'
+    )
     try:
-        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks(), output_schema=vc.build_output_schema(["unstyled"]))
+        v = vc.call_ai_vision(
+            "oc:fireworks/qwen2-vl",
+            blocks=_blocks(),
+            output_schema=vc.build_output_schema(["unstyled"]),
+        )
     finally:
         _restore_runner(old)
     assert v.available is True and v.verdict == "keep"
@@ -773,7 +903,9 @@ def test_cli_backend_unreachable_when_binary_missing():
     import shutil
 
     old_which = shutil.which
-    shutil.which = lambda name: None if name in ("codex", "claude", "opencode") else old_which(name)
+    shutil.which = lambda name: (
+        None if name in ("codex", "claude", "opencode") else old_which(name)
+    )
     try:
         assert vc.vision_backend_available("codex") is False
         assert vc.vision_backend_available("claude:opus") is False
@@ -790,7 +922,10 @@ def test_selection_prefers_first_reachable_cli():
     vc.vision_backend_available = lambda m: True  # pretend everything reachable
     try:
         assert vc.select_vision_backend(["codex", "gemini"]) == "codex"
-        assert vc.select_vision_backend(["oc:fireworks/qwen2-vl", "codex"]) == "oc:fireworks/qwen2-vl"
+        assert (
+            vc.select_vision_backend(["oc:fireworks/qwen2-vl", "codex"])
+            == "oc:fireworks/qwen2-vl"
+        )
     finally:
         vc.vision_backend_available = old
     assert vc.select_vision_backend([]) is None
@@ -828,7 +963,9 @@ def test_call_ai_vision_with_fallback_skips_unusable_primary():
                 error="model is currently unavailable",
                 backend=model,
             )
-        return vc.VisionVerdict(available=True, verdict="keep", confidence=0.91, backend=model)
+        return vc.VisionVerdict(
+            available=True, verdict="keep", confidence=0.91, backend=model
+        )
 
     vc.call_ai_vision = fake
     try:
@@ -926,7 +1063,9 @@ def test_gemini_vision_default_model_is_current():
     try:
         v = vc.call_ai_vision("gemini", blocks=_blocks())
         assert v.verdict == "keep"
-        assert "models/gemini-3.5-flash:generateContent" in captured["url"], captured.get("url")
+        assert "models/gemini-3.5-flash:generateContent" in captured["url"], (
+            captured.get("url")
+        )
     finally:
         urllib.request.urlopen = old_open
         backends._gemini_key = old_key
@@ -981,8 +1120,12 @@ def test_stage_images_writes_real_files_with_right_suffix():
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:
-        jpg_block = vc.VisionBlock(kind="image", label="after", media_type="image/jpeg", data_base64=_IMG)
-        paths = vc._stage_images([vc.VisionBlock(kind="text", text="x"), jpg_block], Path(d))
+        jpg_block = vc.VisionBlock(
+            kind="image", label="after", media_type="image/jpeg", data_base64=_IMG
+        )
+        paths = vc._stage_images(
+            [vc.VisionBlock(kind="text", text="x"), jpg_block], Path(d)
+        )
         assert len(paths) == 1
         assert paths[0].suffix == ".jpg"
         assert paths[0].read_bytes() == _IMG_BYTES
@@ -1009,7 +1152,9 @@ def test_codex_vision_threads_effort_to_reasoning_config():
         vc.call_ai_vision("codex", blocks=_blocks())
     finally:
         _restore_runner(old)
-    assert not any(a.startswith("model_reasoning_effort=") for a in cap2["argv"]), cap2["argv"]
+    assert not any(a.startswith("model_reasoning_effort=") for a in cap2["argv"]), cap2[
+        "argv"
+    ]
 
 
 def test_claude_vision_threads_effort_once():

@@ -392,38 +392,38 @@ def test_board_flags_and_listing():
         # Bare `--show-board` now resolves to the "light" preset (Alex, 2026-08-28:
         # cheap/quick preflight is the default; "default"/"heavy" are opt-in).
         "source: preset:light",
-        "claude:claude-opus-4-8",
+        "claude:claude-opus-5-5",
         "oc:commandcode/deepseek/deepseek-v4-pro",
-        "oc:zai/glm-5.2",
+        "omp:zai/glm-5.3",
         # Grok — verifies the 13-seat count below is actually seats with Grok present,
         # not merely a matching total (review of #166). MIMO_SEAT (review-cli#450) is the
         # 12th light-preset seat; OMP_CLAUDE_SEAT (review-cli#168) makes it 13.
-        "oc:xai/grok-4.6",
-        "omp:opencode-go/mimo-v2.5",
+        "oc:xai/grok-4.7",
+        "omp:opencode-go/mimo-v2.6-pro",
         "contracts",
         "13 seats",
         "#1",
-        # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
-        "commandcode:zai-org/GLM-5.2",
+        # The CTO-directed GLM-5.3-via-commandcode seat (light preset, diff-only keyed HTTP).
+        "commandcode:zai-org/GLM-5.3",
         "GLM-cc",
     ):
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
-    # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
+    # review-cli#fable-seat-reliability: claude:claude-fable-5-1 is EXCLUDED from the
     # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
-    # (Fable was the only seat carrying it). review-cli#382 added TERRA_SEAT/SONNET_SEAT,
+    # (Fable was the only seat carrying it). review-cli#382 added LUNA_SEAT/SONNET_SEAT,
     # so heavy is now 13 seats (with GROK_SEAT, review-cli#165, and MIMO_SEAT,
     # review-cli#450); OMP_CLAUDE_SEAT (review-cli#168) makes it 14.
     for needle in (
         "source: preset:heavy",
-        "codex:gpt-5.6-sol",
+        "codex:gpt-6.1-sol",
         # Grok — same rationale as the default-board needle above.
-        "oc:xai/grok-4.6",
-        "omp:opencode-go/mimo-v2.5",
+        "oc:xai/grok-4.7",
+        "omp:opencode-go/mimo-v2.6-pro",
         "14 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
-    assert_not_in("claude:claude-fable-5", heavy)
+    assert_not_in("claude:claude-fable-5-1", heavy)
     # Heavy has no architect SEAT (Fable is the only seat that carried that lens).
     # `--show-board` also prints a Fallbacks-per-role footer that lists every
     # REVIEW_ROLES key, including architect — so this check is seat lines only.
