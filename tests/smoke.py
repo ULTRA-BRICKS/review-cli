@@ -758,6 +758,10 @@ _UNIT_FILES = [
     # threshold, env overrides, skip reasons). Unit tests patch attributes; the e2e runs
     # bin/review against a fake omp wrapper + fake real binary + fake agent.db in a temp HOME.
     ("test_omp_account_pool.py", {}),
+    # Every harness login in `review seats` (review-cli#646: Claude Code, Codex, omp,
+    # opencode, review-cli keys; no secret printed) and omp:zai seats on review-cli's
+    # .env z.ai key. e2e runs bin/review in a temp HOME with fake claude/omp binaries.
+    ("test_harness_accounts.py", {}),
     # review_omp's true-silence cooldown wiring (review-cli#235 omp half): mirrors
     # test_true_silence_cooldown_wiring.py's opencode coverage above -- recording AND
     # consulting an independent "omp" cooldown namespace, plus a real-subprocess,

@@ -1787,6 +1787,21 @@ def _review_omp_once(
             env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir(profile=profile))
         if credential_id is not None:
             env[_OMP_CREDENTIAL_ID_ENV] = str(credential_id)
+        # review-cli#646: an env-key provider (z.ai) with no credential stored in the
+        # agent dir this seat runs on gets the key the availability probe resolved
+        # (process env first, then review-cli's .env; a blank primary var loses to a set
+        # alias). A stored credential is left to omp.
+        provider = _omp_provider_from_model(model)
+        if oauth_token is not None:
+            stored = False  # the seat's agent dir is the empty sandbox one
+        elif profile is not None:
+            live = _omp_auth_probe(_omp_agent_dir(profile=profile) / "agent.db")
+            stored = provider in (live or ())
+        else:
+            stored = _omp_stored_auth(provider)
+        env_key = None if stored else omp_env_key(provider)
+        if env_key is not None:
+            env[env_key[0]] = env_key[1]
         header = f"omp -m {_safe_log_header(omp_model)}" if omp_model else None
         if header and anthropic_account is not None:
             # the account this call ran on, in the per-call log (review-cli#465/#637)
@@ -1819,7 +1834,7 @@ def _read_env_key(env_file: Path, var: str = "GEMINI_API_KEY") -> str | None:
             if stripped.startswith(f"{var}="):
                 value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
                 return value or None
-    except OSError:
+    except (OSError, ValueError):  # unreadable, or not UTF-8 (UnicodeDecodeError)
         return None
     return None
 
@@ -1828,6 +1843,21 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
     """Resolve a provider API key from the environment, then the same fallback files
     review already reads (GEMINI_ENV_FILE override, else GEMINI_ENV_FALLBACKS — the
     shared `~/.config/review-cli/.env` and the personal env). Returns None if unset.
+    See `resolve_key_source` for the precedence."""
+    found = resolve_key_source(env_names, fallback_var)
+    return found[1] if found is not None else None
+
+
+def _env_key_files() -> tuple[Path, ...]:
+    env_file = os.environ.get("GEMINI_ENV_FILE")
+    return (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
+
+
+def resolve_key_source(
+    env_names: tuple, fallback_var: str
+) -> tuple[str, str, str] | None:
+    """(variable name, key, where: "env" or the .env path) for the key `_resolve_key`
+    returns, or None if unset.
 
     Precedence is KEY-NAME-FIRST, not path-first: env var beats every file, and among
     the files the canonical/primary key name wins over an alias REGARDLESS of which
@@ -1842,9 +1872,8 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
     for name in env_names:
         value = os.environ.get(name, "").strip()
         if value:
-            return value
-    env_file = os.environ.get("GEMINI_ENV_FILE")
-    paths = (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
+            return (name, value, "env")
+    paths = _env_key_files()
     # File lookup is name-priority-first: fallback_var (the canonical/primary name),
     # then the remaining accepted aliases, each checked across ALL .env files before
     # moving to the next name. This keeps key-name precedence deterministic and
@@ -1854,7 +1883,7 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
         for path in paths:
             key = _read_env_key(path, var)
             if key:
-                return key
+                return (var, key, str(path))
     return None
 
 
@@ -5271,11 +5300,63 @@ def _omp_auth_probe(db: Path) -> frozenset[str] | None:
     return frozenset(row[0] for row in rows if isinstance(row[0], str))
 
 
+# review-cli#646: omp also authenticates these providers from an API key in its env
+# (`omp --help` lists ZAI_API_KEY / OPENROUTER_API_KEY). review-cli usually holds such a
+# key in its own ~/.config/review-cli/.env rather than in the process env, so an
+# omp:zai/... seat looked unauthenticated while the key sat on the machine. Provider ->
+# (the env var omp reads, the names review-cli resolves it from, primary first).
+_OMP_ENV_KEY_PROVIDERS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "zai": ("ZAI_API_KEY", ("ZAI_API_KEY", "ZHIPU_API_KEY")),
+    "openrouter": ("OPENROUTER_API_KEY", ("OPENROUTER_API_KEY",)),
+}
+
+
+# omp_env_key memo: board passes probe every omp seat repeatedly, so the .env files are
+# re-read only when the process env values or a file's mtime change.
+_OMP_ENV_KEY_CACHE: dict[tuple, tuple[str, str] | None] = {}
+
+
+def _mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def omp_env_key(provider: str | None) -> tuple[str, str] | None:
+    """(env var, key) review-cli hands an omp seat on `provider`, resolved from the env
+    or review-cli's .env files; None for a provider omp has no env key for, or no key."""
+    spec = _OMP_ENV_KEY_PROVIDERS.get(provider or "")
+    if spec is None:
+        return None
+    var, names = spec
+    files = _env_key_files()
+    stamp = (
+        var,
+        tuple(os.environ.get(n) for n in names),
+        tuple((str(p), _mtime_ns(p)) for p in files),
+    )
+    if stamp not in _OMP_ENV_KEY_CACHE:
+        key = _resolve_key(names, var)
+        _OMP_ENV_KEY_CACHE[stamp] = (var, key) if key else None
+    return _OMP_ENV_KEY_CACHE[stamp]
+
+
 def _omp_auth_available(provider: str | None) -> bool:
     """Cheap OFFLINE omp auth probe: True iff the seat's provider has a usable
-    credential (or ANY provider does, for a bare `omp` seat). One stamp miss hydrates
-    every live provider in a single db read (`_OMP_AUTH_CACHE`), so probing N omp seats
-    costs one db read per board pass; see `_omp_auth_probe` for the read itself."""
+    credential (or ANY provider does, for a bare `omp` seat) — a stored one, else for an
+    env-key provider a key review-cli passes the seat (`omp_env_key`, which reads the
+    small .env only when no stored credential answered)."""
+    if _omp_stored_auth(provider):
+        return True
+    return provider is not None and omp_env_key(provider) is not None
+
+
+def _omp_stored_auth(provider: str | None) -> bool:
+    """True iff omp's auth db holds a usable credential for `provider` (any provider
+    for None). One stamp miss hydrates every live provider in a single db read
+    (`_OMP_AUTH_CACHE`), so probing N omp seats costs one db read per board pass; see
+    `_omp_auth_probe` for the read itself."""
     db = _omp_auth_db()
     stamp = _omp_db_stamp(db)
     if stamp is None:

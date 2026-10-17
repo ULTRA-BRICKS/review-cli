@@ -3,6 +3,27 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.50.0 — 2026-10-17
+
+- **Feat(seats): `review seats` lists every harness login on the machine, and omp:zai
+  seats run on review-cli's z.ai key**
+  ([review-cli#646](https://git.hyperide.ai/ultrabricks/review-cli/issues/646)). A new
+  HARNESS ACCOUNTS section in `review seats` / `status` / `doctor` (`harness_accounts` in
+  `--json`) shows, per harness, who is logged in and where it was found, never a secret:
+  Claude Code (the default config dir's email, plan and login state from `claude auth
+  status`; a registered `~/.claude-accounts` set is pointed at its own section), Codex
+  (`$CODEX_HOME/auth.json`: the ChatGPT login's email and plan, or an API key; an
+  id_token that does not decode to an email or a blank key is not counted), omp (every
+  provider in agent.db with its usable/disabled credential count, plus providers served
+  by a key review-cli passes), opencode (the auth.json, opencode.json `options.apiKey` and
+  env sources the `oc:` probe accepts) and review-cli's own API keys (the variable and
+  file it resolves from, and whether its seats' provider is marked unpaid). An
+  `omp:zai/*` or `omp:openrouter/*` seat with no credential stored in omp now gets
+  `ZAI_API_KEY` (or `ZHIPU_API_KEY`) / `OPENROUTER_API_KEY` from the env or
+  `~/.config/review-cli/.env`, and its availability probe counts that key, so GLM runs
+  agentically through omp on the key that until now only reached the diff-only `zai:`
+  seat. A `.env` that is not valid UTF-8 now reads as "no key" instead of raising.
+
 ## 0.49.0 — 2026-10-16
 
 - **Feat(omp): exclude omp Anthropic accounts and cap their usage**

@@ -1519,9 +1519,10 @@ def _seats_subcommand(verb: str, rest: list[str]) -> int:
         prog=f"review {verb}",
         description=(
             "Show which board seats can run right now and why the others cannot, each "
-            "Claude CLI account's login state, the omp launcher, and each omp Anthropic "
-            "account's availability and usage (read-only, no model is called). Same "
-            "report as a bare `review status`."
+            "Claude CLI account's login state, the omp launcher, each omp Anthropic "
+            "account's availability and usage, and every harness login on this machine "
+            "(Claude Code, Codex, omp, opencode, review-cli's own API keys; no secret is "
+            "shown). Read-only, no model is called. Same report as a bare `review status`."
         ),
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
@@ -2138,6 +2139,9 @@ def _seat_status_report(*, as_json: bool) -> int:
         print(f"[review status] {exc}", file=sys.stderr, flush=True)
         return 2
     accounts = claude_accounts_state()
+    from . import harness_accounts
+
+    logins = harness_accounts.discover()
     omp_pool = omp_pool_state()
     seats = [(r, seat_health(r.model, accounts, omp_pool=omp_pool)) for r in board]
 
@@ -2169,6 +2173,7 @@ def _seat_status_report(*, as_json: bool) -> int:
                 for a in accounts
             ],
             "omp": _omp_pool_json(omp_pool),
+            "harness_accounts": harness_accounts.as_json(logins),
             "admission": admission.status_snapshot(),
         }
         print(_json.dumps(payload, indent=2))
@@ -2193,7 +2198,9 @@ def _seat_status_report(*, as_json: bool) -> int:
 
     lines.append("\nCLAUDE CLI ACCOUNTS (the claude:* seats rotate through these)")
     if not accounts:
-        lines.append("  none registered -- single implicit account")
+        lines.append(
+            "  none registered -- single implicit account (see HARNESS ACCOUNTS)"
+        )
     for a in accounts:
         marker = "*" if a.current else " "
         if a.logged_in is False:
@@ -2213,6 +2220,7 @@ def _seat_status_report(*, as_json: bool) -> int:
             f"  {marker} {a.name:<12} {(a.email or '(no email on disk)'):<28} {state}"
         )
     lines.extend(_omp_pool_lines(omp_pool))
+    lines.extend(harness_accounts.render(logins))
     lines.append("")
     lines.append(admission.render_status(admission.status_snapshot()))
     print("\n".join(lines))
@@ -5435,7 +5443,12 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     diff-only `-m cc` / `-m glm` keyed-HTTP path. omp seats (omp:<provider>/<model>,
     incl. MIMO_SEAT omp:opencode-go/mimo-v2.5) authenticate via `omp setup`
     (`omp token <provider>` shows the stored credential); the startup probe reads omp's
-    auth db read-only. Either way a missing binary or missing provider auth is caught at
+    auth db read-only. Exception: omp:zai/* and omp:openrouter/* seats also run on
+    ZAI_API_KEY (or ZHIPU_API_KEY) / OPENROUTER_API_KEY from the env or
+    ~/.config/review-cli/.env, which review-cli hands the seat (review-cli#646), so
+    `-m omp:zai/<model>` is an agentic GLM seat on the same key as `-m glm`.
+    `review seats` lists every login it found per harness. Either way a missing binary
+    or missing provider auth is caught at
     startup and the seat is skipped gracefully (pool backfills from reserve) rather than
     failing the run.
   z.ai / GLM Coding-Plan endpoint: `glm-5.2` (the flagship) is served only from the

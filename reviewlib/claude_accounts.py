@@ -108,18 +108,22 @@ def rotation_order(root: Path | None = None) -> list[Path]:
     return accounts[start:] + accounts[:start]
 
 
-def account_logged_in(account_dir: Path) -> bool | None:
-    """Whether the Claude CLI considers `account_dir` logged in: `loggedIn` from
-    `claude auth status --json` run with CLAUDE_CONFIG_DIR=account_dir (review-cli#594).
-    Read-only and local -- it never starts a login and never prints a credential. None
-    when it cannot tell (no `claude` binary, a timeout, output that is not that JSON)."""
+def auth_status(account_dir: Path | None) -> dict | None:
+    """`claude auth status --json` for `account_dir` (None = the CLI's own config dir:
+    $CLAUDE_CONFIG_DIR or ~/.claude) -- `loggedIn`, `email`, `subscriptionType`, ...
+    Read-only and local -- it never starts a login and the output carries no credential.
+    None when it cannot tell (no `claude` binary, a timeout, output that is not that
+    JSON object)."""
     binary = shutil.which("claude")
     if binary is None:
         return None
+    env = dict(os.environ)
+    if account_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(account_dir)
     try:
         proc = subprocess.run(
             [binary, "auth", "status", "--json"],
-            env={**os.environ, "CLAUDE_CONFIG_DIR": str(account_dir)},
+            env=env,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -128,7 +132,14 @@ def account_logged_in(account_dir: Path) -> bool | None:
         data = json.loads(proc.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    logged_in = data.get("loggedIn") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def account_logged_in(account_dir: Path) -> bool | None:
+    """Whether the Claude CLI considers `account_dir` logged in: `loggedIn` from
+    `auth_status` (review-cli#594). None when it cannot tell."""
+    data = auth_status(account_dir)
+    logged_in = data.get("loggedIn") if data is not None else None
     return logged_in if isinstance(logged_in, bool) else None
 
 
