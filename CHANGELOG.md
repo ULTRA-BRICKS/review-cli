@@ -3,6 +3,16 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+
+## 0.58.0 — 2026-10-23
+
+- **Feat: `scripts/review-remote` — run `review diff|just-ask|quorum|brainstorm` on a remote box**
+  (`REVIEW_REMOTE=user@host`). Ships the exact repo state (HEAD via a bare mirror + staged /
+  unstaged / untracked deltas, refused unless diff hashes match), runs the box's own `review`
+  with per-job stats/marker files, then imports the box's run-stats records, commit-gate marker
+  and diff-scoped review-stamp so `review task --check`, `gh ship` and the pre-commit gates work
+  unchanged. See README "`scripts/review-remote`". ([review-cli#656](https://git.hyperide.ai/ultrabricks/review-cli/issues/656))
+
 ## 0.57.0 — 2026-10-23
 
 - **Feat(logs): finished call logs move into a SQLite archive inside the log dir**
