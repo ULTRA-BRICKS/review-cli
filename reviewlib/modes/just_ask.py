@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..backends import cap_diff_for_dispatch
+from . import refuse_oversized_diff
 from ..panel import (
     PanelJob,
     format_result,
@@ -38,29 +38,18 @@ def mode_just_ask(
     visual_images: tuple[Path, ...] = (),
     effort_override: "EffortOverride | None" = None,
     diff_from_stdin: bool = False,
-    diff_already_capped: bool = False,
 ) -> int:
-    # codex review finding: the dispatch-time diff cap used to be applied ONLY by
-    # cli.py's `_dispatch`, so a caller reaching this function directly (a library
-    # consumer, an MCP seam, a test) could still send an uncapped diff to every seat —
-    # capped here too, at the mode's own dispatch boundary, mirroring mode_review /
-    # mode_brainstorm. Same stdin exemption: a piped diff was already an explicit,
-    # deliberate scope choice by the caller.
-    #
-    # codex review finding (round 2): capping AGAIN when the CLI layer already capped
-    # it (`diff_already_capped`) used to be silently harmless at the default cap (the
-    # first call's output is already <= cap, so a second call is a true no-op) but NOT
-    # idempotent when `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own
-    # length — a second application would re-truncate the FIRST call's marker text and
-    # report ITS byte count as "the full diff". `diff_already_capped` (default False, so
-    # a direct library caller bypassing the CLI is still protected) skips the redundant
-    # second call entirely rather than relying on it happening to be a no-op.
-    dispatch_diff = (
-        diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
-    )
+    # The diff is embedded in ONE prompt per seat, so an over-budget diff
+    # (`$REVIEW_DIFF_MAX_BYTES`) is refused loudly rather than cut — a piped diff
+    # (`diff_from_stdin`) was scoped on purpose by the caller and is sent whole. Checked
+    # here too (not only in cli.py) so a direct library caller is held to the same rule.
+    if not diff_from_stdin:
+        refusal = refuse_oversized_diff(diff, "just-ask")
+        if refusal is not None:
+            return refusal
     prompt = (
         "Answer this question directly and concisely. Do not edit files or run commands.\n\n"
-        f"QUESTION:\n{question}" + _diff_context_block(dispatch_diff)
+        f"QUESTION:\n{question}" + _diff_context_block(diff)
     )
     jobs = [
         PanelJob(
@@ -118,7 +107,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 def _handler(ctx: ModeContext) -> int:
     images = _visual_images(ctx)
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
-    diff_already_capped = bool(ctx.extra.get("diff_already_capped", False))
     if images:
         return mode_just_ask(
             ctx.with_visual(ctx.args.question),
@@ -129,7 +117,6 @@ def _handler(ctx: ModeContext) -> int:
             images,
             effort_override=ctx.effort_override,
             diff_from_stdin=diff_from_stdin,
-            diff_already_capped=diff_already_capped,
         )
     return mode_just_ask(
         ctx.with_visual(ctx.args.question),
@@ -139,7 +126,6 @@ def _handler(ctx: ModeContext) -> int:
         ctx.timeout,
         effort_override=ctx.effort_override,
         diff_from_stdin=diff_from_stdin,
-        diff_already_capped=diff_already_capped,
     )
 
 

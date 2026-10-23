@@ -30,6 +30,7 @@ from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import COMMAND_TIMEOUT_GRACE_SECONDS, command_deadline, run_backstop
 from .process import _open_log_with_fallback, install_signal_reaper
+from .modes import refuse_oversized_diff
 from .config import (
     CONFIG_PATH,
     DEFAULT_PRESET,
@@ -5112,8 +5113,11 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
         "raised it), plus summary.expected/reported/degraded (which seats ran / "
         "parsed / failed to parse). Exit 0 = no findings, 1 = findings present, 2 = "
         "no seat's structured response was usable at all -- --commit's own checkpoint "
-        "exit codes (11/12/13) still take priority over this 0/1/2 contract when both "
-        "flags are given. For a STANDALONE `review visual IMAGE` (no diff), this "
+        "exit codes (11/12), and 13 (a diff with a hunk too big to split into passes; "
+        "nothing ran), still take priority over this 0/1/2 contract. A diff over "
+        "$REVIEW_DIFF_MAX_BYTES is reviewed in several passes: findings[] then holds "
+        "every pass's findings and a seat counts as reported only when every pass of "
+        "it parsed. For a STANDALONE `review visual IMAGE` (no diff), this "
         "instead emits the structured VISUAL verdict, unchanged from before."
         if mode.name in ("review", "visual")
         else "emit the structured visual verdict as JSON"
@@ -5396,9 +5400,18 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           a literal 0, disables heartbeats entirely; a
                                           positive value below the 0.5s poll
                                           granularity clamps up to it).
-    REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
-                                          <= 0 disables it. See the bold "Diff size cap"
-                                          paragraph in README.md's "Diff review" section.
+    REVIEW_DIFF_MAX_BYTES=N             — max bytes of diff per review PASS (default 300000).
+                                          `review diff` NEVER truncates: a diff over N is
+                                          split at file boundaries (an oversized file at hunk
+                                          boundaries) and the board reviews each part in its
+                                          own pass inside one run, the per-seat results merged
+                                          under "Part i/n" headings; a single hunk bigger
+                                          than N fails loudly (exit 13) naming the file.
+                                          brainstorm/quorum/just-ask put the diff in ONE
+                                          prompt, so an over-N diff fails loudly (exit 13)
+                                          instead. A diff piped on stdin is always sent
+                                          whole. <= 0 never splits (sends the whole diff).
+                                          See README.md's "Diff size cap" paragraph.
     REVIEW_STDIN_WAIT_SECONDS=N         — idle timeout for a non-tty stdin (default 5). A
                                           verb with no explicit diff source (`git diff |
                                           review diff`) reads stdin to EOF but gives up
@@ -7272,10 +7285,10 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     diff = diff or ""
 
     # Diff-identity binding (reviewlib.stats "Diff-identity binding"): captured from
-    # the FULL, uncapped diff — computed BEFORE the dispatch-time cap below and before
-    # mode_review's own internal capping, so a huge diff's identity is never truncated
-    # away. `repo_id` is independent of `diff` (cwd alone), so it's computed even for a
-    # diff-less just-ask/quorum/brainstorm run — that still lets --check catch a
+    # the FULL diff — computed BEFORE mode_review splits it into passes (every file of the
+    # whole diff is recorded, not one pass's share). `repo_id` is independent of `diff`
+    # (cwd alone), so it's computed even for a diff-less just-ask/quorum/brainstorm run —
+    # that still lets --check catch a
     # cross-REPO mismatch (incident #1) even with no file-set signal to add.
     repo_id = _compute_repo_id(cwd)
     diff_files = extract_diff_files(diff)
@@ -7295,40 +7308,24 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # `_write_review_stamp` is ever reached from); None otherwise.
     stamp_diff_hash = _stamp_hash_for_staged_diff(cwd) if args.staged else None
 
-    # Dispatch-time diff cap for the flat PANEL modes (brainstorm/quorum/just-ask) —
-    # see reviewlib.backends.cap_diff_for_dispatch's docstring for why this is NOT
-    # applied to `review`/`visual` (mode_review owns capping its own two dispatch
-    # paths itself, so it can keep the UNCAPPED canonical diff for the --commit
-    # checkpoint's integrity check; these three modes have no such requirement).
-    # brainstorm in particular auto-probes the diff by DEFAULT (no --diff needed), so
-    # without this an oversized diff is sent uncapped to every persona every round —
-    # the worst token-burn multiplier the 2026-08 investigation found (codex/kimi
-    # review finding on this feature's own PR). A piped diff (`diff_from_stdin`) is
-    # exempt, matching mode_review's identical exemption.
-    #
-    # codex review finding (round 2 on this feature's own PR): each of these three
-    # modes ALSO caps at its own dispatch boundary (`cap_diff_for_dispatch` is called
-    # again inside mode_brainstorm/mode_quorum/mode_just_ask, so a direct library
-    # caller bypassing this CLI layer is still protected). Capping HERE and there both
-    # is a genuine double-application: harmless at the DEFAULT cap (the first call's
-    # output is already <= cap, so the second is a true no-op), but NOT idempotent
-    # when `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own length —
-    # the second call then re-truncates the FIRST call's marker text and reports ITS
-    # byte count as "the full diff", not the real original diff's size. Rather than
-    # remove either capping point (the mode-level one is the ONLY guard for a direct
-    # caller; this CLI-level one is what `test_cli_brainstorm_oversized_worktree_diff_
-    # is_capped_for_dispatch` pins), thread whether THIS layer already capped it so the
-    # mode-level call becomes a genuine no-op for the CLI path instead of a second real
-    # application — see `diff_already_capped` in `ModeContext.extra` below.
-    diff_already_capped = False
+    # Single-prompt modes (brainstorm/quorum/just-ask) embed the diff in ONE prompt per
+    # seat, so an over-budget diff (`$REVIEW_DIFF_MAX_BYTES`) is refused HERE — before
+    # any admission wait, TUI or backend call — with a loud error naming the sizes and
+    # the way out, never cut. brainstorm in particular auto-probes the diff by DEFAULT
+    # (no --diff needed), so a big working tree makes a bare `review brainstorm` fail
+    # with that message instead of silently grounding on a fraction of the change. A
+    # piped diff (`diff_from_stdin`) was scoped on purpose and is sent whole. Each mode
+    # repeats the check itself so a direct library caller is held to the same rule;
+    # `review diff` has no such limit — mode_review reviews a large diff in several
+    # passes (reviewlib.diff_chunks).
     if (
         diff
         and not diff_from_stdin
         and mode.name in ("brainstorm", "quorum", "just-ask")
     ):
-        capped_diff = backends.cap_diff_for_dispatch(diff)
-        diff_already_capped = capped_diff != diff
-        diff = capped_diff
+        refusal = refuse_oversized_diff(diff, mode.name)
+        if refusal is not None:
+            return refusal
 
     # --- --visual composition (§2.1). Build the visual context ONCE; thread it into
     # whichever consumer runs. cvGate fires here regardless of mode (a broken render
@@ -7527,7 +7524,6 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         effort_override=effort_override,
         extra={
             "diff_from_stdin": diff_from_stdin,
-            "diff_already_capped": diff_already_capped,
             "stamp_diff_hash": stamp_diff_hash,
             **({"task_roles": panel_task_roles} if panel_task_roles else {}),
         },

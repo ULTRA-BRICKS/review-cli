@@ -155,27 +155,20 @@ git show --format= --no-ext-diff HEAD | review diff --task HYP-742 -m gemini,cod
 > to checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
 > HEAD~1`, which does not touch untracked/foreign files.
 
-**Diff size cap.** The auto-detected diff is capped at 300,000 bytes by default
-(`$REVIEW_DIFF_MAX_BYTES`, `<= 0` disables it) at DISPATCH time, before it is sent to
-every backend — for `review diff`'s own two dispatch paths, and centrally for
-`brainstorm`/`quorum`/`just-ask` too. `brainstorm` in particular auto-probes the
-working-tree diff *by default* (no `--diff` needed) and sends it to every persona every
-round plus the moderator — an oversized diff there was the worst token-burn multiplier
-the 2026-08 investigation found, roughly an order of magnitude worse than the single
-`review diff` panel. A real 6.5MB / 583-file diff (a debug harness's screenshot/video
-capture scripts touching hundreds of files) was found being sent whole to every seat —
-git already collapses each binary file to a one-line stub, so the cost is oversized
-*text*. An over-cap diff is truncated with a visible marker naming the real total, not
-silently dropped — scope the review (`git diff -- <path>`) or raise the cap to see the
-full change. A diff piped on stdin (`git diff | review diff ...` / `... | review
-just-ask ...`) is NEVER capped, in any mode — the user already explicitly, and
-deliberately, scoped what they piped in. The cap never touches the canonical diff
-`review diff --staged --commit`'s checkpoint re-derives to verify its integrity — but a
-STAGED diff big enough to actually get truncated for dispatch REFUSES the checkpoint
-(exit `EXIT_COMMIT_DIFF_TRUNCATED`) and skips the plain `--staged` commit-gate stamp too,
-rather than certifying a partial review as "the full diff was reviewed": a stderr warning
-alone doesn't protect non-interactive automation from silently checkpointing a diff no
-seat fully saw. Scope the review or raise the cap, then re-run.
+**Diff size cap — a big diff is split into passes, never truncated.** `$REVIEW_DIFF_MAX_BYTES`
+(default 300000; `<= 0` never splits) is the max bytes of diff **per review pass**. A bigger
+`review diff` is cut at file boundaries (an oversized file at `@@` hunks, header repeated,
+`[chunk i/n of <path>]` note) and the board runs once per part inside ONE run (one admission
+slot, one `--task` iteration); each prompt says "Part i of n" and lists its files, answers
+merge per seat under `### Part i/n` (`--json`: every pass's `findings[]`), and stderr names
+each part's files. A split staged diff is stamped / `--commit`-checkpointed like any other,
+but only when EVERY pass produced its usable verdicts. Only a single hunk over the budget is
+unsplittable: exit `13` before any seat runs, naming the file and sizes. `brainstorm` /
+`quorum` / `just-ask` embed the diff in one prompt, so over budget they fail loudly (exit
+`13`; pipe a scoped diff in — `git diff -- <path> | review brainstorm ...` — or raise the
+budget). A diff piped on stdin is never split or refused (and never stamped: it is not the
+index). Why: a 6.5MB / 583-file diff once went whole to every seat (2026-08 token-burn
+investigation), and the first fix cut it at the cap so no seat saw the tail.
 
 **Checkpointing a multi-round fix loop (`--commit`).** An agent iterating review → fix
 findings → re-review may need several attempts, and a bad attempt needs a SAFE way back —

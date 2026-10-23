@@ -447,10 +447,8 @@ def test_cli_brainstorm_nonempty_pipe_takes_precedence_over_worktree():
 
 
 def _with_default_diff_cap(fn):
-    """Clear $REVIEW_DIFF_MAX_BYTES for the duration of `fn` — the two cap tests below
-    assume DIFF_MAX_BYTES_DEFAULT, so a host with this exported would otherwise flake
-    (the exact ambient-env class test_diff_cap.py's `_with_default_cap` was written to
-    fix; kimi review finding: these two tests were missed when that fix landed)."""
+    """Clear $REVIEW_DIFF_MAX_BYTES for the duration of `fn` — the two budget tests below
+    assume DIFF_MAX_BYTES_DEFAULT, so a host with this exported would otherwise flake."""
     saved = os.environ.get("REVIEW_DIFF_MAX_BYTES")
     try:
         os.environ.pop("REVIEW_DIFF_MAX_BYTES", None)
@@ -462,41 +460,45 @@ def _with_default_diff_cap(fn):
             os.environ["REVIEW_DIFF_MAX_BYTES"] = saved
 
 
-def test_cli_brainstorm_oversized_worktree_diff_is_capped_for_dispatch():
-    """codex/kimi P1 finding (2026-08 token-burn investigation): brainstorm auto-probes
-    the working-tree diff BY DEFAULT (no --diff needed) and, before this fix, sent it
-    UNCAPPED to every persona every round — the worst token-burn multiplier found (an
-    order of magnitude worse than the single review-diff panel the cap originally
-    covered). Pins that an oversized auto-detected diff reaching `mode_brainstorm` is
-    now capped, exactly like `review diff`'s own dispatch."""
-    from reviewlib import backends
+def test_cli_brainstorm_oversized_worktree_diff_is_refused_loudly():
+    """brainstorm auto-probes the working-tree diff BY DEFAULT (no --diff needed) and
+    embeds it in every persona prompt of every round. An over-budget diff used to be cut
+    at the cap with a marker; it is now REFUSED — loudly, naming the sizes and the way out
+    — before any seat runs, so brainstorm never grounds on a silently partial change."""
+    import contextlib
+    import io
+
+    from reviewlib import diff_chunks
 
     big = "diff --git a/x b/x\n" + ("+line\n" * 100_000)
-    assert len(big.encode("utf-8")) > backends.DIFF_MAX_BYTES_DEFAULT
+    assert len(big.encode("utf-8")) > diff_chunks.DIFF_MAX_BYTES_DEFAULT
 
     def _git_big(_cwd, _staged):
         return big
 
-    cap = _with_default_diff_cap(
-        lambda: _capture_cli_brainstorm_diff(
-            ["brainstorm", "topic", "-C", str(REPO_ROOT)],
-            stdin_text=None,
-            git_diff=_git_big,
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        cap = _with_default_diff_cap(
+            lambda: _capture_cli_brainstorm_diff(
+                ["brainstorm", "topic", "-C", str(REPO_ROOT)],
+                stdin_text=None,
+                git_diff=_git_big,
+            )
         )
-    )
     assert cap["git_called"] is True
-    assert "[review-cli] diff truncated at" in cap["diff"]
-    assert len(cap["diff"].encode("utf-8")) < len(big.encode("utf-8"))
+    assert "diff" not in cap, "mode_brainstorm must not run on an over-budget diff"
+    assert "per-prompt budget is 300000 bytes" in err.getvalue(), err.getvalue()
+    assert "never truncates" in err.getvalue(), err.getvalue()
 
 
 def test_cli_brainstorm_piped_diff_is_not_capped():
     """The stdin exemption applies here too: an explicitly piped diff is the user's own
     already-scoped choice (matching mode_review's identical exemption), so it must reach
     mode_brainstorm byte-identical even when it exceeds the cap."""
-    from reviewlib import backends
+    from reviewlib import diff_chunks
 
     big_piped = "diff --git a/x b/x\n" + ("+line\n" * 100_000)
-    assert len(big_piped.encode("utf-8")) > backends.DIFF_MAX_BYTES_DEFAULT
+    assert len(big_piped.encode("utf-8")) > diff_chunks.DIFF_MAX_BYTES_DEFAULT
 
     cap = _with_default_diff_cap(
         lambda: _capture_cli_brainstorm_diff(

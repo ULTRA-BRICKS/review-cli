@@ -84,24 +84,11 @@ class ModeContext:
     #                                                   outcome to, so the CLI can report
     #                                                   the models that actually ran
     #                                                   (`review` mode only).
-    #   * "diff_from_stdin"     — bool : the diff came from a piped stdin (brainstorm/
-    #                                    quorum/just-ask read this to exempt a piped diff
-    #                                    from their own dispatch-time cap).
-    #   * "diff_already_capped" — bool : the CLI's `_dispatch` already ran
-    #                                    `cap_diff_for_dispatch` on `diff` before this
-    #                                    context was built (brainstorm/quorum/just-ask
-    #                                    only). Lets the mode's own dispatch-boundary
-    #                                    capping — which exists so a direct library
-    #                                    caller bypassing this CLI layer is still
-    #                                    protected — skip a REDUNDANT second application:
-    #                                    harmless at the default cap (a second call on an
-    #                                    already-<=cap diff is a no-op anyway), but a real
-    #                                    correctness gap when `$REVIEW_DIFF_MAX_BYTES` is
-    #                                    set below the truncation marker's own length (the
-    #                                    second call would re-truncate the FIRST call's
-    #                                    marker text and report ITS size as "the full
-    #                                    diff" — codex review finding, 2026-08 seat-
-    #                                    cooldown/diff-cap feature, round 2).
+    #   * "diff_from_stdin"     — bool : the diff came from a piped stdin (review/
+    #                                    brainstorm/quorum/just-ask read this to send a
+    #                                    piped diff whole — it is exempt from
+    #                                    `$REVIEW_DIFF_MAX_BYTES` — and to refuse the
+    #                                    index-provenance stamp/checkpoint for it).
     #   * "task_roles"   — list[str] : REVIEW_ROLES ids for a recorded one-model
     #                                  `-m --task` pad (quorum / brainstorm; never
     #                                  just-ask, review-cli#587), or quorum's

@@ -85,6 +85,13 @@ def _make_repo(tmp: Path) -> Path:
 
 
 _DIFF = "diff --git a b\n+x\n"
+# A multi-file diff well over the 1000-byte budget the oversized tests set: splittable at
+# file boundaries into several passes (a one-file header-only diff would be unsplittable).
+_BIG_DIFF = "".join(
+    f"diff --git a/f{i}.txt b/f{i}.txt\n--- a/f{i}.txt\n+++ b/f{i}.txt\n"
+    "@@ -0,0 +1,3 @@\n+x\n+x\n+x\n"
+    for i in range(100)
+)
 
 
 def test_touch_helper_creates_marker_and_parents():
@@ -349,81 +356,32 @@ def test_failed_staged_review_prints_no_gate_notice():
         assert _GATE_NOTICE not in err, err
 
 
-def test_truncated_staged_review_gets_its_own_remediation():
-    """The truncated branch must NOT be told to "re-run --staged": re-running the same
-    oversized diff truncates again, so that advice loops — the exact "agent follows the
-    tool's own instructions into a wall" failure this notice exists to prevent. Driven at
-    the helper (the dispatch cap that produces `truncated=True` is `_warn_if_dispatch_diff_
-    truncated`'s business, not this gate's), which is also the only place `truncated` can
-    be pinned without a multi-megabyte fixture diff."""
-    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
-        tmp = Path(d)
-        repo = _make_repo(tmp)
-        marker = tmp / "cache" / "last-review"
-        os.environ["REVIEW_MARKER"] = str(marker)
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            review_mode._stamp_if_staged_commit_review(
-                True,
-                True,
-                False,
-                repo,
-                _DIFF,
-                True,
-            )
-        err = buf.getvalue()
-        assert not marker.exists(), (
-            "a truncated staged review must not satisfy the gate"
-        )
-        assert _GATE_NOTICE in err, err
-        assert "truncated" in err, err
-        assert "split the change" in err, (
-            "the truncated branch needs its own remediation"
-        )
-        assert "stage what you are about to commit" not in err, (
-            "looping advice: re-running the same oversized diff truncates again"
-        )
-
-
-def test_unstaged_oversized_review_is_told_to_split_not_to_re_run():
-    """END-TO-END counterpart to `test_truncated_reason_wins_over_not_staged`, which only
-    drives the helper with a hand-supplied `truncated=True`. That left the CALLER free to
-    hand the helper a wrong value, and it did: `_warn_if_dispatch_diff_truncated` used to
-    return the truncation fact only for `--staged` runs, so a real unstaged oversized diff
-    reached the helper as `truncated=False`, took the not-staged branch, and was told to
-    "stage and re-run `--staged`" — which truncates again (codex finding, iteration 4).
-    Only a run through `mode_review` with a diff that genuinely exceeds the cap pins the
-    caller/helper contract, so this drives the cap for real."""
+def test_unstaged_oversized_review_is_split_and_told_to_stage():
+    """A diff over the per-pass budget is reviewed in several passes, not cut: the run
+    announces the split, succeeds, and — being unstaged — gets the ordinary not-staged
+    remediation (there is no "split the change" dead end any more: re-running `--staged`
+    reviews the same diff in passes again, and that DOES satisfy the gate)."""
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         repo = _make_repo(tmp)
         marker = tmp / "cache" / "last-review"
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
-        # A diff comfortably larger than the cap, so `cap_diff_for_dispatch` really cuts
-        # it (the cap also has to exceed the truncation marker's own length, or the
-        # dispatched text degenerates to marker-only — a shape that proves nothing here).
         os.environ["REVIEW_DIFF_MAX_BYTES"] = "1000"
-        big_diff = "diff --git a b\n" + "+x\n" * 2000
-        rc, err = _review_capturing_stderr(cwd=repo, staged=False, diff=big_diff)
+        rc, err = _review_capturing_stderr(cwd=repo, staged=False, diff=_BIG_DIFF)
         assert rc == 0, rc
+        assert "reviewing it in" in err and "passes" in err, err
         assert not marker.exists()
         assert _GATE_NOTICE in err, err
-        assert "split the change" in err, (
-            "an unstaged OVERSIZED review must get the truncation remediation: staging it "
-            "and re-running truncates the same diff again"
-        )
-        assert "stage what you are about to commit" not in err, err
+        assert "stage what you are about to commit" in err, err
+        assert "split the change" not in err and "truncated" not in err, err
 
 
-def test_staged_oversized_review_writes_nothing_and_says_to_split():
-    """The STAGED twin of the unstaged oversized run. `test_truncated_staged_review_gets_
-    its_own_remediation` drives the helper with a hand-supplied `truncated=True`, which
-    proves the helper but not the WIRING: a refactor that hardcoded `truncated=False` on
-    the staged path (or crossed the staged/unstaged wiring) would silently stamp an
-    oversized staged review again — the exact fail-open the "no default for `truncated`"
-    rule exists to prevent — with every existing test still green (Fable finding,
-    iteration 8). Only a real cap overflow through `mode_review` pins it."""
+def test_staged_oversized_review_satisfies_the_gate():
+    """The STAGED twin: every file was reviewed (in several passes), so the oversized
+    staged review writes the marker exactly like a small one and prints no gate notice.
+    It used to refuse — a truncated dispatch never certified the full diff; a split one
+    does."""
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         repo = _make_repo(tmp)
@@ -431,41 +389,24 @@ def test_staged_oversized_review_writes_nothing_and_says_to_split():
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
         os.environ["REVIEW_DIFF_MAX_BYTES"] = "1000"
-        big_diff = "diff --git a b\n" + "+x\n" * 2000
-        rc, err = _review_capturing_stderr(cwd=repo, staged=True, diff=big_diff)
+        rc, err = _review_capturing_stderr(cwd=repo, staged=True, diff=_BIG_DIFF)
         assert rc == 0, rc
-        assert not marker.exists(), (
-            "a truncated STAGED review must not satisfy the gate — no seat saw it all"
+        assert "reviewing it in" in err and "passes" in err, err
+        assert marker.exists(), (
+            "a fully reviewed (split) staged diff satisfies the gate"
         )
-        assert not (repo / ".git" / "review-stamp").exists(), (
-            "and it must not leave a diff-scoped stamp either"
-        )
-        assert _GATE_NOTICE in err, err
-        assert "split the change" in err, err
+        assert _GATE_NOTICE not in err, err
 
 
 def test_gate_reason_truth_table():
     """The helper's own truth table: None exactly for the one gate-eligible shape, and a
     non-empty (reason, remediation) pair for every other."""
-    assert review_mode._commit_gate_skip_reason(True, False, False) is None
-    for args in ((False, False, False), (True, True, False), (True, False, True)):
+    assert review_mode._commit_gate_skip_reason(True, False) is None
+    for args in ((False, False), (True, True)):
         skipped = review_mode._commit_gate_skip_reason(*args)
         assert skipped is not None, args
         reason, remediation = skipped
         assert reason and remediation, args
-
-
-def test_truncated_reason_wins_over_not_staged():
-    """Compound failure ordering: an UNSTAGED and TRUNCATED run must hear "split the
-    change", not "stage it and re-run `--staged`". Staging fixes the staged condition but
-    not the truncation, so the staged-first advice costs a whole extra review round and
-    then lands on the truncation anyway — advice that loops is the failure mode this
-    notice exists to remove, so the ordering is part of the contract, not an accident."""
-    skipped = review_mode._commit_gate_skip_reason(False, False, True)
-    assert skipped is not None
-    reason, remediation = skipped
-    assert "truncated" in reason, reason
-    assert "split the change" in remediation, remediation
 
 
 def test_stamp_asks_the_helper_instead_of_re_spelling_the_predicate():
@@ -490,14 +431,13 @@ def test_stamp_asks_the_helper_instead_of_re_spelling_the_predicate():
             review_mode._commit_gate_skip_reason = lambda *a, **k: None
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
-                # Unstaged + piped + truncated: ineligible by every real condition.
+                # Unstaged + piped: ineligible by every real condition.
                 review_mode._stamp_if_staged_commit_review(
                     True,
                     False,
                     True,
                     repo,
                     _DIFF,
-                    True,
                 )
             assert marker.exists(), (
                 "the caller re-spelled the predicate instead of asking the helper"
@@ -512,14 +452,13 @@ def test_stamp_asks_the_helper_instead_of_re_spelling_the_predicate():
             review_mode._commit_gate_skip_reason = lambda *a, **k: sentinel
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
-                # Staged, from the index, untruncated: eligible by every real condition.
+                # Staged, from the index: eligible by every real condition.
                 review_mode._stamp_if_staged_commit_review(
                     True,
                     True,
                     False,
                     repo,
                     _DIFF,
-                    False,
                 )
             err = buf.getvalue()
             assert not marker.exists(), "the caller ignored the helper's skip reason"
@@ -575,12 +514,9 @@ def test_marker_pointing_at_a_directory_is_reported_as_a_failure():
 
 
 def test_unstaged_oversized_commit_run_still_fails_on_the_staged_requirement():
-    """`_warn_if_dispatch_diff_truncated` now returns the plain truncation fact instead of
-    a `--staged`-scoped one, so the staged-scoping lives in its callers. This pins the
-    caller that could quietly change meaning: `--commit` without `--staged` must still be
-    rejected as a usage error BEFORE dispatch, not reinterpreted as a truncation refusal
-    (Fable finding, iteration 5 — the widened boolean must not leak into the checkpoint
-    path)."""
+    """`--commit` without `--staged` must still be rejected as a usage error BEFORE
+    dispatch, however large the diff — never split and reviewed first (paid passes the
+    checkpoint could never have used)."""
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         repo = _make_repo(tmp)
@@ -588,7 +524,7 @@ def test_unstaged_oversized_commit_run_still_fails_on_the_staged_requirement():
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
         os.environ["REVIEW_DIFF_MAX_BYTES"] = "1000"
-        big_diff = "diff --git a b\n" + "+x\n" * 2000
+        big_diff = _BIG_DIFF
         rc, err = _review_capturing_stderr(
             cwd=repo, staged=False, diff=big_diff, commit=True
         )
@@ -770,17 +706,13 @@ def test_every_rerun_remediation_carries_a_task_code():
     """Codex finding on PR #359: every recorded review mode requires `--task CODE`, so a
     remediation that says "re-run `review diff --staged`" without one fails on the very
     first keystroke when $REVIEW_TASK_CODE is unset — the advertised fix must be runnable.
-    Pins every non-None shape of the gate predicate (all 8 boolean triples, so a fourth
+    Pins every non-None shape of the gate predicate (all 4 boolean pairs, so a third
     skip condition cannot dodge it) AND, via a source scan, the write-failure and
     `--commit` notices that are only reachable by breaking a real filesystem write."""
-    for staged, diff_from_stdin, truncated in itertools.product(
-        (False, True), repeat=3
-    ):
-        skipped = review_mode._commit_gate_skip_reason(
-            staged, diff_from_stdin, truncated
-        )
+    for staged, diff_from_stdin in itertools.product((False, True), repeat=2):
+        skipped = review_mode._commit_gate_skip_reason(staged, diff_from_stdin)
         if skipped is None:
-            assert (staged, diff_from_stdin, truncated) == (True, False, False)
+            assert (staged, diff_from_stdin) == (True, False)
             continue
         _reason, remediation = skipped
         assert re.search(r"--task\s+<CODE>", remediation), remediation
@@ -796,9 +728,9 @@ def test_every_rerun_remediation_carries_a_task_code():
     # GLM finding on #359: a PREFIX-anchored scan (only spans starting `review diff `) is
     # dodged by any rephrase like "`cd <repo> && review diff --staged`" — so this collects
     # EVERY backtick span and only requires ones actually mentioning `review diff` (or
-    # interpolating one of the two shared constants) to carry the placeholder. The eight
-    # ACTIONABLE sites today: the three gate reasons, the two write-failure notices, and
-    # the three `--commit` refusals (usage, truncated checkpoint, failed checkpoint) —
+    # interpolating one of the two shared constants) to carry the placeholder. The six
+    # ACTIONABLE sites today: the two gate reasons, the two write-failure notices, and
+    # the two `--commit` refusals (usage, failed checkpoint) —
     # `_CHECKPOINT_COMMIT_MESSAGE` (a git commit message, never shown as a rerun
     # instruction, and containing no backticks) is deliberately not one of them.
     src = re.sub(r"(?m)^\s*#.*$", "", inspect.getsource(review_mode))
@@ -814,7 +746,7 @@ def test_every_rerun_remediation_carries_a_task_code():
         for span in re.findall(r"`([^`]*)`", src)
         if "review diff" in span or span in constants
     ]
-    assert len(rerun_spans) >= 8, rerun_spans
+    assert len(rerun_spans) >= 6, rerun_spans
     for span in rerun_spans:
         if span in constants:
             continue

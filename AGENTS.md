@@ -80,12 +80,16 @@ still gets committed (the checkpoint gates on the pool producing usable verdicts
 `ok` that gates the existing `--staged` commit-hook stamp, NOT on "zero findings"). The
 commit runs the repo's own commit-msg/pre-commit hooks; a hook rejection fails `--commit`
 loudly with its own exit code rather than silently skipping the checkpoint. See
-`reviewlib/modes/review.py` (`EXIT_COMMIT_REQUIRES_STAGED` / `EXIT_COMMIT_FAILED` /
-`EXIT_COMMIT_DIFF_TRUNCATED`, `_checkpoint_if_requested`) and the README's "Diff review"
-section for the full contract. A staged diff big enough to hit the dispatch cap
-(`$REVIEW_DIFF_MAX_BYTES`) also refuses `--commit` — a checkpoint must certify the FULL
-reviewed diff, and a truncated dispatch never did; the plain `--staged` stamp is skipped
-the same way (see `reviewlib.backends.cap_diff_for_dispatch`'s docstring).
+`reviewlib/modes/review.py` (`EXIT_COMMIT_REQUIRES_STAGED` / `EXIT_COMMIT_FAILED`,
+`_checkpoint_if_requested`) and the README's "Diff review" section for the full contract.
+A staged diff over `$REVIEW_DIFF_MAX_BYTES` is NOT refused: `review diff` never truncates a
+diff, it splits it per file group (`reviewlib/diff_chunks.py`) and reviews each part in its
+own pass inside the one run (`reviewlib/diff_passes.py` merges the per-seat results), so the
+stamp and the `--commit` checkpoint certify a diff every file of which a seat saw — and are
+written only when EVERY pass produced its usable verdicts. A single hunk larger than the
+budget is the one unsplittable case: exit 13 before any seat runs, naming the file and sizes.
+brainstorm/quorum/just-ask embed the diff in one prompt and fail loudly (exit 13) over the
+budget; a diff piped on stdin is never split or refused.
 
 ### Option scoping — global vs subcommand
 

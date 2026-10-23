@@ -1009,18 +1009,20 @@ _UNIT_FILES = [
     # shared agenttools_rig_delegate helper). The two delegation cases SKIP when that in-ecosystem
     # helper isn't installed (bare CI); the rig-absent / helper-missing cases always run.
     ("test_install_commit_hook_rig_delegate.py", {}),
-    # The token-burn investigation's first two concrete fixes: the dispatch-time
-    # diff-size cap (backends.cap_diff_for_dispatch / $REVIEW_DIFF_MAX_BYTES, applied
-    # at the mode_review dispatch boundary — deliberately NEVER in _git_diff, which
-    # would break the --commit checkpoint's integrity check; a piped diff is exempt
-    # everywhere) and the cross-invocation Fable cooldown cache
-    # (reviewlib.seat_cooldown) and its wiring into review_claude/review_with_images.
-    # Both deterministic — no live backends, no network; the seat_cooldown wiring
-    # tests redirect $REVIEW_SEAT_COOLDOWN_FILE, $REVIEW_LOG_DIR, and
+    # The token-burn investigation's concrete fixes: the per-pass diff budget
+    # (reviewlib.diff_chunks / $REVIEW_DIFF_MAX_BYTES — an over-budget diff is SPLIT per file
+    # group and reviewed in several passes inside one run, never truncated; applied at the
+    # mode_review dispatch boundary, deliberately NEVER in _git_diff, which would break the
+    # --commit checkpoint's integrity check; a piped diff is exempt everywhere) and the
+    # cross-invocation Fable cooldown cache (reviewlib.seat_cooldown) and its wiring into
+    # review_claude/review_with_images. Both deterministic — no live backends, no network;
+    # the diff-chunking e2e drives the real `bin/review diff` over the fake backend with
+    # its own temp HOME/log/stats dirs; the seat_cooldown wiring tests redirect
+    # $REVIEW_SEAT_COOLDOWN_FILE, $REVIEW_LOG_DIR, and
     # $REVIEW_CLAUDE_MODE (the cooldown-skip path writes a real sidecar log via
     # reviewlib.process.log_dir(), and REVIEW_CLAUDE_MODE=cli keeps the dispatch
     # deterministic on any host).
-    ("test_diff_cap.py", {}),
+    ("test_diff_chunking.py", {}),
     ("test_seat_cooldown.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # `review stat`'s data model (reviewlib.dashboard.tokenstats): parsing per-call logs
     # into the per-harness/per-model breakdown, the REST-backend token-text parser, the

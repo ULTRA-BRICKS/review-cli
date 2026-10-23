@@ -21,8 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..backends import cap_diff_for_dispatch
 from ..config import REVIEW_ROLES
+from . import refuse_oversized_diff
 from ..panel import (
     PanelJob,
     completed_role_coverage,
@@ -126,7 +126,6 @@ def mode_brainstorm(
     diff: str = "",
     *,
     diff_from_stdin: bool = False,
-    diff_already_capped: bool = False,
     seed_transcript: list[str] | None = None,
     seed_persona_index: int = 0,
     start_round: int = 1,
@@ -174,27 +173,15 @@ def mode_brainstorm(
     # ideation is grounded without re-transporting the diff every round. An empty diff
     # keeps the classic pure-ideation behaviour unchanged.
     grounded = bool(diff.strip())
-    # codex review finding: the dispatch-time diff cap used to be applied ONLY by
-    # cli.py's `_dispatch`, so a caller reaching this function directly (a library
-    # consumer, an MCP seam, a test) could still send an uncapped diff to every
-    # persona/moderator every round — reintroducing the exact multi-seat/multi-round
-    # token burn this cap exists to stop. Capped here too, at the mode's own dispatch
-    # boundary, so the guarantee holds regardless of caller. Same stdin exemption as
-    # mode_review: a piped diff was already an explicit, deliberate scope choice by the
-    # caller.
-    #
-    # codex review finding (round 2, applied here to match just_ask.py's identical fix):
-    # capping AGAIN when the CLI layer already capped it (`diff_already_capped`) is
-    # silently harmless at the default cap (the first call's output is already <= cap,
-    # so a second call is a true no-op) but NOT idempotent when
-    # `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own length — a
-    # second application would re-truncate the FIRST call's marker text and report ITS
-    # byte count as "the full diff" every round. `diff_already_capped` (default False,
-    # so a direct library caller bypassing the CLI is still protected) skips the
-    # redundant second call entirely rather than relying on it happening to be a no-op.
-    dispatch_diff = (
-        diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
-    )
+    # The diff rides in every persona/moderator prompt of every round, so it must fit ONE
+    # prompt: an over-budget diff (`$REVIEW_DIFF_MAX_BYTES`) is refused loudly, never cut —
+    # multi-pass splitting makes no sense for a multi-round discussion. A piped diff
+    # (`diff_from_stdin`) was scoped on purpose by the caller and is sent whole. Checked
+    # here too (not only in cli.py) so a direct library caller is held to the same rule.
+    if not diff_from_stdin:
+        refusal = refuse_oversized_diff(diff, "brainstorm")
+        if refusal is not None:
+            return refusal
     # A one-line note appended to the FIRST round's persona prompts (and every
     # moderator/synthesis prompt) when grounded, so the model knows the fenced
     # ```diff``` block (added by the backend's _payload from PanelJob.diff) is the
@@ -331,7 +318,7 @@ def mode_brainstorm(
             # need it to judge convergence / write the recommendation) — only the per-
             # persona dispatch below is round-gated.
             if round_no == start_round:
-                persona_diff = dispatch_diff
+                persona_diff = diff
                 persona_diff_note = diff_note
             else:
                 persona_diff = ""
@@ -524,7 +511,7 @@ def mode_brainstorm(
                 mod_prompt,
                 cwd,
                 timeout,
-                diff=dispatch_diff,
+                diff=diff,
                 round_no=round_no,
             )
             out.append(
@@ -567,7 +554,7 @@ def mode_brainstorm(
             synth_prompt,
             cwd,
             timeout,
-            diff=dispatch_diff,
+            diff=diff,
             round_no=max(completed, 1),
         )
         out.append("\n# Final synthesis\n" + format_result(synth))
@@ -636,7 +623,6 @@ def _handler(ctx: ModeContext) -> int:
     kwargs = {
         "diff": ctx.diff,
         "diff_from_stdin": bool(ctx.extra.get("diff_from_stdin", False)),
-        "diff_already_capped": bool(ctx.extra.get("diff_already_capped", False)),
         "effort_override": ctx.effort_override,
     }
     if images:

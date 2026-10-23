@@ -3,6 +3,38 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.53.0 — 2026-10-23
+
+- **Feat(diff): an over-budget diff is split into passes, never truncated**
+  ([review-cli#662](https://git.hyperide.ai/ultrabricks/review-cli/issues/662)). A diff over
+  `$REVIEW_DIFF_MAX_BYTES` (default 300000, now "max bytes of diff per pass") used to be cut
+  at the cap with a marker, so no seat saw the tail of a big change and `--staged` stamps /
+  `--commit` checkpoints were refused. `review diff` now splits it (`reviewlib/diff_chunks.py`):
+  at `diff --git` file boundaries, whole files packed greedily in diff order; a single file
+  over the budget at `@@` hunk boundaries, its header repeated in every piece with a visible
+  `[chunk i/n of <path>]` line. The board runs once per part, one after another inside ONE
+  run (one admission slot, one run-stats record and `--task` iteration with all its seats),
+  each prompt saying `Part i of n of the change` and listing its files so seats do not flag
+  files they cannot see. `reviewlib/diff_passes.py` merges the answers into one report per
+  seat under `### Part i/n` headings; with `--json`, `findings[]` holds every pass's findings
+  and a seat is `reported` only when every pass of it parsed. The split is announced on stderr
+  with each part's files. `--staged` stamps and `--commit` checkpoints are now valid for a
+  split diff (every file was reviewed) and still withheld unless EVERY pass produced its
+  usable verdicts. A diff within the budget is dispatched exactly as before.
+  - **Loud failure, never a silent cut.** Only one HUNK (or one header-only file section)
+    bigger than the budget is unsplittable: `review diff` exits `13` before any seat runs,
+    naming the file, the hunk number and the sizes. `$REVIEW_DIFF_MAX_BYTES=0` (or any value
+    `<= 0`) never splits and sends the whole diff.
+  - **brainstorm / quorum / just-ask** put the diff in one prompt, so an over-budget diff now
+    fails loudly (exit `13`, naming sizes and the way out) instead of grounding on a fraction
+    of it — on a big dirty tree pipe a scoped diff in (`git diff -- <path> | review brainstorm
+    ...`) or raise the budget. A diff piped on stdin is never split or refused, in any mode.
+  - **Removed:** the dispatch-time truncation function and its marker, the over-cap
+    stderr warning, the `EXIT_COMMIT_DIFF_TRUNCATED` code (exit `13` now means "diff cannot
+    be reviewed whole"), and the `diff_already_capped` mode-context key.
+  - `REVIEW_FAKE_RECORD_DIR` (test-only, with `REVIEW_FAKE_BACKEND`) records the prompt and
+    diff each fake seat call received.
+
 ## 0.52.0 — 2026-10-23
 
 - **New: `review capacity-check [--preset NAME] [--json]` — is the active board's whole
@@ -1855,7 +1887,7 @@ semantic versioning.
   the largest individual calls recorded — see `reviewlib/dashboard/tokenstats.py` and
   the README's `review stat` section. Two concrete causes the investigation evidenced
   are now fixed at the source, not just measured: (1) a dispatch-time diff-size cap
-  (`reviewlib.backends.cap_diff_for_dispatch`, default 300,000 bytes,
+  (the since-removed truncating cap — see 0.52.0 — default 300,000 bytes,
   `$REVIEW_DIFF_MAX_BYTES`) truncates an oversized diff before it reaches any backend —
   a real 6.5MB/583-file diff was previously sent whole to every board seat every round;
   the canonical diff used by `--commit`'s checkpoint integrity check stays uncapped, and

@@ -334,8 +334,8 @@ REVIEW_ROLES = {
 # NOT review-cli's own installation directory.
 LENS_OVERRIDE_SUBDIR = Path(".review") / "lenses"
 # A project override is meant to be a short addendum (a house rule, an invariant
-# reminder), not a document -- capped well under the diff dispatch cap
-# (`backends.DIFF_MAX_BYTES_DEFAULT`, 300_000) so a pathologically large file at this
+# reminder), not a document -- capped well under the per-pass diff budget
+# (`diff_chunks.DIFF_MAX_BYTES_DEFAULT`, 300_000) so a pathologically large file at this
 # path can never balloon into a huge chunk of every matching seat's prompt.
 LENS_OVERRIDE_MAX_BYTES = 8_192
 

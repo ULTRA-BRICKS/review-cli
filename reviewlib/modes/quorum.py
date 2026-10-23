@@ -13,8 +13,9 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..backends import ReviewResult, cap_diff_for_dispatch
+from ..backends import ReviewResult
 from ..config import REVIEW_ROLES
+from . import refuse_oversized_diff
 from ..panel import (
     PanelJob,
     format_result,
@@ -226,7 +227,7 @@ def _adversarial_refutation_prompt(question: str, transcript: str, summary: str)
     for (audit finding: no evidence requirement for a clean pass): a null result must
     name what was specifically checked, not just assert agreement with the panel.
 
-    Deliberately does NOT receive `diff_block`/`dispatch_diff` (k3 review finding,
+    Deliberately does NOT receive `diff_block` (k3 review finding,
     round 6): this pass can only re-examine the EXPERTS' OWN ANSWERS and the
     moderator's synthesis, not the raw diff independently — if every expert overlooks
     a buggy hunk and so never quotes it, this pass cannot discover the omission
@@ -427,40 +428,23 @@ def mode_quorum(
     visual_images: tuple[Path, ...] = (),
     effort_override: "EffortOverride | None" = None,
     diff_from_stdin: bool = False,
-    diff_already_capped: bool = False,
     adversarial_check: bool = False,
     roles: list[str] | None = None,
 ) -> int:
-    # codex review finding: the dispatch-time diff cap used to be applied ONLY by
-    # cli.py's `_dispatch`, so a caller reaching this function directly (a library
-    # consumer, an MCP seam, a test) could still send an uncapped diff to every expert
-    # — capped here too, at the mode's own dispatch boundary, mirroring mode_review /
-    # mode_brainstorm / mode_just_ask. Same stdin exemption: a piped diff was already an
-    # explicit, deliberate scope choice by the caller.
+    # The diff is embedded in ONE prompt per expert, so an over-budget diff
+    # (`$REVIEW_DIFF_MAX_BYTES`) is refused loudly rather than cut — a piped diff
+    # (`diff_from_stdin`) was scoped on purpose by the caller and is sent whole. Checked
+    # here too (not only in cli.py) so a direct library caller is held to the same rule.
     #
-    # codex review finding, round 3 — corrects an earlier, INACCURATE version of this
-    # comment that claimed capping applies "to every expert AND THE MODERATOR": the
-    # moderator call below (`run_moderator(moderators, mod_prompt, cwd, timeout)`) has
-    # NEVER received `diff` at all, in any version of this function — it synthesizes
-    # QUORUM/DISAGREEMENT from the experts' own transcript, not from the raw diff again.
-    # That is PRE-EXISTING behavior this PR did not introduce or change, so this cap
-    # genuinely has nothing to do for the moderator today. Whether the moderator SHOULD
-    # see the diff too is a separate, real question — tracked as review-cli#189, not
-    # fixed here (out of scope for the diff-cap feature this comment is actually about).
-    #
-    # codex review finding (round 2, applied here to match just_ask.py's identical fix):
-    # capping AGAIN when the CLI layer already capped it (`diff_already_capped`) is
-    # silently harmless at the default cap (the first call's output is already <= cap,
-    # so a second call is a true no-op) but NOT idempotent when
-    # `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own length — a
-    # second application would re-truncate the FIRST call's marker text and report ITS
-    # byte count as "the full diff". `diff_already_capped` (default False, so a direct
-    # library caller bypassing the CLI is still protected) skips the redundant second
-    # call entirely rather than relying on it happening to be a no-op.
-    dispatch_diff = (
-        diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
-    )
-    diff_block = _diff_context_block(dispatch_diff)
+    # The moderator call below (`run_moderator(moderators, mod_prompt, cwd, timeout)`) has
+    # NEVER received `diff` at all — it synthesizes QUORUM/DISAGREEMENT from the experts'
+    # own transcript, not from the raw diff again. Whether the moderator SHOULD see the
+    # diff too is a separate question, tracked as review-cli#189.
+    if not diff_from_stdin:
+        refusal = refuse_oversized_diff(diff, "quorum")
+        if refusal is not None:
+            return refusal
+    diff_block = _diff_context_block(diff)
     # expand_flat_models_with_reuse can shrink a 100%-exhausted panel to [].
     # `all(result_is_usable(r) for r in [])` is vacuously True, so an empty
     # expert list would otherwise run a moderator on an empty transcript and
@@ -707,7 +691,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 def _handler(ctx: ModeContext) -> int:
     images = _visual_images(ctx)
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
-    diff_already_capped = bool(ctx.extra.get("diff_already_capped", False))
     adversarial_check = bool(getattr(ctx.args, "adversarial_check", False))
     roles = ctx.extra.get("task_roles") or None
     if images:
@@ -721,7 +704,6 @@ def _handler(ctx: ModeContext) -> int:
             images,
             effort_override=ctx.effort_override,
             diff_from_stdin=diff_from_stdin,
-            diff_already_capped=diff_already_capped,
             adversarial_check=adversarial_check,
             roles=roles,
         )
@@ -734,7 +716,6 @@ def _handler(ctx: ModeContext) -> int:
         ctx.moderators,
         effort_override=ctx.effort_override,
         diff_from_stdin=diff_from_stdin,
-        diff_already_capped=diff_already_capped,
         adversarial_check=adversarial_check,
         roles=roles,
     )

@@ -138,74 +138,6 @@ def _payload(prompt: str, diff: str = "") -> str:
     return out
 
 
-# --- diff size guard (dispatch-time only) ------------------------------------------
-# An uncapped diff is the single biggest token-burn driver the 2026-08 investigation
-# found: a real 6.5MB / 583-file diff (a debug harness's screenshot/video capture
-# scripts touching hundreds of files) was sent WHOLE to every seat in the board. git
-# already collapses each binary file to a one-line "Binary files ... differ" stub, so
-# the actual cost is oversized TEXT — a huge generated/vendored file, or (as in that
-# case) simply a very large number of changed files.
-#
-# THIS MUST NEVER TOUCH THE CANONICAL DIFF used for the staged commit-stamp / the
-# `--commit` checkpoint's integrity check (reviewlib.modes.review._current_staged_diff
-# independently re-derives an UNCAPPED `git diff --cached` and compares it byte-for-
-# byte — capping the diff at the SOURCE, in `cli._git_diff`, broke that comparison for
-# any staged diff over the cap: codex review finding on this feature's own PR). So the
-# cap is applied HERE, only to the copy of the diff handed to backend dispatch — never
-# to the `diff` variable a caller threads into stamping/checkpointing.
-DIFF_MAX_BYTES_DEFAULT = 300_000
-_DIFF_TRUNCATED_NOTE = (
-    "\n\n[review-cli] diff truncated at {cap} bytes (the full diff was {total} bytes "
-    "across {files} changed files) — the payload is capped so a huge diff isn't sent in "
-    "full to every board seat. Scope the review (e.g. `git diff -- <path>`) or raise the "
-    "cap with $REVIEW_DIFF_MAX_BYTES to review the full change.\n"
-)
-_DIFF_GIT_FILE_RE = re.compile(r"^diff --git ", re.MULTILINE)
-
-
-def _diff_max_bytes() -> int:
-    """The configured diff size cap, read at CALL time so an env override applies. A
-    missing/blank/non-integer value falls back to the default; <= 0 disables the cap
-    entirely (the pre-fix, uncapped behaviour)."""
-    raw = os.environ.get("REVIEW_DIFF_MAX_BYTES")
-    if raw is None or not raw.strip():
-        return DIFF_MAX_BYTES_DEFAULT
-    try:
-        return int(raw)
-    except ValueError:
-        return DIFF_MAX_BYTES_DEFAULT
-
-
-def cap_diff_for_dispatch(diff: str) -> str:
-    """Truncate an oversized diff to the configured byte cap, appending a visible
-    marker naming the real total so the truncation is honest, not silent. A no-op when
-    the diff is already within the cap or the cap is disabled.
-
-    The marker itself is reserved OUT OF `cap`, not appended on top of it (codex review
-    finding: the first version of this function truncated the diff TO `cap` bytes and
-    then appended the marker after, so the actual dispatched payload always exceeded
-    `cap` by the marker's length — for the ~300-byte default marker against the
-    300,000-byte default cap that's a ~0.1% overshoot, but a small custom cap (e.g. a
-    test, or an operator scoping tightly) could end up with a payload many times the
-    requested size). Only when `cap` is smaller than the marker itself does the
-    truncated diff text drop to empty — the marker still names the real total even
-    then, so the truncation is never silent, but the guarantee "result <= cap" cannot
-    hold below that floor.
-
-    Callers: apply this to a LOCAL copy used only for backend dispatch (mode_review's
-    flat `-m` path and board path) — never to the diff threaded into the staged-commit
-    stamp or the `--commit` checkpoint's integrity check (see the module note above)."""
-    cap = _diff_max_bytes()
-    encoded = diff.encode("utf-8")
-    if cap <= 0 or len(encoded) <= cap:
-        return diff
-    files = len(_DIFF_GIT_FILE_RE.findall(diff))
-    marker = _DIFF_TRUNCATED_NOTE.format(cap=cap, total=len(encoded), files=files)
-    budget = max(0, cap - len(marker.encode("utf-8")))
-    truncated = encoded[:budget].decode("utf-8", errors="ignore")
-    return truncated + marker
-
-
 def _claude_api_model(model: str) -> str:
     return (
         model.split(":", 1)[1]
@@ -4431,9 +4363,21 @@ def review_fake(
     The text embeds `model`/`round_no` so each round's content is distinct and a resumed
     run's new rounds are visibly different from the pre-kill ones. `REVIEW_FAKE_DELAY`
     (float seconds, default 0) sleeps per call so an e2e can make a run slow enough to
-    reliably SIGTERM it mid-round; the delay still honours `timeout` as an upper bound."""
+    reliably SIGTERM it mid-round; the delay still honours `timeout` as an upper bound.
+    `REVIEW_FAKE_RECORD_DIR` (a directory) makes every call write one `<ns>-<pid>-<tid>.json`
+    file holding the `model`, `prompt` and `diff` it received, so an e2e can assert exactly
+    what each seat was sent (e.g. that a chunked diff's passes cover every file)."""
     prompt = _prompt_with_effort(prompt, effort)
-    import time
+    record_dir = os.environ.get("REVIEW_FAKE_RECORD_DIR", "").strip()
+    if record_dir:
+        target = Path(record_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        (
+            target / f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}.json"
+        ).write_text(
+            json.dumps({"model": model, "prompt": prompt, "diff": diff}),
+            encoding="utf-8",
+        )
 
     # Lazy import (not at module top) so this lower backends layer never imports the higher
     # modes layer at import time — only when the env-gated fake is actually exercised.

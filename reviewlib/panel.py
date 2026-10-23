@@ -289,6 +289,14 @@ def clean_verdict_missing_evidence(body: str) -> bool:
     return bool(_CLEAN_VERDICT_RE.search(body))
 
 
+MISSING_EVIDENCE_WARNING = (
+    "> [review-cli] WARNING: this reads as a clean verdict with no "
+    "evidence of what was checked (no file:line finding, no 'checked: "
+    "...' statement) — treat with skepticism; it may be a skim rather "
+    "than a real adversarial pass."
+)
+
+
 def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
     """Render one `ReviewResult` for terminal/transcript output.
 
@@ -312,12 +320,7 @@ def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
     if body:
         parts.append(body)
         if check_evidence and clean_verdict_missing_evidence(body):
-            parts.append(
-                "> [review-cli] WARNING: this reads as a clean verdict with no "
-                "evidence of what was checked (no file:line finding, no 'checked: "
-                "...' statement) — treat with skepticism; it may be a skim rather "
-                "than a real adversarial pass."
-            )
+            parts.append(MISSING_EVIDENCE_WARNING)
     if err:
         parts.append("stderr:\n" + err)
     return "\n\n".join(parts)

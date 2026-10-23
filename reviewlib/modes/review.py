@@ -35,7 +35,6 @@ from ..backends import (
     backend_available,
     backend_unavailable_reason,
     call_backend,
-    cap_diff_for_dispatch,
     resolve_backend,
     review_with_images,
     runtime_provider_marked_unpaid,
@@ -47,6 +46,24 @@ from ..config import (
     _effective_pool_size,
     apply_effort_override,
     select_pool_and_reserve_with_reuse,
+)
+
+# EXIT_DIFF_TOO_LARGE (13): a diff over the per-pass budget is reviewed in several passes;
+# it is only unreviewable when ONE hunk is larger than the budget — the review is then
+# refused BEFORE any seat runs (nothing was reviewed, so no stamp/checkpoint), naming the
+# file and the sizes. Silently cutting the hunk would certify a review of code no seat saw.
+from ..diff_chunks import (
+    EXIT_DIFF_TOO_LARGE,
+    DiffChunk,
+    DiffUnsplittableError,
+    diff_budget_bytes,
+    split_diff,
+)
+from ..diff_passes import (
+    describe_plan,
+    merge_outcomes,
+    merge_passes,
+    with_part_note,
 )
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
@@ -82,17 +99,6 @@ EXIT_COMMIT_REQUIRES_STAGED = 11
 # checkpoint guarantee and did not get one — that must be a visible, distinct failure, never
 # silently swallowed as if the review itself failed (which already has its own 0/1 result).
 EXIT_COMMIT_FAILED = 12
-# codex review finding: the stamp/checkpoint always certify against the UNCAPPED
-# canonical diff (by design), while every backend actually saw only the CAPPED,
-# possibly-truncated copy — so a truncated staged review used to still pass the
-# commit-hook gate / create a checkpoint that CLAIMS the full diff was reviewed when
-# only a partial view was. Automation invoking `review diff --staged --commit`
-# non-interactively never sees the stderr warning, so a warning alone does not protect
-# it. A truncated staged diff now REFUSES to stamp or checkpoint (this exit code for
-# `--commit`; the plain `--staged` stamp is skipped the same way, silently, matching how
-# it already skips silently on `ok=False`) — the gate exists specifically to certify
-# "the full diff was reviewed", and a partial review must never certify as one.
-EXIT_COMMIT_DIFF_TRUNCATED = 13
 
 
 # ---------------------------------------------------------------------------
@@ -420,15 +426,70 @@ def _json_exit_code(report: dict) -> int:
     return 0
 
 
-def _print_json_report(results: list[ReviewResult]) -> dict:
-    """Build + print the `--json` payload for `results` in ONE place -- both
+def _build_json_report_passes(passes: list[list[ReviewResult]]) -> dict:
+    """`_build_json_report` over the per-pass results of a chunked-diff review. One
+    pass is exactly `_build_json_report(passes[0])`. With several passes every pass's
+    findings are kept (each tagged with its seat as `source`, as always); a seat label
+    is listed once in `expected`, and is `degraded` when ANY pass of it failed or
+    returned an unparseable block, `reported` only when every pass of it parsed — so
+    one lost part never reads as a clean full review."""
+    if len(passes) == 1:
+        return _build_json_report(passes[0])
+    findings: list[dict] = []
+    expected: list[str] = []
+    failed: set[str] = set()
+    for results in passes:
+        for result in results:
+            if result.model not in expected:
+                expected.append(result.model)
+            seat_findings, ok = _seat_json_findings(result)
+            if not ok:
+                failed.add(result.model)
+            findings.extend({**item, "source": result.model} for item in seat_findings)
+    return {
+        "findings": findings,
+        "summary": {
+            "expected": expected,
+            "reported": [m for m in expected if m not in failed],
+            "degraded": [m for m in expected if m in failed],
+        },
+    }
+
+
+def _print_json_report(passes: list[list[ReviewResult]]) -> dict:
+    """Build + print the `--json` payload for the per-pass `passes` in ONE place -- both
     `mode_review`'s flat path and `_mode_review_board` call this instead of
     repeating the build/print pair (review-cli#546, code-quality review finding),
     and both reuse the RETURNED report for `_json_exit_code` rather than
     rebuilding/re-parsing it a second time."""
-    report = _build_json_report(results)
+    report = _build_json_report_passes(passes)
     print(json.dumps(report, indent=2))
     return report
+
+
+def _plan_passes(
+    diff: str, diff_from_stdin: bool, reporter: "BoardReporter | None" = None
+) -> list[DiffChunk] | None:
+    """The dispatch passes for `diff`, or None when it cannot be split (the loud error
+    is already printed). A diff within `$REVIEW_DIFF_MAX_BYTES` — and any PIPED diff,
+    which the user scoped on purpose — is ONE pass carrying the diff unchanged; a bigger
+    one is split per file group (`reviewlib.diff_chunks.split_diff`), never truncated.
+    The split is announced (stderr, or the TUI's event log) so it is never silent."""
+    budget = 0 if diff_from_stdin else diff_budget_bytes()
+    try:
+        chunks = split_diff(diff, budget)
+    except DiffUnsplittableError as exc:
+        if reporter is not None:
+            reporter.close()
+        print(f"[review-cli] ERROR: {exc}", file=sys.stderr, flush=True)
+        return None
+    if len(chunks) > 1:
+        note = describe_plan(chunks, budget, len(diff.encode("utf-8")))
+        if reporter is not None:
+            reporter.event(f"[split] {note}")
+        else:
+            print(f"[review-cli] {note}", file=sys.stderr, flush=True)
+    return chunks
 
 
 def _predispatch_error_exit(json_output: bool) -> int:
@@ -624,7 +685,13 @@ def mode_review(
     # review-cli#157: "Apply provider failover to flat -m reviews"). Each provider first gets
     # the same-provider retry; a still-unusable result switches this SAME model to its NEXT
     # provider, so the seat only fails once every provider is exhausted.
-    results: list[ReviewResult] = []
+    # Split the diff per file group when it exceeds $REVIEW_DIFF_MAX_BYTES (never
+    # truncated; see _plan_passes). `diff` itself — the canonical diff the
+    # stamp/checkpoint certify — is untouched: every byte of it is dispatched, spread
+    # over `chunks`. A piped diff and a within-budget diff are ONE chunk, sent as-is.
+    chunks = _plan_passes(diff, diff_from_stdin)
+    if chunks is None:
+        return EXIT_DIFF_TOO_LARGE
 
     def _seat_effort(model: str) -> str | None:
         # The flat `-m` path has no BoardReviewer, so the run-scoped `--effort` is the only
@@ -633,31 +700,18 @@ def mode_review(
             effort_override.effort_for(model) if effort_override is not None else None
         )
 
-    # Capped copy for backend dispatch ONLY — never for the stamp/checkpoint `diff`
-    # below (see cap_diff_for_dispatch's docstring: capping the canonical diff broke
-    # the --commit checkpoint's integrity check, codex P1 finding). A PIPED diff
-    # (`diff_from_stdin`) is exempt from the cap — the user already explicitly, and
-    # deliberately, scoped what they piped in; capping it too would silently truncate
-    # an intentional `git diff | review diff ...` (a second codex P1 finding on the
-    # same PR: the cap originally ignored this flag even though the stamp/checkpoint
-    # calls right below already receive it).
-    dispatch_diff = diff if diff_from_stdin else cap_diff_for_dispatch(diff)
-    dispatch_diff_truncated = _warn_if_dispatch_diff_truncated(
-        diff, dispatch_diff, staged
-    )
-
-    def _dispatch(model: str) -> ReviewResult:
+    def _dispatch(model: str, pass_prompt: str, pass_diff: str) -> ReviewResult:
         backend = resolve_backend(model)
         effort = _seat_effort(model)
         if visual_images:
             if effort is None:
                 return review_with_images(
-                    model, prompt, dispatch_diff, cwd, timeout, 0, visual_images
+                    model, pass_prompt, pass_diff, cwd, timeout, 0, visual_images
                 )
             return review_with_images(
                 model,
-                prompt,
-                dispatch_diff,
+                pass_prompt,
+                pass_diff,
                 cwd,
                 timeout,
                 0,
@@ -667,56 +721,73 @@ def mode_review(
         # Always through call_backend: it holds the seat's host-wide provider slot
         # (reviewlib.admission, review-cli#614) whether or not an effort is set.
         return call_backend(
-            backend, model, prompt, dispatch_diff, cwd, timeout, effort=effort
+            backend, model, pass_prompt, pass_diff, cwd, timeout, effort=effort
         )
 
-    def _run_seat_with_failover(model: str) -> ReviewResult:
-        return _flat_seat_with_provider_failover(model, _dispatch)
+    def _run_flat_pass(pass_prompt: str, pass_diff: str) -> list[ReviewResult]:
+        """Every seat on ONE chunk, in parallel — the whole flat dispatch of a
+        within-budget diff, repeated per chunk for a split one."""
+        results: list[ReviewResult] = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
-        futures = {
-            pool.submit(_run_seat_with_failover, model): model for model in models
-        }
-        for future in concurrent.futures.as_completed(futures):
-            model = futures[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:  # noqa: BLE001 - report, never crash the panel
-                results.append(
-                    ReviewResult(
-                        model=model,
-                        command="internal",
-                        returncode=127,
-                        stdout="",
-                        stderr=str(exc),
+        def _run_seat_with_failover(model: str) -> ReviewResult:
+            return _flat_seat_with_provider_failover(
+                model, lambda m: _dispatch(m, pass_prompt, pass_diff)
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
+            futures = {
+                pool.submit(_run_seat_with_failover, model): model for model in models
+            }
+            for future in concurrent.futures.as_completed(futures):
+                model = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:  # noqa: BLE001 - report, never crash the panel
+                    results.append(
+                        ReviewResult(
+                            model=model,
+                            command="internal",
+                            returncode=127,
+                            stdout="",
+                            stderr=str(exc),
+                        )
                     )
-                )
-            # One tally per logical seat (its FINAL outcome after any retry). No-op outside a
-            # CLI-driven run; this flat path runs its own executor, so it tallies here.
-            # glm-5.2 review finding (2026-08 seat-cooldown feature): this used to tally by
-            # bare returncode, so a cached-cooldown sentinel (rc=0, non-empty "unavailable"
-            # body) recorded as `ok` in run-stats — the same distortion `run_moderator`'s
-            # `_tally_ok(result_is_usable(...))` already fixed. `result_is_usable` is the
-            # SAME predicate this function's own `ok` determination uses below, so a
-            # cooling-down seat can no longer report differently to run-stats than it does
-            # to the review's own pass/fail result.
-            _tally_ok(result_is_usable(results[-1]))
-            # Token tallying happens PER DISPATCH ATTEMPT inside `_safe_dispatch`
-            # above (codex review finding: tallying only the seat's final result
-            # here undercounted a seat that needed an in-seat retry or a provider
-            # failover -- each such attempt is a separate real backend call). Do
-            # NOT also tally `results[-1]` here -- it was already counted once as
-            # the last `_safe_dispatch` call that produced it; tallying it again
-            # would double-count that one attempt.
+                # One tally per logical seat (its FINAL outcome after any retry). No-op
+                # outside a CLI-driven run; this flat path runs its own executor, so it
+                # tallies here. glm-5.2 review finding (2026-08 seat-cooldown feature):
+                # this used to tally by bare returncode, so a cached-cooldown sentinel
+                # (rc=0, non-empty "unavailable" body) recorded as `ok` in run-stats —
+                # the same distortion `run_moderator`'s `_tally_ok(result_is_usable(...))`
+                # already fixed. `result_is_usable` is the SAME predicate this function's
+                # own `ok` determination uses below, so a cooling-down seat can no longer
+                # report differently to run-stats than it does to the review's own
+                # pass/fail result.
+                _tally_ok(result_is_usable(results[-1]))
+                # Token tallying happens PER DISPATCH ATTEMPT inside `_safe_dispatch`
+                # above (codex review finding: tallying only the seat's final result
+                # here undercounted a seat that needed an in-seat retry or a provider
+                # failover -- each such attempt is a separate real backend call). Do
+                # NOT also tally `results[-1]` here -- it was already counted once as
+                # the last `_safe_dispatch` call that produced it; tallying it again
+                # would double-count that one attempt.
+        return results
 
-    by_model = {result.model: result for result in results}
+    # Passes run one after another inside this ONE run (one admission slot, one
+    # run-stats record); each pass's seats still run in parallel.
+    passes: list[list[ReviewResult]] = []
+    for chunk in chunks:
+        pass_results = _run_flat_pass(with_part_note(prompt, chunk), chunk.text)
+        by_model = {result.model: result for result in pass_results}
+        passes.append([by_model[model] for model in models])
+    results = [result for pass_results in passes for result in pass_results]
+
     # `report` stays None on the prose path (never read there); the --json path
     # builds+prints it here via `_print_json_report` so the SAME merged payload
     # backs both stdout and the exit-code decision below (`_json_exit_code`) --
     # never rebuilt/re-parsed a second time for the return value.
     report: dict | None = None
     if json_output:
-        report = _print_json_report([by_model[model] for model in models])
+        report = _print_json_report(passes)
     else:
         # check_evidence=prompt.startswith(DEFAULT_PROMPT) (k3 review finding, round 6;
         # `.startswith` not `==`, k3 finding round 7 — see below): only the diff-review
@@ -743,10 +814,12 @@ def mode_review(
         # the prose branch only (code-quality review finding, review-cli#546): the
         # --json branch above never calls format_result, so this was dead weight there.
         check_evidence = prompt.startswith(DEFAULT_PROMPT)
+        # A split review inlines the missing-evidence warning per part (merge_passes),
+        # so it must not be applied again to the merged body.
         print(
             "\n\n---\n\n".join(
-                format_result(by_model[model], check_evidence=check_evidence)
-                for model in models
+                format_result(seat, check_evidence=check_evidence and len(chunks) == 1)
+                for seat in merge_passes(passes, chunks, check_evidence=check_evidence)
             )
         )
     # Opus review finding: this used to check ONLY `returncode == 0`, not
@@ -783,93 +856,14 @@ def mode_review(
         diff_from_stdin,
         cwd,
         diff,
-        dispatch_diff_truncated,
         stamp_diff_hash=stamp_diff_hash,
     )
-    override = _checkpoint_if_requested(
-        commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
-    )
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
     if override is not None:
         return override
     if json_output:
         return _json_exit_code(report)
     return 0 if ok else 1
-
-
-def _warn_if_dispatch_diff_truncated(
-    diff: str, dispatch_diff: str, staged: bool, reporter: "BoardReporter | None" = None
-) -> bool:
-    """Print a visible stderr warning whenever the dispatch cap actually truncated the
-    diff, and return WHETHER IT DID (codex review finding, round 5, then round 6): the
-    stamp/checkpoint always certify against the UNCAPPED canonical `diff` (by design —
-    see cap_diff_for_dispatch's docstring), so `review diff --staged` on an oversized
-    staged diff used to still pass the commit-hook gate ("the staged index was
-    reviewed") even though every seat actually saw only the first
-    $REVIEW_DIFF_MAX_BYTES plus a truncation note. A stderr warning alone does NOT
-    protect automation (a non-interactive `review diff --staged --commit` never sees it)
-    — the return value here lets the caller REFUSE to stamp/checkpoint on a truncated
-    staged diff, not just warn about it (see EXIT_COMMIT_DIFF_TRUNCATED).
-
-    This return used to be STAGED-SCOPED — `False` for an unstaged truncated run, on the
-    reasoning that such a run has no commit-gate certification to refuse. That became
-    wrong the moment `_commit_gate_skip_reason` started using the same value to pick
-    WHICH remediation to print (codex finding, iteration 4): an unstaged oversized run
-    arrived as `truncated=False`, fell through to the not-staged branch, and was told to
-    "stage and re-run `--staged`" — which truncates again, the exact looping advice that
-    branch ordering exists to prevent. The value is now the plain fact "the cap cut this
-    diff", and staged-scoping happens where it belongs, in the callers that act on it:
-    the stamp path refuses an unstaged run anyway (it is not `staged`), and the
-    checkpoint path is only ever reached under `--staged` (`--commit` without `--staged`
-    is rejected before dispatch, EXIT_COMMIT_REQUIRES_STAGED). Only the WORDING of the
-    warning below is still staged-specific.
-
-    Opus review finding (this feature's own PR): an unstaged, over-cap `review diff`
-    used to truncate completely SILENTLY to the user — the only signal was the marker
-    embedded in the payload handed to the backend, which never reaches the user's own
-    stdout. Not printing a warning here just because there's no gate to refuse left a
-    real, common case (a plain `review diff` on a huge change) reviewing a partial diff
-    with zero visible notice. Both branches below share the same byte-count facts; only
-    the framing (commit-gate consequence vs none) and the git command hint differ.
-
-    `reporter` (review-cli#548's optional live TUI observer, None for the flat path,
-    which never has one) routes this warning into the TUI's event log instead of a raw
-    stderr print when active -- this is exactly the safety warning the feature's own
-    docstring says used to be silently lost, so it must survive an active curses screen
-    too (review finding on this feature's own PR: printed directly, it would vanish the
-    instant the alt-screen later restores, recreating the very incident this function
-    exists to prevent, for the one audience -- an interactive human -- most likely to be
-    reviewing a large change by hand)."""
-    truncated = dispatch_diff != diff
-    if not truncated:
-        return False
-    full_bytes = len(diff.encode("utf-8"))
-    reviewed_bytes = len(dispatch_diff.encode("utf-8"))
-    if staged:
-        note = (
-            "WARNING: the staged diff exceeded $REVIEW_DIFF_MAX_BYTES and "
-            "was TRUNCATED for every seat — this review covers only a PARTIAL view of "
-            "the staged change, not the full diff, so no commit-gate stamp/checkpoint "
-            f"will be created. Full diff: {full_bytes} bytes; reviewed: "
-            f"{reviewed_bytes} bytes. Scope the review "
-            "(`git diff --cached -- <path>`) or raise the cap to review the full change."
-        )
-        if reporter is not None:
-            reporter.event(f"[warn] {note}")
-        else:
-            print(f"[review-cli] {note}", file=sys.stderr, flush=True)
-        return True
-    note = (
-        "WARNING: the diff exceeded $REVIEW_DIFF_MAX_BYTES and was "
-        "TRUNCATED for every seat — this review covers only a PARTIAL view of the "
-        f"change. Full diff: {full_bytes} bytes; reviewed: {reviewed_bytes} bytes. "
-        "Scope the review (`git diff -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES to "
-        "review the full change."
-    )
-    if reporter is not None:
-        reporter.event(f"[warn] {note}")
-    else:
-        print(f"[review-cli] {note}", file=sys.stderr, flush=True)
-    return True
 
 
 def _warn_if_board_reused(
@@ -1181,32 +1175,19 @@ _RERUN_STAGED_COMMIT = "review diff --task <CODE> --staged --commit"
 # stderr turns that into a one-line fix.
 #
 # The REMEDIATION is per-reason, not one shared suffix: "re-run it `--staged`" is right for an
-# unstaged or piped run and WRONG for a truncated one (re-running truncates again — advice that
-# loops is how an agent burns another 40 minutes).
+# unstaged or piped run; each reason names the concrete re-run that fixes IT.
 
 
 def _commit_gate_skip_reason(
-    staged: bool, diff_from_stdin: bool, truncated: bool
+    staged: bool, diff_from_stdin: bool
 ) -> tuple[str, str] | None:
     """`(reason, remediation)` for the first condition this review fails, or None when it
     satisfies the gate. Callers must only consult it for an OK review — a FAILED review has
-    its own, louder reason (the failure itself) and is not this function's business."""
-    # ORDER MATTERS, and `truncated` deliberately comes FIRST (Fable review finding on
-    # iteration 2). Only ONE reason is reported — the first failing condition — so the
-    # order decides which remediation a compound failure gets. `staged`/`diff_from_stdin`
-    # are fixed by re-running differently; `truncated` is NOT: it persists across every
-    # re-run of the same oversized diff. Checking `staged` first would tell an unstaged,
-    # oversized run to "stage and re-run `--staged`", it would truncate again, and only
-    # THEN would it hear "split the change" — one wasted multi-minute review round, which
-    # is precisely the looping-advice failure this whole notice exists to prevent.
-    if truncated:
-        return (
-            "the diff was truncated for dispatch, so no seat saw all of it",
-            "split the change into smaller staged commits (or raise $REVIEW_DIFF_MAX_BYTES) "
-            f"and review each part with `{_RERUN_STAGED}` — re-running this "
-            "same diff truncates again, and piping a smaller one in still fails the "
-            "index-provenance check",
-        )
+    its own, louder reason (the failure itself) and is not this function's business.
+
+    A diff over `$REVIEW_DIFF_MAX_BYTES` is NOT a reason: it is reviewed in several passes
+    (reviewlib.diff_chunks), every file in some pass, and the caller's `ok` is true only
+    when every pass produced its usable verdicts."""
     if not staged:
         return (
             "the review was not `--staged` (the gate certifies the staged index)",
@@ -1242,7 +1223,7 @@ _GATE_MARKER = (
     "Never create it by hand — a completed staged review is what writes it, so a "
     "hand-made one certifies a review that did not happen.",
 )
-# The SKIP path (unstaged / piped / truncated) writes NEITHER artifact, so naming only one
+# The SKIP path (unstaged / piped) writes NEITHER artifact, so naming only one
 # of them invites the reader with the other gate installed to conclude the line is not
 # about them (Fable finding, iteration 12).
 _GATE_BOTH = (
@@ -1303,7 +1284,6 @@ def _stamp_if_staged_commit_review(
     diff_from_stdin: bool,
     cwd: Path,
     diff: str,
-    truncated: bool,
     *,
     stamp_diff_hash: str | None = None,
 ) -> None:
@@ -1320,12 +1300,6 @@ def _stamp_if_staged_commit_review(
         not satisfy the commit gate. The stamp is diff-scoped (the hook re-derives the
         cached diff and compares), but the marker is mtime-only and would otherwise be
         forgeable this way — so both are gated on real-index provenance.
-      * NOT `truncated` — codex review finding: the stamp certifies the UNCAPPED
-        canonical `diff`, but every seat only saw the CAPPED, truncated copy when this
-        is True — so a truncated staged review no longer satisfies the pre-commit hook
-        gate it would otherwise pass. (`_warn_if_dispatch_diff_truncated` has already
-        printed the loud stderr warning explaining the truncation itself before this
-        function is ever called; the gate line below adds only the gate consequence.)
 
     When the review is `ok` but one of the other conditions fails, this NAMES the failed
     condition on stderr (`_warn_commit_gate_not_satisfied`) instead of skipping silently
@@ -1334,11 +1308,6 @@ def _stamp_if_staged_commit_review(
     marker write fails is reported too, so "the review passed but the marker is stale" is
     never an unexplained state. A FAILED review (`ok=False`) still skips silently: its own
     failure output is the reason, and a gate line on top of it would just be noise.
-
-    `truncated` has NO default (Fable review finding): a defaulted `False` would be
-    fail-OPEN — a future call site that simply forgets to pass it would silently
-    certify a truncated review again, exactly the bug this parameter exists to prevent.
-    Every current caller already computes and threads it explicitly.
 
     `stamp_diff_hash` (round-5 review finding, k3+Opus): the pre-commit-hook-compatible
     hash captured by the CLI at DISPATCH time (adjacent to `diff`'s own capture), passed
@@ -1350,7 +1319,7 @@ def _stamp_if_staged_commit_review(
     """
     if not ok:
         return  # the review's own failure output already says why; no gate line on top of it.
-    skipped = _commit_gate_skip_reason(staged, diff_from_stdin, truncated)
+    skipped = _commit_gate_skip_reason(staged, diff_from_stdin)
     if skipped is not None:
         _warn_commit_gate_not_satisfied(*skipped, artifact_and_consequence=_GATE_BOTH)
         return
@@ -1690,14 +1659,12 @@ def _checkpoint_if_requested(
     diff_from_stdin: bool,
     cwd: Path,
     diff: str,
-    truncated: bool,
 ) -> int | None:
     """Create the `--commit` checkpoint commit after a review, if requested.
 
     Called only after `mode_review` has already validated commit-implies-staged up
     front, so `staged` is always True here by construction — the remaining gate mirrors
-    `_stamp_if_staged_commit_review`'s other conditions (`ok`, not `diff_from_stdin`,
-    not `truncated`).
+    `_stamp_if_staged_commit_review`'s other conditions (`ok`, not `diff_from_stdin`).
 
     Precisely: this CHECKPOINTS the reviewed staged diff after the review completes —
     it does NOT mean "commits when the review passes". `ok` means the pool produced
@@ -1706,23 +1673,16 @@ def _checkpoint_if_requested(
     same as the existing `--staged` stamp gate). That is intended, not a bug.
 
     Returns `None` to leave the review's own 0/1 result standing (covers: `--commit`
-    not requested; the gate not satisfied — the review failed, the diff was piped, or
-    the diff was truncated for dispatch — in which case a note is printed but the
-    review's own result is untouched; or the checkpoint commit itself succeeded).
-    Returns `EXIT_COMMIT_FAILED` to OVERRIDE an otherwise-successful review's exit code
-    when the review passed, the gate was satisfied, but the `git commit` subprocess
-    itself failed. Returns `EXIT_COMMIT_DIFF_TRUNCATED` when the staged diff exceeded
-    the dispatch cap (codex review finding): a checkpoint is supposed to certify the
-    FULL reviewed diff, but every seat only saw the truncated copy — a stderr warning
-    alone does not protect non-interactive automation from silently checkpointing a
-    partial review, so this REFUSES rather than checkpoints. Either override is a
-    visible, distinct failure, never silently swallowed as the review's own 0/1 result.
+    not requested; the gate not satisfied — the review failed or the diff was piped — in
+    which case a note is printed but the review's own result is untouched; or the
+    checkpoint commit itself succeeded). Returns `EXIT_COMMIT_FAILED` to OVERRIDE an
+    otherwise-successful review's exit code when the review passed, the gate was
+    satisfied, but the `git commit` subprocess itself failed — a visible, distinct
+    failure, never silently swallowed as the review's own 0/1 result.
 
-    `truncated` has NO default (Fable review finding): a defaulted `False` would be
-    fail-OPEN — a future call site that simply forgets to pass it would silently
-    checkpoint a truncated review again. Every current caller already computes and
-    threads it explicitly.
-    """
+    A staged diff over `$REVIEW_DIFF_MAX_BYTES` is checkpointed like any other: it was
+    reviewed in several passes covering every file, and `ok` is true only when every
+    pass produced its usable verdicts."""
     if not commit:
         return None
     if not ok:
@@ -1741,17 +1701,6 @@ def _checkpoint_if_requested(
             flush=True,
         )
         return None
-    if truncated:
-        print(
-            "[review-cli] --commit: the staged diff exceeded $REVIEW_DIFF_MAX_BYTES and "
-            "was TRUNCATED for dispatch — no checkpoint created (a checkpoint must certify "
-            "the FULL reviewed diff, and every seat here only saw a partial view). Scope "
-            "the review (`git diff --cached -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES, "
-            f"then re-run `{_RERUN_STAGED_COMMIT}`.",
-            file=sys.stderr,
-            flush=True,
-        )
-        return EXIT_COMMIT_DIFF_TRUNCATED
     succeeded, detail = _checkpoint_commit(cwd, diff)
     if succeeded:
         print(
@@ -1892,24 +1841,30 @@ def _mode_review_board(
         )
         return _predispatch_error_exit(json_output)
 
-    # Capped copy for backend dispatch ONLY — `diff` itself (used below for the
-    # stamp/checkpoint) stays uncapped (see cap_diff_for_dispatch's docstring). Same
-    # stdin exemption as the flat path above.
-    dispatch_diff = diff if diff_from_stdin else cap_diff_for_dispatch(diff)
-    dispatch_diff_truncated = _warn_if_dispatch_diff_truncated(
-        diff, dispatch_diff, staged, reporter
-    )
-    outcome = run_board_with_failover(
-        pool,
-        reserve,
-        prompt,
-        dispatch_diff,
-        cwd,
-        timeout,
-        visual_images,
-        reporter=reporter,
-        reuse_healthy=not exact_board,
-    )
+    # Split the diff per file group when it exceeds $REVIEW_DIFF_MAX_BYTES (never
+    # truncated; see _plan_passes). `diff` itself — what the stamp/checkpoint certify —
+    # is untouched: every byte of it is dispatched, spread over `chunks`. A piped diff
+    # and a within-budget diff are ONE chunk, sent as-is (the pre-chunking dispatch).
+    chunks = _plan_passes(diff, diff_from_stdin, reporter)
+    if chunks is None:
+        return EXIT_DIFF_TOO_LARGE
+    # One pass per chunk, one after another inside this ONE run (one admission slot, one
+    # run-stats record); each pass runs the whole board with its own failover/backfill.
+    outcomes = [
+        run_board_with_failover(
+            pool,
+            reserve,
+            with_part_note(prompt, chunk),
+            chunk.text,
+            cwd,
+            timeout,
+            visual_images,
+            reporter=reporter,
+            reuse_healthy=not exact_board,
+        )
+        for chunk in chunks
+    ]
+    outcome = merge_outcomes(outcomes)
     # Close the TUI (if active) THE MOMENT dispatch is done -- see the `if not pool:`
     # comment above for why this must happen before the prose findings print below, not
     # deferred to the CLI's own cleanup (cli.py still closes it too, defensively, for a
@@ -1925,30 +1880,39 @@ def _mode_review_board(
     # never rebuilt/re-parsed a second time for the return value.
     report: dict | None = None
     if json_output:
-        report = _print_json_report(outcome.results)
+        report = _print_json_report([o.results for o in outcomes])
     else:
         # check_evidence=prompt.startswith(DEFAULT_PROMPT) — see the flat path's
         # identical note above (k3 review finding, rounds 6-7). Computed HERE,
         # inside the prose branch only (code-quality review finding,
         # review-cli#546): the --json branch above never calls format_result.
         check_evidence = prompt.startswith(DEFAULT_PROMPT)
+        # A split review inlines the missing-evidence warning per part (merge_passes),
+        # so it must not be applied again to the merged body.
+        merged = merge_passes(
+            [o.results for o in outcomes], chunks, check_evidence=check_evidence
+        )
         print(
             "\n\n---\n\n".join(
-                format_result(r, check_evidence=check_evidence) for r in outcome.results
+                format_result(r, check_evidence=check_evidence and len(chunks) == 1)
+                for r in merged
             )
         )
 
-    if outcome.degraded and len(outcome.usable) < outcome.target:
-        # The reporter is already closed by this point (see above) -- a plain print,
-        # same as every non-TUI run, always correct here regardless of how this run
-        # started.
-        print(
-            f"[review-cli] board: degraded — only {len(outcome.usable)} of "
-            f"{outcome.target} seats produced a usable verdict (reserve exhausted).",
-            file=sys.stderr,
-            flush=True,
-        )
-    _report_role_shortfall(outcome, json_output=json_output)
+    for chunk, pass_outcome in zip(chunks, outcomes, strict=True):
+        if pass_outcome.degraded and len(pass_outcome.usable) < pass_outcome.target:
+            # The reporter is already closed by this point (see above) -- a plain print,
+            # same as every non-TUI run, always correct here regardless of how this run
+            # started.
+            part = f" (part {chunk.index}/{chunk.total})" if chunk.total > 1 else ""
+            print(
+                f"[review-cli] board: degraded{part} — only {len(pass_outcome.usable)} "
+                f"of {pass_outcome.target} seats produced a usable verdict (reserve "
+                "exhausted).",
+                file=sys.stderr,
+                flush=True,
+            )
+        _report_role_shortfall(pass_outcome, json_output=json_output)
 
     # Success gate: the pool refilled to its target of usable verdicts AND of distinct
     # roles (NOT degraded). A failed-then-replaced seat is handled, so it must not block
@@ -1960,12 +1924,9 @@ def _mode_review_board(
         diff_from_stdin,
         cwd,
         diff,
-        dispatch_diff_truncated,
         stamp_diff_hash=stamp_diff_hash,
     )
-    override = _checkpoint_if_requested(
-        commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
-    )
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
     if override is not None:
         return override
     if json_output:

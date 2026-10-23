@@ -8,8 +8,15 @@ cross-mode helpers, e.g. `PERSONAS` (the persona/lens pool `brainstorm` and
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from ..diff_chunks import (
+    EXIT_DIFF_TOO_LARGE,
+    DiffTooLargeError,
+    require_single_prompt_diff,
+)
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
@@ -19,6 +26,18 @@ def _diff_context_block(diff: str) -> str:
     if not diff.strip():
         return ""
     return f"\n\nAdditional context — a git diff:\n\n```diff\n{diff}\n```"
+
+
+def refuse_oversized_diff(diff: str, mode: str) -> int | None:
+    """For the single-prompt modes (brainstorm/quorum/just-ask): print the loud error and
+    return `EXIT_DIFF_TOO_LARGE` when `diff` is over `$REVIEW_DIFF_MAX_BYTES`; None when
+    it fits and the mode proceeds. A diff is never cut."""
+    try:
+        require_single_prompt_diff(diff, mode)
+    except DiffTooLargeError as exc:
+        print(f"[review-cli] ERROR: {exc}", file=sys.stderr, flush=True)
+        return EXIT_DIFF_TOO_LARGE
+    return None
 
 
 # Distinct expert personas shared by every mode that assigns a per-seat role/lens
