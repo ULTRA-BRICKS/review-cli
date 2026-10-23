@@ -44,6 +44,7 @@ from typing import Callable
 from .backends import ReviewResult
 from .panel import _UNAVAILABLE_MAX_LEN, result_is_usable
 from .process import write_retry_log
+from .seat_cooldown import CHRONIC_QUOTA_MARKERS
 
 # ── transient classification (MIRRORED from agent-tools fallback_chain.py) ────────────────
 # The closed vocabulary of error SIGNALS that count as TRANSIENT (retry the same seat). These
@@ -301,10 +302,24 @@ _THROTTLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 
+def _is_non_throttle_failure(text: str) -> bool:
+    """True when failure `text` is a quota, auth or billing failure, never provider pushback.
+
+    That covers the seat-fatal vocabulary plus the seat cooldown's chronic-quota markers: z.ai's
+    HTTP 429 + code 1310 "Weekly/Monthly Limit Exhausted. Your limit will reset at ...", a CLI's
+    "session limit", "usage credits". Backing off does not clear those, so feeding one to
+    admission control would halve the provider's limit on every run until the quota resets
+    (review-cli#660). The marker list is the seat cooldown's, so both stay in step."""
+    lowered = text.lower()
+    if any(marker in lowered for marker in CHRONIC_QUOTA_MARKERS):
+        return True
+    return any(p.search(text) for p in _SEAT_FATAL_PATTERNS)
+
+
 def text_is_throttle(text: str) -> bool:
     """True when a transport's failure text reports provider pushback (429 / 529 / rate
     limit / overloaded) and not a quota, auth or billing failure."""
-    if any(p.search(text) for p in _SEAT_FATAL_PATTERNS):
+    if _is_non_throttle_failure(text):
         return False
     return any(p.search(text) for p in _THROTTLE_PATTERNS)
 
@@ -317,7 +332,7 @@ def is_throttle(result: ReviewResult) -> bool:
     if result_is_usable(result):
         return False
     channel = _error_channel(result)
-    if any(p.search(channel) for p in _SEAT_FATAL_PATTERNS):
+    if _is_non_throttle_failure(channel):
         return False
     if result.returncode in _HTTP_THROTTLE_STATUSES:
         return True

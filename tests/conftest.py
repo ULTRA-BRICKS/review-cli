@@ -114,6 +114,20 @@ def _isolate_omp_accounts(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_seat_cooldown(tmp_path, monkeypatch):
+    """Default EVERY test to a throwaway seat-cooldown store (review-cli#663). A failed seat
+    call now records an availability window (and a skipped seat is read back from it), so
+    a suite that drives `backends.call_backend` against a failing stub must not write into
+    — or be excluded by — the developer's real ~/.config/review-cli/seat-cooldown.json."""
+    monkeypatch.setenv(
+        "REVIEW_SEAT_COOLDOWN_FILE", str(tmp_path / "seat-cooldown.json")
+    )
+    # The automatic pre-dispatch health check would probe the stub CLIs/servers a test
+    # drives and consume their scripted answers; tests/test_health.py turns it on itself.
+    monkeypatch.setenv("REVIEW_HEALTH_PREFLIGHT", "0")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_admission(tmp_path, monkeypatch):
     """Default EVERY test to host-wide admission OFF, with a throwaway registry dir
     (review-cli#614). Admission reads the REAL host load/memory and coordinates through a

@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib import admission, backstop  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
-from reviewlib.retry import is_throttle  # noqa: E402
+from reviewlib.retry import is_throttle, text_is_throttle  # noqa: E402
 
 A = admission
 
@@ -255,6 +255,35 @@ def test_is_throttle_reads_http_status_from_returncode():
         ReviewResult("gemini", "POST", 429, "", "insufficient credit balance")
     )
     assert not is_throttle(ReviewResult("gemini", "POST", 500, "", ""))
+
+
+_ZAI_1310 = (
+    '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. '
+    'Your limit will reset at 2026-10-26 05:58:34"}}'
+)
+
+
+def test_chronic_quota_failure_is_not_a_throttle():
+    """z.ai answers an exhausted weekly quota with HTTP 429 and a reset time (code 1310).
+    That is not provider pushback: counting it halves the provider's limit on every run
+    and renews the cooldown, so the host admitted one review at a time until the reset
+    (review-cli#660)."""
+    scenarios = {
+        "zai-1310-http-429": (429, "", _ZAI_1310),
+        "zai-1310-on-stdout": (1, _ZAI_1310, ""),
+        "session-limit": (1, "", "429 You've hit your session limit"),
+        "usage-credits": (429, "", "429 usage credits exhausted"),
+        "usage-credits-hyphen": (429, "", "429 usage-credits exhausted"),
+    }
+    for name, (returncode, stdout, stderr) in scenarios.items():
+        result = ReviewResult("zai:glm-5.3", "POST", returncode, stdout, stderr)
+        assert not is_throttle(result), name
+        assert not text_is_throttle(stdout or stderr), name
+
+
+def test_plain_rate_limit_still_throttles():
+    assert is_throttle(ReviewResult("zai:glm-5.3", "POST", 429, "", "rate limit"))
+    assert text_is_throttle("429 rate limit")
 
 
 def test_call_backend_caps_its_timeout_to_the_command_deadline():

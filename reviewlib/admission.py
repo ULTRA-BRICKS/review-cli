@@ -1044,7 +1044,11 @@ def routed(models: list[str]) -> list[str]:
     """The executors a TEXT panel's seats are dispatched to first: the head of each
     model's failover chain (unpaid and unavailable providers dropped, last-working
     first), the same chain panel dispatch walks — so a run reserves the providers it will
-    actually call. Direct executors (the qa tester, vision calls) skip this."""
+    actually call. A seat whose whole chain is excluded (an exhausted quota or a failed
+    login recorded by `reviewlib.availability`) is not planned at all: it
+    answers with a skip sentinel without a call, so it must not hold a provider
+    reservation or a place in the queue behind other runs. Direct executors (the qa
+    tester, vision calls) skip this."""
     try:
         from . import backends
         from .provider_failover import provider_chain
@@ -1056,7 +1060,10 @@ def routed(models: list[str]) -> list[str]:
                 available=backends.backend_available,
                 unpaid=backends.runtime_provider_marked_unpaid,
             )
-            out.append(chain[0] if chain else model)
+            head = chain[0] if chain else model
+            # only a seat that answers with a skip sentinel (no call) is left unplanned
+            if backends.availability_exclusion(head) is None:
+                out.append(head)
         return out
     except Exception:  # noqa: BLE001 — planning must never break a run
         return list(models)
@@ -1846,6 +1853,18 @@ def recent_admissions(
     return summary
 
 
+def _provider_exclusions() -> dict:
+    """Provider name -> `availability.Exclusion` for every provider whose quota/credits an
+    earlier failure showed exhausted; shown by `review jobs` as an exclusion with its end
+    time, not as a throttle. Never raises."""
+    try:
+        from . import availability
+
+        return availability.provider_exclusions()
+    except Exception:  # noqa: BLE001 — a display aid must never break `review jobs`
+        return {}
+
+
 def status_snapshot(
     cfg: Settings | None = None, probe: Callable[[], HostSnapshot] = probe_host
 ) -> dict:
@@ -1922,7 +1941,9 @@ def status_snapshot(
         {e.get("provider") for e in entries if e.get("kind") == "seat"}
         | set(state)
         | set(cfg.providers)
+        | set(_provider_exclusions())
     )
+    excluded = _provider_exclusions()
     for p in sorted(x for x in providers if x):
         seats = [
             e
@@ -1942,6 +1963,10 @@ def status_snapshot(
             else int(rpm_limit(cfg, p)),
             "starts_last_minute": len(state.get(p, {}).get("starts", [])),
             "throttled": bool(state.get(p, {}).get("throttles")),
+            "excluded_until": excluded[p].until if p in excluded else None,
+            "excluded_reason": (
+                f"EXCLUDED, {excluded[p].describe()}" if p in excluded else None
+            ),
         }
     return snap
 
@@ -2004,6 +2029,8 @@ def render_status(snap: dict) -> str:
         for name, p in snap["providers"].items():
             limit = "∞" if p["limit"] is None else p["limit"]
             extra = " THROTTLED" if p["throttled"] else ""
+            if p.get("excluded_until"):
+                extra = f" {p['excluded_reason']}"
             rpm = (
                 ""
                 if p["rpm_limit"] is None

@@ -30,6 +30,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import reviewlib.availability as availability  # noqa: E402
 import reviewlib.backends as backends  # noqa: E402
 import reviewlib.capacity_check as cc  # noqa: E402
 import reviewlib.claude_accounts as accts  # noqa: E402
@@ -42,6 +43,7 @@ from reviewlib.config import (  # noqa: E402
     resolve_review_board,
 )
 
+_REAL_BACKEND_UNAVAILABLE_REASON = backends.backend_unavailable_reason
 OPUS = "claude:claude-opus-4-8"
 SONNET = "claude:claude-sonnet-5"
 OPUS_OMP = "omp:anthropic/claude-opus-4-8"
@@ -161,7 +163,7 @@ def _env(
         os.environ["OMP_AUTH_DB"] = str(
             _make_omp_db(Path(d) / "agent.db", omp_accounts)
         )
-        backends.backend_unavailable_reason = lambda m: (
+        backends.backend_unavailable_reason = lambda m, honor_exclusions=True: (
             None if m in live else f"stub: {m} not live"
         )
         backends.runtime_provider_marked_unpaid = lambda m: False
@@ -355,6 +357,232 @@ def test_route_level_quota_cooldown_is_not_attributed_to_one_of_several_accounts
     reasons = {c["reason"] for c in report["candidates"]}
     assert reasons == {"cooldown_not_account_scoped"}, report["candidates"]
     assert report["all_exhausted"] is False
+
+
+def test_availability_window_is_read_like_a_timer_cooldown_review_cli_663():
+    """A seat's availability window (`record_window`, access method `window`) carries the
+    same typed cause: quota is quota evidence under the same freshness/identity rules,
+    every other cause is non-quota evidence."""
+    with _env(live={OPUS}):
+        sc.record_window(
+            OPUS,
+            "weekly limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=NOW - 120,
+        )
+        cand = _report([OPUS])["candidates"][0]
+    assert (cand["status"], cand["reason"], cand["cause"], cand["source"]) == (
+        "exhausted",
+        "quota_cooldown",
+        "quota",
+        "seat-cooldown:window",
+    ), cand
+    assert cand["observed_at"] == cc._iso(NOW - 120)
+
+    for cause in (sc.CAUSE_RATE_LIMIT, sc.CAUSE_AUTH, sc.CAUSE_UNAVAILABLE):
+        with _env(live={OPUS}):
+            sc.record_window(
+                OPUS,
+                "blocked",
+                until=NOW + 3600,
+                cause=cause,
+                source="retry-after",
+                now=NOW - 60,
+            )
+            cand = _report([OPUS])["candidates"][0]
+        assert (cand["status"], cand["reason"], cand["cause"]) == (
+            "unavailable",
+            "cooldown_not_quota",
+            cause,
+        ), cand
+
+    with _env(live={OPUS}, accounts=("a@x.com", "b@x.com")):
+        sc.record_window(
+            OPUS,
+            "weekly limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=NOW - 60,
+        )
+        report = _report([OPUS])
+    assert {c["reason"] for c in report["candidates"]} == {
+        "cooldown_not_account_scoped"
+    }
+    assert report["all_exhausted"] is False
+
+
+def test_window_on_a_keyless_backend_and_on_its_provider_key_is_read():
+    """codex records no timer cooldown, but `call_backend` writes its window under the
+    route; a provider-wide exhaustion is written under `provider:<name>` (review-cli#663)."""
+    with _env(live={"codex"}):
+        sc.record_window(
+            "codex",
+            "usage limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=NOW - 30,
+        )
+        cand = _report(["codex"])["candidates"][0]
+    assert (cand["status"], cand["reason"], cand["source"]) == (
+        "exhausted",
+        "quota_cooldown",
+        "seat-cooldown:window",
+    ), cand
+
+    zai = "omp:zai/glm-5.3"
+    assert availability.provider_key(zai) == "provider:zai"
+    with _env(live={zai}):
+        sc.record_window(
+            "provider:zai",
+            "credits exhausted",
+            until=NOW + 3600,
+            cause=sc.CAUSE_UNAVAILABLE,
+            source="credits",
+            now=NOW - 30,
+        )
+        cand = _report([zai])["candidates"][0]
+    assert (cand["status"], cand["reason"], cand["cause"]) == (
+        "unavailable",
+        "cooldown_not_quota",
+        "unavailable",
+    ), cand
+
+
+def test_omp_pool_route_window_counts_only_when_it_is_not_quota():
+    with _env(live={OPUS_OMP}, omp_accounts=OMP_POOL):
+        sc.record_window(
+            OPUS_OMP,
+            "weekly limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=NOW - 30,
+        )
+        report = _report([OPUS_OMP])
+    assert {c["reason"] for c in report["candidates"]} == {"no_observation"}
+    with _env(live={OPUS_OMP}, omp_accounts=OMP_POOL):
+        sc.record_window(
+            OPUS_OMP,
+            "login rejected",
+            until=NOW + 3600,
+            cause=sc.CAUSE_AUTH,
+            source="credential",
+            now=NOW - 30,
+        )
+        report = _report([OPUS_OMP])
+    assert {(c["status"], c["cause"]) for c in report["candidates"]} == {
+        ("unavailable", "auth")
+    }
+
+
+def test_omp_pool_route_timer_cooldown_counts_only_when_it_is_not_quota():
+    """A stall on the route blocks dispatch for every pool account (`review_omp` checks
+    the route cooldown first); a quota one names no single account."""
+    with _env(live={OPUS_OMP}, omp_accounts=OMP_POOL):
+        sc.record_cooldown(
+            OPUS_OMP,
+            "true-silence timeout",
+            access_method="omp",
+            now=NOW - 30,
+            ttl_seconds=3600,
+            cause=sc.CAUSE_STALL,
+        )
+        report = _report([OPUS_OMP])
+    assert {(c["status"], c["cause"]) for c in report["candidates"]} == {
+        ("unavailable", "stall")
+    }
+    with _env(live={OPUS_OMP}, omp_accounts=OMP_POOL):
+        sc.record_cooldown(
+            OPUS_OMP,
+            "session limit",
+            access_method="omp",
+            now=NOW - 30,
+            ttl_seconds=3600,
+            cause=sc.CAUSE_QUOTA,
+        )
+        report = _report([OPUS_OMP])
+    assert {c["reason"] for c in report["candidates"]} == {"no_observation"}
+
+
+def test_real_probe_honors_a_stored_window_unless_asked_not_to():
+    """The production `backend_unavailable_reason` reports a windowed seat as unavailable;
+    `honor_exclusions=False` is what lets capacity-check read the typed window itself."""
+    with _env(live={OPUS}):
+        real = _REAL_BACKEND_UNAVAILABLE_REASON
+        os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        sc.record_window(
+            "codex",
+            "usage limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=time.time() - 30,
+        )
+        assert real("codex").startswith("unavailable:")
+        assert not (real("codex", honor_exclusions=False) or "").startswith(
+            "unavailable:"
+        )
+
+
+def test_freshest_typed_quota_record_decides_not_the_first_found():
+    with _env(live={OPUS}):
+        sc.record_cooldown(
+            OPUS,
+            "session limit",
+            access_method="cli",
+            now=NOW - 7200,
+            ttl_seconds=86400,
+            cause=sc.CAUSE_QUOTA,
+        )
+        sc.record_window(
+            OPUS,
+            "weekly limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=NOW - 10,
+        )
+        cand = _report([OPUS])["candidates"][0]
+    assert (cand["status"], cand["reason"], cand["source"]) == (
+        "exhausted",
+        "quota_cooldown",
+        "seat-cooldown:window",
+    ), cand
+    # an untyped record never masks a typed quota one
+    with _env(live={OPUS}):
+        sc.record_cooldown(
+            OPUS, "mystery", access_method="cli", now=NOW - 5, ttl_seconds=3600
+        )
+        sc.record_window(
+            OPUS,
+            "weekly limit",
+            until=NOW + 3600,
+            cause=sc.CAUSE_QUOTA,
+            source="reset-time",
+            now=NOW - 60,
+        )
+        cand = _report([OPUS])["candidates"][0]
+    assert cand["reason"] == "quota_cooldown", cand
+
+
+def test_stored_exclusion_is_evidence_not_a_backend_probe_failure():
+    """Production `backend_unavailable_reason` reports an excluded seat as unavailable;
+    capacity-check must ask without the exclusion so the typed record is what it reads."""
+    seen = []
+    with _env(live={OPUS}):
+        stub = backends.backend_unavailable_reason
+
+        def spy(m, honor_exclusions=True):
+            seen.append(honor_exclusions)
+            return stub(m, honor_exclusions=honor_exclusions)
+
+        backends.backend_unavailable_reason = spy
+        _report([OPUS])
+    assert seen and set(seen) == {False}, seen
 
 
 def test_account_fallbacks_every_failover_route_must_be_exhausted():

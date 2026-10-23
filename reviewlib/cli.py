@@ -2025,17 +2025,23 @@ def _entity_harness_for_model(model: str) -> str:
     return _ENTITY_HARNESS_LABELS.get(getattr(fn, "__name__", ""), "unknown")
 
 
-def _configured_board(config: dict) -> list[BoardReviewer]:
-    """The board `review diff` would use from `config` (its `models:` roster, else its
-    `board:`/the default board), with the config's unpaid providers and provider chains
-    applied so availability and failover read the same as a real run. Raises
-    BoardConfigError for a malformed `board:`."""
+def _apply_runtime_config(config: dict) -> None:
+    """Apply the config's unpaid providers, omp settings and provider chains so
+    availability and failover read the same as a real run."""
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
     backends.configure_omp_bin(config.get("omp_bin"))
     backends.configure_omp_accounts(config.get("omp_accounts"))
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))
+
+
+def _configured_board(config: dict) -> list[BoardReviewer]:
+    """The board `review diff` would use from `config` (its `models:` roster, else its
+    `board:`/the default board), with the config's unpaid providers and provider chains
+    applied so availability and failover read the same as a real run. Raises
+    BoardConfigError for a malformed `board:`."""
+    _apply_runtime_config(config)
     config_models = _split_models(config.get("models") or [])
     return (
         board_from_models(config_models, config)
@@ -2269,6 +2275,171 @@ def _seat_status_report(*, as_json: bool) -> int:
     lines.append(admission.render_status(admission.status_snapshot()))
     print("\n".join(lines))
     return 0
+
+
+def _health_seats(
+    config: dict,
+    mode_name: str,
+    preset: str | None,
+    explicit_models: list[str],
+) -> list[str]:
+    """The seats a run of `mode_name` may use, for the health check: the explicit `-m`
+    list, else the diff review's board (the preset's, or the configured one), else a panel
+    mode's configured/default model list. Raises BoardConfigError for a malformed board."""
+    if explicit_models:
+        return list(explicit_models)
+    if mode_name == "review":
+        board = (
+            load_board(config, preset=preset) if preset else _configured_board(config)
+        )
+        return [r.model for r in board]
+    src = (
+        _split_models(config.get("brainstorm_models") or [])
+        if mode_name == "brainstorm"
+        else []
+    ) or _split_models(config.get("models") or [])
+    return list(src or [_expand_alias(x) for x in DEFAULT_MODELS])
+
+
+def _health_subcommand(rest: list[str]) -> int:
+    """`review health [--seat X]... [--preset P] [--host H]... [--json] [--timeout S]
+    [--cached] [--no-probe]` -- probe every seat of the active board in parallel with the
+    cheapest call it offers (default 5 s timeout), record what each failure says about
+    when the seat answers again, and print the result (`review help health`). Exit 0 when
+    at least one seat is ok, 1 when none is. `--host H` runs the same check on another
+    machine over ssh (its own logins, its own store); repeat it for several hosts, and use
+    `--host local` to include this one."""
+    from . import health
+
+    parser = argparse.ArgumentParser(
+        prog="review health",
+        description="Probe review seats now and record when each unavailable seat "
+        "answers again. See `review help health`.",
+    )
+    parser.add_argument(
+        "--seat",
+        "-m",
+        action="append",
+        default=[],
+        metavar="MODEL",
+        help="seat to check (repeatable); default: every seat of the active board",
+    )
+    parser.add_argument(
+        "--preset", default=None, help="check this preset's board instead"
+    )
+    parser.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="run the check on HOST over ssh (repeatable; `local` = this machine)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="S",
+        help=f"per-seat probe timeout (default {health.DEFAULT_TIMEOUT_SECONDS:g}s, "
+        f"${health._ENV_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--cached",
+        action="store_true",
+        help=f"let a probe newer than ${health._ENV_TTL} "
+        f"({health.DEFAULT_TTL_SECONDS:g}s) answer instead of probing again",
+    )
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="report only what the store and static checks know; call no model",
+    )
+    ns = parser.parse_args(rest)
+    timeout = ns.timeout  # None = automatic per seat (`health.timeout_for`)
+    live = not ns.no_probe
+    bad_host = next((h for h in ns.host if h.startswith("-")), None)
+    if bad_host:
+        print(f"[review health] invalid --host {bad_host!r}", file=sys.stderr)
+        return 2
+
+    remote_args: list[str] = []
+    for seat in ns.seat:
+        remote_args += ["--seat", seat]
+    if ns.preset:
+        remote_args += ["--preset", ns.preset]
+    if timeout is not None:
+        remote_args += ["--timeout", f"{timeout:g}"]
+    if ns.cached:
+        remote_args.append("--cached")
+    if not live:
+        remote_args.append("--no-probe")
+
+    reports: list[dict] = []
+    remote_hosts = [h for h in ns.host if h != "local"]
+    if remote_hosts:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(remote_hosts)) as pool:
+            futures = [
+                pool.submit(
+                    health.run_remote,
+                    h,
+                    remote_args,
+                    timeout=timeout or health.AGENTIC_TIMEOUT_SECONDS,
+                )
+                for h in remote_hosts
+            ]
+            if not ns.host or "local" in ns.host:
+                reports.append(_local_health_report(ns, timeout, live))
+            reports.extend(f.result() for f in futures)
+    else:
+        reports.append(_local_health_report(ns, timeout, live))
+    if reports and reports[0].get("error") and not remote_hosts:
+        print(f"[review health] {reports[0]['error']}", file=sys.stderr, flush=True)
+        return 2
+
+    if ns.json:
+        import json as _json
+
+        print(
+            _json.dumps(
+                reports[0] if len(reports) == 1 else {"hosts": reports}, indent=2
+            )
+        )
+    else:
+        for rep in reports:
+            if rep.get("error"):
+                print(f"Seat health @{rep['host']}: {rep['error']}")
+            else:
+                print(health.render_text(rep))
+    if not live:
+        return 0  # nothing was probed: the exit status has no health to report
+    ok = any(s["status"] == health.OK for rep in reports for s in rep.get("seats", []))
+    return 0 if ok else 1
+
+
+def _local_health_report(ns, timeout: float, live: bool) -> dict:
+    """This machine's `review health` report (or a report-shaped `error`)."""
+    import socket
+
+    from . import health
+
+    config = load_config()
+    _apply_runtime_config(config)
+    host = socket.gethostname()
+    try:
+        seats = _health_seats(
+            config, "review", ns.preset, [_expand_alias(s) for s in ns.seat]
+        )
+    except BoardConfigError as exc:
+        return {"host": host, "error": str(exc)}
+    results = health.probe_seats(
+        seats,
+        timeout=timeout,
+        ttl=health.default_ttl() if ns.cached else 0.0,
+        live=live,
+    )
+    return health.report(results, host=host, timeout=timeout, live=live)
 
 
 def _entities_subcommand(rest: list[str]) -> int:
@@ -5190,6 +5361,7 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "stat",
         "entities",
         "capacity-check",
+        "health",
         "trust-module",
         "register-module",
         "spec-web",
@@ -5446,6 +5618,11 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_HEALTH_PREFLIGHT=0           — skip the automatic pre-dispatch seat health check
+                                          (`review help health`).
+    REVIEW_HEALTH_TTL_SECONDS=N         — how long a successful probe answers for the pre-dispatch
+                                          check (default 300; <= 0 disables the check).
+    REVIEW_HEALTH_TIMEOUT_SECONDS=N     — per-seat probe timeout (default 5).
     REVIEW_TRIVIAL_DELTA_LINES=N        — pre-commit gate: max changed lines tolerated
                                           against the last reviewed baseline before a
                                           restage forces a fresh full review (default 10);
@@ -5546,10 +5723,12 @@ HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-
   xai, opencode-go, google, ...): at most floor(max_concurrent x (1 - headroom)) (>= 1)
   at once and, with rpm set, floor(rpm x (1 - headroom)) starts per minute. A 429 /
   overload reply lowers that provider's limit to floor(current x throttle_backoff) for
-  throttle_cooldown_seconds. A seat still waiting after provider_wait_seconds (0 = wait
-  forever) is skipped as unavailable, so failover moves to the next provider/reserve. A
-  run is also held back until every provider it needs has room for its planned seats next
-  to the seats of runs already running, so admitted runs rarely wait on a provider.
+  throttle_cooldown_seconds; an exhausted quota (z.ai code 1310 "Weekly/Monthly Limit
+  Exhausted", a CLI "session limit" or "usage credits") is not a throttle and never lowers
+  it. A seat still waiting after provider_wait_seconds (0 = wait forever) is skipped as
+  unavailable, so failover moves to the next provider/reserve. A run is also held back
+  until every provider it needs has room for its planned seats next to the seats of runs
+  already running, so admitted runs rarely wait on a provider.
   Leases live in the registry dir as flock-held files: a killed holder is reclaimed at
   once, a lease whose heartbeat is older than stale_lease_seconds stops counting. The
   shared registry.lock is held only for each admission decision; a holder stopped or
@@ -5694,6 +5873,66 @@ See also: `review task --help` (the flag surface), `review help config`.
 """
 
 
+def _help_topic_health() -> str:
+    """The `review help health` deep reference (help-docs-sync): availability windows and
+    the `review health` command. Keep in sync with `reviewlib/availability.py` and
+    `reviewlib/health.py`."""
+    from . import availability, health
+
+    wide = ", ".join(sorted(availability.PROVIDER_WIDE))
+    return f"""\
+review health — which seats answer right now, and for how long a dead one stays out
+
+  review health                         probe every seat of the active board (parallel, {health.DEFAULT_TIMEOUT_SECONDS:g}s each)
+  review health --seat omp:zai/glm-5.3  probe one seat (repeatable); --preset NAME for a preset's board
+  review health --json                  machine-readable report (schema "{health.SCHEMA}", version {health.SCHEMA_VERSION})
+  review health --cached                let a probe newer than $REVIEW_HEALTH_TTL_SECONDS answer
+  review health --no-probe              store + static checks only; calls no model
+  review health --host home --host clvm run the same check on other machines over ssh (their
+                                        own logins and stores; `--host local` includes this one)
+
+Exit 0 when at least one seat is ok, 1 when none is (`--no-probe` always 0). Statuses: `ok` answered; `unavailable`
+excluded (the reason and the end time are shown); `unknown` did not answer in time or failed
+transiently — a slow CLI is not a dead one, so it is left alone.
+
+AVAILABILITY WINDOWS (what an unavailable seat is excluded for, and until when)
+  Every failed seat call is read for when the seat answers again, and recorded in
+  ~/.config/review-cli/seat-cooldown.json (bucket `window`):
+    quota        the reset time the error names — z.ai `429` code 1310 "will reset at
+                 2026-10-26 05:58:34" (zone-less = UTC), the Claude CLI's "resets 7:30pm
+                 (Europe/Moscow)" / "resets Oct 18, 5am", an epoch `x-ratelimit-reset`, or a
+                 `Retry-After`; none named -> the escalating timer (10 min .. 8 h)
+    credits      "insufficient balance", HTTP 402: 6 h, re-probed every 30 min (a top-up ends it)
+    auth         HTTP 401, invalid_grant, "not logged in": until the credential file behind the
+                 seat changes (~/.claude*/.credentials.json, ~/.codex/auth.json, omp's agent.db,
+                 opencode's auth.json, ~/.config/review-cli/.env), re-probed hourly
+    rate_limit   only when the error names a wait of 2 minutes or more
+  A window of an hour or more is re-probed every quarter of its remainder (15 min .. 6 h): a
+  top-up or a mis-read time zone ends it early. A quota that names its reset is account-wide for
+  providers that bill one account ({wide}), so every seat on that provider is excluded
+  (`provider:<name>` in the store); anthropic and openai are per seat (separate logins).
+
+An excluded seat is skipped by board selection, admission planning (it holds no slot and no
+provider reservation) and dispatch (a skip sentinel, no call). `review --show-board` lists it
+as SKIPPED with the reason and `until`; `review jobs` shows an excluded provider as EXCLUDED
+with its end time; `review seats` shows the cooldown. `REVIEW_SEAT_COOLDOWN_SECONDS=0` disables
+the whole store (one-off escape hatch); delete an entry from seat-cooldown.json to end it by hand.
+
+PRE-DISPATCH CHECK
+  `review diff|quorum|brainstorm|just-ask` probe the seats the run may use before asking for
+  a slot. A probe newer than $REVIEW_HEALTH_TTL_SECONDS (default {health.DEFAULT_TTL_SECONDS:g}s) is reused, so
+  back-to-back reviews do not probe again. It prints one stderr line per seat found
+  unavailable and blocks at most the probe timeout (${health._ENV_TIMEOUT}, default
+  {health.DEFAULT_TIMEOUT_SECONDS:g}s; {health.AGENTIC_TIMEOUT_SECONDS:g}s for the CLI seats claude, codex, omp, opencode).
+  Off with $REVIEW_HEALTH_PREFLIGHT=0.
+
+A probe asks the seat's own backend "Reply with exactly: OK" over no diff. It takes no admission
+slot and writes no review log or run-stats record.
+
+See also: `review help config`, `review --show-board`, `review jobs`, `review seats`.
+"""
+
+
 def _help_topic_runtime() -> str:
     """The `review help runtime` deep reference (help-docs-sync): run stats and the
     startup ETA line printed before a dispatch, plus why `review` must never be
@@ -5790,9 +6029,11 @@ THE PREDICATE
       account's own card, matched by email; the codex card) with a 5-hour/weekly
       window at >= 100% that has not reset, read within the freshness window;
     - an active seat cooldown whose typed cause is `quota` (a session-limit /
-      usage-credits failure), recorded within the freshness window, on a route whose
-      quota identity is the route itself or its only account, or under one omp pool
-      account's own `omp-account:` key.
+      usage-credits failure; a timer cooldown or an availability window), recorded
+      within the freshness window, on a route whose quota identity is the route itself
+      or its only account, or under one omp pool account's own `omp-account:` key.
+      A window is read under the route and, for a provider-wide exhaustion,
+      `provider:<name>` (z.ai, Gemini, ...).
   Checked in this order, first decisive answer wins: backend not runnable
   (unavailable) -> the omp account policy leaves an omp Anthropic seat no account
   (unavailable) -> the account's recorded login failure (unavailable, cause auth) ->
@@ -5839,9 +6080,9 @@ COMPATIBILITY
 SOURCE LIMITS (each makes the affected candidates `unknown`, never exhausted)
   - Only Claude Code (CLI) and Codex have quota data (harness-cli cards). opencode,
     omp and the Claude API transport are covered only by a quota cooldown a real call
-    on that route recorded. z.ai, Gemini, OpenRouter and CommandCode record no
-    cooldowns, so their routes have no evidence path at all: a board using them can
-    never read all_exhausted.
+    on that route recorded. z.ai, Gemini, OpenRouter and CommandCode record no timer
+    cooldowns; their only evidence path is an availability window (a quota/credits
+    failure naming its reset), read under the route or `provider:<name>`.
   - The cooldown store keys routes, not accounts, so a quota cooldown on a Claude CLI
     route that rotates through several accounts is not attributed to any of them.
   - A cooldown is recorded when the failing call returns; later runs skip the seat
@@ -5851,8 +6092,9 @@ SOURCE LIMITS (each makes the affected candidates `unknown`, never exhausted)
   - tg-ctl usage samples carry no account and are not used.
   - omp's own account pool windows (`omp usage`) are not read; an omp Anthropic account
     is judged by its own quota cooldown or its Claude Code card (same email). With
-    several pool accounts the route cooldown a pool call also writes names none of them
-    and is not read.
+    several pool accounts the route's quota cooldown or window names none of them and is
+    not read as quota evidence; a non-quota record on the route (auth, stall, unavailable)
+    blocks every account and makes each one `unavailable`.
 
 See also: `review status` (which seats can run now), `review entities`.
 """
@@ -5879,6 +6121,10 @@ HELP_TOPICS: dict[str, tuple[str, "object"]] = {
         "the `capacity-check --json` quota-outage contract and evidence predicate",
         _help_topic_capacity,
     ),
+    "health": (
+        "seat health checks and how long an unavailable seat stays excluded",
+        _help_topic_health,
+    ),
 }
 
 
@@ -5896,6 +6142,7 @@ def _subcommand_epilog() -> str:
             "\n  stat        per-harness/per-model usage + health report from the real call logs"
             "\n  capacity-check"
             "\n              is the active board's whole capacity out of quota? (`review help capacity`)"
+            "\n  health      probe every seat now (5s, parallel), record when unavailable seats answer again"
             "\n  jobs        list detached (--detach) review jobs"
             "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`);"
             "\n              bare `status`: which board seats can run now, why not, and their substitute"
@@ -6430,6 +6677,8 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # `review entities` — read-only overview of review-cli's own configured
     # harnesses/providers/models/accounts/effort-role lenses. A bare MANAGEMENT
     # subcommand (like stat/task/dashboard/sessions), NOT a fan-out mode (review-cli#487).
+    if argv and argv[0] == "health":
+        return _health_subcommand(argv[1:])
     if argv and argv[0] == "entities":
         return _entities_subcommand(argv[1:])
     # `review capacity-check` — report whether every configured review-board seat is
@@ -6842,6 +7091,22 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
 
     if mode.name == "visual" and not args.visual:
         parser.error("the following arguments are required: IMAGE")
+
+    # Fast health check before the run asks for a slot (`review help health`): probe the
+    # seats this run may use (cached for a few minutes), so a seat whose quota/credits/login
+    # is gone is in the availability store — out of board selection and admission planning —
+    # instead of costing this review a slot or a doomed call. Every failure is swallowed.
+    if mode.name in ("review", "quorum", "brainstorm", "just-ask"):
+        from . import health as _health
+
+        if _health.preflight_enabled():
+            try:
+                _apply_runtime_config(config)
+                _health.preflight(
+                    _health_seats(config, mode.name, active_preset, explicit_models)
+                )
+            except Exception:  # noqa: BLE001 — the dispatch below reports a bad board/config itself
+                pass
 
     # Suppress the "reviewing it as-is" non-repo warning on the REVIEW-mode required-diff
     # path: there a non-repo hard-fails via `_fail_not_a_repo` (the authoritative message),
@@ -8025,6 +8290,8 @@ def _show_board(
         available = avail[index]
         if available:
             status = "available"
+        elif (excluded := backends.availability_exclusion(reviewer.model)) is not None:
+            status = f"SKIPPED (unavailable: {excluded.describe()})"
         elif backends.runtime_provider_marked_unpaid(reviewer.model):
             status = (
                 "will attempt (provider unpaid/disabled)"

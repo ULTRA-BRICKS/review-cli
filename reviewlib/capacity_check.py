@@ -37,9 +37,12 @@ Evidence, per candidate, in this order (first decisive answer wins):
      route whose quota identity is the route itself or its only account, or under one omp
      pool account's own `omp-account:` key -> `exhausted`. On a multi-account Claude CLI
      route it is NOT attributable to any one account (the store keys routes, not
-     accounts) -> `unknown`; with several omp pool accounts the route-level cooldown a
-     pool call also writes names none of them and is not read (with one, it is that
-     account's);
+     accounts) -> `unknown`; with several omp pool accounts the route-level quota
+     record names none of them and is not read (a non-quota one blocks them all; with
+     one account the route record is that account's). The cooldowns of steps 3 and 5 are
+     the timer cooldowns AND the availability windows (review-cli#663, the `window`
+     access method, keyed by the route and by `provider:<name>`); the stored exclusion
+     itself is not a step-1 probe failure (`honor_exclusions=False`);
   6. otherwise `unknown`, with the typed reason saying what was missing.
 
 `all_exhausted` = at least one candidate AND every candidate `exhausted`.
@@ -55,7 +58,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import backends, claude_accounts, omp_accounts, seat_cooldown, usage_limits
+from . import (
+    availability,
+    backends,
+    claude_accounts,
+    omp_accounts,
+    seat_cooldown,
+    usage_limits,
+)
 from .config import CONFIG_PATH, _agentic, load_config, resolve_review_board
 from .provider_failover import configure_provider_chains, provider_chain
 
@@ -306,6 +316,13 @@ def _route_candidates(route: str, cards: list[dict], now: float) -> list[dict]:
         "backend": backends.provider_route_name(route),
         "access_method": method,
         "cooldown_keys": [] if key is None else [key],
+        # where `call_backend` records the seat's availability window: the route itself,
+        # and `provider:<name>` when the provider's whole account is exhausted
+        "window_keys": [route, *filter(None, [availability.provider_key(route)])],
+        # a route that rotates through several accounts: a quota record on the route
+        # names none of them, a non-quota one blocks all of them
+        "window_quota_unattributable": False,
+        "route_cooldown_keys": [],
         # why dispatch refuses the route outright (omp account policy), else None
         "refusal": None,
         # only a Claude CLI account has a `claude_accounts` login to check
@@ -350,6 +367,10 @@ def _route_candidates(route: str, cards: list[dict], now: float) -> list[dict]:
                 {
                     **base,
                     "cooldown_keys": keys,
+                    "window_quota_unattributable": len(pool) > 1,
+                    "route_cooldown_keys": (
+                        [key] if len(pool) > 1 and key is not None else []
+                    ),
                     "account": label,
                     "account_dir": None,
                     "account_email": account.email,
@@ -397,6 +418,30 @@ def _route_candidates(route: str, cards: list[dict], now: float) -> list[dict]:
     ]
 
 
+def _recorded_at_key(item: tuple[str | None, dict]) -> float:
+    recorded_at = item[1]["recorded_at"]
+    return -math.inf if recorded_at is None else recorded_at
+
+
+def _pick_cooldown(
+    found: list[tuple[str | None, dict]], default_method: str | None
+) -> tuple[str | None, dict | None]:
+    """The one record that decides a candidate: the freshest typed non-quota record first
+    (a login or stall record is never masked by quota evidence), else the freshest typed
+    quota record, else an untyped one (which never counts as quota)."""
+    blocking = [
+        item
+        for item in found
+        if item[1]["cause"] not in (None, seat_cooldown.CAUSE_QUOTA)
+    ]
+    if blocking:
+        return max(blocking, key=_recorded_at_key)
+    quota = [item for item in found if item[1]["cause"] == seat_cooldown.CAUSE_QUOTA]
+    if quota:
+        return max(quota, key=_recorded_at_key)
+    return found[0] if found else (default_method, None)
+
+
 def _candidate_verdict(
     cand: dict,
     *,
@@ -429,8 +474,16 @@ def _candidate_verdict(
     # A candidate can have two keys (an omp pool's only account: its own, then the
     # route's). A typed non-quota cooldown on either outranks quota evidence, so a
     # login/stall record is never masked by an older quota one.
+    # The seat's availability WINDOW (review-cli#663: an exclusion until the time the
+    # failure itself named) is stored under the transport-independent `window` method with
+    # the same typed cause, keyed by the seat's route (and `provider:<name>` for a
+    # provider-wide failure). It is read like a timer cooldown: a quota window is quota
+    # evidence under the same freshness and account-identity rules, any other cause (auth,
+    # unavailable, rate_limit, stall) is non-quota evidence. A route that rotates through
+    # several accounts records its window on the route, so only its non-quota windows
+    # (which block every account) count there; a quota window names no single account.
     found = [
-        entry
+        (cand["access_method"], entry)
         for key in cand["cooldown_keys"]
         if (
             entry := seat_cooldown.active_cooldown(
@@ -439,11 +492,29 @@ def _candidate_verdict(
         )
         is not None
     ]
-    cooldown = next(
-        (c for c in found if c["cause"] not in (None, seat_cooldown.CAUSE_QUOTA)),
-        found[0] if found else None,
-    )
-    source = f"seat-cooldown:{cand['access_method']}"
+    for key in cand["route_cooldown_keys"]:
+        entry = seat_cooldown.active_cooldown(
+            key, access_method=cand["access_method"], now=now
+        )
+        if entry is not None and entry["cause"] not in (
+            None,
+            seat_cooldown.CAUSE_QUOTA,
+        ):
+            found.append((cand["access_method"], entry))
+    for key in cand["window_keys"]:
+        entry = seat_cooldown.active_cooldown(
+            key, access_method=seat_cooldown.WINDOW_ACCESS_METHOD, now=now
+        )
+        if entry is None:
+            continue
+        if cand["window_quota_unattributable"] and entry["cause"] in (
+            None,
+            seat_cooldown.CAUSE_QUOTA,
+        ):
+            continue
+        found.append((seat_cooldown.WINDOW_ACCESS_METHOD, entry))
+    method, cooldown = _pick_cooldown(found, cand["access_method"])
+    source = f"seat-cooldown:{method}"
     if cooldown is not None and cooldown["cause"] not in (
         None,
         seat_cooldown.CAUSE_QUOTA,
@@ -593,7 +664,9 @@ def board_capacity_report(
 
     def _unavailable(route: str) -> str | None:
         if route not in unavailable:
-            unavailable[route] = backends.backend_unavailable_reason(route)
+            unavailable[route] = backends.backend_unavailable_reason(
+                route, honor_exclusions=False
+            )
         return unavailable[route]
 
     models = list(dict.fromkeys(r.model for r in board))

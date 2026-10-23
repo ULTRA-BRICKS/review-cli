@@ -174,6 +174,35 @@ An explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` override always resets `fail_count` 
 its next write, the same as a genuine success — it's a human asking for a specific window,
 which takes priority over the escalation history the way any explicit request does.
 
+**Availability windows and fast health checks (review-cli#663).** The escalating timer above
+guesses; most failures say exactly when the seat answers again. `reviewlib.availability`
+reads that out of every failed seat call and records `unavailable_until` in the same store
+(bucket `window`): a quota with a named reset (z.ai `429` code 1310 "will reset at
+2026-10-26 05:58:34", zone-less = UTC; the Claude CLI's "resets 7:30pm (Europe/Moscow)";
+an epoch `x-ratelimit-reset`; a `Retry-After`), credits exhausted (6 h, re-probed every
+30 min), a suspended account (6 h, re-probed every 30 min), a rejected login (until the
+credential file behind the seat changes, re-probed hourly) and a rate limit that names a
+wait of two minutes or more. A quota that names its reset on a provider that bills one
+account (z.ai, commandcode, gemini, xai, opencode-go, openrouter, moonshot, fireworks) is also
+recorded as `provider:<name>`, so every seat on it is excluded; Anthropic and OpenAI stay per
+seat because a Claude CLI login, omp's account pool and an API key are separate accounts.
+A window of an hour or more is re-probed every quarter of its remainder (15 min to 6 h), so a
+top-up or a mis-read time zone ends it early. An excluded seat is out of board selection
+and out of admission planning — it holds no run slot and no provider reservation, which is
+what used to serialize every review behind a dead provider (review-cli#660) — and
+dispatching it returns a skip sentinel without a call. `review --show-board` lists it as
+`SKIPPED (unavailable: <reason> (until <UTC time>))`, `review jobs` shows an excluded provider as
+`EXCLUDED` instead of `THROTTLED`. No config edit is needed when a quota runs out or comes back.
+
+`review health` probes every seat of the board in parallel with the cheapest call its
+backend offers (the seat is asked to "Reply with exactly: OK" over no diff; 5 s timeout, 15 s for the CLI seats claude/codex/omp/opencode),
+records what each failure says, and prints `ok` / `unavailable` (with `until`) / `unknown`
+(no answer in time — a slow CLI is not a dead one). `--json`, `--seat`, `--preset`,
+`--cached`, `--no-probe` and `--host H` (the same check on another machine over ssh) are
+described by `review help health`. `review diff|quorum|brainstorm|just-ask` run the same
+check before asking for a slot (results cached for `$REVIEW_HEALTH_TTL_SECONDS`, default
+300 s, so back-to-back reviews do not probe again; `$REVIEW_HEALTH_PREFLIGHT=0` turns it off), so a dead seat never costs a review a slot.
+
 **Diagnostic gap (known, tracked):** `stalled_models` is scoped to the models a task's
 recorded runs actually attempted (`record_run`'s `models=`), which on the normal
 board/failover dispatch path only ever contains the SEATS THAT SURVIVED — a chronically-

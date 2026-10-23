@@ -992,6 +992,7 @@ qa SUT              Agent-as-tester mode for authored QA suites.
 dashboard           Local web dashboard over review-cli runs.
 sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
 task [CODE]         List task-coded review iterations, models, and transcript details.
+health [--seat M]   Probe every board seat now (parallel, 5s), record when unavailable seats answer again (`--host H` over ssh, `--json`; `review help health`).
 jobs                List detached (--detach) review jobs.
 status JOB-ID       Show one detached job's status, paths, and a log tail.
 wait JOB-ID         Block until a detached job finishes; exits with its status.

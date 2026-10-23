@@ -172,6 +172,7 @@ class _Machine:
             "OMP_AUTH_DB": str(self.db),
             "GEMINI_ENV_FILE": str(self.env_file),
             "REVIEW_ADMISSION": "0",
+            "REVIEW_HEALTH_PREFLIGHT": "0",
             "REVIEW_ADMISSION_DIR": str(state / "admission"),
             "REVIEW_LOG_DIR": str(state / "logs"),
             "REVIEW_STATS_FILE": str(state / "stats.jsonl"),

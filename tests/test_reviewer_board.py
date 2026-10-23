@@ -5391,8 +5391,16 @@ def test_brainstorm_records_only_usable_completed_roles():
 
 if __name__ == "__main__":
     failures = 0
+    import tempfile
+
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
+            # a failed seat call records an availability window (review-cli#663): each
+            # test gets its own store so no test is excluded by a sibling's failure
+            # (pytest does the same through tests/conftest.py).
+            os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(
+                Path(tempfile.mkdtemp()) / "seat-cooldown.json"
+            )
             try:
                 fn()
                 print(f"PASS {name}")

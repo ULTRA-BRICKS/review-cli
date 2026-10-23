@@ -168,7 +168,13 @@ _REASON_MAX_LEN = 200
 # store shape). Owned HERE so a reader that enumerates methods (`stats.quorum_check`'s
 # stalled-model probe) can never silently miss one a recorder started using (round-1/2
 # review finding, Fable/Sonnet): add a transport here, not at a call site.
-ACCESS_METHODS: tuple[str, ...] = ("cli", "api", "opencode")
+ACCESS_METHODS: tuple[str, ...] = ("cli", "api", "opencode", "window")
+
+# The bucket for availability WINDOWS (`record_window`): an exclusion whose end is known
+# from the failure itself (a reset time, a Retry-After, a credential file that must change)
+# rather than guessed by the escalating timer above. Transport-independent: it keys a seat
+# (or a `provider:<name>` budget) whichever transport saw the failure.
+WINDOW_ACCESS_METHOD = "window"
 
 # review-cli#472: WHY a cooldown was recorded, as a closed vocabulary stored next to the
 # free-text `reason`. Readers that must tell quota exhaustion apart from every other
@@ -179,8 +185,9 @@ CAUSE_QUOTA = "quota"  # a provider session/usage-limit notice (the account's qu
 CAUSE_UNAVAILABLE = "unavailable"  # an administrative "model is unavailable" sentinel
 CAUSE_STALL = "stall"  # a call that produced no output (true silence / opencode stall)
 CAUSE_AUTH = "auth"  # a failed login on an account (claude_accounts, review-cli#596)
+CAUSE_RATE_LIMIT = "rate_limit"  # a rate limit that named how long to wait (review-cli#663)
 COOLDOWN_CAUSES: frozenset[str] = frozenset(
-    {CAUSE_QUOTA, CAUSE_UNAVAILABLE, CAUSE_STALL, CAUSE_AUTH}
+    {CAUSE_QUOTA, CAUSE_UNAVAILABLE, CAUSE_STALL, CAUSE_AUTH, CAUSE_RATE_LIMIT}
 )
 
 
@@ -660,6 +667,12 @@ def active_cooldown(
     entry = model_entry.get(access_method)
     if not isinstance(entry, dict):
         return None
+    return _entry_view(entry, now)
+
+
+def _entry_view(entry: dict, now: float) -> dict | None:
+    """The reader-facing view of one stored entry, or None when it is expired, corrupt
+    or its watched credential changed. Shared by `active_cooldown` and `iter_active`."""
     until = entry.get("until")
     if not isinstance(until, (int, float)) or not math.isfinite(until) or until <= now:
         return None
@@ -688,11 +701,24 @@ def active_cooldown(
     recorded_at = entry.get("recorded_at")
     if type(recorded_at) not in (int, float) or not math.isfinite(recorded_at):
         recorded_at = None
+    # A rejected credential stays excluded only until the credential is rewritten: a
+    # watched file modified after the failure means the login/key was replaced, so the
+    # entry no longer describes the seat.
+    watch = entry.get("watch")
+    watch = [p for p in watch if isinstance(p, str)] if isinstance(watch, list) else []
+    if recorded_at is not None and _credential_changed_since(watch, recorded_at):
+        return None
     # review-cli#472: the typed cause, or None for an entry without a recognised one
     # (recorded before the field existed, or corrupt) — never guessed from `reason`.
     cause = entry.get("cause")
     if not isinstance(cause, str) or cause not in COOLDOWN_CAUSES:
         cause = None
+    source = entry.get("source")
+    if not isinstance(source, str):
+        source = None
+    probe_after = entry.get("probe_after")
+    if type(probe_after) not in (int, float) or not math.isfinite(probe_after):
+        probe_after = None
     return {
         "reason": reason,
         "until": until,
@@ -700,7 +726,118 @@ def active_cooldown(
         "fail_count": fail_count,
         "recorded_at": recorded_at,
         "cause": cause,
+        "source": source,
+        "probe_after": probe_after,
+        "watch": watch,
     }
+
+
+def _credential_changed_since(paths: list[str], moment: float) -> bool:
+    """True when any of `paths` exists and was modified after `moment`. Metadata only:
+    a credential file is never read here."""
+    for raw in paths:
+        try:
+            if os.stat(raw).st_mtime > moment:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def iter_active(*, now: float | None = None) -> list[tuple[str, str, dict]]:
+    """Every `(key, access_method, view)` currently cooling down in the store, for the
+    board / `review health` / `review jobs` displays. Never raises (a corrupt store reads
+    as empty), honors the `$REVIEW_SEAT_COOLDOWN_SECONDS<=0` hatch like `active_cooldown`."""
+    if _ttl_seconds() <= 0:
+        return []
+    now = now if now is not None else time.time()
+    try:
+        data = _load(cooldown_path())
+    except Exception:  # noqa: BLE001 — see active_cooldown: never raises
+        return []
+    out: list[tuple[str, str, dict]] = []
+    for key, per_method in data.items():
+        if not isinstance(per_method, dict) or "until" in per_method:
+            continue
+        for method, entry in per_method.items():
+            if isinstance(entry, dict):
+                view = _entry_view(entry, now)
+                if view is not None:
+                    out.append((key, method, view))
+    return out
+
+
+def record_window(
+    key: str,
+    reason: str,
+    *,
+    until: float | None,
+    cause: str,
+    source: str,
+    now: float | None = None,
+    watch: list[str] | None = None,
+    probe_after: float | None = None,
+    access_method: str = WINDOW_ACCESS_METHOD,
+) -> None:
+    """Record that `key` (a seat model, or `provider:<name>`) is unavailable until `until`,
+    an end time the failure itself named (`source`: "reset-time", "retry-after", "credits",
+    "credential"...). `until=None` means the failure named none: the escalating timer
+    picks the window (the same `_ESCALATION_SCHEDULE` `record_cooldown` walks).
+
+    An explicit window REPLACES whatever entry the key had (what the provider just said
+    beats a blind timer) and carries the consecutive-failure count forward. `watch` lists
+    credential files whose later modification ends the entry; `probe_after` is when a
+    cheap health probe may try the seat again before `until`. Best-effort, never raises;
+    `$REVIEW_SEAT_COOLDOWN_SECONDS<=0` disables recording like `record_cooldown`."""
+    now = now if now is not None else time.time()
+    try:
+        override = _env_ttl_override()
+        if override is not None and override <= 0:
+            return
+        path = cooldown_path()
+        with _locked(path):
+            data = _load(path)
+            per_method = data.get(key)
+            if not isinstance(per_method, dict) or "until" in per_method:
+                per_method = {}
+            prior = per_method.get(access_method)
+            fail_count = 1
+            if isinstance(prior, dict):
+                prior_at = prior.get("recorded_at")
+                prior_count = prior.get("fail_count")
+                if (
+                    type(prior_at) in (int, float)
+                    and math.isfinite(prior_at)
+                    and 0 <= now - prior_at <= _ESCALATION_RESET_SECONDS
+                    and type(prior_count) is int
+                    and prior_count >= 1
+                ):
+                    fail_count = prior_count + 1
+            if until is None:
+                until = (
+                    now
+                    + _ESCALATION_SCHEDULE[
+                        min(fail_count - 1, len(_ESCALATION_SCHEDULE) - 1)
+                    ]
+                )
+            entry: dict = {
+                "until": until,
+                "reason": reason[:_REASON_MAX_LEN],
+                "recorded_at": now,
+                "fail_count": fail_count,
+                "source": source,
+            }
+            if cause in COOLDOWN_CAUSES:
+                entry["cause"] = cause
+            if watch:
+                entry["watch"] = list(watch)
+            if probe_after is not None:
+                entry["probe_after"] = probe_after
+            per_method[access_method] = entry
+            data[key] = per_method
+            _write(path, data)
+    except Exception:  # noqa: BLE001 — best-effort cache, see record_cooldown
+        pass
 
 
 def clear_cooldown(model: str, *, access_method: str) -> None:
@@ -778,4 +915,22 @@ def clear_cooldown(model: str, *, access_method: str) -> None:
                 del data[model]
             _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
+        pass
+
+
+def defer_probe(
+    key: str, when: float, *, access_method: str = WINDOW_ACCESS_METHOD
+) -> None:
+    """Move the `probe_after` of `key`'s window entry to `when` (a re-probe that got no
+    answer must not come due again at every health check). Best-effort, never raises."""
+    try:
+        path = cooldown_path()
+        with _locked(path):
+            data = _load(path)
+            entry = (data.get(key) or {}).get(access_method)
+            if not isinstance(entry, dict) or "probe_after" not in entry:
+                return
+            entry["probe_after"] = when
+            _write(path, data)
+    except Exception:  # noqa: BLE001 — best-effort cache, see record_cooldown
         pass

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .config import _agentic
+from . import availability
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
 from . import admission, omp_accounts
@@ -190,6 +191,15 @@ def _opencode_variant(effort: str | None) -> str | None:
     return effort
 
 
+def _http_error_text(exc: urllib.error.HTTPError) -> str:
+    """An HTTP error's body, plus its `Retry-After` header as a trailing line: the header
+    is where a provider says how long to wait, and `availability` reads it from the text."""
+    body = exc.read().decode("utf-8", "replace")
+    headers = getattr(exc, "headers", None)
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    return f"{body}\nRetry-After: {retry_after}" if retry_after else body
+
+
 def call_backend(
     backend: Callable[..., ReviewResult],
     model: str,
@@ -205,7 +215,14 @@ def call_backend(
     (reviewlib.admission, review-cli#614); a 429/overload reply feeds back into that
     budget. The per-call `timeout` starts only once the slot is held, and is capped to
     the time left of an explicit `--timeout N`: an HTTP backend has no process for the
-    command deadline to kill, so queue time plus its call must not outrun N."""
+    command deadline to kill, so queue time plus its call must not outrun N.
+
+    A seat that is excluded (`availability`: its quota/credits/login window has not
+    ended) is answered with the cached-skip sentinel BEFORE it takes a provider slot,
+    and what a failed call says about when the seat answers again is recorded."""
+    excluded = availability_exclusion(model)
+    if excluded is not None:
+        return _availability_skip_result(model, round_no, excluded)
     with admission.seat_slot(model) as denied:
         if denied is not None:
             return _admission_skip_result(model, round_no, denied)
@@ -216,7 +233,68 @@ def call_backend(
             backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
         )
     admission.note_result(model, result)
+    note_availability(model, result)
     return result
+
+
+def _availability_methods(model: str) -> tuple[str, ...]:
+    """The cooldown-store transports `model` can actually run on, whose older escalating-
+    timer entries therefore exclude it: claude's resolved transport, opencode's and omp's
+    own bucket, else the CLI/API buckets (the `window` bucket is always checked)."""
+    backend = resolve_backend(model)
+    if backend is review_claude:
+        return (claude_access_method(),)
+    if backend is review_opencode:
+        return (_OPENCODE_ACCESS_METHOD,)
+    if backend is review_omp:
+        return (_OMP_ACCESS_METHOD,)
+    return ("cli", "api")
+
+
+def availability_exclusion(model: str) -> availability.Exclusion | None:
+    """Why `model` must not be dispatched right now — a quota/credits/login/rate-limit
+    window recorded from an earlier failure (own seat or whole provider) — or None.
+    Disabled under the test fake backend and by `$REVIEW_SEAT_COOLDOWN_SECONDS<=0`."""
+    if _fake_backend_enabled():
+        return None
+    try:
+        return availability.exclusion(
+            model,
+            methods=_availability_methods(model),
+            legacy_check=lambda m, access_method: _cooldown_after_recovery_probe(
+                m, access_method=access_method
+            ),
+        )
+    except Exception:  # noqa: BLE001 — a bookkeeping failure must not block a seat
+        return None
+
+
+def note_availability(model: str, result: ReviewResult) -> None:
+    """Feed a finished seat call to `availability.observe`. Never raises."""
+    if _fake_backend_enabled():
+        return
+    try:
+        from .panel import result_is_usable
+
+        availability.observe(model, result, usable=result_is_usable(result))
+    except Exception:  # noqa: BLE001 — see availability.observe
+        pass
+
+
+def _availability_skip_result(
+    model: str, round_no: int, excluded: availability.Exclusion
+) -> ReviewResult:
+    """The cached-skip sentinel for an excluded seat: same shape as a cooldown skip, so
+    failover and the dashboard treat it as unavailable without any call being made."""
+    return _cooldown_skip_result(
+        model,
+        round_no,
+        {
+            "reason": excluded.describe(),
+            "remaining_seconds": excluded.remaining_seconds,
+        },
+        backend=provider_route_name(model),
+    )
 
 
 def _admission_skip_result(model: str, round_no: int, reason: str) -> ReviewResult:
@@ -1966,7 +2044,7 @@ def review_gemini(
             output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", "replace")
+        body_text = _http_error_text(exc)
         rc = exc.code or 1
         _emit_rest_log(
             "gemini",
@@ -2360,7 +2438,7 @@ def _openai_compatible_request(
             output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", "replace")
+        body_text = _http_error_text(exc)
         rc = exc.code or 1
         if _is_payment_preflight_denial(rc, body_text):
             _cache_payment_preflight_denial(model, rc, body_text)
@@ -2932,7 +3010,7 @@ def review_claude_api(
             output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", "replace")
+        body_text = _http_error_text(exc)
         rc = exc.code or 1
         _emit_rest_log(
             "claude",
@@ -5496,8 +5574,14 @@ def backend_available(model: str) -> bool:
     return backend_unavailable_reason(model) is None
 
 
-def backend_unavailable_reason(model: str) -> str | None:
+def backend_unavailable_reason(
+    model: str, *, honor_exclusions: bool = True
+) -> str | None:
     """Human-readable reason `model`'s backend is NOT live right now, or None if it is.
+
+    `honor_exclusions=False` skips the stored availability exclusion (a quota/credit/login
+    window or escalating cooldown): `review capacity-check` reads those records itself, with
+    their typed cause, so a quota exclusion is evidence there rather than a probe failure.
 
     Mirrors `backend_available`'s probe exactly but surfaces WHY a seat is dead so the
     pool-selection guard (reviewlib.pool_guard) can annotate every printed model list with
@@ -5513,6 +5597,9 @@ def backend_unavailable_reason(model: str) -> str | None:
     preflight = cached_payment_preflight_unavailable_reason(model)
     if preflight is not None:
         return preflight
+    excluded = availability_exclusion(model) if honor_exclusions else None
+    if excluded is not None:
+        return f"unavailable: {excluded.describe()}"
     backend = resolve_backend(model)
     try:
         if backend is review_gemini:

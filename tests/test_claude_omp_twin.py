@@ -170,14 +170,15 @@ def test_board_claude_seat_with_expired_login_answers_through_omp_under_its_own_
     assert "OAuth session expired" in err.getvalue(), err.getvalue()
 
 
-def test_claude_cli_stays_the_first_executor_on_the_next_run():
+def test_claude_cli_with_a_known_reset_is_skipped_to_its_omp_twin_on_the_next_run():
+    """The session-limit notice names its reset time (review-cli#663), so run 2 does not
+    pay the failed Claude CLI call again: the seat goes straight to its omp twin."""
     seat = [BoardReviewer(_OPUS_CLI, "correctness", "Opus")]
     with _FakeExecutors({_OPUS_CLI: (1, _SESSION_LIMIT)}) as fx:
         with contextlib.redirect_stderr(io.StringIO()):
             run_board_with_failover(seat, [], "Review this.", "+x", REPO_ROOT, 5)
             run_board_with_failover(seat, [], "Review this.", "+x", REPO_ROOT, 5)
-    # Run 2 tries the Claude CLI again first (it may have recovered), then omp.
-    assert fx.dispatched == [_OPUS_CLI, _OPUS_OMP, _OPUS_CLI, _OPUS_OMP], fx.dispatched
+    assert fx.dispatched == [_OPUS_CLI, _OPUS_OMP, _OPUS_OMP], fx.dispatched
 
 
 def test_just_ask_answers_through_the_omp_twin_and_prints_the_substitution():
@@ -204,7 +205,9 @@ def test_a_last_working_cache_reorder_is_not_reported_as_a_substitution():
     with _FakeExecutors({}) as fx:
         fx.cache.write_text(json.dumps({"glm-5.3": "oc:zai/glm-5.3"}), encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
-            outcome = run_board_with_failover(seat, [], "Review this.", "+x", REPO_ROOT, 5)
+            outcome = run_board_with_failover(
+                seat, [], "Review this.", "+x", REPO_ROOT, 5
+            )
     assert fx.dispatched == ["oc:zai/glm-5.3"], fx.dispatched
     assert "substituted" not in format_result(outcome.usable[0])
     assert outcome.usable_models == ["zai:glm-5.3"], outcome.usable_models
@@ -351,6 +354,11 @@ if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
+            # a failed seat call records an availability window (review-cli#663): a fresh
+            # store per test, so no test is excluded by a sibling's failure.
+            os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(
+                Path(tempfile.mkdtemp()) / "seat-cooldown.json"
+            )
             try:
                 fn()
                 print(f"PASS {name}")

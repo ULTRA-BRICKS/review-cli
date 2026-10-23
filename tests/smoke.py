@@ -82,6 +82,8 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         # A private admission registry (review-cli#614): smoke's own `review` runs must
         # never queue behind (or count against) reviews really running on this host.
         "REVIEW_ADMISSION_DIR": str(Path(home) / "admission"),
+        # no pre-dispatch seat probe against the stub CLIs smoke drives (review-cli#663)
+        "REVIEW_HEALTH_PREFLIGHT": "0",
     }
     full_env.update(env or {})
     return full_env
@@ -1024,6 +1026,11 @@ _UNIT_FILES = [
     # deterministic on any host).
     ("test_diff_chunking.py", {}),
     ("test_seat_cooldown.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Availability windows + fast health checks (review-cli#663): reset/Retry-After/credits/
+    # auth parsing, store exclusion, board/admission wiring, `review health` end to end
+    # against a local HTTP stub. Each test isolates its own cooldown store and log dir.
+    ("test_availability.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    ("test_health.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # `review stat`'s data model (reviewlib.dashboard.tokenstats): parsing per-call logs
     # into the per-harness/per-model breakdown, the REST-backend token-text parser, the
     # Fable dispatch/failure report, and byte-proxy stats. Deterministic — synthetic

@@ -562,6 +562,7 @@ class _World:
             "OMP_NO_SCOPE": "1",
             "FAKE_OMP_LOG": str(self.log),
             "REVIEW_ADMISSION": "0",
+            "REVIEW_HEALTH_PREFLIGHT": "0",
             "REVIEW_ADMISSION_DIR": str(state / "admission"),
             "REVIEW_LOG_DIR": str(state / "logs"),
             "REVIEW_STATS_FILE": str(state / "stats.jsonl"),
@@ -1063,7 +1064,9 @@ def test_duplicate_usage_reports_for_one_email_keep_every_window():
             {
                 "provider": "anthropic",
                 "metadata": {"email": "a@example.com"},
-                "limits": [{"label": "Claude 5 Hour", "amount": {"usedFraction": 0.95}}],
+                "limits": [
+                    {"label": "Claude 5 Hour", "amount": {"usedFraction": 0.95}}
+                ],
             },
             {
                 "provider": "anthropic",
@@ -1080,7 +1083,10 @@ def test_duplicate_usage_reports_for_one_email_keep_every_window():
             argv0=str(fake), real_bin=None, source="PATH"
         )
         usage = omp_accounts.usage_by_email(launcher)
-    assert [w.label for w in usage["a@example.com"]] == ["Claude 5 Hour", "Claude 7 Day"]
+    assert [w.label for w in usage["a@example.com"]] == [
+        "Claude 5 Hour",
+        "Claude 7 Day",
+    ]
 
 
 def test_pool_never_fetches_a_token_for_an_excluded_account():

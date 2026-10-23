@@ -3,6 +3,40 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.54.0 — 2026-10-23
+
+- **Feat(availability): a dead seat or provider is excluded until the time its own error
+  names, and `review health` finds dead seats before a review pays for them**
+  ([review-cli#663](https://git.hyperide.ai/ultrabricks/review-cli/issues/663), closes the
+  rest of [#660](https://git.hyperide.ai/ultrabricks/review-cli/issues/660)). New
+  `reviewlib/availability.py` reads every failed seat call: a quota with a named reset (z.ai
+  `429` code 1310 `will reset at <time>`, the Claude CLI's `resets 7:30pm (Europe/Moscow)`, an
+  epoch `x-ratelimit-reset`, `Retry-After`), exhausted credits, a suspended account, a rejected
+  login (ends when the credential file changes) and a long rate limit, and records
+  `unavailable_until` in `seat-cooldown.json` (bucket `window`, with `cause`, `source`,
+  `watch` and `probe_after`). A provider-wide exhaustion (z.ai, commandcode, gemini, xai,
+  opencode-go, openrouter, moonshot, fireworks) also records `provider:<name>` and excludes every
+  seat on it; long windows are re-probed periodically. The exclusion is read by
+  `backend_unavailable_reason` (board selection, `review --show-board`: `SKIPPED (unavailable:
+  <reason> (until <time>))`), `admission.routed` (an excluded seat holds no run slot and no
+  provider reservation, so reviews are no longer serialized behind a dead provider), and
+  `call_backend` (a skip sentinel, no call, no provider slot). `review jobs` shows an excluded
+  provider as `EXCLUDED` instead of `THROTTLED`. REST seats (z.ai, commandcode, gemini,
+  openrouter, codex) now feed the store too; HTTP `Retry-After` headers are kept in the error text.
+- **Feat(health): `review health [--seat M] [--preset P] [--host H] [--json] [--cached]
+  [--no-probe] [--timeout S]`.** Probes every seat in parallel with the cheapest call its
+  backend offers (5 s timeout; no admission slot, no review log, no run-stats record), updates
+  the store (a seat that answers drops its stale window; one that does not time out is `unknown`,
+  not excluded) and caches results (`$REVIEW_HEALTH_TTL_SECONDS`, default 300 s). The same check
+  runs automatically before `review diff|quorum|brainstorm|just-ask` ask for a slot
+  (`$REVIEW_HEALTH_PREFLIGHT=0` disables it). `--host H` runs it on another machine over ssh.
+  `review help health`, README and docs/board.md describe it.
+- `review capacity-check` reads a seat's availability windows (its route and, for a
+  provider-wide exhaustion, `provider:<name>`) like timer cooldowns and no longer treats a
+  stored exclusion as a backend-probe failure: a `quota` window is quota evidence under the
+  same freshness and account-identity rules (the freshest typed record wins), any other
+  cause (`auth`, `unavailable`, `rate_limit`, `stall`) makes the seat `unavailable`.
+
 ## 0.53.0 — 2026-10-23
 
 - **Feat(diff): an over-budget diff is split into passes, never truncated**
@@ -34,6 +68,20 @@ semantic versioning.
     be reviewed whole"), and the `diff_already_capped` mode-context key.
   - `REVIEW_FAKE_RECORD_DIR` (test-only, with `REVIEW_FAKE_BACKEND`) records the prompt and
     diff each fake seat call received.
+
+## 0.52.1 — 2026-10-23
+
+- **Fix(admission): an exhausted provider quota is no longer counted as a throttle**
+  ([review-cli#660](https://git.hyperide.ai/ultrabricks/review-cli/issues/660)). z.ai answers
+  a used-up weekly quota with HTTP 429 and `Weekly/Monthly Limit Exhausted. Your limit will
+  reset at <time>` (code 1310). `is_throttle` / `text_is_throttle` read that as provider
+  pushback, so every run's zai seat halved the provider's concurrent-seat limit to 1 and
+  renewed the 300 s cooldown. Each run reserves a zai seat, so the host admitted one review at
+  a time (one running, 15 waiting, load 2.1 of 9.6) until the quota reset. A failure carrying a
+  seat cooldown's chronic-quota marker (`CHRONIC_QUOTA_MARKERS`: the weekly/monthly reset
+  notice, "session limit", "usage credits") now never feeds the admission limit; the marker
+  list is shared with the seat cooldown. Genuine 429 / 529 pushback still throttles. Excluding
+  a quota-exhausted provider from the board plan up front stays open on #660.
 
 ## 0.52.0 — 2026-10-23
 

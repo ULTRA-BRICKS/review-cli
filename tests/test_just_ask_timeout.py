@@ -89,6 +89,9 @@ class _World:
             "REVIEW_LOG_DIR": str(state / "logs"),
             "REVIEW_STATS_FILE": str(state / "stats.jsonl"),
             "REVIEW_SEAT_COOLDOWN_FILE": str(state / "cooldown.json"),
+            # the automatic pre-dispatch seat probe would add a call to the stub seat
+            # these tests count (review-cli#663)
+            "REVIEW_HEALTH_PREFLIGHT": "0",
             "REVIEW_PROVIDER_CACHE": str(state / "last-provider.json"),
             "REVIEW_USAGE_LIMITS_DIR": str(state / "usage"),
             "REVIEW_JOBS_DIR": str(state / "jobs"),
