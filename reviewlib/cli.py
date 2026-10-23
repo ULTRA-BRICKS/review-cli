@@ -5972,8 +5972,9 @@ HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-
   at once and, with rpm set, floor(rpm x (1 - headroom)) starts per minute. A 429 /
   overload reply lowers that provider's limit to floor(current x throttle_backoff) for
   throttle_cooldown_seconds; an exhausted quota (z.ai code 1310 "Weekly/Monthly Limit
-  Exhausted", a CLI "session limit" or "usage credits") is not a throttle and never lowers
-  it. A seat still waiting after provider_wait_seconds (0 = wait forever) is skipped as
+  Exhausted" or code 1308 "Usage limit reached for 5 hour", each with "Your limit will
+  reset at ...", a CLI "session limit" or "usage credits") is not a throttle and never
+  lowers it. A seat still waiting after provider_wait_seconds (0 = wait forever) is skipped as
   unavailable, so failover moves to the next provider/reserve. A run is also held back
   until every provider it needs has room for its planned seats next to the seats of runs
   already running, so admitted runs rarely wait on a provider.

@@ -261,6 +261,11 @@ _ZAI_1310 = (
     '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. '
     'Your limit will reset at 2026-10-26 05:58:34"}}'
 )
+# z.ai's 5-hour plan quota: same 429, reset notice and non-throttle meaning, other wording
+_ZAI_1308 = (
+    '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. '
+    'Your limit will reset at 2026-10-23 22:58:34"}}'
+)
 
 
 def test_chronic_quota_failure_is_not_a_throttle():
@@ -271,6 +276,13 @@ def test_chronic_quota_failure_is_not_a_throttle():
     scenarios = {
         "zai-1310-http-429": (429, "", _ZAI_1310),
         "zai-1310-on-stdout": (1, _ZAI_1310, ""),
+        "zai-1308-5-hour-http-429": (429, "", _ZAI_1308),
+        "zai-1308-5-hour-on-stdout": (1, _ZAI_1308, ""),
+        "zai-1308-5-hour-wrapped": (
+            429,
+            "",
+            "Usage limit reached for 5 hour.\nYour limit will reset at 2026-10-23 22:58:34",
+        ),
         "session-limit": (1, "", "429 You've hit your session limit"),
         "usage-credits": (429, "", "429 usage credits exhausted"),
         "usage-credits-hyphen": (429, "", "429 usage-credits exhausted"),

@@ -3,6 +3,17 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.59.0 — 2026-10-23
+
+- **Fix(admission): z.ai's 5-hour plan quota (HTTP 429, code 1308 "Usage limit reached for 5 hour.
+  Your limit will reset at ...") is no longer counted as a throttle** ([review-cli#660](https://git.hyperide.ai/ultrabricks/review-cli/issues/660)).
+  The weekly/monthly shape (code 1310) already was not; the 5-hour wording matched no chronic
+  marker, so every run's z.ai seat still halved the provider limit and renewed the cooldown for
+  a limit that backing off cannot clear. A quota notice that names its own reset ("limit
+  exhausted/reached ... Your limit will reset") is now recognised in `retry`; the seat's exclusion
+  until that reset stays with `availability`, so a 5-hour quota is not stretched into the seat
+  cooldown's up-to-8-hour escalation.
+
 
 ## 0.58.0 — 2026-10-23
 

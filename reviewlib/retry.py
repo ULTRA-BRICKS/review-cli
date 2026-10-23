@@ -302,6 +302,16 @@ _THROTTLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 
+# A provider quota notice that names its own reset ("... Your limit will reset at <time>"): z.ai's
+# weekly/monthly code 1310 and its 5-hour plan code 1308 ("Usage limit reached for 5 hour. Your
+# limit will reset at ..."). Not in CHRONIC_QUOTA_MARKERS on purpose: those drive the seat
+# cooldown's escalating windows (up to 8 h), which would overshoot a 5-hour reset; the
+# availability store already excludes the seat exactly until the reset the error names.
+_QUOTA_WITH_RESET = re.compile(
+    r"limit (?:exhausted|reached)[\s\S]{0,80}?\byour limit will reset\b", re.IGNORECASE
+)
+
+
 def _is_non_throttle_failure(text: str) -> bool:
     """True when failure `text` is a quota, auth or billing failure, never provider pushback.
 
@@ -312,6 +322,8 @@ def _is_non_throttle_failure(text: str) -> bool:
     (review-cli#660). The marker list is the seat cooldown's, so both stay in step."""
     lowered = text.lower()
     if any(marker in lowered for marker in CHRONIC_QUOTA_MARKERS):
+        return True
+    if _QUOTA_WITH_RESET.search(text):
         return True
     return any(p.search(text) for p in _SEAT_FATAL_PATTERNS)
 
