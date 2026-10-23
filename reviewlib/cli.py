@@ -46,6 +46,7 @@ from .config import (
     VISUAL_MODELS,
     BoardConfigError,
     BoardReviewer,
+    DEFAULT_PRESET_BOARD,
     EffortValueError,
     _drop_malformed_board_entries,
     _expand_alias,
@@ -5548,7 +5549,8 @@ def _add_global_options(
             "first N seats participate, the rest are kept in reserve. The board is "
             "never off — --pool only sizes it. N<=0 means all seats. An explicit `--pool N` "
             "below 3 with `--task` still wins but warns. Ignored for exact multi-model -m; "
-            "a recorded `--task -m` one-model run pads that model across the ship floor. "
+            "a recorded `--task -m` one-model run pads that model across the ship floor; "
+            "a default brainstorm `--task` gives its live panel ship-floor role slots. "
             "Recorded `--task --pool 0` still pads a same-role config roster to the ship floor."
         ),
     )
@@ -5952,7 +5954,8 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   `--pool N` still wins (warns if N<{SHIP_MIN_ROLES}). `-m one-model` with `--task` pads
   that model across {SHIP_MIN_ROLES} roles for review, quorum, and brainstorm (quorum and
   brainstorm announce the role slots on stderr, one call each); just-ask never pads — one
-  `-m` model is one call.
+  `-m` model is one call. A default (no `-m`) brainstorm `--task` gives its live panel
+  max({SHIP_MIN_ROLES}, engines) distinct role slots per round; `--pool 1` opts out.
   Use `--preset default` for a routine change
   review (pool 4, high effort) or `--preset heavy` for release/risky changes
   (Sol/Opus/GLM-cc/Kimi at highest effort; Fable is excluded from every preset — a
@@ -7602,6 +7605,9 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # can be merged into `panel_task_roles` further down and threaded through
     # `ctx.extra["task_roles"]` to `mode_quorum`'s real `_seat_assignments`.
     quorum_auto_roles: list[str] = []
+    # Brainstorm's default panel had at least one reachable engine (False on its
+    # all-unreachable fallback, which must not be role-padded: review-cli#444).
+    brainstorm_has_live = False
     if explicit_models:
         models = explicit_models
     elif is_brainstorm:
@@ -7614,6 +7620,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         if not models:
             models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
         else:
+            brainstorm_has_live = True
             # Reuse-aware panel: pad back up to the AVAILABILITY-filtered count
             # (not `len(src)`) when some of the reachable models are near their
             # usage limit, instead of silently running a smaller panel (Alex,
@@ -7779,16 +7786,25 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # path; panel modes pad the flat `models` list below. Never just-ask
     # (review-cli#587): it asks every seat the same question with no role lens,
     # so a pad only multiplied the calls — and the wait — by the role count.
+    # A default brainstorm `--task` (no `-m`) gets the same pad over its live
+    # panel (review-cli#444): it used to run literary personas and record ZERO
+    # roles, so it could never meet the ship floor — one live engine or five.
+    # Brainstorm already dispatches max(3, len(panel)) slots per round, so the
+    # pad relabels those slots with role lenses instead of adding calls. Its
+    # `--pool 0` ("all seats") still pads to the ship floor, like review's
+    # (review-cli#433); only `--pool 1` keeps the persona panel.
     task_role_pad = (
         bool(task_code)
         and mode.name in ("review", "quorum", "brainstorm")
-        and len(explicit_models) == 1
-        and effective_pool_size > 1
+        and (
+            (len(explicit_models) == 1 and effective_pool_size > 1)
+            or (brainstorm_has_live and effective_pool_size != 1)
+        )
     )
     if task_role_pad and _no_deliberate_pool_choice(args, explicit_preset, config):
-        # Without `--pool`/`--preset`/config `pool:`, a one-model `-m` pad targets
-        # the ship floor, not DEFAULT_POOL_SIZE 4 (the no-preset fallback `-m` never
-        # consumed).
+        # Without `--pool`/`--preset`/config `pool:`, a recorded pad targets the
+        # ship floor, not DEFAULT_POOL_SIZE 4 (the no-preset fallback a one-model
+        # `-m` or a default brainstorm never consumed).
         effective_pool_size = SHIP_MIN_ROLES
 
     panel_task_roles: list[str] = []
@@ -7800,24 +7816,50 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         # review-cli#422: a typo'd config `board:` role must not crash --task panel
         # dispatch with a raw traceback -- `_board_from_models_lenient` (shared with
         # `validate_board`/`_show_board` below) recovers the same way every other
-        # explicit -m call site does.
-        board_source = _board_from_models_lenient(explicit_models, config)
-        padded_board = ensure_min_distinct_roles(board_source, pad_min)
-        models = [r.model for r in padded_board]
-        panel_task_roles = [r.role for r in padded_board]
-        # review-cli#587: the pad multiplies the calls, so say so up front.
-        print(
-            f"[review-cli] --task with one -m model: {mode.name} runs "
-            f"{explicit_models[0]} as {len(models)} role slots "
-            f"({', '.join(panel_task_roles)}) = {len(models)} calls",
-            file=sys.stderr,
-            flush=True,
-        )
+        # explicit -m call site does. A default brainstorm pads its live panel.
+        if explicit_models:
+            board_source = _board_from_models_lenient(explicit_models, config)
+            padded_board = ensure_min_distinct_roles(board_source, pad_min)
+            models = [r.model for r in padded_board]
+            panel_task_roles = [r.role for r in padded_board]
+        else:
+            # Brainstorm's default panel relabels its own max(3, panel) slots: every
+            # live engine keeps a slot (cycled) and gets a distinct role lens; a
+            # deliberate `--pool N` or a configured-role collision never adds calls or
+            # drops an engine (review-cli#444).
+            slot_roles = list(
+                dict.fromkeys(r.role for r in DEFAULT_PRESET_BOARD if r.role_lens)
+            )
+            slot_count = max(SHIP_MIN_ROLES, len(models))
+            models = [models[i % len(models)] for i in range(slot_count)]
+            panel_task_roles = [
+                slot_roles[i % len(slot_roles)] for i in range(slot_count)
+            ]
+        if explicit_models:
+            # review-cli#587: the pad multiplies the calls, so say so up front.
+            print(
+                f"[review-cli] --task with one -m model: {mode.name} runs "
+                f"{explicit_models[0]} as {len(models)} role slots "
+                f"({', '.join(panel_task_roles)}) = {len(models)} calls",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            # Only brainstorm's default (no `-m`) path reaches here: every other
+            # task_role_pad requires exactly one explicit `-m` model.
+            engines = ", ".join(dict.fromkeys(models))
+            print(
+                f"[review-cli] --task brainstorm: {len(models)} role slots per round "
+                f"({', '.join(panel_task_roles)}) on {engines}",
+                file=sys.stderr,
+                flush=True,
+            )
     elif quorum_auto_roles:
         # Mutually exclusive with task_role_pad in practice (quorum_auto_roles
-        # is only ever populated on the no-`-m` default path, task_role_pad
-        # requires exactly one explicit `-m`), but kept as `elif` defensively
-        # -- task_role_pad's own role assignment wins if both were somehow true.
+        # is only ever populated on quorum's no-`-m` default path, where
+        # task_role_pad requires exactly one explicit `-m`), but kept as `elif`
+        # defensively -- task_role_pad's own role assignment wins if both were
+        # somehow true.
         panel_task_roles = quorum_auto_roles
 
     use_board = not panel_mode and (

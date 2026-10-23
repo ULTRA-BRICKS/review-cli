@@ -3,6 +3,19 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.61.0 — 2026-10-23
+
+- **Fix(brainstorm): a default `brainstorm --task` can meet the ship floor**
+  ([review-cli#610](https://git.hyperide.ai/ultrabricks/review-cli/issues/610), part of
+  [review-cli#444](https://git.hyperide.ai/ultrabricks/review-cli/issues/444)).
+  Without `-m`, brainstorm ran literary personas and recorded no roles, so
+  `review task CODE --check` could not count it toward the 3 distinct roles, whether one
+  engine was live or five. Its live panel now gets role slots: one or two live engines
+  run 3 distinct roles (each role a separate call, as brainstorm already dispatched 3
+  slots per round), a wider panel gets one distinct role per engine, and only completed
+  slots are recorded. Dead engines are never cloned. `--pool 1` keeps the persona panel.
+  Quorum already assigns default roles, and just-ask still never pads.
+
 ## 0.60.0 — 2026-10-23
 
 - **Feat(task): `review task CODE --export`, `--import FILE|-` and `--import-from USER@HOST`
