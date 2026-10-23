@@ -805,6 +805,7 @@ _UNIT_FILES = [
     ("test_role_models.py", {}),
     ("test_review_marker.py", {}),
     ("test_review_remote.py", {}),
+    ("test_install_review_remote.py", {}),
     # `review task --export / --import / --import-from`: iterations recorded on another machine (#659).
     ("test_task_export_import.py", {}),
     # `review diff --staged --commit` (the checkpoint-commit feature): the usage gate

@@ -553,7 +553,9 @@ def install_codex_recursion_guard() -> bool:
         return False
 
 
-def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
+def install_agent_skill(
+    name: str, skill_md: str, blurb: str, *, link_script: Path | None = None
+) -> int:
     """Idempotently install the agent skill across detected harnesses. Reports each target's
     STATE (ROADMAP "install-* commands must show INSTALLED state"): a green check + "already
     configured" when nothing changed, "+ wrote/updated" when it (re)wrote. A re-run on a
@@ -624,6 +626,27 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
                 # rerun with everything else unchanged would falsely say "nothing to do"
                 # while the Claude skill link was never installed (codex review).
                 conflicts.append(f"{link} could not be created ({exc})")
+
+    if (
+        link_script is not None and os.name != "nt"
+    ):  # no extensionless shebang scripts on Windows
+        # `review-remote` ships in the checkout's scripts/; link it next to `review` so a new
+        # machine needs no manual step (review-cli#658). A package install has no script.
+        link = home / ".local" / "bin" / link_script.name
+        try:
+            if link.is_symlink() and link.resolve() == link_script.resolve():
+                results.append((str(link), False))
+            elif link.is_symlink() or link.exists():
+                conflicts.append(f"{link} exists and is not a link to {link_script}")
+            else:
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(link_script)
+                results.append((str(link), True))
+        except (
+            OSError,
+            RuntimeError,
+        ) as exc:  # RuntimeError: symlink loop on Python < 3.13
+            conflicts.append(f"{link} could not be linked ({exc})")
 
     harness_files = [
         ("claude", home / ".claude" / "CLAUDE.md", ("~/.claude",)),
@@ -709,7 +732,13 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
 
 
 def install_skill() -> int:
-    return install_agent_skill(SKILL_NAME, SKILL_MD, SKILL_BLURB)
+    script = Path(__file__).resolve().parent.parent / "scripts" / "review-remote"
+    return install_agent_skill(
+        SKILL_NAME,
+        SKILL_MD,
+        SKILL_BLURB,
+        link_script=script if script.is_file() else None,
+    )
 
 
 _PRECOMMIT_MARKER = "# review-before-commit-gate"

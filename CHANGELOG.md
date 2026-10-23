@@ -3,6 +3,15 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.62.0 — 2026-10-23
+
+- **Feat(install): `review install-skill` links `scripts/review-remote` into `~/.local/bin`**
+  ([review-cli#658](https://git.hyperide.ai/ultrabricks/review-cli/issues/658)), reported like every
+  install target (`+ wrote/updated`, `✓ already configured`, `! conflict` when another file holds the
+  name); a package install without the script skips it. Lane vs default provider state: the
+  review-remote lane has its own admission dir, so seat leases and the 429 state are NOT shared with the
+  box's default lane (documented in docs/review-remote.md).
+
 ## 0.61.0 — 2026-10-23
 
 - **Feat(task): a recording run checks `--task CODE` against the repo's tracker**

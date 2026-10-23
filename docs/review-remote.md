@@ -56,3 +56,8 @@ review task HYP-742 --export > hyp-742.jsonl        # or move the JSONL by hand 
 review task --import hyp-742.jsonl --from-host box  # ... and import it (- reads stdin)
 ```
 
+
+
+## Lane vs default provider state
+
+A review-remote job runs in its own admission lane (`REVIEW_ADMISSION_DIR`), so its provider seat leases and 429 state are separate from the box's default lane: a plain `review` on the box does not share them. Keep other review traffic on the box off the same providers, or accept the double budget.
