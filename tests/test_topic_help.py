@@ -129,6 +129,23 @@ def test_help_runtime_documents_review_feedback_and_stat_sections():
         assert flag in help_out, (flag, help_out)
 
 
+def test_help_config_says_the_admission_queue_is_the_only_host_gate_review_cli_659():
+    """A lock held around `review` is held for the whole queue wait, so callers pile up behind one
+    waiting holder while the host has capacity (the 2026-10-23 slot-1 starvation)."""
+    rc, out, _ = _run(["help", "config"])
+    assert rc == 0, rc
+    flat = " ".join(out.split()).lower()
+    assert "do not hold a lock" in flat, out
+    assert "only host-wide gate" in flat, out
+
+
+def test_help_task_documents_moving_iterations_between_machines_review_cli_659():
+    rc, out, _ = _run(["task", "--help"])
+    flat = " ".join(out.split())
+    for needle in ("--export", "--import", "--import-from", "--from-host"):
+        assert needle in flat, (needle, out)
+
+
 def test_help_config_alias_via_dashdash_help():
     rc_a, out_a, _ = _run(["help", "config"])
     rc_b, out_b, _ = _run(["--help", "config"])

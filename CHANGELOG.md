@@ -4,6 +4,21 @@ All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
 
+## 0.59.0 — 2026-10-23
+
+- **Feat(task): `review task CODE --export`, `--import FILE|-` and `--import-from USER@HOST`
+  move review iterations between machines** ([review-cli#659](https://git.hyperide.ai/ultrabricks/review-cli/issues/659)).
+  Reviews recorded on the build box were invisible to `review task CODE --check` (and so to
+  `gh ship`) on the workstation. `--import-from` runs `review task CODE --export` over ssh and
+  appends the records here; each keeps its `repo_id` / `diff_files`, so `--check` still verifies
+  it against the local checkout, and a record already in the store is skipped (importing twice
+  never double-counts, also when two imports run at once). `review-remote` imports through the
+  same function, so a retried import is idempotent too. A transfer flag cannot be combined with
+  `--check`/`--json`/`--detail` (a gate never exits 0 without running), and `--import` takes no CODE.
+- **Docs: the admission queue is the only host-wide review gate** (same issue). A lock held
+  around `review` stays held for the whole queue wait, so every caller behind it waits one
+  queue ETA after another while the host has capacity; `review help config` and docs/board.md now say so.
+
 ## 0.58.0 — 2026-10-23
 
 - **Feat: `scripts/review-remote` — run `review diff|just-ask|quorum|brainstorm` on a remote box**
