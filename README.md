@@ -799,6 +799,10 @@ reboot — before it could record its own terminal status). `--detach` is reject
 
 ---
 
+## `scripts/review-remote` — review on another box
+
+Run `review` on a second box and import its records, marker and stamp: [docs/review-remote.md](docs/review-remote.md).
+
 ## `review dashboard` — local web dashboard (managed service)
 
 A **managed service** (`run` / `start` / `status` / `stop` / `enable` / `disable`, via the
