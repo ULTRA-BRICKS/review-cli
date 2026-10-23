@@ -384,6 +384,36 @@ def test_harness_stats_to_dict_bytes_percentiles():
         assert row["bytes_max"] >= row["bytes_p90"] >= row["bytes_p50"] >= 0
 
 
+def test_harness_stats_bytes_fail_tracks_only_the_failed_calls():
+    """Overspend-investigation addition: `bytes_fail`/`bytes_fail_pct` answer "how much
+    of this harness's volume was wasted on calls that failed anyway" — the retry-
+    inflation cost signal `review stat`'s FAIL%B column surfaces."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        ok_path = _codex_log(d, stamp="20260813T100000_000000Z", task="T1")
+        fail_path = _write(
+            d,
+            "20260813T100100_000000Z-codex-r0.log",
+            "[review-cli] codex: codex (args redacted) task=T1\n"
+            "boom\n"
+            "[review-cli] EXIT 1\n",
+        )
+        calls = ts.list_call_logs(d)
+        stats = ts.compute_harness_stats(calls)
+        row = stats["codex"].to_dict()
+        assert row["ok"] == 1 and row["fail"] == 1
+        assert row["bytes_fail"] == fail_path.stat().st_size
+        assert row["bytes_total"] == ok_path.stat().st_size + fail_path.stat().st_size
+        expected_pct = round(100 * row["bytes_fail"] / row["bytes_total"], 1)
+        assert row["bytes_fail_pct"] == expected_pct
+
+
+def test_harness_stats_bytes_fail_zero_when_no_calls():
+    row = ts.HarnessStats(harness="codex").to_dict()
+    assert row["bytes_fail"] == 0
+    assert row["bytes_fail_pct"] == 0.0
+
+
 # ---- Fable-specific report --------------------------------------------------------------
 def test_fable_report_counts_dispatch_and_classifies_reason():
     with tempfile.TemporaryDirectory() as tmp:

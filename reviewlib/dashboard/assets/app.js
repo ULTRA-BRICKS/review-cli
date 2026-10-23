@@ -509,6 +509,7 @@ PANELS.overview = () => {
     ['timeouts', s.timeout_calls, 'calls that aged out'],
     ['true-silence', s.true_silence_calls != null ? s.true_silence_calls : 0, 'calls reaped for producing zero output'],
     ['conscious', s.conscious_count, 'reviewed by overseer'],
+    ['rated', s.useful_count, 'runs rated useful or not (review feedback --useful)'],
   ];
   let html = `<div class="panel-head"><h2>Overview</h2><p class="sub">Sessions are time-clustered bursts of backend calls (review-cli emits no run id; gap = ${state.gap}s).</p></div>`;
   html += `<div class="cards">${cards

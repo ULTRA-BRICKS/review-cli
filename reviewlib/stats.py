@@ -332,6 +332,30 @@ def stats_path() -> Path:
     return p
 
 
+def run_id_for(ts: str, mode: str, task_code: str | None) -> str:
+    """Short, deterministic id for one run-stats record, used to key overseer
+    feedback (``review feedback <run_id> ...`` / ``reviewlib.dashboard.store``).
+
+    Deterministic from (ts, mode, task_code) rather than random so a caller who
+    already has those three fields (e.g. re-deriving the id for an OLD record
+    that predates this field) can recompute the exact same id without re-reading
+    the record itself. Collisions are not a security concern here (see
+    ``record_run``'s own threat-model note) — worst case two runs that started at
+    the exact same microsecond with the same mode/task share an id, which just
+    means feedback left under one also shows up for the other.
+
+    16 hex chars (64 bits), not fewer: a review finding on the original 10-hex-char
+    (40-bit) cut found a ~36% birthday-collision chance at a realistic one-million-run
+    history -- silently misattributing feedback between two unrelated runs. 64 bits
+    needs billions of runs before that risk becomes non-negligible, while staying
+    short enough to read/type/paste from the end-of-run nudge.
+    """
+    digest = hashlib.sha256(
+        f"{ts}|{mode}|{task_code or ''}".encode("utf-8")
+    ).hexdigest()
+    return digest[:16]
+
+
 def fmt_duration(seconds: float) -> str:
     """Compact human duration: ``6m12s``, ``47s``, ``1h03m``. Always >= ``0s``."""
     total = int(round(max(0.0, seconds)))
@@ -361,6 +385,7 @@ def record_run(
     usable_roles: list[str] | None = None,
     prompt_tokens: int = 0,
     output_tokens: int = 0,
+    run_id: str | None = None,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -434,6 +459,10 @@ def record_run(
     ``prompt_tokens``/``output_tokens`` are aggregate REAL token counts for the run
     (see the v5 STATS_VERSION comment above) — default 0, which means "no REST usage
     data", not a confirmed zero-token run.
+
+    ``run_id`` lets a caller pin the exact id that will be written (see the `run_id`
+    field assignment below); ``None`` (the default) derives one from
+    ``(ts, mode, task_code)`` via ``run_id_for``.
     """
     try:
         clean_task = normalize_task_code(task_code)
@@ -451,6 +480,15 @@ def record_run(
         "prompt_tokens": int(prompt_tokens),
         "output_tokens": int(output_tokens),
     }
+    # `run_id` keys overseer feedback (``review feedback <run_id>``, review-cli#feedback
+    # -fill-rate) — deterministic from (ts, mode, task_code) via `run_id_for` when the
+    # caller doesn't supply one, so every record gets a stable id even from callers that
+    # predate this field. The CLI's `_run_mode_with_stats` computes it itself BEFORE
+    # calling this function (same three inputs) so the id it prints in the completion
+    # nudge is guaranteed to match what lands in the record, rather than depending on
+    # this function's return value (which stays a plain bool — see the docstring above
+    # — to avoid breaking the existing `record_run(...) is True/False` contract).
+    record["run_id"] = run_id or run_id_for(record["ts"], mode, clean_task)
     if clean_task is not None:
         record["task_code"] = clean_task
     if passed is not None:
@@ -2120,6 +2158,164 @@ def task_summaries() -> list[dict]:
         item["duration_seconds"] = round(item["duration_seconds"], 3)
         summaries.append(item)
     summaries.sort(key=lambda item: item.get("last_ts") or "", reverse=True)
+    return summaries
+
+
+def find_by_run_id(run_id: str) -> dict | None:
+    """Look up one run-stats record by its `run_id` (the id `review feedback` takes as
+    its positional argument). Returns the FIRST match. A record written before this
+    field existed has no `run_id` key at all -- for THOSE, recompute it on the fly via
+    `run_id_for(ts, mode, task_code)` (the exact same deterministic formula
+    `record_run` uses for a record with no explicit `run_id` passed in), honoring
+    `run_id_for`'s own docstring promise that a caller who knows those three fields
+    can always recompute a pre-existing record's id. Records that DO carry `run_id`
+    are matched directly without recomputing (cheaper, and correct even for the rare
+    caller-pinned id that wouldn't match the deterministic formula). Ties across two
+    DIFFERENT records are astronomically unlikely (see `run_id_for`'s docstring); this
+    returns the first match either way."""
+    for record in _load_records():
+        if "run_id" in record:
+            if record["run_id"] == run_id:
+                return record
+            continue
+        ts = record.get("ts")
+        mode = record.get("mode")
+        if isinstance(ts, str) and isinstance(mode, str):
+            if run_id_for(ts, mode, record.get("task_code")) == run_id:
+                return record
+    return None
+
+
+def _record_ts_ge(record: dict, since: datetime | None) -> bool:
+    if since is None:
+        return True
+    ts = record.get("ts")
+    if not isinstance(ts, str):
+        return False
+    # Review finding (Codex): `datetime.fromisoformat` only accepts a trailing `Z`
+    # (Zulu/UTC) shorthand from Python 3.11 onward, but this project declares
+    # `requires-python = ">=3.9"` -- `cli._resolve_stat_since` already normalizes
+    # this exact shorthand for `--since`'s OWN input for that reason; this reader
+    # needs the identical normalization for a record's `ts`, since no CURRENT
+    # producer writes `Z` (`record_run`'s `.isoformat()` always emits `+00:00`) but a
+    # hand-written/future/external record legitimately could.
+    normalized = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed >= since
+
+
+def load_run_records() -> list[dict]:
+    """Public read of the whole run-stats history, so a caller needing several
+    aggregates (`review stat`'s by_mode + by_repo_top) parses the JSONL once and hands
+    the list to each `*_summary(records=...)`."""
+    return _load_records()
+
+
+def mode_summary(
+    since: datetime | None = None, records: list[dict] | None = None
+) -> list[dict]:
+    """Aggregate run-stats by MODE (review/quorum/brainstorm/just-ask/qa) — answers
+    "which mode is actually burning the time/calls", which the per-harness/per-model
+    `review stat` report (sourced from the call logs, not this store) never joins
+    against. One row per mode, busiest (by total duration) first. `records` is a
+    pre-loaded `load_run_records()` result (default: read the store).
+    """
+    groups: dict[str, dict] = {}
+    for record in _load_records() if records is None else records:
+        if not _record_ts_ge(record, since):
+            continue
+        mode = record.get("mode")
+        if not isinstance(mode, str) or not mode:
+            continue
+        group = groups.setdefault(
+            mode,
+            {
+                "mode": mode,
+                "runs": 0,
+                "duration_seconds": 0.0,
+                "ok_count": 0,
+                "fail_count": 0,
+                "pool_size_total": 0,
+            },
+        )
+        group["runs"] += 1
+        dur = record.get("duration_seconds")
+        if isinstance(dur, (int, float)):
+            group["duration_seconds"] += float(dur)
+        for key in ("ok_count", "fail_count"):
+            value = record.get(key)
+            if isinstance(value, int):
+                group[key] += value
+        pool = record.get("pool_size")
+        if isinstance(pool, int):
+            group["pool_size_total"] += pool
+    summaries = []
+    for group in groups.values():
+        item = dict(group)
+        item["duration_seconds"] = round(item["duration_seconds"], 3)
+        item["avg_pool_size"] = (
+            round(item["pool_size_total"] / item["runs"], 1) if item["runs"] else 0.0
+        )
+        calls = item["ok_count"] + item["fail_count"]
+        item["fail_rate"] = round(item["fail_count"] / calls, 3) if calls else None
+        del item["pool_size_total"]
+        summaries.append(item)
+    summaries.sort(key=lambda item: item["duration_seconds"], reverse=True)
+    return summaries
+
+
+def repo_summary(
+    since: datetime | None = None,
+    top: int = 10,
+    records: list[dict] | None = None,
+) -> list[dict]:
+    """Aggregate run-stats by `repo_id` (review-cli#195/#213's diff-identity field) —
+    answers "which repo is actually generating the volume". Only ~26% of historical
+    records carry `repo_id` at all (pre-v4, or a diff-less mode) — those are excluded
+    here rather than lumped into a misleading "unknown" bucket, same convention as
+    `quorum_check`'s identity handling. Busiest (by run count) `top` repos first.
+
+    `top <= 0` returns EVERY repo, uncapped — the same "<=0 means no cap" convention
+    `_resolve_stat_since` already uses for `--days`. The CLI's own `--top` clamps to
+    `>= 1` before calling this (review-cli#355 review finding: this function's OWN
+    default contract is "the caller decides whether 0 means capped-to-nothing or
+    unbounded" — clamping here too would silently take away the "give me all of them"
+    use a direct library caller might want). `records` is a pre-loaded
+    `load_run_records()` result (default: read the store)."""
+    groups: dict[str, dict] = {}
+    for record in _load_records() if records is None else records:
+        if not _record_ts_ge(record, since):
+            continue
+        repo_id = record.get("repo_id")
+        if not isinstance(repo_id, str) or not repo_id:
+            continue
+        # A moved/renamed repo (`_REPO_ID_ALIASES`) counts under its current id, the
+        # same identity `quorum_check` compares on, instead of splitting in two.
+        repo_id = _comparable_repo_id(repo_id)
+        group = groups.setdefault(
+            repo_id,
+            {"repo_id": repo_id, "runs": 0, "duration_seconds": 0.0, "fail_count": 0},
+        )
+        group["runs"] += 1
+        dur = record.get("duration_seconds")
+        if isinstance(dur, (int, float)):
+            group["duration_seconds"] += float(dur)
+        fail = record.get("fail_count")
+        if isinstance(fail, int):
+            group["fail_count"] += fail
+    summaries = []
+    for group in groups.values():
+        item = dict(group)
+        item["duration_seconds"] = round(item["duration_seconds"], 3)
+        summaries.append(item)
+    summaries.sort(key=lambda item: item["runs"], reverse=True)
+    if top > 0:
+        summaries = summaries[:top]
     return summaries
 
 

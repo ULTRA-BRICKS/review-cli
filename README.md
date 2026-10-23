@@ -735,7 +735,7 @@ JSON top-level shape:
 
 | Command | Shape |
 |---------|-------|
-| `review stat --json` | `{"log_dir": str, "since": str\|null, "call_count": int, "retry_event_count": int, "tokens_recorded_backends": [str], "harnesses": {name: {calls, ok, fail, running, bytes_total, bytes_avg, bytes_p50, bytes_p90, bytes_max, tokens_real: bool, tokens_prompt, tokens_output, calls_with_real_tokens, skill_md_calls, memory_md_calls}}, "models": {model_id: {calls, bytes_total, classes}}, "fable": {dispatch_attempts, cached_skips, paywall_sentinel_calls, failure_rate, retry_events, retry_event_reasons, cached_skip_retry_events_excluded}, "retry_events_by_kind": {kind: int}, "top_oversized_calls": [{backend, model, task_code, started, size_bytes, diff_git_files, binary_stub_files, skill_md, memory_md, path}]}` |
+| `review stat --json` | `{"log_dir": str, "since": str\|null, "call_count": int, "retry_event_count": int, "tokens_recorded_backends": [str], "harnesses": {name: {calls, ok, fail, running, bytes_total, bytes_fail, bytes_fail_pct, bytes_avg, bytes_p50, bytes_p90, bytes_max, tokens_real: bool, tokens_prompt, tokens_output, calls_with_real_tokens, skill_md_calls, memory_md_calls}}, "models": {model_id: {calls, bytes_total, classes}}, "fable": {dispatch_attempts, cached_skips, paywall_sentinel_calls, failure_rate, retry_events, retry_event_reasons, cached_skip_retry_events_excluded}, "retry_events_by_kind": {kind: int}, "by_mode": [...], "by_repo_top": [...], "top_oversized_calls": [{backend, model, task_code, started, size_bytes, diff_git_files, binary_stub_files, skill_md, memory_md, path}]}` |
 
 ---
 

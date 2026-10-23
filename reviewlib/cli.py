@@ -97,13 +97,18 @@ from .stats import (
     announce_eta,
     diff_content_hash,
     extract_diff_files,
+    find_by_run_id,
     fmt_duration,
     iterations_for_task,
+    load_run_records,
+    mode_summary,
     normalize_repo_remote,
     normalize_task_code,
     parse_iso_ts,
     quorum_check,
     record_run,
+    repo_summary,
+    run_id_for,
     task_summaries,
 )
 
@@ -1715,6 +1720,141 @@ def _normalize_harness_arg(raw: str) -> str:
     return _HARNESS_ARG_ALIASES.get(key, key)
 
 
+_USEFUL_CHOICES = {
+    "yes": True,
+    "y": True,
+    "true": True,
+    "no": False,
+    "n": False,
+    "false": False,
+    "unsure": None,
+    "unknown": None,
+}
+
+
+def _feedback_subcommand(rest: list[str]) -> int:
+    """`review feedback <run_id> [--note TEXT] [--useful yes|no|unsure] [--ticket ID]
+    [--pr N] [--json]` — the CLI-side path onto the overseer annotation store
+    (`reviewlib.dashboard.store`), keyed under `"run-<run_id>"`. `<run_id>` is the id
+    printed by `_print_feedback_nudge` at the end of every recorded run (also visible
+    in `review task`/`review stat --json` records under the `run_id` field).
+
+    This exists because the ONLY prior path to `feedback`/`conscious`/`links` was the
+    dashboard web UI (`POST /api/runs/<id>/feedback`) — real usage showed a 0% fill
+    rate (`~/.config/review-cli/dashboard.json` had never once been written) because
+    nothing in the CLI path ever told a caller the feature existed. Giving none of
+    `--note`/`--useful`/`--ticket`/`--pr` turns this into a READ instead of a write —
+    it prints whatever is already on file (defaults if nothing was ever recorded) so a
+    caller can check a run's annotation without risking an accidental write.
+
+    If the looked-up run-stats record's `task_code` already looks like a ticket ID
+    (the same `HYP-742`-shaped pattern `--ticket` itself validates) and no explicit
+    `--ticket` was given, it is auto-linked — the ticket the run was FOR is already
+    known, no reason to make the caller retype it."""
+    from .dashboard import store as dashboard_store
+
+    parser = argparse.ArgumentParser(
+        prog="review feedback",
+        description="Attach overseer feedback/usefulness/links to a recorded run.",
+    )
+    parser.add_argument("run_id", help="the run_id printed at the end of a review run")
+    parser.add_argument("--note", default=None, help="free-text feedback")
+    parser.add_argument(
+        "--useful",
+        choices=sorted(_USEFUL_CHOICES),
+        default=None,
+        help="was this run worth the tokens it burned",
+    )
+    parser.add_argument("--ticket", default=None, help="ticket id, e.g. HYP-742")
+    parser.add_argument("--pr", default=None, help="PR number, e.g. 123 or #123")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+    nothing_to_write = (
+        ns.note is None and ns.useful is None and ns.ticket is None and ns.pr is None
+    )
+
+    record = find_by_run_id(ns.run_id)
+    if record is None:
+        print(
+            f"[review feedback] warning: run_id {ns.run_id!r} not found in "
+            "run-stats.jsonl (recording the annotation anyway — it may be a stale/"
+            "hand-typed id, or predate this field).",
+            file=sys.stderr,
+        )
+
+    key = f"run-{ns.run_id}"
+    if not nothing_to_write:
+        # Validate --ticket/--pr shape BEFORE writing ANYTHING (note/useful included)
+        # — review finding: this used to write --note/--useful first, then validate
+        # links after, so `review feedback <id> --useful yes --pr garbage` persisted
+        # `useful=yes` and THEN failed with rc 2, reading as "nothing happened" when
+        # something had.
+        try:
+            if ns.ticket is not None:
+                dashboard_store.validate_ticket(ns.ticket)
+            if ns.pr is not None:
+                dashboard_store.validate_pr(ns.pr)
+        except ValueError as exc:
+            print(f"[review feedback] {exc}", file=sys.stderr)
+            return 2
+
+        ticket_to_link = ns.ticket
+        if ticket_to_link is None and record is not None:
+            task_code = record.get("task_code")
+            if isinstance(task_code, str) and dashboard_store.looks_like_ticket(
+                task_code
+            ):
+                ticket_to_link = task_code
+
+        # Review finding, round 2: applying note/useful/ticket/pr as up to FOUR
+        # separate load-modify-write cycles (even after validating shapes up front)
+        # still let an I/O failure or a concurrent writer land BETWEEN two of them,
+        # leaving a genuinely partial annotation. `apply_feedback` does the whole
+        # thing as ONE locked critical section — real all-or-nothing, not just
+        # validated-then-hopefully-uninterrupted.
+        dashboard_store.apply_feedback(
+            key,
+            feedback=ns.note if ns.note is not None else dashboard_store.UNSET,
+            useful=(
+                _USEFUL_CHOICES[ns.useful]
+                if ns.useful is not None
+                else dashboard_store.UNSET
+            ),
+            ticket=ticket_to_link,
+            pr=ns.pr,
+        )
+
+    rec = dashboard_store.get_annotation(key)
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps({"run_id": ns.run_id, **rec}, indent=2))
+        return 0
+    context = ""
+    if record is not None:
+        context = f" ({record.get('mode', '?')}, task={record.get('task_code', '-')})"
+    if nothing_to_write:
+        # No --note/--useful/--ticket/--pr given: a plain `review feedback <id>` is a
+        # READ, not a write — show whatever is on file (empty defaults if nothing was
+        # ever recorded) instead of erroring on a caller who just wants to check.
+        print(
+            f"[review feedback] current annotation for run {ns.run_id}{context}: {rec}"
+        )
+        # Review finding (Opus): gating this hint on feedback/useful alone was wrong
+        # -- a run annotated with ONLY a --ticket/--pr (feedback/useful both still
+        # None) got a contradictory "nothing recorded yet" printed right next to its
+        # real ticket/PR links. `updated` is set by every write path (set_feedback/
+        # apply_feedback/add_link all touch it), so `None` means genuinely never written.
+        if rec["updated"] is None:
+            print(
+                "  (nothing recorded yet — add --note/--useful/--ticket/--pr to set it)",
+                file=sys.stderr,
+            )
+    else:
+        print(f"[review feedback] recorded for run {ns.run_id}{context}: {rec}")
+    return 0
+
+
 def _stat_subcommand(rest: list[str]) -> int:
     """`review stat [--days N] [--since ISO] [--top N] [--harness NAME] [--json]` —
     detailed per-harness/per-model usage + health report parsed from the real per-call
@@ -1742,7 +1882,8 @@ def _stat_subcommand(rest: list[str]) -> int:
         "--top",
         type=int,
         default=10,
-        help="how many largest calls to list (default 10; clamped to >= 1)",
+        help="how many largest calls to list (default 10; clamped to >= 1) — also "
+        "caps the by_repo_top row count",
     )
     parser.add_argument(
         "--harness",
@@ -1775,6 +1916,20 @@ def _stat_subcommand(rest: list[str]) -> int:
     from .dashboard.tokenstats import compute_stat_report
 
     report = compute_stat_report(since=since, top=ns.top)
+    # `by_mode`/`by_repo_top` join in `reviewlib.stats`'s run-stats.jsonl (mode/task/
+    # repo attribution — GROUND TRUTH, not inferred, see that module's docstring) on
+    # top of the call-log-only report above (deliberately NOT computed inside
+    # `compute_stat_report`/`tokenstats.py`, which documents itself as a call-log-only
+    # data model — mixing the two stores in one function would blur which section
+    # answers which question). Overspend-investigation finding (2026-09): the
+    # pre-existing report had per-harness/per-model breakdowns but nothing answering
+    # "which MODE (review/quorum/brainstorm/just-ask) or which REPO is actually
+    # generating the volume" — this closes that gap.
+    # One read of the run-stats history feeds both sections (it is re-parsed in full
+    # per `_load_records` call, which grows with history).
+    run_records = load_run_records()
+    report["by_mode"] = mode_summary(since=since, records=run_records)
+    report["by_repo_top"] = repo_summary(since=since, top=ns.top, records=run_records)
     # glm review finding, round 2: normalize BEFORE filtering — see
     # `_normalize_harness_arg` for why a raw alias (`glm`, `zai`, `oc`, `cc`) used to
     # always miss even though the report's own footnote teaches it. Displaying the
@@ -1867,6 +2022,8 @@ def _render_stat_report_text(
         ),
         _render_stat_fable_section(report["fable"]),
         _render_stat_retry_section(report["retry_events_by_kind"]),
+        _render_stat_mode_section(report["by_mode"]),
+        _render_stat_repo_section(report["by_repo_top"]),
         _render_stat_oversized_section(report["top_oversized_calls"]),
         "Note: real token counts exist ONLY for REST-backed calls "
         f"({', '.join(report['tokens_recorded_backends'])}); the agentic CLI harnesses "
@@ -1911,7 +2068,7 @@ def _render_stat_harness_table(
 
     header = (
         f"{'HARNESS':<14}{'CALLS':>7}{'OK':>6}{'FAIL':>6}{'RUN':>5}  "
-        f"{'BYTES':>9}{'AVG':>9}{'P90':>9}{'MAX':>9}  {'TOK(real)':>10}  SKILL.md  MEMORY.md"
+        f"{'BYTES':>9}{'FAIL%B':>7}{'AVG':>9}{'P90':>9}{'MAX':>9}  {'TOK(real)':>10}  SKILL.md  MEMORY.md"
     )
     rows = [header, "-" * len(header)]
     for name, hs in harnesses.items():
@@ -1921,15 +2078,18 @@ def _render_stat_harness_table(
         calls = hs["calls"] or 1
         skill_pct = f"{100 * hs['skill_md_calls'] / calls:.0f}%"
         mem_pct = f"{100 * hs['memory_md_calls'] / calls:.0f}%"
+        fail_b_pct = f"{hs['bytes_fail_pct']:.0f}%"
         rows.append(
             f"{name:<14}{hs['calls']:>7}{hs['ok']:>6}{hs['fail']:>6}{hs['running']:>5}  "
-            f"{format_bytes(hs['bytes_total']):>9}{format_bytes(hs['bytes_avg']):>9}"
+            f"{format_bytes(hs['bytes_total']):>9}{fail_b_pct:>7}{format_bytes(hs['bytes_avg']):>9}"
             f"{format_bytes(hs['bytes_p90']):>9}{format_bytes(hs['bytes_max']):>9}  "
             f"{tok:>10}  {skill_pct:>8}  {mem_pct:>9}"
         )
     title = (
         "Per-harness breakdown (bytes = call-log size, a token PROXY for every "
-        "harness; TOK(real) = exact prompt/output tokens, REST backends only):"
+        "harness; FAIL%B = share of that harness's total bytes spent on calls that "
+        "failed anyway — the retry-inflation cost signal; TOK(real) = exact "
+        "prompt/output tokens, REST backends only):"
     )
     return title + "\n" + "\n".join(rows)
 
@@ -1967,6 +2127,45 @@ def _render_stat_retry_section(by_kind: dict) -> str:
         return "Retry/promotion events: none recorded in this window."
     parts = " ".join(f"{kind}={count}" for kind, count in sorted(by_kind.items()))
     return f"Retry/promotion events by kind: {parts}"
+
+
+def _render_stat_mode_section(by_mode: list[dict]) -> str:
+    """`reviewlib.stats.mode_summary` rendered — busiest MODE first (by total real
+    wall-clock, not call-log bytes: this section is sourced from run-stats.jsonl, the
+    ground-truth store, not the call logs the rest of this report reads)."""
+    if not by_mode:
+        return "By mode: no run-stats.jsonl history in this window."
+    header = f"{'MODE':<12}{'RUNS':>6}{'DURATION':>10}{'AVG_POOL':>9}{'FAIL%':>7}"
+    rows = [header, "-" * len(header)]
+    for item in by_mode:
+        fail_pct = (
+            f"{100 * item['fail_rate']:.0f}%" if item["fail_rate"] is not None else "-"
+        )
+        rows.append(
+            f"{item['mode']:<12}{item['runs']:>6}"
+            f"{fmt_duration(item['duration_seconds']):>10}"
+            f"{item['avg_pool_size']:>9}{fail_pct:>7}"
+        )
+    return "By mode (from run-stats.jsonl):\n" + "\n".join(rows)
+
+
+def _render_stat_repo_section(by_repo: list[dict]) -> str:
+    """`reviewlib.stats.repo_summary` rendered — busiest repo first, by run count.
+    Only records with a resolvable `repo_id` are counted (see that function's
+    docstring for why the rest are excluded rather than lumped as "unknown")."""
+    if not by_repo:
+        return "By repo: no repo-identified run-stats.jsonl history in this window."
+    header = f"{'REPO':<50}{'RUNS':>6}{'DURATION':>10}{'FAIL':>6}"
+    rows = [header, "-" * len(header)]
+    for item in by_repo:
+        repo = item["repo_id"]
+        if len(repo) > 48:
+            repo = "…" + repo[-47:]
+        rows.append(
+            f"{repo:<50}{item['runs']:>6}"
+            f"{fmt_duration(item['duration_seconds']):>10}{item['fail_count']:>6}"
+        )
+    return "By repo, top by run count (from run-stats.jsonl):\n" + "\n".join(rows)
 
 
 def _render_stat_oversized_section(top: list[dict]) -> str:
@@ -3724,6 +3923,27 @@ def _spec_web_reply_to_tg(
         print(f"[review spec-web reply] tg delivery error: {exc}", flush=True)
 
 
+def _print_feedback_nudge(run_id: str) -> None:
+    """One-line reminder printed after every recorded run, pointing at `review
+    feedback`. Overseer feedback used to be dashboard-web-UI-only (`POST
+    /api/runs/<id>/feedback`) with NO nudge anywhere in the CLI path — real usage
+    showed a 0% fill rate (`~/.config/review-cli/dashboard.json` had never once been
+    written) because nothing ever told a caller the feature existed, let alone gave
+    it the id to use. Most callers of `review` are AGENTS, not a human at an
+    interactive terminal, so this is a plain printed line (not an
+    `input()`-blocking prompt, which would hang a non-interactive/piped invocation)
+    — it lands in the agent's own transcript/stdout capture where it can act on it,
+    exactly like the existing ETA line. `REVIEW_NO_FEEDBACK_NUDGE=1` silences it for
+    scripted/CI invocations that don't want the extra line."""
+    if os.environ.get("REVIEW_NO_FEEDBACK_NUDGE"):
+        return
+    print(
+        f"[review] run recorded (run_id={run_id}). Rate it: "
+        f'review feedback {run_id} --useful yes|no [--note "..."] [--ticket ID]',
+        file=sys.stderr,
+    )
+
+
 def _run_mode_with_stats(
     mode: str,
     pool_models: list[str],
@@ -3997,7 +4217,17 @@ def _run_admitted_mode_with_stats(
                 verdict = False
             else:
                 verdict = rc == 0
-            record_run(
+            # Computed BEFORE the call (not read back from `record_run`, which stays a
+            # plain bool — see its docstring) from the exact same three inputs
+            # `record_run` itself hashes, so the id this prints below is guaranteed to
+            # match what actually lands in the stored record, even if the append
+            # itself silently fails (best-effort store — see `record_run`).
+            try:
+                clean_task_for_id = normalize_task_code(task_code)
+            except ValueError:
+                clean_task_for_id = None
+            this_run_id = run_id_for(started.isoformat(), mode, clean_task_for_id)
+            recorded_ok = record_run(
                 task_code=task_code,
                 mode=mode,
                 models=recorded_models,
@@ -4013,7 +4243,17 @@ def _run_admitted_mode_with_stats(
                 usable_roles=recorded_usable_roles,
                 prompt_tokens=prompt_tokens,
                 output_tokens=output_tokens,
+                run_id=this_run_id,
             )
+            # Review finding (Codex): this used to print the nudge UNCONDITIONALLY,
+            # ignoring `record_run`'s own success/failure return. With an unwritable
+            # `$REVIEW_STATS_FILE` the append silently fails (best-effort, by design —
+            # see `record_run`'s docstring), yet the run still told the caller to
+            # `review feedback <run_id>` an id that was never actually persisted,
+            # creating an orphan annotation with nothing in run-stats.jsonl to join
+            # it to. Only nudge when the record genuinely landed.
+            if recorded_ok:
+                _print_feedback_nudge(this_run_id)
 
 
 def _call_with_task_env(task_code: str | None, fn):
@@ -4193,6 +4433,13 @@ _VALUE_TAKING_OPTS = frozenset(
         # value, so the `-o` pre-scan must skip its argument — otherwise `--retry -o…`-shaped input
         # would have the retry count mis-read as the output flag.
         "--retry",
+        # `review feedback <run_id>`'s value-taking flags: `--note` is free text that can start
+        # with `-` (e.g. `--note '-o drops the report text'`), so the `-o` pre-scan must skip
+        # each one's argument instead of stealing it as an output path.
+        "--note",
+        "--useful",
+        "--ticket",
+        "--pr",
         # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
         # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
         # pre-scan never steals it.
@@ -5362,6 +5609,7 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "entities",
         "capacity-check",
         "health",
+        "feedback",
         "trust-module",
         "register-module",
         "spec-web",
@@ -5984,6 +6232,25 @@ RUN STATS & THE STARTUP ETA
   to thread (`qa` is report-only by design; see `reviewlib/qa/executor.py`) -- never
   crashes a reader, but the quorum gate treats unknown as not-passed either way.
 
+RUN FEEDBACK & `review stat`
+  Every new record also carries a run_id (16 hex chars, deterministic from ts/mode/
+  task_code). A recorded run ends with a one-line stderr reminder naming it;
+  REVIEW_NO_FEEDBACK_NUDGE=1 silences it for scripted/CI callers. Rate the run with:
+
+    review feedback <run_id> [--useful yes|no|unsure] [--note TEXT] [--ticket ID] [--pr N] [--json]
+
+  It writes (in one locked load-modify-write) into the same annotation store the
+  dashboard reads (~/.config/review-cli/dashboard.json). A task_code that looks like a
+  ticket is auto-linked. `review stat` joins run-stats.jsonl's mode/repo attribution:
+  by_mode / by_repo_top sections, plus a FAIL%B column (bytes_fail/bytes_fail_pct in
+  --json) -- the share of a harness's bytes spent on calls that failed anyway.
+  `review stat --json` shapes: by_mode = [{{mode, runs, duration_seconds, ok_count,
+  fail_count, avg_pool_size, fail_rate: number|null}}] (busiest by duration first);
+  by_repo_top = [{{repo_id, runs, duration_seconds, fail_count}}] (busiest by runs
+  first; only records with a repo_id, a moved repo counted under its current id).
+  `review feedback <run_id>` with no write flag is a read; --useful also accepts
+  y/n/true/false/unknown.
+
 See also: `review --help` (overview), README's "Quorum" section, `review task CODE`.
 """
 
@@ -6148,6 +6415,7 @@ def _subcommand_epilog() -> str:
             "\n              bare `status`: which board seats can run now, why not, and their substitute"
             "\n  seats       = bare `status`: every seat, Claude CLI account and omp Anthropic account (alias: doctor)"
             "\n  wait        block until a detached job finishes (`wait <job-id>`)"
+            "\n  feedback    attach overseer feedback/usefulness/ticket-link to a recorded run (run_id from the end-of-run nudge)"
             "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
             "\n  install-skill / install-commit-hook / install-hook tg / register-module"
             "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
@@ -6687,6 +6955,11 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # subcommand (like stat/task/dashboard/sessions), NOT a fan-out mode.
     if argv and argv[0] == "capacity-check":
         return _capacity_check_subcommand(argv[1:])
+    # `review feedback <run_id>` — the CLI-side path onto the overseer annotation store
+    # (see `_print_feedback_nudge`/`reviewlib.dashboard.store`); a bare MANAGEMENT
+    # subcommand like `stat`/`task`, not a fan-out mode.
+    if argv and argv[0] == "feedback":
+        return _feedback_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the

@@ -833,6 +833,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 stats["feedback_count"] = sum(
                     1 for a in anns.values() if a.get("feedback")
                 )
+                # review-cli#355 review finding: `useful` (the CLI's `review feedback
+                # --useful yes|no` rating, review-cli's feedback-fill-rate fix) had NO
+                # aggregate here at all — a usefulness-only annotation (no free-text
+                # `feedback`) contributed to neither pre-existing counter, so the
+                # dashboard's own fill-rate signal silently missed it. `is not None`
+                # (not truthiness) because `False` ("not useful") is a real, counted
+                # rating, unlike `conscious`/`feedback` where the empty/falsy state
+                # genuinely means "nothing there."
+                stats["useful_count"] = sum(
+                    1 for a in anns.values() if a.get("useful") is not None
+                )
                 return self._send_json(stats)
             if path == "/api/annotations":
                 return self._send_json(dstore.all_annotations())

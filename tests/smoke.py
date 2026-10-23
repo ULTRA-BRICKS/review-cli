@@ -1039,6 +1039,11 @@ _UNIT_FILES = [
     # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
     # text rendering, --harness table filtering). Deterministic, no network/backend.
     ("test_stat_subcommand.py", {}),
+    # `review feedback <run_id>` — the CLI path onto the overseer annotation store
+    # (review-cli#355's 0% fill-rate fix). Isolates its own $REVIEW_STATS_FILE/
+    # $REVIEW_DASHBOARD_STORE per test via its own `_Isolated` context manager, no
+    # shared env needed here. Deterministic, no network/backend.
+    ("test_feedback_subcommand.py", {}),
     # The persistent call-log cache (reviewlib.dashboard.call_log_cache) that lets a
     # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
     # Deterministic — synthetic tmpdirs, no real log dir, no network.

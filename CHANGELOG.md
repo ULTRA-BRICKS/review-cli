@@ -3,6 +3,49 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.56.0 — 2026-10-23
+
+- **Add `review feedback <run_id>` and close the overseer-feedback 0% fill-rate gap.**
+  Real usage showed `~/.config/review-cli/dashboard.json` had never once been written —
+  `feedback`/`conscious`/`links` existed only as a dashboard web-UI action with no CLI
+  path and no reminder anywhere, so nobody ever used it. Every recorded run now prints a
+  one-line stderr reminder (`[review] run recorded (run_id=...). Rate it: review
+  feedback <run_id> --useful yes|no [...]`), and `review feedback` writes into the same
+  annotation store the web UI reads. Adds a `run_id` field (deterministic from
+  `ts`/`mode`/`task_code`) to every new run-stats.jsonl record, a tri-state `useful`
+  rating alongside the existing `conscious`/`links` fields, and auto-links a run's
+  `task_code` as a ticket when it already looks like one. `REVIEW_NO_FEEDBACK_NUDGE=1`
+  silences the reminder for scripted/CI callers. The annotation store now holds a
+  cross-process advisory lock (`review feedback` made it a multi-process writer for
+  the first time — it used to have exactly one, the long-lived dashboard server),
+  mirroring `reviewlib.seat_cooldown`'s degrade-rather-than-hang design: it never
+  blocks a write indefinitely, degrading to in-process-only after a small bounded
+  wait on a contended peer (an accepted, narrow lost-update window under sustained
+  contention — same tradeoff `seat_cooldown` already makes). `--ticket`/`--pr`/
+  `--note`/`--useful` writes are validated up front, then applied in a SINGLE
+  load-modify-write (`store.apply_feedback`) rather than up to four separate ones —
+  a real all-or-nothing write, not just validated-then-hopefully-uninterrupted.
+  `run_id` is a 64-bit (16 hex char) digest — long enough that a collision needs
+  billions of runs to become likely. `/api/stats` gains a `useful_count` alongside
+  the existing `conscious_count`/`feedback_count`, so a usefulness-only annotation
+  (no free-text note) still shows up in the dashboard's fill-rate signal, and the
+  Overview panel shows it as a `rated` card. The store's cross-process lock goes through
+  `reviewlib.portable` (`fcntl` on POSIX, `msvcrt` on Windows), and
+  `--note`/`--useful`/`--ticket`/`--pr` are registered with the `-o` pre-scan so a note
+  starting with `-o ...` is not read as an output path.
+- **`review stat`: join run-stats.jsonl's mode/repo attribution and a fail-bytes
+  column, closing gaps found in a 2026-09 token-overspend investigation ([review-cli#355](https://git.hyperide.ai/ultrabricks/review-cli/issues/355)).**
+  New `by_mode`/`by_repo_top` sections (busiest mode/repo first, from `reviewlib.stats`'
+  ground-truth store — the pre-existing report only ever broke usage down by
+  harness/model, never by which MODE or REPO was generating it) and a `FAIL%B` column
+  on the per-harness table (`bytes_fail`/`bytes_fail_pct` in `--json`) showing what
+  share of a harness's bytes were spent on calls that failed anyway — the
+  retry-inflation cost signal.
+- Known gap, tracked separately ([review-cli#357](https://git.hyperide.ai/ultrabricks/review-cli/issues/357)): a `review feedback` annotation is
+  invisible in the dashboard's own per-session drill-down (it looks up by a different,
+  call-log-derived session id) — it does still count toward the dashboard's aggregate
+  `feedback_count`/`conscious_count`.
+
 ## 0.55.0 — 2026-10-23
 
 - **Feat(dashboard): the Metrics tab shows real token usage and $ cost**

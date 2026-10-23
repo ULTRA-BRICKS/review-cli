@@ -106,6 +106,29 @@ def test_help_runtime_schema_version_matches_stats():
     assert f"currently v: {STATS_VERSION}" in out, out
 
 
+def test_help_runtime_documents_review_feedback_and_stat_sections():
+    """`review feedback` (subcommand + flags), its nudge opt-out env var and the
+    `review stat` by_mode/by_repo_top/FAIL%B additions stay in the runtime topic."""
+    rc, out, _ = _run(["help", "runtime"])
+    assert rc == 0, rc
+    for needle in (
+        "review feedback <run_id>",
+        "--useful",
+        "--note",
+        "--ticket",
+        "--pr",
+        "REVIEW_NO_FEEDBACK_NUDGE=1",
+        "by_mode",
+        "by_repo_top",
+        "FAIL%B",
+    ):
+        assert needle in out, (needle, out)
+    # The documented flags must be real `review feedback` flags.
+    rc_h, help_out, _ = _run(["feedback", "--help"])
+    for flag in ("--useful", "--note", "--ticket", "--pr", "--json"):
+        assert flag in help_out, (flag, help_out)
+
+
 def test_help_config_alias_via_dashdash_help():
     rc_a, out_a, _ = _run(["help", "config"])
     rc_b, out_b, _ = _run(["--help", "config"])

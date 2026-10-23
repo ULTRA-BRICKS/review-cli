@@ -507,6 +507,8 @@ def test_value_taking_opts_are_all_value_taking():
     # ONLY on the `qa` subparser (modes/qa.py): the Phase-2 executor flags + the Phase-3
     # SUT-env value-taking flags (--stage-url / --config).
     qa_only = {"--suites", "--kind", "--report", "--max-cases", "--stage-url", "--config"}
+    # ONLY on the bare `feedback <run_id>` subcommand's own parser (cli._feedback_subcommand).
+    feedback_only = {"--note", "--useful", "--ticket", "--pr"}
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
@@ -517,6 +519,8 @@ def test_value_taking_opts_are_all_value_taking():
             argv = ["spec-web", "reply", "cid", "ans", opt]
         elif opt in moderator_only:
             argv = ["quorum", "q", opt]  # --moderator is a quorum/brainstorm flag
+        elif opt in feedback_only:
+            argv = ["feedback", "run-id", opt]
         elif opt in qa_only:
             # --suites lives only on the qa parser; lead with --timeout so the parser
             # reaches the bare opt at the end without running anything.

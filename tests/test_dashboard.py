@@ -21,6 +21,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -6073,6 +6074,76 @@ def test_store_conscious_roundtrip():
     _with_store(body)
 
 
+def test_apply_feedback_writes_all_fields_in_one_call():
+    """Review finding, round 2: `review feedback`'s multi-flag write used to be up to
+    FOUR separate load-modify-write cycles (feedback, useful, link x2) —
+    a mid-operation failure or a concurrent writer landing between two of them could
+    leave a genuinely partial annotation. `apply_feedback` composes all of it into
+    ONE `_locked()` critical section."""
+
+    def body(store):
+        rec = store.apply_feedback(
+            "sess-atomic",
+            feedback="great catch",
+            useful=True,
+            ticket="HYP-1",
+            pr="42",
+        )
+        assert rec["feedback"] == "great catch"
+        assert rec["useful"] is True
+        assert rec["links"]["tickets"] == ["HYP-1"]
+        assert rec["links"]["prs"] == ["#42"]
+        ann = store.get_annotation("sess-atomic")
+        assert ann == rec
+
+    _with_store(body)
+
+
+def test_apply_feedback_unset_sentinel_leaves_fields_untouched():
+    """`UNSET` (not a bare default of `None`) is required because `None` is a valid
+    VALUE for both `feedback` (clears it) and `useful` (marks "unrated") -- passing
+    neither must leave whatever was already there alone, not silently clear it."""
+
+    def body(store):
+        store.apply_feedback("sess-partial", feedback="first note", useful=True)
+        # A later call that only touches `ticket` must not clobber feedback/useful.
+        rec = store.apply_feedback("sess-partial", ticket="HYP-2")
+        assert rec["feedback"] == "first note"
+        assert rec["useful"] is True
+        assert rec["links"]["tickets"] == ["HYP-2"]
+        # An explicit None DOES clear/unset, distinct from omitting the kwarg.
+        rec2 = store.apply_feedback("sess-partial", feedback=None, useful=None)
+        assert rec2["feedback"] is None
+        assert rec2["useful"] is None
+        assert rec2["links"]["tickets"] == ["HYP-2"]  # untouched by this call
+        # `useful=False` is stored as False, not as "unrated", and `useful` and
+        # `conscious` are independent fields: setting one never touches the other.
+        store.set_conscious("sess-partial", True)
+        rec3 = store.apply_feedback("sess-partial", useful=False)
+        assert rec3["useful"] is False and rec3["conscious"] is True
+
+    _with_store(body)
+
+
+def test_apply_feedback_dedups_links_like_add_link():
+    def body(store):
+        store.apply_feedback("sess-dedup", ticket="HYP-1", pr="1")
+        rec = store.apply_feedback("sess-dedup", ticket="HYP-1", pr="1")
+        assert rec["links"]["tickets"] == ["HYP-1"]
+        assert rec["links"]["prs"] == ["#1"]
+
+    _with_store(body)
+
+
+def test_store_looks_like_ticket():
+    from reviewlib.dashboard import store
+
+    assert store.looks_like_ticket("HYP-742")
+    assert store.looks_like_ticket("hyp-742")
+    assert not store.looks_like_ticket("not-a-ticket")
+    assert not store.looks_like_ticket("")
+
+
 def test_store_links_roundtrip_and_validation():
     def body(store):
         store.add_link("sess-3", pr="123", ticket="hyp-742")
@@ -6104,6 +6175,99 @@ def test_store_persists_to_disk_and_is_private():
         assert "sess-4" in data["sessions"]
         mode = oct(os.stat(p).st_mode & 0o777)
         assert mode == "0o600", mode
+
+    _with_store(body)
+
+
+def test_locked_holds_a_real_cross_process_flock():
+    """Review finding (feedback-fill-rate fix): before `review feedback` existed, this
+    store had exactly one writer (the long-lived dashboard server), so an in-process
+    `threading.RLock` was enough. `review feedback` makes it a per-invocation
+    multi-process writer, so `_locked()` must hold a REAL OS-level advisory lock a
+    SEPARATE file descriptor on the same sidecar path can observe as held — not just
+    the in-process lock, which a second fd can never see."""
+    import fcntl
+
+    def body(store):
+        # Force the sidecar lock file to exist first (mirrors a prior write).
+        store.set_feedback("sess-lock", "seed")
+        p = store.store_path()
+        lock_path = p.parent / f".{p.name}.lock"
+        with store._locked():
+            assert lock_path.exists()
+            probe_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                try:
+                    fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    raise AssertionError(
+                        "expected the flock to be held by the outer _locked() context"
+                    )
+                except BlockingIOError:
+                    pass  # correctly blocked -- the lock IS held cross-fd
+            finally:
+                os.close(probe_fd)
+        # Released after the context exits: a fresh probe now succeeds immediately.
+        probe_fd2 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(probe_fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd2, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd2)
+
+    _with_store(body)
+
+
+def test_useful_and_feedback_writes_on_different_keys_both_persist():
+    """Sequential writes to DIFFERENT keys (review finding: this test's previous name
+    implied a concurrency check, but two sequential calls in one thread pass
+    identically with the lock deleted entirely — it is NOT a race regression test,
+    just a basic correctness check that `_session_record`'s `setdefault` never lets
+    one key's write clobber another's). The real concurrency guarantee is exercised by
+    `test_locked_degrades_to_unlocked_when_flock_contended_past_budget` below, which
+    holds the flock from a SEPARATE fd while a write happens."""
+
+    def body(store):
+        store.apply_feedback("sess-a", useful=True)
+        store.set_feedback("sess-b", "unrelated note")
+        ann_a = store.get_annotation("sess-a")
+        ann_b = store.get_annotation("sess-b")
+        assert ann_a["useful"] is True
+        assert ann_b["feedback"] == "unrelated note"
+        data = store.load_store()
+        assert "sess-a" in data["sessions"] and "sess-b" in data["sessions"]
+
+    _with_store(body)
+
+
+def test_locked_degrades_to_unlocked_when_flock_contended_past_budget():
+    """Review finding (Opus): the flock retry has its own small
+    `_FLOCK_SUB_BUDGET_SECONDS` sub-budget (not the full lock deadline) so a
+    same-process thread never hangs waiting out a peer's flock — it degrades to
+    `_LOCK`-only and proceeds, rather than blocking or raising. Proves the write
+    still LANDS (and returns promptly, bounded by the sub-budget) when a SEPARATE fd
+    holds the flock for the whole operation — the actual degrade path, not just
+    the lock being held (which the sibling `test_locked_holds_a_real_cross_process_
+    flock` test already covers)."""
+    import fcntl
+
+    def body(store):
+        store.set_feedback("sess-seed", "seed")  # ensure the lock sidecar exists
+        p = store.store_path()
+        lock_path = p.parent / f".{p.name}.lock"
+        blocker_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(blocker_fd, fcntl.LOCK_EX)
+        try:
+            start = time.monotonic()
+            rec = store.apply_feedback("sess-degrade", useful=True)
+            elapsed = time.monotonic() - start
+        finally:
+            fcntl.flock(blocker_fd, fcntl.LOCK_UN)
+            os.close(blocker_fd)
+        assert rec["useful"] is True
+        assert store.get_annotation("sess-degrade")["useful"] is True
+        # Bounded by the flock sub-budget (0.15s) plus slack, never the full
+        # multi-second lock deadline or an indefinite hang.
+        assert elapsed < 2.0
 
     _with_store(body)
 
@@ -6315,6 +6479,17 @@ def test_endpoints_end_to_end():
                 _, stats2 = _get(base, "/api/stats")
                 assert stats2["conscious_count"] == 1
 
+                # `useful` (review-cli#355's CLI-only `review feedback --useful`
+                # rating, review finding: it had no aggregate at all) has no HTTP
+                # write endpoint yet (tracked separately, review-cli#357) — written
+                # directly via the store, exactly as `review feedback` would, to
+                # prove `/api/stats` picks it up regardless of which path wrote it.
+                from reviewlib.dashboard import store as _dstore
+
+                _dstore.apply_feedback(sid, useful=True)
+                _, stats2b = _get(base, "/api/stats")
+                assert stats2b["useful_count"] == 1
+
                 # POST link round-trip
                 st, r = _post(
                     base, f"/api/runs/{sid}/links", {"pr": "456", "ticket": "HYP-742"}
@@ -6338,6 +6513,9 @@ def test_endpoints_end_to_end():
                     base + "/assets/app.js", timeout=10
                 ) as resp:
                     assert resp.status == 200
+                    # The Overview renderer must surface the `review feedback --useful`
+                    # aggregate, not just the API (review-cli#355 review finding).
+                    assert b"useful_count" in resp.read()
                 # A committed model brand-logo PNG is served from the allowlisted icons/ path
                 # as a real image (the front-end renders each model as <img>, never an emoji).
                 # mini_claude.png is the Anthropic brand mark (always committed — Opus/Fable seats).

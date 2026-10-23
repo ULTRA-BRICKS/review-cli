@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -61,6 +62,22 @@ def _run(argv, *, log_dir: Path) -> subprocess.CompletedProcess:
         env["HOME"] = fake_home
         env["XDG_CONFIG_HOME"] = str(Path(fake_home) / ".config")
         env["REVIEW_LOG_DIR"] = str(log_dir)
+        # `stats_path()` reads `$REVIEW_STATS_FILE` FIRST, falling back to
+        # `Path.home()` only when it's unset. Under `python -m pytest`, the autouse
+        # `_isolate_log_and_stats_paths` conftest fixture already gives every test a
+        # fresh one, so `dict(os.environ)` above inherits an already-isolated value —
+        # but under `python tests/smoke.py` (what CI runs), `REVIEW_STATS_FILE` is set
+        # ONCE for the whole process to a single shared throwaway file, so inheriting
+        # it here means every `_run()` call across the whole smoke run reads/writes
+        # the SAME stats file. That's invisible to tests that never look at `by_mode`/
+        # `by_repo_top`, but `test_stat_by_mode_and_by_repo_empty_when_no_run_stats_history`
+        # asserts the store is EMPTY — a real record left over from an earlier smoke.py
+        # test sharing that file makes it flaky by test order. Force a fresh, guaranteed-
+        # empty path scoped to this call's own `fake_home`, matching the isolation the
+        # `HOME`/`XDG_CONFIG_HOME` overrides above already promise.
+        env["REVIEW_STATS_FILE"] = str(
+            Path(fake_home) / ".config" / "review-cli" / "run-stats.jsonl"
+        )
         return subprocess.run(
             [sys.executable, REVIEW, "stat", *argv],
             capture_output=True,
@@ -267,6 +284,225 @@ def test_stat_harness_filter_json_still_explains_an_empty_result_on_stderr():
         assert (
             "no calls recorded for harness 'nonexistent-harness'" in proc.stderr.lower()
         )
+
+
+def test_stat_text_report_shows_fail_bytes_column():
+    """Overspend-investigation addition: FAIL%B is the share of a harness's total
+    bytes spent on calls that failed anyway — the one column the pre-existing table
+    never had, and the single most actionable overspend number (see cli.py's
+    `_render_stat_harness_table`)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _write_fixture_logs(d)
+        proc = _run(["--days", "0"], log_dir=d)
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        assert "FAIL%B" in proc.stdout
+        # The fixture's `claude` call is a 100%-failed paywall sentinel -> all its
+        # bytes are fail bytes.
+        claude_row = next(
+            line for line in proc.stdout.splitlines() if line.startswith("claude ")
+        )
+        assert "100%" in claude_row
+
+
+def test_stat_json_includes_bytes_fail_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _write_fixture_logs(d)
+        proc = _run(["--days", "0", "--json"], log_dir=d)
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        payload = json.loads(proc.stdout)
+        assert payload["harnesses"]["claude"]["bytes_fail_pct"] == 100.0
+        assert payload["harnesses"]["codex"]["bytes_fail"] == 0
+
+
+def test_stat_by_mode_and_by_repo_empty_when_no_run_stats_history():
+    """`review stat` reads run-stats.jsonl for `by_mode`/`by_repo_top` from a
+    completely fresh (isolated, per-test) $HOME — no history exists yet, and both
+    sections must degrade to an explicit empty message/list, not crash."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _write_fixture_logs(d)
+        proc = _run(["--days", "0"], log_dir=d)
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        assert "By mode: no run-stats.jsonl history in this window." in proc.stdout
+        assert (
+            "By repo: no repo-identified run-stats.jsonl history in this window."
+            in proc.stdout
+        )
+        proc_json = _run(["--days", "0", "--json"], log_dir=d)
+        payload = json.loads(proc_json.stdout)
+        assert payload["by_mode"] == []
+        assert payload["by_repo_top"] == []
+
+
+def test_stat_by_mode_reflects_seeded_run_stats_file():
+    """Seed a real run-stats.jsonl in the isolated $HOME `review stat` reads from,
+    and check the `by_mode` join actually surfaces it — not just that it degrades
+    gracefully when empty (the prior test)."""
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        tempfile.TemporaryDirectory() as fake_home,
+    ):
+        d = Path(tmp)
+        _write_fixture_logs(d)
+        stats_dir = Path(fake_home) / ".config" / "review-cli"
+        stats_dir.mkdir(parents=True)
+        stats_file = stats_dir / "run-stats.jsonl"
+        stats_file.write_text(
+            '{"v":4,"ts":"2026-08-13T10:00:00+00:00","mode":"brainstorm",'
+            '"pool_size":2,"models":["codex","gemini"],"duration_seconds":321.0,'
+            '"ok_count":2,"fail_count":0,"repo_id":"local:/tmp/some-repo"}\n',
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        # `stats_path()` reads `$REVIEW_STATS_FILE` FIRST, falling back to
+        # `Path.home()` only when it's unset -- the autouse
+        # `_isolate_log_and_stats_paths` conftest fixture already sets
+        # `$REVIEW_STATS_FILE` (to a throwaway path) for every test by default, so
+        # a bare `$HOME` override here is silently ignored by the subprocess unless
+        # `$REVIEW_STATS_FILE` is pointed at the SAME file this test just seeded.
+        env["REVIEW_STATS_FILE"] = str(stats_file)
+        env["REVIEW_LOG_DIR"] = str(d)
+        proc = subprocess.run(
+            [sys.executable, REVIEW, "stat", "--days", "0", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        payload = json.loads(proc.stdout)
+        assert payload["by_mode"] == [
+            {
+                "mode": "brainstorm",
+                "runs": 1,
+                "duration_seconds": 321.0,
+                "ok_count": 2,
+                "fail_count": 0,
+                "avg_pool_size": 2.0,
+                "fail_rate": 0.0,
+            }
+        ]
+        assert payload["by_repo_top"] == [
+            {
+                "repo_id": "local:/tmp/some-repo",
+                "runs": 1,
+                "duration_seconds": 321.0,
+                "fail_count": 0,
+            }
+        ]
+
+
+def test_stat_by_mode_since_filter_excludes_older_records_through_the_real_cli():
+    """Test-gap finding: every OTHER by_mode/by_repo test used `--days 0` (since=None),
+    which short-circuits `_record_ts_ge` before any real comparison — so a non-None
+    `since` (a real `--days N`) had never actually been driven through the CLI. Seeds
+    one record inside a 1-day window and one clearly outside it."""
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        tempfile.TemporaryDirectory() as fake_home,
+    ):
+        d = Path(tmp)
+        _write_fixture_logs(d)
+        stats_dir = Path(fake_home) / ".config" / "review-cli"
+        stats_dir.mkdir(parents=True)
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        lines = [
+            json.dumps(
+                {
+                    "v": 4,
+                    "ts": recent_ts,
+                    "mode": "review",
+                    "pool_size": 1,
+                    "models": ["codex"],
+                    "duration_seconds": 5.0,
+                    "ok_count": 1,
+                    "fail_count": 0,
+                }
+            ),
+            json.dumps(
+                {
+                    "v": 4,
+                    "ts": old_ts,
+                    "mode": "quorum",
+                    "pool_size": 1,
+                    "models": ["codex"],
+                    "duration_seconds": 5.0,
+                    "ok_count": 1,
+                    "fail_count": 0,
+                }
+            ),
+        ]
+        stats_file = stats_dir / "run-stats.jsonl"
+        stats_file.write_text("\n".join(lines) + "\n")
+        env = dict(os.environ)
+        # See `test_stat_by_mode_reflects_seeded_run_stats_file`'s comment: the
+        # autouse conftest fixture already sets `$REVIEW_STATS_FILE`, which
+        # `stats_path()` checks before `$HOME` -- point it at the seeded file.
+        env["REVIEW_STATS_FILE"] = str(stats_file)
+        env["REVIEW_LOG_DIR"] = str(d)
+        proc = subprocess.run(
+            [sys.executable, REVIEW, "stat", "--days", "1", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        payload = json.loads(proc.stdout)
+        assert [m["mode"] for m in payload["by_mode"]] == ["review"]
+
+
+def test_stat_by_mode_via_since_flag_does_not_crash_on_a_bare_date():
+    """Review finding: `--since` (as opposed to `--days`) was never exercised through
+    `by_mode`/`by_repo_top` at all -- `_resolve_stat_since` always returns a
+    tz-AWARE datetime (or None/False), so `_record_ts_ge`'s `parsed >= since`
+    comparison is safe, but nothing pinned that. A bare `YYYY-MM-DD` (no time/tz
+    component, `_resolve_stat_since`'s naive-datetime path) must not crash."""
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        tempfile.TemporaryDirectory() as fake_home,
+    ):
+        d = Path(tmp)
+        _write_fixture_logs(d)
+        stats_dir = Path(fake_home) / ".config" / "review-cli"
+        stats_dir.mkdir(parents=True)
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        stats_file = stats_dir / "run-stats.jsonl"
+        stats_file.write_text(
+            json.dumps(
+                {
+                    "v": 4,
+                    "ts": recent_ts,
+                    "mode": "just-ask",
+                    "pool_size": 1,
+                    "models": ["codex"],
+                    "duration_seconds": 3.0,
+                    "ok_count": 1,
+                    "fail_count": 0,
+                }
+            )
+            + "\n"
+        )
+        env = dict(os.environ)
+        # See `test_stat_by_mode_reflects_seeded_run_stats_file`'s comment: the
+        # autouse conftest fixture already sets `$REVIEW_STATS_FILE`, which
+        # `stats_path()` checks before `$HOME` -- point it at the seeded file.
+        env["REVIEW_STATS_FILE"] = str(stats_file)
+        env["REVIEW_LOG_DIR"] = str(d)
+        proc = subprocess.run(
+            [sys.executable, REVIEW, "stat", "--since", "2020-01-01", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        assert "Traceback" not in proc.stdout + proc.stderr
+        payload = json.loads(proc.stdout)
+        assert [m["mode"] for m in payload["by_mode"]] == ["just-ask"]
 
 
 if __name__ == "__main__":

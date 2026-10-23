@@ -509,6 +509,14 @@ class HarnessStats:
     fail: int = 0
     running: int = 0
     bytes_total: int = 0
+    # Overspend-investigation finding (2026-09): the pre-existing `bytes_total` never
+    # answered "how much of this harness's volume was WASTED on calls that failed
+    # anyway" — the single most actionable split for a retry-inflation diagnosis (a
+    # failed call still pays for every token/byte it produced before failing).
+    # Tracked separately from `bytes_total` (never overlapping: every call's bytes land
+    # in exactly one of ok/fail/running) rather than derived, since `running` calls
+    # contribute to `bytes_total` but to neither ok nor fail bucket.
+    bytes_fail: int = 0
     bytes_list: list[int] = field(default_factory=list)
     tokens_prompt: int = 0
     tokens_output: int = 0
@@ -534,6 +542,12 @@ class HarnessStats:
             "fail": self.fail,
             "running": self.running,
             "bytes_total": self.bytes_total,
+            "bytes_fail": self.bytes_fail,
+            "bytes_fail_pct": (
+                round(100 * self.bytes_fail / self.bytes_total, 1)
+                if self.bytes_total
+                else 0.0
+            ),
             "bytes_avg": round(self.bytes_total / self.calls, 1) if self.calls else 0.0,
             "bytes_p50": self._percentile(ordered, 0.5),
             "bytes_p90": self._percentile(ordered, 0.9),
@@ -576,6 +590,7 @@ def compute_harness_stats(calls: list[CallLog]) -> dict[str, HarnessStats]:
             stats.ok += 1
         else:
             stats.fail += 1
+            stats.bytes_fail += call.size_bytes
         usage = extract_usage_tokens(call)
         if usage is not None:
             stats.calls_with_real_tokens += 1

@@ -233,11 +233,15 @@ def test_record_run_writes_correct_shape():
             "fail_count",
             "prompt_tokens",
             "output_tokens",
+            "run_id",
             "task_code",
             "passed",
         }
         assert set(r.keys()) <= allowed_keys, set(r.keys()) - allowed_keys
         assert "api" not in json.dumps(r).lower()
+        # `run_id` is always written (feedback-fill-rate fix) and is deterministic from
+        # (ts, mode, task_code) — a caller who knows those three can recompute it.
+        assert r["run_id"] == _stats.run_id_for(r["ts"], "brainstorm", TASK)
         # No `passed=` kwarg given -> verdict UNKNOWN -> the key is omitted entirely
         # (not written as null), so a reader can tell "never told us" from "told us False".
         assert "passed" not in r
@@ -361,6 +365,239 @@ def test_task_summaries_pre_v5_record_with_no_token_keys_does_not_crash():
         assert summaries[0]["iterations"] == 2
         assert summaries[0]["prompt_tokens"] == 100
         assert summaries[0]["output_tokens"] == 20
+
+
+def test_run_id_for_is_deterministic_and_input_sensitive():
+    a = _stats.run_id_for("2026-09-01T00:00:00+00:00", "review", "HYP-1")
+    b = _stats.run_id_for("2026-09-01T00:00:00+00:00", "review", "HYP-1")
+    assert a == b
+    # Any of the three inputs changing must change the id — this is the whole point of
+    # keying overseer feedback off it (two different runs must not collide).
+    assert a != _stats.run_id_for("2026-09-01T00:00:01+00:00", "review", "HYP-1")
+    assert a != _stats.run_id_for("2026-09-01T00:00:00+00:00", "quorum", "HYP-1")
+    assert a != _stats.run_id_for("2026-09-01T00:00:00+00:00", "review", "HYP-2")
+    assert a != _stats.run_id_for("2026-09-01T00:00:00+00:00", "review", None)
+
+
+def test_run_id_for_is_long_enough_to_avoid_realistic_collisions():
+    """Review finding (Codex): the original 10-hex-char (40-bit) cut had a ~36%
+    birthday-collision chance at a one-million-run history -- long enough for a
+    long-lived install to plausibly hit it and silently misattribute feedback
+    between two unrelated runs. Pins the length at 16 hex chars (64 bits)."""
+    rid = _stats.run_id_for("2026-09-01T00:00:00+00:00", "review", "HYP-1")
+    assert len(rid) == 16
+
+
+def test_record_run_honors_caller_supplied_run_id():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            run_id="pinned-id-123",
+        )
+        recs = store.records()
+        assert recs[0]["run_id"] == "pinned-id-123"
+
+
+def test_find_by_run_id_matches_and_misses():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            run_id="findme-1",
+        )
+        found = _stats.find_by_run_id("findme-1")
+        assert found is not None and found["task_code"] == TASK
+        assert _stats.find_by_run_id("nope-nope") is None
+
+
+def test_find_by_run_id_recomputes_for_a_pre_0_36_record_missing_the_field():
+    """`run_id_for`'s docstring promises a caller who knows (ts, mode, task_code) can
+    recompute the exact id for a record that predates this field entirely (review
+    finding: `find_by_run_id` didn't honor that promise -- it only ever matched a
+    literal `run_id` key)."""
+    with _TmpStore() as store:
+        legacy_ts = "2026-01-01T00:00:00+00:00"
+        legacy_record = {
+            "v": 4,
+            "ts": legacy_ts,
+            "mode": "review",
+            "pool_size": 1,
+            "models": ["codex"],
+            "duration_seconds": 1.0,
+            "ok_count": 1,
+            "fail_count": 0,
+            "task_code": TASK,
+            # deliberately NO "run_id" key -- simulates a pre-0.36 record.
+        }
+        store.path.write_text(json.dumps(legacy_record) + "\n")
+        expected_id = _stats.run_id_for(legacy_ts, "review", TASK)
+        found = _stats.find_by_run_id(expected_id)
+        assert found is not None and found["ts"] == legacy_ts
+        assert _stats.find_by_run_id("some-other-id") is None
+
+
+def test_mode_summary_aggregates_by_mode_sorted_by_duration():
+    with _TmpStore():
+        _stats.record_run(
+            mode="review",
+            models=["codex"],
+            duration_seconds=10.0,
+            ok_count=1,
+            fail_count=1,
+        )
+        _stats.record_run(
+            mode="review",
+            models=["codex"],
+            duration_seconds=5.0,
+            ok_count=1,
+            fail_count=0,
+        )
+        _stats.record_run(
+            mode="brainstorm",
+            models=["codex", "gemini"],
+            duration_seconds=100.0,
+            ok_count=2,
+            fail_count=0,
+        )
+        summary = _stats.mode_summary()
+        assert [s["mode"] for s in summary] == ["brainstorm", "review"]
+        review = next(s for s in summary if s["mode"] == "review")
+        assert review["runs"] == 2
+        assert review["duration_seconds"] == 15.0
+        assert review["ok_count"] == 2 and review["fail_count"] == 1
+        assert review["avg_pool_size"] == 1.0
+        assert review["fail_rate"] == round(1 / 3, 3)
+        brainstorm = next(s for s in summary if s["mode"] == "brainstorm")
+        assert brainstorm["fail_rate"] == 0.0
+
+
+def test_mode_summary_since_filter_excludes_older_records():
+    with _TmpStore():
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        recent = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        _stats.record_run(
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            started=old,
+        )
+        _stats.record_run(
+            mode="quorum",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            started=recent,
+        )
+        summary = _stats.mode_summary(since=datetime(2025, 1, 1, tzinfo=timezone.utc))
+        assert [s["mode"] for s in summary] == ["quorum"]
+
+
+def test_record_ts_ge_accepts_a_trailing_z_suffix():
+    """Review finding (Codex): `datetime.fromisoformat` only accepts a trailing `Z`
+    shorthand from Python 3.11 onward, but this project declares `>=3.9` -- and
+    `cli._resolve_stat_since` already normalizes it for `--since`'s OWN input for
+    exactly that reason. `_record_ts_ge` needs the same normalization for a record's
+    `ts`: no CURRENT producer writes `Z` (`record_run` always emits `+00:00`), but a
+    hand-written/external/future record legitimately could, and it must not be
+    silently dropped from every `since`-filtered view."""
+    record = {"ts": "2026-08-13T10:00:00Z"}
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert _stats._record_ts_ge(record, since) is True
+    assert (
+        _stats._record_ts_ge(record, datetime(2030, 1, 1, tzinfo=timezone.utc)) is False
+    )
+
+
+def test_repo_summary_excludes_records_with_no_repo_id_and_ranks_by_runs():
+    with _TmpStore():
+        _stats.record_run(
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+        )  # no repo_id -> excluded
+        for _ in range(2):
+            _stats.record_run(
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                repo_id="repo-a",
+            )
+        _stats.record_run(
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            repo_id="repo-b",
+        )
+        summary = _stats.repo_summary()
+        assert [s["repo_id"] for s in summary] == ["repo-a", "repo-b"]
+        assert summary[0]["runs"] == 2
+        assert summary[1]["fail_count"] == 1
+
+
+def test_summaries_accept_preloaded_records_and_read_the_store_once():
+    """`review stat` hands ONE `load_run_records()` result to both `mode_summary` and
+    `repo_summary` (review finding: each used to re-parse the whole JSONL). Passing
+    `records=` must give the same answer without touching the store again."""
+    with _TmpStore():
+        _stats.record_run(
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            repo_id="repo-a",
+        )
+        records = _stats.load_run_records()
+        original = _stats._load_records
+        _stats._load_records = lambda: (_ for _ in ()).throw(
+            AssertionError("store re-read despite records=")
+        )
+        try:
+            assert _stats.mode_summary(records=records)[0]["mode"] == "review"
+            assert _stats.repo_summary(records=records)[0]["repo_id"] == "repo-a"
+        finally:
+            _stats._load_records = original
+
+
+def test_repo_summary_merges_a_moved_repo_under_its_current_identity():
+    """A record from before a repo move (`_REPO_ID_ALIASES`) counts toward the repo's
+    current identity, not a second row."""
+    with _TmpStore():
+        for repo_id in (
+            "github.com/alex-mextner/review-cli",
+            "git.hyperide.ai/ultrabricks/review-cli",
+        ):
+            _stats.record_run(
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                repo_id=repo_id,
+            )
+        summary = _stats.repo_summary()
+        assert [s["repo_id"] for s in summary] == [
+            "git.hyperide.ai/ultrabricks/review-cli"
+        ]
+        assert summary[0]["runs"] == 2
 
 
 def test_task_summaries_group_iterations_and_models():
@@ -1485,6 +1722,47 @@ def test_qa_mode_exit_0_does_not_record_passed_true():
         assert result["passed"] is False
         assert result["passed_iterations"] == 0
         assert result["total_iterations"] == 1
+
+
+def test_run_mode_with_stats_prints_feedback_nudge_matching_recorded_run_id():
+    """Feedback-fill-rate fix: every recorded run must print a `review feedback
+    <run_id>` nudge on stderr, and the printed id must be the EXACT id that landed in
+    the record — a mismatched id would send a caller to annotate the wrong run."""
+
+    def _fake_dispatch() -> int:
+        _panel._tally_ok(True)
+        return 0
+
+    with _TmpStore() as store:
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli._run_mode_with_stats(
+                "review", ["codex"], _fake_dispatch, task_code=TASK
+            )
+        assert rc == 0
+        recs = store.records()
+        assert len(recs) == 1
+        run_id = recs[0]["run_id"]
+        assert f"review feedback {run_id}" in err.getvalue()
+        assert "run_id=" + run_id in err.getvalue()
+
+
+def test_run_mode_with_stats_feedback_nudge_silenced_by_env():
+    def _fake_dispatch() -> int:
+        _panel._tally_ok(True)
+        return 0
+
+    with _TmpStore():
+        os.environ["REVIEW_NO_FEEDBACK_NUDGE"] = "1"
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                _cli._run_mode_with_stats(
+                    "review", ["codex"], _fake_dispatch, task_code=TASK
+                )
+            assert "review feedback" not in err.getvalue()
+        finally:
+            os.environ.pop("REVIEW_NO_FEEDBACK_NUDGE", None)
 
 
 def test_cli_second_run_eta_uses_first_runs_history():
