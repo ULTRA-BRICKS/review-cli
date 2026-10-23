@@ -1,792 +1,372 @@
 #!/usr/bin/env python3
-"""review-remote — run a `review` mode on a remote box and bring the evidence home.
+"""review-remote — run `review diff` on another host and bring the report (and gate record) back.
 
-    export REVIEW_REMOTE=ultra@65.21.40.51
-    review-remote diff --staged --task CODE -C <repo>       # same args as `review`
-    review-remote diff --task CODE -C <repo> --detach        # returns a job id at once
-    review-remote status <job> | wait <job> | jobs
+The local box has ONE host-wide review admission queue; when it is long, run the same review on
+`home` (laptop) or `clvm` (65.21.40.51) instead. Nothing is pushed to any remote repository:
 
-Why: the local host's admission queue (`review jobs`) serialises every agent's review
-behind the same CPU/RAM budget and provider seats. A build box with its own omp logins
-has idle capacity; this runs the SAME `review` binary there, on an exact copy of the
-repo state, then imports the real result so every local gate keeps working:
+  1. a snapshot (`git archive`) of the base commit travels over ssh into a scratch dir on the
+     host (`~/.cache/review-remote/<job>/wt`), committed there with the real `origin` URL so
+     review-cli's repo identity matches;
+  2. the exact diff (`git diff --cached` or `git diff A B`) is applied to it and staged, so the
+     seats see the same files and the same diff the local run would;
+  3. `review diff --staged ...` runs there (its own admission queue, its own seats), its output
+     streams back;
+  4. with --record-local the remote run's run-stats record(s) are appended to the local
+     run-stats.jsonl (tagged `remote_host`), so `review task CODE --check` sees the iteration;
+  5. the scratch dir is removed.
 
-  1. Repo state is shipped, not guessed: HEAD is pushed to a bare mirror on the box
-     (only missing objects travel), the job checks it out, then re-applies the staged
-     patch, the unstaged patch and the untracked files. Before dispatch the box's
-     `git diff --cached` / `git diff HEAD` hashes must equal the local ones, or the run
-     is refused (a review of different bytes would certify nothing).
-  2. The box runs `review <mode> ... -C <job checkout>` with a per-job
-     REVIEW_STATS_FILE / REVIEW_MARKER, so its run-stats records and gate artifacts are
-     isolated from anything else on the box.
-  3. Imports, each only when the box's own review produced it:
-       * run-stats records  -> appended unmodified (plus `remote_host`) to the local
-         run-stats.jsonl, which is what `review task CODE --check` / `gh ship` count;
-       * the commit-gate marker -> touched locally iff the box's staged review wrote it;
-       * the diff-scoped review-stamp (+ stamp-diff) -> copied iff its digest equals the
-         sha256 of the LOCAL `git diff --no-ext-diff --cached` and its HEAD equals the
-         local HEAD.
-     Nothing is fabricated: no box record, no import.
+Usage:
+  review-remote [--host home|clvm|auto|USER@HOST] [--range A..B] [-C DIR] [--record-local]
+                [--keep] [--dry-run] [-o FILE] [--] [review diff args: --task CODE --preset ... -m ...]
 
-Exit code is the remote `review` exit code (255 = ssh failure, 2 = usage/sync refusal).
+Default diff = the STAGED diff of -C DIR (like `review diff --staged`). --range A..B reviews
+`git diff A B` instead (what a merged PR / a stale-base branch really changed).
+Seats a host can run are limited to its logins (`ssh HOST review status`): neither remote host
+has a Codex login, so a review that must include Codex needs a separate local `-m codex...` run.
 """
-
 from __future__ import annotations
 
-import hashlib
-import io
+import argparse
 import json
 import os
-import re
-import secrets
-import select
 import shlex
-import signal
-import stat
 import subprocess
 import sys
-import tarfile
-import threading
+import tempfile
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-MODES = {"diff", "just-ask", "ask", "quorum", "brainstorm"}
-# Local-only commands that read the (imported) local store: running them remotely would
-# look at the wrong data, so say so instead of silently doing it.
-LOCAL_ONLY = {"task", "stat", "dashboard", "sessions", "visual"}
-# Safe-to-forward knobs (no local paths). Everything else is the box's own config.
-FORWARD_ENV = (
-    "REVIEW_TASK_CODE",
-    "REVIEW_RETRY_COUNT",
-    "REVIEW_BACKSTOP_SECONDS",
-    "REVIEW_IDLE_TIMEOUT_SECONDS",
-)
-# diff-affecting git config: the box must render `git diff` byte-identically to here, or
-# the stamp digest the box writes would not match the local pre-commit hook's own hash.
-DIFF_CONFIG_KEYS = (
-    "diff.noprefix",
-    "diff.mnemonicprefix",
-    "diff.srcprefix",
-    "diff.dstprefix",
-    "diff.context",
-    "diff.interhunkcontext",
-    "diff.algorithm",
-    "diff.indentheuristic",
-    "core.quotepath",
-    "core.abbrev",
-)
-MAX_PAYLOAD_BYTES = 200 * 1024 * 1024
-STATE_DIR = Path(
-    os.environ.get("REVIEW_REMOTE_STATE", "~/.cache/review-remote")
-).expanduser()
-REMOTE_ROOT = "review-remote"  # relative to the remote $HOME
-JOB_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
-LANE_DIR = "$HOME/.local/state/review-cli/admission-review-remote"
+HOSTS = {"home": "home", "clvm": "ultra@65.21.40.51"}
+SSH = [
+    "ssh",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=10",
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={Path.home()}/.cache/review-remote/cm-%C",
+    "-o", "ControlPersist=120",
+]
+REMOTE_PATH = 'export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"'
 
+# Flags review-remote owns; everything else passes through to the remote `review diff`.
+DROP_WITH_VALUE = {"-C", "--cwd", "-o", "--output"}
+DROP_BARE = {"--staged", "--diff", "--detach"}
 
-def die(msg: str, code: int = 2) -> None:
-    print(f"[review-remote] {msg}", file=sys.stderr)
-    sys.exit(code)
-
-
-def log(msg: str) -> None:
-    print(f"[review-remote] {msg}", file=sys.stderr, flush=True)
-
-
-def ssh_base(host: str) -> list[str]:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    return [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "ServerAliveInterval=30",
-        "-o",
-        "ServerAliveCountMax=8",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        f"ControlPath={STATE_DIR}/cm-%C",
-        "-o",
-        "ControlPersist=300",
-        host,
-    ]
-
-
-def git(cwd: str, *args: str, check: bool = True) -> bytes:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    p = subprocess.run(
-        ["git", "-C", cwd, *args], capture_output=True, env=env, check=False
-    )
-    if check and p.returncode != 0:
-        die(
-            f"git {' '.join(args)} failed in {cwd}: {p.stderr.decode(errors='replace').strip()}"
-        )
-    return p.stdout if p.returncode == 0 else b""
-
-
-def remote_sh(host: str, script: str, *, check: bool = True) -> bytes:
-    p = subprocess.run(
-        [*ssh_base(host), "bash", "-s"],
-        input=script.encode(),
-        capture_output=True,
-        check=False,
-    )
-    if check and p.returncode != 0:
-        sys.stderr.write(p.stderr.decode(errors="replace"))
-        die(
-            f"remote step failed (rc={p.returncode}) on {host}",
-            255 if p.returncode == 255 else 2,
-        )
-    return p.stdout
-
-
-def sha(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-_SPECIAL_LONG = ("--cwd", "--output", "--detach", "--commit", "--visual", "--before")
-
-
-def _canon_long(a: str) -> str:
-    """argparse accepts unambiguous abbreviations (`--comm`, `--out=f`); expand the ones this
-    wrapper must recognise so an abbreviation cannot slip past its checks."""
-    if not a.startswith("--") or len(a) < 4:
-        return a
-    name, sep, val = a.partition("=")
-    if len(name) >= 4:
-        for full in _SPECIAL_LONG:
-            if full.startswith(name):
-                return full + sep + val
-    return a
-
-
-def _read_stdin_bounded(idle: float = 10.0) -> bytes:
-    """Read a piped diff from stdin, giving up when the writer stays silent for `idle` seconds
-    (an inherited-but-never-closed pipe must not hang a detach launch)."""
-    chunks: list[bytes] = []
-    while True:
-        ready, _, _ = select.select([0], [], [], idle)
-        if not ready:
-            break
-        chunk = os.read(0, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def parse_args(argv: list[str]) -> dict:
-    """Split `review`'s own argv into what review-remote consumes locally (-C, -o, --detach)
-    and what is forwarded verbatim. Mirrors `review`'s own `-o` pre-scan: scanning stops at
-    `--`, and the token after a value-taking option is that option's value, never a flag."""
-    _lib()
-    from reviewlib.cli import _VALUE_TAKING_OPTS
-
-    mode = argv[0]
-    rest = argv[1:]
-    out: list[str] = []
-    cwd = os.getcwd()
-    output = None
-    detach = False
-    i = 0
-    refused: list[str] = []
-    while i < len(rest):
-        a = _canon_long(rest[i])
-        if a == "--":
-            out.extend(rest[i:])
-            break
-        if a in ("-C", "--cwd") and i + 1 < len(rest):
-            cwd = rest[i + 1]
-            i += 2
-        elif a.startswith("--cwd="):
-            cwd = a.split("=", 1)[1]
-            i += 1
-        elif a in ("-o", "--output") and i + 1 < len(rest):
-            output = rest[i + 1]
-            i += 2
-        elif a.startswith("--output="):
-            output = a.split("=", 1)[1]
-            i += 1
-        elif a.startswith("-o") and len(a) > 2 and not a.startswith("--"):
-            output = a[2:].removeprefix("=")
-            i += 1
-        elif a.startswith("-C") and len(a) > 2 and not a.startswith("--"):
-            cwd = a[2:].removeprefix("=")
-            i += 1
-        elif a == "--detach":
-            detach = True
-            i += 1
-        elif a.split("=", 1)[0] in ("--commit", "--visual", "--before"):
-            refused.append(a.split("=", 1)[0])
-            out.append(a)
-            i += 1
-        elif a in _VALUE_TAKING_OPTS and i + 1 < len(rest):
-            out.extend(rest[i : i + 2])
-            i += 2
-        else:
-            out.append(a)
-            i += 1
-    return {
-        "mode": mode,
-        "args": out,
-        "cwd": os.path.abspath(os.path.expanduser(cwd)),
-        "output": output,
-        "detach": detach,
-        "refused": refused,
-    }
-
-
-def build_payload(top: str) -> tuple[bytes, str, str]:
-    """tar{staged.patch, unstaged.patch, untracked/...} + local cached/worktree diff hashes."""
-    # Payload diffs are for `git apply -p1` on the box: pin the prefixes and colour so a local
-    # diff.noprefix / color.ui=always cannot break the patch. (The hashes below stay on the
-    # hook's own plain `git diff --no-ext-diff --cached` command.)
-    fmt = ("--binary", "--no-ext-diff", "--no-textconv", "--no-color")
-    fmt += ("--src-prefix=a/", "--dst-prefix=b/")
-    staged = git(top, "diff", "--cached", *fmt)
-    unstaged = git(top, "diff", *fmt)
-    untracked = [
-        p
-        for p in git(top, "ls-files", "--others", "--exclude-standard", "-z").split(
-            b"\0"
-        )
-        if p
-    ]
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        for name, data in (("staged.patch", staged), ("unstaged.patch", unstaged)):
-            ti = tarfile.TarInfo(name)
-            ti.size = len(data)
-            tar.addfile(ti, io.BytesIO(data))
-        for raw in untracked:
-            rel = raw.decode("utf-8", "surrogateescape")
-            path = os.path.join(top, rel)
-            st = os.lstat(path)
-            if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
-                log(f"skipping untracked non-regular file {rel}")
-                continue
-            tar.add(path, arcname=f"untracked/{rel}", recursive=False)
-    data = buf.getvalue()
-    if len(data) > MAX_PAYLOAD_BYTES:
-        die(
-            f"dirty-state payload is {len(data) >> 20} MiB (> {MAX_PAYLOAD_BYTES >> 20}); "
-            "stage/ignore the large untracked files first"
-        )
-    cached_h = sha(git(top, "diff", "--no-ext-diff", "--cached"))
-    work_h = sha(git(top, "diff", "--no-ext-diff", "HEAD"))
-    return data, cached_h, work_h
-
-
-def sync_repo(host: str, top: str, job: str) -> dict:
-    head = git(top, "rev-parse", "HEAD").decode().strip()
-    origin = (
-        git(top, "config", "--get", "remote.origin.url", check=False).decode().strip()
-    )
-    branch = (
-        git(top, "symbolic-ref", "-q", "--short", "HEAD", check=False).decode().strip()
-    )
-    if not origin:
-        die(
-            "this repo has no `origin` remote: review-cli keys run-stats by the origin URL, so "
-            "records produced on the box would not match this checkout and no gate would count "
-            "them; use plain `review` here"
-        )
-    ident = origin
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(top).name) or "repo"
-    slug = f"{hashlib.sha1(ident.encode()).hexdigest()[:12]}-{safe_name}"
-    payload, cached_h, work_h = build_payload(top)
-    cfg = {}
-    for key in DIFF_CONFIG_KEYS:
-        v = git(top, "config", "--get", key, check=False).decode().strip()
-        if v:
-            cfg[key] = v
-    if "core.abbrev" not in cfg:
-        # `index <abbrev>..<abbrev>` lines use an object-count-dependent hash length ("auto"):
-        # the box's near-empty mirror abbreviates to 7 where a big local repo uses 8+, which
-        # changes every index line and so the diff hashes the stamp is checked against.
-        short = git(top, "rev-parse", "--short", "HEAD", check=False).decode().strip()
-        if short:
-            cfg["core.abbrev"] = str(len(short))
-
-    remote_sh(
-        host,
-        f"""set -eu
-R="$HOME/{REMOTE_ROOT}"
-mkdir -p "$R/mirror" "$R/jobs/{job}"
-[ -d "$R/mirror/{slug}.git" ] || git init --bare -q "$R/mirror/{slug}.git"
-# housekeeping (at most hourly, in the background): job checkouts older than 3 days, then
-# mirror refs whose job dir is gone, then a cheap `gc --auto` per mirror
-if [ -z "$(find "$R/.housekeeping" -mmin -60 2>/dev/null)" ]; then
-  touch "$R/.housekeeping"
-  (
-    find "$R/jobs" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {{}} + 2>/dev/null
-    for M in "$R"/mirror/*.git; do
-      git -C "$M" for-each-ref --format='%(refname)' refs/jobs 2>/dev/null | while read -r ref; do
-        [ -d "$R/jobs/${{ref#refs/jobs/}}" ] || git -C "$M" update-ref -d "$ref"
-      done
-      git -C "$M" gc --auto -q 2>/dev/null
-    done
-  ) </dev/null >/dev/null 2>&1 &
-fi
-""",
-    )
-    env = {
-        **os.environ,
-        "GIT_SSH_COMMAND": " ".join(shlex.quote(a) for a in ssh_base(host)[:-1]),
-    }
-    # `host` is appended by git itself; ssh_base()[:-1] is the option list without it.
-    p = subprocess.run(
-        [
-            "git",
-            "-C",
-            top,
-            "-c",
-            "core.hooksPath=/dev/null",
-            "push",
-            "-q",
-            "--force",
-            f"{host}:{REMOTE_ROOT}/mirror/{slug}.git",
-            f"{head}:refs/jobs/{job}",
-        ],
-        env=env,
-        capture_output=True,
-        check=False,
-    )
-    if p.returncode != 0:
-        sys.stderr.write(p.stderr.decode(errors="replace"))
-        die("pushing HEAD to the remote mirror failed", 255)
-
-    q = shlex.quote
-    cfg_lines = "\n".join(f"git config {q(k)} {q(v)}" for k, v in cfg.items())
-    origin_line = f"git remote add origin {q(origin)}" if origin else ":"
-    checkout = (
-        f"git checkout -q -B {q(branch)} FETCH_HEAD"
-        if branch
-        else "git checkout -q --detach FETCH_HEAD"
-    )
-    setup = f"""set -eu
-R="$HOME/{REMOTE_ROOT}"; J="$R/jobs/{job}"; M="$R/mirror/{slug}.git"
-cd "$J"
-mkdir -p payload && tar -xf payload.tar -C payload
-git init -q repo
-cd repo
-printf '%s\\n' "$M/objects" > .git/objects/info/alternates
-git fetch -q --no-tags "$M" refs/jobs/{job}
-{checkout}
-{origin_line}
-{cfg_lines}
-git config user.name review-remote; git config user.email review-remote@localhost
-if [ -s ../payload/staged.patch ]; then git apply --index --binary ../payload/staged.patch; fi
-if [ -s ../payload/unstaged.patch ]; then git apply --binary ../payload/unstaged.patch; fi
-if [ -d ../payload/untracked ]; then cp -a ../payload/untracked/. .; fi
-echo "CACHED $(git diff --no-ext-diff --cached | sha256sum | cut -d' ' -f1)"
-echo "WORK $(git diff --no-ext-diff HEAD | sha256sum | cut -d' ' -f1)"
-echo "HEAD $(git rev-parse HEAD)"
+RUN_SCRIPT = r"""
+set -eu
+%(path)s
+J=$1; ORIGIN=$2; shift 2
+cd "$J/wt"
+git init -q
+git config user.email review-remote@localhost
+git config user.name review-remote
+git remote add origin "$ORIGIN"
+git add -A -f
+git commit -q -m "review-remote snapshot" --no-verify
+git apply --index --binary "$J/patch"
+echo "[review-remote] $(hostname): snapshot $(git rev-parse --short HEAD), $(git diff --cached --numstat | wc -l) file(s) staged" >&2
+set +e
+review diff --staged -C "$J/wt" "$@" </dev/null
+echo $? > "$J/exit"
+exit 0
 """
-    # payload first (stdin), then the setup script.
-    p = subprocess.run(
-        [*ssh_base(host), f'cat > "$HOME/{REMOTE_ROOT}/jobs/{job}/payload.tar"'],
-        input=payload,
-        capture_output=True,
-        check=False,
+
+
+def die(msg: str, code: int = 2) -> "None":
+    print(f"review-remote: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(repo: str, *args: str, binary: bool = False) -> "str | bytes":
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    if r.returncode != 0:
+        die(f"git {' '.join(args)} failed: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout if binary else r.stdout.decode()
+
+
+def ssh(host: str, remote_cmd: str, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run([*SSH, host, remote_cmd], **kw)
+
+
+def probe(host: str) -> tuple[float, str] | None:
+    """(load score, summary) for auto-selection; None when unreachable. Lower = emptier."""
+    script = (
+        f'{REMOTE_PATH}; read l _ < /proc/loadavg; n=$(nproc); '
+        'u=$(review status 2>/dev/null | sed -n "3,16p" | grep -c " usable$"); '
+        'out=$(review jobs --slots 2>/dev/null | grep -m1 "reviews:"); echo "$l $n $u | $out"'
     )
-    if p.returncode != 0:
-        die(
-            f"uploading dirty-state payload failed: {p.stderr.decode(errors='replace').strip()}",
-            255,
-        )
-    out = remote_sh(host, setup).decode()
-    got = dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
-    if (
-        got.get("HEAD") != head
-        or got.get("CACHED") != cached_h
-        or got.get("WORK") != work_h
-    ):
-        die(
-            f"remote checkout is not byte-identical to the local change "
-            f"(HEAD {got.get('HEAD')} vs {head}; cached {got.get('CACHED')} vs {cached_h}; "
-            f"worktree {got.get('WORK')} vs {work_h}) — refusing to review different bytes"
-        )
-    return {"head": head, "cached_hash": cached_h, "origin": origin, "slug": slug}
-
-
-def _lib() -> None:
-    """Make the in-repo `reviewlib` importable (this script lives in <checkout>/scripts/)."""
-    root = str(Path(__file__).resolve().parent.parent)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-
-
-def import_results(host: str, top: str, job: str, meta: dict) -> None:
-    _lib()
-    from reviewlib.install import _touch_review_marker
-    from reviewlib.stats import stats_path
-
-    jdir = f"$HOME/{REMOTE_ROOT}/jobs/{job}"
-    raw = remote_sh(
-        host,
-        f"cat {jdir}/stats.jsonl 2>/dev/null || true",
-        check=False,
-    ).decode()
-    lines = []
-    for line in raw.splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and "duration_seconds" in rec:
-            rec["remote_host"] = host
-            lines.append(json.dumps(rec, separators=(",", ":")))
-    if lines:
-        path = stats_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, ("\n".join(lines) + "\n").encode())
-        finally:
-            os.close(fd)
-    meta["imported_records"] = len(lines)
-    log(f"imported {len(lines)} run-stats record(s) into the local store")
-
-    marker = (
-        remote_sh(host, f"test -f {jdir}/marker && echo yes || true", check=False)
-        .decode()
-        .strip()
-    )
-    meta["marker"] = False
-    if marker == "yes":
-        err = _touch_review_marker()
-        if err:
-            log(f"commit-gate marker NOT written locally: {err}")
-        else:
-            meta["marker"] = True
-            log(
-                "commit-gate marker written by the remote staged review -> touched locally"
-            )
-
-    gp = git(top, "rev-parse", "--git-path", "review-stamp").decode().strip()
-    gpd = git(top, "rev-parse", "--git-path", "review-stamp-diff").decode().strip()
-    local_stamp = Path(gp) if os.path.isabs(gp) else Path(top) / gp
-    local_stamp_diff = Path(gpd) if os.path.isabs(gpd) else Path(top) / gpd
-    meta["stamp"] = False
-    rstamp = remote_sh(
-        host,
-        f'cd {jdir}/repo && cat "$(git rev-parse --git-path review-stamp)" 2>/dev/null || true',
-        check=False,
-    ).decode()
-    if rstamp.strip():
-        rdiff = remote_sh(
-            host,
-            f'cd {jdir}/repo && cat "$(git rev-parse --git-path review-stamp-diff)" 2>/dev/null || true',
-            check=False,
-        )
-        head_now = git(top, "rev-parse", "HEAD").decode().strip()
-        digest_now = sha(git(top, "diff", "--no-ext-diff", "--cached"))
-        first = rdiff.split(b"\n", 1)[0].decode(errors="replace").strip()
-        if rstamp.strip() == digest_now and (not rdiff or first == head_now):
-            local_stamp.write_text(rstamp.strip() + "\n", encoding="utf-8")
-            if rdiff:
-                local_stamp_diff.write_bytes(rdiff)
-            meta["stamp"] = True
-            log(
-                f"review-stamp from the remote staged review installed at {local_stamp}"
-            )
-        else:
-            log(
-                "remote review-stamp NOT installed: it does not match the current local staged diff/HEAD "
-                "(the index changed during the review, or the review was not a passing staged run)"
-            )
-
-
-def run(host: str, req: dict, job: str, jobdir: Path) -> int:
-    """Run one job; meta.json is ALWAYS written (even when a sync refusal, an abort or a crash
-    ends it early) so `status`/`wait` on a detached job can never spin forever or report
-    success for a job that never reviewed anything."""
-    meta = {
-        "job": job,
-        "host": host,
-        "mode": req["mode"],
-        "repo": req["cwd"],
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "args": req["args"],
-        "remote_rc": None,
-    }
     try:
-        return _run(host, req, job, jobdir, meta)
-    except SystemExit as exc:
-        meta["error"] = f"aborted before completion (exit {exc.code})"
-        meta["remote_rc"] = exc.code if isinstance(exc.code, int) else 2
-        raise
-    except KeyboardInterrupt:
-        meta["error"] = "interrupted"
-        meta["remote_rc"] = 130
-        raise
-    except BaseException as exc:
-        meta["error"] = f"{type(exc).__name__}: {exc}"
-        meta["remote_rc"] = 1
-        raise
-    finally:
-        meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        tmp = jobdir / "meta.json.tmp"
-        tmp.write_text(json.dumps(meta, indent=1) + "\n")
-        os.replace(tmp, jobdir / "meta.json")
-
-
-def _run(host: str, req: dict, job: str, jobdir: Path, meta: dict) -> int:
-    top = git(req["cwd"], "rev-parse", "--show-toplevel").decode().strip()
-    meta["repo"] = top
-    log(f"job={job} host={host} repo={top}")
-    info = sync_repo(host, top, job)
-    meta.update(remote_dir=f"~/{REMOTE_ROOT}/jobs/{job}/repo", head=info["head"])
-    jdir = f"$HOME/{REMOTE_ROOT}/jobs/{job}"
-    fwd_env = {k: os.environ[k] for k in FORWARD_ENV if os.environ.get(k)}
-    # A review is ~0.05 cpu of API waiting, but review-cli's host-wide admission gates on the
-    # box's load average — and a build box is routinely at load 30+ from compiles, which parks
-    # every review in a strict-FIFO queue for hours. So review-remote jobs get their OWN
-    # admission lane (a separate registry dir: they never queue behind, or block, the box's
-    # other reviews) and `min_slots` runs in it always start regardless of load. Provider seat
-    # limits (anthropic/zai/... max_concurrent, 429 backoff) still apply inside the lane.
-    fwd_env.setdefault(
-        "REVIEW_ADMISSION_MIN_SLOTS", os.environ.get("REVIEW_REMOTE_MIN_SLOTS", "12")
-    )
-    fwd = " ".join(f"{k}={shlex.quote(v)}" for k, v in fwd_env.items())
-    argv = " ".join(shlex.quote(a) for a in req["args"])
-    cmd = (
-        f'J="{jdir}"; cd "$J/repo" && exec env REVIEW_STATS_FILE="$J/stats.jsonl" '
-        f'REVIEW_MARKER="$J/marker" REVIEW_ADMISSION_DIR="{LANE_DIR}" {fwd} '
-        f'review {shlex.quote(req["mode"])} -C "$J/repo" {argv}'
-    )
-    log(
-        f"dispatching `review {req['mode']}` on {host} (remote admission queue, not the local one)"
-    )
-    stdin = subprocess.DEVNULL if sys.stdin.isatty() else None
-    proc = subprocess.Popen(
-        [*ssh_base(host), cmd],
-        stdin=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=False,
-    )
-
-    def _abort(_sig, _frm):
-        proc.terminate()
-        subprocess.run(
-            [*ssh_base(host), f'pkill -TERM -f -- "-C {jdir}/repo" || true'],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, _abort)
-    signal.signal(signal.SIGTERM, _abort)
-    sink = open(jobdir / "review.out", "wb")  # noqa: SIM115 — closed after the pumps join
-
-    def pump(src, dst, keep):
-        for chunk in iter(lambda: src.read1(65536), b""):
-            dst.buffer.write(chunk)
-            dst.buffer.flush()
-            if keep:
-                sink.write(chunk)
-                sink.flush()
-
-    ts = [
-        threading.Thread(target=pump, args=(proc.stdout, sys.stdout, True)),
-        threading.Thread(target=pump, args=(proc.stderr, sys.stderr, False)),
-    ]
-    for t in ts:
-        t.start()
-    rc = proc.wait()
-    for t in ts:
-        t.join()
-    sink.close()
-    meta["remote_rc"] = rc
-    if req["output"] and rc not in (2, 255):
-        # Same contract as `review -o`: persisted text is ANSI-stripped, and a usage error or a
-        # dropped connection never truncates an existing target.
-        _lib()
-        from reviewlib.cli import _write_output_file
-
-        _write_output_file(
-            Path(req["output"]).expanduser(),
-            (jobdir / "review.out").read_text(encoding="utf-8", errors="replace"),
-        )
-    if rc == 255:
-        log(
-            "ssh connection failed/dropped; the remote review may still be running — "
-            f"results stay in ~/{REMOTE_ROOT}/jobs/{job} on {host}"
-        )
-    else:
-        import_results(host, top, job, meta)
-    log(
-        f"done rc={rc}; remote job dir ~/{REMOTE_ROOT}/jobs/{job} on {host}; "
-        f"local record {jobdir}/meta.json, stdout {jobdir}/review.out"
-    )
-    return rc
-
-
-def _rc_of(meta: dict) -> int:
-    """A job with no recorded remote exit code did NOT succeed (never report 0 for it)."""
-    rc = meta.get("remote_rc")
-    return 1 if rc is None else rc
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
+        r = ssh(host, script, capture_output=True, text=True, timeout=40)
+    except subprocess.TimeoutExpired:
+        return None
+    if r.returncode != 0 or "|" not in r.stdout:
+        return None
+    head, _, tail = r.stdout.partition("|")
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        load, ncpu, usable = head.split()
+        if int(usable) < 2:  # fewer than two usable seats cannot make a quorum
+            return None
+        running = waiting = 0
+        if "running" in tail:
+            words = tail.replace(",", " ").split()
+            running = int(words[words.index("running") - 1])
+            waiting = int(words[words.index("waiting") - 1]) if "waiting" in words else 0
+        score = waiting * 3 + running + float(load) / float(ncpu) * 4
+    except (ValueError, IndexError):
+        return None
+    return score, f"load {load}/{ncpu}cpu,{tail.strip() or 'reviews: ?'}"
 
 
-def job_dir(job: str) -> Path:
-    if not JOB_RE.fullmatch(job):
-        die(f"invalid job id {job!r}")
-    return STATE_DIR / "jobs" / job
+def pick_host(spec: str) -> str:
+    if spec in HOSTS:
+        return HOSTS[spec]
+    if spec != "auto":
+        return spec
+    best: tuple[float, str] | None = None
+    for name, host in HOSTS.items():
+        p = probe(host)
+        print(f"[review-remote] probe {name}: {p[1] if p else 'skipped (unreachable or <2 usable seats; see `ssh HOST review status`)'}", file=sys.stderr)
+        if p and (best is None or p[0] < best[0]):
+            best = (p[0], host)
+    if best is None:
+        die("no remote host reachable", 3)
+    return best[1]
 
 
-def cmd_status(job: str) -> int:
-    d = job_dir(job)
-    if not d.is_dir():
-        die(f"unknown job {job}")
-    m = d / "meta.json"
-    if m.exists():
-        text = m.read_text()
-        print(text, end="")
-        return _rc_of(json.loads(text))
-    pid_file = d / "pid"
-    if pid_file.exists() and not _pid_alive(int(pid_file.read_text() or 0)):
-        if m.exists():  # finished between the two checks
-            return cmd_status(job)
-        print(f"job {job}: DIED without recording a result (log {d}/out.log)")
-        return 1
-    print(f"job {job}: running (log {d}/out.log)")
-    return 0
+def split_args(rest: list[str]) -> tuple[list[str], str | None, str | None]:
+    """Passthrough args for `review diff`, plus the local -o target and the --task code."""
+    out: list[str] = []
+    output = task = None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        flag, eq, val = a.partition("=")
+        if flag in DROP_WITH_VALUE:
+            if not eq:
+                i += 1
+                val = rest[i] if i < len(rest) else ""
+            if flag in ("-o", "--output"):
+                output = val
+        elif a in DROP_BARE:
+            pass
+        else:
+            out.append(a)
+            if flag == "--task":
+                if eq:
+                    task = val
+                elif i + 1 < len(rest):
+                    task = rest[i + 1]
+        i += 1
+    return out, output, task
 
 
-def cmd_wait(job: str) -> int:
-    d = job_dir(job)
-    if not d.is_dir():
-        die(f"unknown job {job}")
-    pid_file = d / "pid"
-    while not (d / "meta.json").exists():
-        if pid_file.exists() and not _pid_alive(int(pid_file.read_text() or 0)):
-            if (d / "meta.json").exists():
-                break
-            die(f"job {job} died without recording a result (see {d}/out.log)", 1)
-        time.sleep(5)
-    print((d / "out.log").read_text(errors="replace"), end="")
-    return _rc_of(json.loads((d / "meta.json").read_text()))
+def load_waiting_job(job_id: str) -> dict:
+    p = Path.home() / ".cache/review-cli/jobs" / f"{job_id}.json"
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        die(f"no such detached job: {job_id}")
+    if data.get("status") != "running" or data.get("admission") != "waiting":
+        die(f"job {job_id} is not waiting in the admission queue (status={data.get('status')}, "
+            f"admission={data.get('admission')}); leave it to run locally")
+    if data.get("argv", [None])[0] != "diff":
+        die("only `review diff` jobs can be taken over")
+    return data
+
+
+def load_job_safe(job_id: str) -> dict | None:
+    try:
+        return json.loads((Path.home() / ".cache/review-cli/jobs" / f"{job_id}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def finish_job(job: dict, rc: int, host: str, report: str | None) -> None:
+    """Retire the local queue entry of a job whose review ran remotely: stop the waiting
+    process, then mark the job record done so `review wait/status` and the agent that is
+    polling its result file see a finished job. Does nothing when the local run got admitted
+    in the meantime (the local run then wins)."""
+    jid, pid = job["job_id"], job.get("pid")
+    now = load_job_safe(jid)
+    if now is None or now.get("admission") != "waiting":
+        print(f"[review-remote] job {jid} was admitted locally meanwhile; left running", file=sys.stderr)
+        return
+    if isinstance(pid, int):
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()
+        except OSError:
+            cmd = ""
+        if "reviewlib" in cmd or "review" in cmd:
+            try:
+                os.kill(pid, 15)
+            except PermissionError:
+                print(f"[review-remote] cannot signal pid {pid} from this environment: job {jid} stays queued "
+                      f"and will still run locally; the remote report is at {report}", file=sys.stderr)
+                return
+            for _ in range(40):
+                if not Path(f"/proc/{pid}").exists():
+                    break
+                time.sleep(0.25)
+    review_src = Path(os.path.realpath(Path.home() / ".local/bin/review")).parent.parent
+    sys.path.insert(0, str(review_src))
+    from reviewlib import jobs  # type: ignore[import-not-found]
+
+    jobs.write_job(
+        jid,
+        status="done" if rc == 0 else "failed",
+        exit_code=rc,
+        finished_at=time.time(),
+        admission=f"ran-remotely:{host}",
+        queue_position=0,
+    )
+    if report and Path(report).exists():
+        Path(report).replace(job["result_path"])
+    print(f"[review-remote] job {jid}: local queue entry cancelled, marked done (exit {rc})", file=sys.stderr)
 
 
 def main() -> int:
-    argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__)
-        return 0 if argv else 2
-    if argv[0] == "status" and len(argv) == 2:
-        return cmd_status(argv[1])
-    if argv[0] == "wait" and len(argv) == 2:
-        return cmd_wait(argv[1])
-    if argv[0] == "queue":
-        # The box-side view of THIS wrapper's admission lane (who runs / waits there).
-        host = os.environ.get("REVIEW_REMOTE", "").strip() or die(
-            "REVIEW_REMOTE is not set"
-        )
-        out = remote_sh(
-            host, f'REVIEW_ADMISSION_DIR="{LANE_DIR}" review jobs 2>&1', check=False
-        )
-        sys.stdout.write(out.decode(errors="replace"))
-        return 0
-    if argv[0] == "jobs":
-        for d in (
-            sorted((STATE_DIR / "jobs").glob("*"))
-            if (STATE_DIR / "jobs").is_dir()
-            else []
-        ):
-            print(d.name, "done" if (d / "meta.json").exists() else "running")
-        return 0
-    if argv[0] in LOCAL_ONLY:
-        die(
-            f"`review {argv[0]}` reads the local store; run it as plain `review {argv[0]} ...` "
-            "(imported remote records are already there)"
-        )
-    if argv[0] not in MODES:
-        die(f"unsupported mode {argv[0]!r}; supported: {', '.join(sorted(MODES))}")
-    host = os.environ.get("REVIEW_REMOTE", "").strip()
-    if not host:
-        die("REVIEW_REMOTE is not set (e.g. export REVIEW_REMOTE=ultra@65.21.40.51)")
-    req = parse_args(argv)
-    if req["refused"]:
-        die(
-            f"{', '.join(sorted(set(req['refused'])))} cannot run through review-remote: "
-            "`--commit` would checkpoint-commit inside the box's throwaway checkout, and "
-            "`--visual`/`--before` name local image files the box cannot read; run plain "
-            "`review` for those"
-        )
-    job = os.environ.get("REVIEW_REMOTE_JOB") or (
-        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default="auto")
+    ap.add_argument("--range", dest="rng")
+    ap.add_argument("-C", dest="cwd", default=".")
+    ap.add_argument("--record-local", action="store_true")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--take-job", metavar="JOB_ID", help="take over a WAITING detached local job (see `review jobs`)")
+    ap.add_argument("-o", "--output", dest="output")
+    ap.add_argument("rest", nargs=argparse.REMAINDER)
+    ns = ap.parse_args()
+    rest = ns.rest[1:] if ns.rest[:1] == ["--"] else ns.rest
+    job: dict | None = None
+    if ns.take_job:
+        job = load_waiting_job(ns.take_job)
+        jargv = job["argv"][1:]
+        rv_args, out_file, task = split_args(jargv)
+        ns.cwd = job["cwd"]
+        for i, a in enumerate(jargv):
+            if a in ("-C", "--cwd") and i + 1 < len(jargv):
+                ns.cwd = str((Path(job["cwd"]) / jargv[i + 1]).resolve())
+        out_file = str(job["result_path"]) + ".remote"
+        ns.record_local = True
+    else:
+        rv_args, out_file, task = split_args(rest)
+        out_file = ns.output or out_file
+    task = task or os.environ.get("REVIEW_TASK_CODE")
+    if "--task" not in rv_args and task:
+        rv_args += ["--task", task]
+
+    repo = str(git(ns.cwd, "rev-parse", "--show-toplevel")).strip()
+    origin = str(git(repo, "remote", "get-url", "origin")).strip()
+    if ns.rng:
+        three = "..." in ns.rng
+        a, sep, b = ns.rng.partition("..." if three else "..")
+        if not sep or not a or not b:
+            die("--range wants A..B or A...B (A...B = merge-base(A,B)..B, no stale-base noise)")
+        head = str(git(repo, "rev-parse", f"{b}^{{commit}}")).strip()
+        base = str(git(repo, "rev-parse", f"{a}^{{commit}}")).strip()
+        if three:
+            base = str(git(repo, "merge-base", base, head)).strip()
+        patch = git(repo, "diff", "--binary", base, head, binary=True)
+    else:
+        base = str(git(repo, "rev-parse", "HEAD")).strip()
+        patch = git(repo, "diff", "--cached", "--binary", binary=True)
+    if not patch:
+        die("empty diff: nothing staged (git add the change, or pass --range A..B)")
+
+    host = pick_host(ns.host)
+    rjob = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    jdir = f".cache/review-remote/{rjob}"  # relative to remote $HOME
+    print(
+        f"[review-remote] host={host} repo={Path(repo).name} base={base[:9]} "
+        f"diff={len(patch)} bytes job={rjob} args={' '.join(rv_args) or '(default board)'}",
+        file=sys.stderr,
     )
-    jobdir = job_dir(job)
-    jobdir.mkdir(parents=True, exist_ok=True)
-    if req["detach"]:
-        # `-C`/`-o` go right after the mode so a user `--` separator in req["args"] can't turn
-        # them into positionals.
-        child_argv = [
-            sys.executable,
-            os.path.abspath(__file__),
-            req["mode"],
-            "-C",
-            req["cwd"],
-        ]
-        if req["output"]:
-            child_argv += ["-o", req["output"]]
-        child_argv += req["args"]
-        env = {**os.environ, "REVIEW_REMOTE_JOB": job}
-        # A piped/redirected diff on stdin is spooled NOW (the child has no terminal and must
-        # not silently review the working tree instead of the diff the caller piped). With an
-        # explicit --staged/--diff source `review` never reads stdin, so neither do we; and an
-        # open pipe that never delivers is abandoned after a short idle wait (like `review`).
-        child_stdin = subprocess.DEVNULL
-        spool = None
-        explicit_source = any(a in ("--staged", "--diff") for a in req["args"])
-        if (
-            not explicit_source
-            and not os.isatty(0)
-            and not stat.S_ISCHR(os.fstat(0).st_mode)
-        ):
-            data = _read_stdin_bounded()
-            if data:
-                (jobdir / "stdin.diff").write_bytes(data)
-                spool = open(jobdir / "stdin.diff", "rb")  # noqa: SIM115 — closed below
-                child_stdin = spool
-        with open(jobdir / "out.log", "ab") as out:
-            child = subprocess.Popen(
-                child_argv,
-                stdin=child_stdin,
-                stdout=out,
-                stderr=out,
-                start_new_session=True,
-                env=env,
-            )
-        if spool:
-            spool.close()
-        (jobdir / "pid").write_text(str(child.pid))
-        print(
-            f"job-id: {job}\nlog: {jobdir}/out.log\npoll: review-remote status {job}   |   review-remote wait {job}"
-        )
+    if ns.dry_run:
         return 0
-    # Convert a plain SIGTERM into a normal exit so meta.json records the abort.
-    signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(143))
-    return run(host, req, job, jobdir)
+
+    t0 = datetime.now(timezone.utc)
+    Path.home().joinpath(".cache/review-remote").mkdir(parents=True, exist_ok=True)
+    # 1+2: snapshot + patch
+    tar = subprocess.Popen(["git", "-C", repo, "archive", "--format=tar", base], stdout=subprocess.PIPE)
+    r = ssh(host, f'mkdir -p "$HOME/{jdir}/wt" && tar -x -C "$HOME/{jdir}/wt"', stdin=tar.stdout)
+    tar.stdout.close()
+    if tar.wait() != 0 or r.returncode != 0:
+        die("snapshot upload failed", 4)
+    r = ssh(host, f'cat > "$HOME/{jdir}/patch"', input=patch)
+    if r.returncode != 0:
+        die("patch upload failed", 4)
+
+    # 3: run (stdout/stderr stream through)
+    cmd = f'bash -s -- "$HOME/{jdir}" {shlex.quote(origin)} ' + " ".join(shlex.quote(a) for a in rv_args)
+    script = RUN_SCRIPT % {"path": REMOTE_PATH}
+    with tempfile.TemporaryFile() as captured:
+        p = subprocess.Popen([*SSH, host, cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
+        assert p.stdin and p.stdout
+        p.stdin.write(script.encode())
+        p.stdin.close()
+        for chunk in iter(lambda: p.stdout.read(4096), b""):
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            captured.write(chunk)
+        ssh_rc = p.wait()
+        if out_file:
+            captured.seek(0)
+            Path(out_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            Path(out_file).expanduser().write_bytes(captured.read())
+
+    exit_r = ssh(host, f'cat "$HOME/{jdir}/exit" 2>/dev/null', capture_output=True, text=True)
+    try:
+        rc = int(exit_r.stdout.strip())
+    except ValueError:
+        rc = ssh_rc or 1
+        print("[review-remote] remote exit code unreadable; the run did not finish", file=sys.stderr)
+
+    # 4: bring the gate record(s) home — but only while the local queue entry is still waiting;
+    # a job the local queue admitted meanwhile keeps its own run, result file and record.
+    if job is not None and (load_job_safe(job["job_id"]) or {}).get("admission") != "waiting":
+        print(f"[review-remote] job {job['job_id']} was admitted locally meanwhile: local run wins; "
+              f"remote report left at {out_file}, nothing recorded or overwritten", file=sys.stderr)
+        job = None
+    elif ns.record_local:
+        n = import_records(host, t0, task)
+        print(f"[review-remote] recorded {n} run-stats record(s) locally (remote_host={host})", file=sys.stderr)
+    if job is not None:
+        finish_job(job, rc, host, out_file)
+
+    # 5: cleanup
+    if not ns.keep:
+        ssh(host, f'rm -rf "$HOME/{jdir}"')
+    else:
+        print(f"[review-remote] kept {host}:~/{jdir}", file=sys.stderr)
+    return rc
+
+
+def import_records(host: str, since: datetime, task: str | None) -> int:
+    r = ssh(host, 'tail -n 200 "$HOME/.config/review-cli/run-stats.jsonl"', capture_output=True, text=True)
+    local = Path(os.environ.get("REVIEW_STATS_FILE") or Path.home() / ".config/review-cli/run-stats.jsonl").expanduser()
+    existing = local.read_text() if local.exists() else ""
+    fresh: list[str] = []
+    for line in r.stdout.splitlines():
+        try:
+            rec = json.loads(line)
+            ts = datetime.fromisoformat(rec["ts"])
+        except (ValueError, KeyError):
+            continue
+        if ts < since or (task and rec.get("task_code") != task) or not rec.get("task_code"):
+            continue
+        rec["remote_host"] = host
+        out = json.dumps(rec, separators=(",", ":"))
+        if out not in existing:
+            fresh.append(out)
+    if fresh:
+        fd = os.open(str(local), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, ("\n".join(fresh) + "\n").encode())
+        finally:
+            os.close(fd)
+    return len(fresh)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
