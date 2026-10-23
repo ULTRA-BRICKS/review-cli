@@ -140,3 +140,15 @@ def _isolate_admission(tmp_path, monkeypatch):
     admission.reset_for_tests()
     yield
     admission.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _disable_taskref_backend_validation(monkeypatch):
+    """Default every test to permissive task-code shape checks (review-cli#427).
+
+    Backend validation via ``agenttools_taskref`` is opt-in under pytest so the
+    existing synthetic placeholders (``TEST-1``, ``CODE``, …) keep working without
+    mocking ``gh``. Tests that exercise validation set ``REVIEW_TASKREF_VALIDATE=1``
+    explicitly.
+    """
+    monkeypatch.setenv("REVIEW_TASKREF_VALIDATE", "0")

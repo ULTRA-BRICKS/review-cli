@@ -3,6 +3,27 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.61.0 — 2026-10-23
+
+- **Feat(task): a recording run checks `--task CODE` against the repo's tracker**
+  ([review-cli#427](https://git.hyperide.ai/ultrabricks/review-cli/issues/427)). With the
+  agent-tools `agenttools_taskref` lib installed, `review <mode> --task CODE` (or
+  `$REVIEW_TASK_CODE`) asks it whether the code is real before recording the run, and exits 2
+  on an invented code with the lib's `task find` / `task new` guidance. The code is recorded
+  as written, not rewritten to the lib's canonical form. The lib knows GitHub issues and
+  Linear only:
+  - a repo that declares another backend (`rig.yaml` `task.backend: forgejo`, as this one
+    does) gets the shape check only, and stderr says why. Without this, the lib rejects
+    every code there, `#608` included;
+  - so does a GitHub-issues repo that takes its repo from `origin` (the lib's default)
+    when `origin` is not on github.com or is missing, a run where the lib raises, and a
+    GitHub number `gh` gave no verdict on (missing, unauthenticated or offline: the lib's
+    "could not verify" answers). A bad shape, a 404 or any other answer is still refused;
+  - without the lib, every run gets the shape check only, as before;
+  - `review task CODE` and `review task CODE --check` read history and keep the shape check;
+  - `REVIEW_TASKREF_VALIDATE=0` turns tracker validation off; `tests/conftest.py` and
+    `tests/smoke.py` set it so the suites' synthetic codes stay valid.
+
 ## 0.60.0 — 2026-10-23
 
 - **Feat(task): `review task CODE --export`, `--import FILE|-` and `--import-from USER@HOST`
@@ -126,7 +147,6 @@ semantic versioning.
   call with a provider reading; the dashboard and `review stat` read it, falling back to
   the old stdout usage line for older logs. The call-log cache re-parses once (parser
   version 3).
-
 
 ## 0.54.0 — 2026-10-23
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyper-review"
-version = "0.60.0"
+version = "0.61.0"
 description = "Multi-model read-only code review + AI panels."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -44,6 +44,12 @@ dashboard = []
 # (the direct installer). Install editable from the agent-tools checkout to enable delegation:
 #   pip install -e <agent-tools>/lib/agenttools_rig_delegate
 rig-delegate = []
+# `review diff --task CODE` validates codes against the repo's tracker backend via the
+# shared `agenttools_taskref` lib (agent-tools#607). It is an IN-ECOSYSTEM dependency,
+# not on PyPI. When absent, review-cli falls back to shape-only normalization (permissive).
+# Install editable from the agent-tools checkout to enable backend validation:
+#   pip install -e <agent-tools>/lib/agenttools_taskref
+taskref = []
 
 # Stage 0 (decomposition) packaging — see docs/architecture-visual-verification.md §8.1, D8.
 # The CLI is now a real package (`reviewlib`), so it is exposed via a proper console

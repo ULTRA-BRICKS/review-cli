@@ -114,6 +114,7 @@ from .stats import (
     run_id_for,
     task_summaries,
 )
+from .taskref import resolve_task_code
 
 if TYPE_CHECKING:
     from agenttools_service import ServiceManager
@@ -1557,6 +1558,8 @@ def _task_subcommand(rest: list[str]) -> int:
             )
         return 0
 
+    # History lookup reads what was recorded; it does not record, so it keeps the shape-only
+    # check (like --check above) and stays usable for codes recorded before #427.
     try:
         code = normalize_task_code(ns.code)
     except ValueError as exc:
@@ -6047,6 +6050,11 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TASKREF_VALIDATE=0           — skip checking --task CODE against the repo's tracker via the
+                                          optional agenttools_taskref lib (shape check only; `0`, also
+                                          `false`/`no`/`off`; any other value keeps it on). An invented
+                                          code exits 2. Repos whose backend the lib lacks (forgejo)
+                                          get the shape check only, with a note.
     REVIEW_HEALTH_PREFLIGHT=0           — skip the automatic pre-dispatch seat health check
                                           (`review help health`).
     REVIEW_HEALTH_TTL_SECONDS=N         — how long a successful probe answers for the pre-dispatch
@@ -7491,8 +7499,9 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     )
     if requires_task_code:
         raw_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
+        task_repo = _effective_cwd(args.cwd, warn=False) if raw_task else None
         try:
-            task_code = normalize_task_code(raw_task)
+            task_code = resolve_task_code(raw_task, task_repo)
         except ValueError as exc:
             print(
                 f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True

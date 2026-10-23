@@ -48,6 +48,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
         "test_stdin_silent_pipe.py",
+        "test_taskref.py",
         "test_tui_pty.py",
     }
 )
@@ -85,6 +86,9 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "REVIEW_ADMISSION_DIR": str(Path(home) / "admission"),
         # no pre-dispatch seat probe against the stub CLIs smoke drives (review-cli#663)
         "REVIEW_HEALTH_PREFLIGHT": "0",
+        # Synthetic codes (SMOKE-1, TEST-1, ...) must not hit a real tracker (review-cli#427);
+        # test_taskref.py turns validation back on per test.
+        "REVIEW_TASKREF_VALIDATE": "0",
     }
     full_env.update(env or {})
     return full_env
@@ -959,6 +963,9 @@ _UNIT_FILES = [
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Backend-aware --task validation (review-cli#427). Skips lib-dependent
+    # checks when agent-tools is not checked out beside review-cli (CI).
+    ("test_taskref.py", {}),
     # Diff-identity binding (review-cli#213): repo/diff mismatch detection for
     # `review task CODE --check`'s self-merge-authority gate.
     ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
