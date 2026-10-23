@@ -515,6 +515,9 @@ def run(host: str, req: dict, job: str, jobdir: Path) -> int:
         "remote_rc": None,
     }
     try:
+        # Detached children get this written by the launcher too (same pid); a foreground run
+        # needs it so `status`/`wait` can tell a killed job from a running one.
+        _write_pid(jobdir, os.getpid())
         return _run(host, req, job, jobdir, meta)
     except SystemExit as exc:
         meta["error"] = f"aborted before completion (exit {exc.code})"
@@ -646,6 +649,43 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _write_pid(jobdir: Path, pid: int) -> None:
+    """Replace `pid` atomically: a poller must never see the empty file a plain rewrite leaves."""
+    if _read_pid(jobdir) == pid:
+        return
+    # one temp name per writer process: launcher and child may race to record the same pid
+    tmp = jobdir / f"pid.{os.getpid()}.tmp"
+    tmp.write_text(str(pid))
+    os.replace(tmp, jobdir / "pid")
+
+
+def _read_pid(jobdir: Path) -> int | None:
+    """The recorded pid, or None when there is none yet (missing/empty/garbled = unknown)."""
+    try:
+        return int((jobdir / "pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _job_died(jobdir: Path) -> bool:
+    """True only when a recorded pid is no longer alive."""
+    pid = _read_pid(jobdir)
+    return pid is not None and not _pid_alive(pid)
+
+
+def _job_log(jobdir: Path) -> Path:
+    """Detached jobs log to out.log; a foreground job's stdout is review.out."""
+    for name in ("out.log", "review.out"):
+        if (jobdir / name).exists():
+            return jobdir / name
+    return jobdir / "out.log"
+
+
+def _job_output(jobdir: Path) -> str:
+    log_file = _job_log(jobdir)
+    return log_file.read_text(errors="replace") if log_file.exists() else ""
+
+
 def job_dir(job: str) -> Path:
     if not JOB_RE.fullmatch(job):
         die(f"invalid job id {job!r}")
@@ -661,13 +701,12 @@ def cmd_status(job: str) -> int:
         text = m.read_text()
         print(text, end="")
         return _rc_of(json.loads(text))
-    pid_file = d / "pid"
-    if pid_file.exists() and not _pid_alive(int(pid_file.read_text() or 0)):
+    if _job_died(d):
         if m.exists():  # finished between the two checks
             return cmd_status(job)
-        print(f"job {job}: DIED without recording a result (log {d}/out.log)")
+        print(f"job {job}: DIED without recording a result (log {_job_log(d)})")
         return 1
-    print(f"job {job}: running (log {d}/out.log)")
+    print(f"job {job}: running (log {_job_log(d)})")
     return 0
 
 
@@ -675,14 +714,13 @@ def cmd_wait(job: str) -> int:
     d = job_dir(job)
     if not d.is_dir():
         die(f"unknown job {job}")
-    pid_file = d / "pid"
     while not (d / "meta.json").exists():
-        if pid_file.exists() and not _pid_alive(int(pid_file.read_text() or 0)):
+        if _job_died(d):
             if (d / "meta.json").exists():
                 break
-            die(f"job {job} died without recording a result (see {d}/out.log)", 1)
+            die(f"job {job} died without recording a result (see {_job_log(d)})", 1)
         time.sleep(5)
-    print((d / "out.log").read_text(errors="replace"), end="")
+    print(_job_output(d), end="")
     return _rc_of(json.loads((d / "meta.json").read_text()))
 
 
@@ -691,10 +729,12 @@ def main() -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0 if argv else 2
-    if argv[0] == "status" and len(argv) == 2:
-        return cmd_status(argv[1])
-    if argv[0] == "wait" and len(argv) == 2:
-        return cmd_wait(argv[1])
+    if argv[0] in ("status", "wait"):
+        if len(argv) != 2:
+            die(
+                f"`review-remote {argv[0]}` takes exactly one job id (from `--detach`, or `review-remote jobs`)"
+            )
+        return cmd_status(argv[1]) if argv[0] == "status" else cmd_wait(argv[1])
     if argv[0] == "queue":
         # The box-side view of THIS wrapper's admission lane (who runs / waits there).
         host = os.environ.get("REVIEW_REMOTE", "").strip() or die(
@@ -778,7 +818,7 @@ def main() -> int:
             )
         if spool:
             spool.close()
-        (jobdir / "pid").write_text(str(child.pid))
+        _write_pid(jobdir, child.pid)
         print(
             f"job-id: {job}\nlog: {jobdir}/out.log\npoll: review-remote status {job}   |   review-remote wait {job}"
         )

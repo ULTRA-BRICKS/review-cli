@@ -12,6 +12,8 @@ semantic versioning.
   with per-job stats/marker files, then imports the box's run-stats records, commit-gate marker
   and diff-scoped review-stamp so `review task --check`, `gh ship` and the pre-commit gates work
   unchanged. See README "`scripts/review-remote`". ([review-cli#656](https://git.hyperide.ai/ultrabricks/review-cli/issues/656))
+  `review-remote wait`/`status` without exactly one job id is a usage error (never a second run), and a
+  foreground job records its pid so `wait` on a killed job ends instead of spinning.
 
 ## 0.57.0 — 2026-10-23
 

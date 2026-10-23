@@ -257,6 +257,185 @@ def test_import_installs_records_marker_and_stamp_only_when_they_match():
         assert meta["marker"] is False and not marker.exists()
         assert meta["imported_records"] == 0
 
+        # the box's review wrote no stamp (not a passing staged run): nothing is installed,
+        # so the commit gate keeps blocking an unreviewed diff
+        _stub_remote(rr, {})
+        meta = {}
+        with (
+            _env(REVIEW_STATS_FILE=str(stats), REVIEW_MARKER=str(marker)),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            rr.import_results("box", str(root), "20261022T182746Z-33b75c", meta)
+        assert meta["stamp"] is False and not stamp.exists()
+
+
+def _main_exit(rr, argv: list[str]) -> tuple[int, str]:
+    """Run rr.main() with argv, returning (exit code, stderr); any ssh/git work is a failure."""
+
+    def boom(*_a, **_k):
+        raise AssertionError(
+            "review-remote touched the box for an invalid command line"
+        )
+
+    rr.run = boom
+    rr.remote_sh = boom
+    saved = sys.argv
+    sys.argv = ["review-remote", *argv]
+    err = io.StringIO()
+    try:
+        with _env(REVIEW_REMOTE="box"), contextlib.redirect_stderr(err):
+            try:
+                code = rr.main()
+            except SystemExit as exc:
+                code = exc.code
+    finally:
+        sys.argv = saved
+    return code, err.getvalue()
+
+
+def test_job_subcommands_without_a_job_id_are_usage_errors_not_runs():
+    # `review-remote wait` (no id) used to fall through to the mode check; it must say what
+    # is missing and never dispatch a run.
+    rr = _load()
+    for sub in ("wait", "status"):
+        code, err = _main_exit(rr, [sub])
+        assert code == 2, (sub, code, err)
+        assert "job id" in err and sub in err, err
+    code, err = _main_exit(rr, ["wait", "20261022T182746Z-33b75c", "extra"])
+    assert code == 2 and "job id" in err, err
+    code, err = _main_exit(rr, ["nonsense"])
+    assert code == 2 and "unsupported mode" in err, err
+
+
+def test_foreground_run_records_its_pid_so_a_killed_job_does_not_wait_forever():
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        jobdir = Path(td)
+        seen = {}
+
+        def fake_run(_host, _req, _job, jd, _meta):
+            seen["pid"] = (jd / "pid").read_text() if (jd / "pid").exists() else None
+            return 0
+
+        rr._run = fake_run
+        rr.run("box", {"mode": "diff", "cwd": td, "args": []}, "j", jobdir)
+        assert seen["pid"] == str(os.getpid())
+
+
+def _job_in(rr, td: str, job: str = "20261022T182746Z-33b75c") -> Path:
+    rr.STATE_DIR = Path(td)
+    d = Path(td) / "jobs" / job
+    d.mkdir(parents=True)
+    return d
+
+
+def test_empty_pid_file_is_unknown_not_dead():
+    # a child rewriting `pid` empties it for an instant; a poller must not call that a death
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        d = _job_in(rr, td)
+        (d / "pid").write_text("")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = rr.cmd_status(d.name)
+        assert rc == 0 and "running" in out.getvalue() and "DIED" not in out.getvalue()
+
+
+def test_dead_job_with_pid_file_and_no_result_ends_wait_with_failure():
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        d = _job_in(rr, td)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (d / "pid").write_text(str(dead.pid))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                rr.cmd_wait(d.name)
+            except SystemExit as exc:
+                assert exc.code == 1 and "died" in err.getvalue()
+            else:
+                raise AssertionError("wait returned for a job that never finished")
+
+
+def test_wait_on_a_finished_foreground_job_prints_its_review_output():
+    # foreground jobs keep their output in review.out (only detached ones have out.log)
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        d = _job_in(rr, td)
+        (d / "review.out").write_text("the findings\n")
+        (d / "meta.json").write_text(json.dumps({"remote_rc": 0}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = rr.cmd_wait(d.name)
+        assert rc == 0 and "the findings" in out.getvalue()
+
+
+def test_a_failing_pid_write_still_leaves_a_result_for_wait():
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        jobdir = Path(td)
+
+        def no_pid(*_a, **_k):
+            raise OSError("disk full")
+
+        rr._write_pid = no_pid
+        try:
+            rr.run("box", {"mode": "diff", "cwd": td, "args": []}, "j", jobdir)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("the OSError was swallowed")
+        meta = json.loads((jobdir / "meta.json").read_text())
+        assert meta["remote_rc"] == 1 and "disk full" in meta["error"]
+
+
+def test_concurrent_pid_writers_never_collide_on_a_shared_temp_file():
+    # the detached launcher and its child both record the pid; two os.replace calls over one
+    # fixed temp path made the loser die with FileNotFoundError
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        code = (
+            "import importlib.machinery as m, importlib.util as u, sys, pathlib\n"
+            f"l = m.SourceFileLoader('rr', {str(SCRIPT)!r}); mod = u.module_from_spec(u.spec_from_loader('rr', l)); l.exec_module(mod)\n"
+            "d = pathlib.Path(sys.argv[1]); base = int(sys.argv[2])\n"
+            "for i in range(300):\n"
+            "    mod._write_pid(d, base + i)\n"
+        )
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(d), str(1000 * (n + 1))],
+                stderr=subprocess.PIPE,
+            )
+            for n in range(6)
+        ]
+        errs = [p.communicate()[1].decode() for p in procs]
+        assert all(p.returncode == 0 for p in procs), errs
+        assert rr._read_pid(d) is not None
+        assert not list(d.glob("pid.*tmp")) and not (d / "pid.tmp").exists()
+
+
+def test_status_and_wait_name_the_log_file_the_job_really_has():
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        d = _job_in(rr, td)
+        (d / "review.out").write_text("partial\n")
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (d / "pid").write_text(str(dead.pid))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert rr.cmd_status(d.name) == 1
+        assert "review.out" in out.getvalue() and "out.log" not in out.getvalue()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                rr.cmd_wait(d.name)
+            except SystemExit:
+                pass
+        assert "review.out" in err.getvalue() and "out.log" not in err.getvalue()
+
 
 if __name__ == "__main__":
     failures = 0
