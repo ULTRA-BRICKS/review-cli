@@ -709,6 +709,8 @@ _FRESH_TMP = object()
 _UNIT_FILES = [
     ("test_dashboard_service.py", {}),
     ("test_dashboard.py", {}),
+    ("test_capacity_check.py", {}),
+    ("test_capacity_check_contract.py", {}),
     ("test_streaming.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # review-cli#221: run_board_with_failover arms/clears the wall-clock board deadline
     # at the right moments (the clamp math itself is covered in test_streaming.py). One

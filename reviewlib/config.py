@@ -1697,3 +1697,25 @@ def _split_models(raw: list[str]) -> list[str]:
             if part:
                 values.append(_expand_alias(part))
     return values
+
+
+def resolve_review_board(
+    config: dict, *, preset: str | None = None
+) -> tuple[list[BoardReviewer], str, str | None]:
+    """`(board, source, preset)` for a `review diff` run with no `-m`: an explicit
+    `preset` > config `models:` > config `board:` > DEFAULT_PRESET, the precedence the
+    CLI's dispatch uses. `source` names which one won (`preset:<name>`,
+    `config.yaml (models:)`, `config.yaml (board:)`); `preset` is the preset whose board
+    it is, or None for a config roster. Raises BoardConfigError like `load_board`."""
+    if preset:
+        return load_board(config, preset=preset), f"preset:{preset}", preset
+    config_models = _split_models(config.get("models") or [])
+    if config_models:
+        return board_from_models(config_models, config), "config.yaml (models:)", None
+    if isinstance(config.get("board"), list) and config.get("board"):
+        return load_board(config), "config.yaml (board:)", None
+    return (
+        load_board(config, preset=DEFAULT_PRESET),
+        f"preset:{DEFAULT_PRESET}",
+        DEFAULT_PRESET,
+    )

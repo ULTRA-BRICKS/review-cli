@@ -1811,6 +1811,48 @@ def _stat_subcommand(rest: list[str]) -> int:
     return 0
 
 
+def _capacity_check_subcommand(rest: list[str]) -> int:
+    """`review capacity-check [--preset NAME] [--json]` — whether every route and account
+    the active review board could dispatch on is confirmed out of quota right now
+    (review-cli#472; the evidence predicate is in `reviewlib.capacity_check`'s docstring
+    and `review help capacity`). Built for `gh ship`'s review-quorum/external-review
+    gates (agent-tools ci/ship/ship.sh), which skip the manual hatch prompt only on
+    `all_exhausted: true`. A bare MANAGEMENT subcommand (like stat/task/entities), NOT a
+    fan-out mode.
+
+    Always exits 0 in --json mode (the caller gates on `all_exhausted`/`error`, not the
+    exit code); the text form exits 1 only when the board could not be resolved."""
+    parser = argparse.ArgumentParser(
+        prog="review capacity-check",
+        description=(
+            "Report whether every route/account the active review board could use is "
+            "confirmed out of quota. See `review help capacity`."
+        ),
+    )
+    parser.add_argument(
+        "--preset",
+        default=None,
+        help="evaluate this preset's board instead of the config/default board "
+        "(the board `review diff --preset NAME` would run)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+
+    from .capacity_check import board_capacity_report, render_text
+
+    report = board_capacity_report(preset=ns.preset)
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps(report, indent=2))
+        return 0
+    if report.get("error"):
+        print(render_text(report), end="", file=sys.stderr)
+        return 1
+    print(render_text(report), end="")
+    return 0
+
+
 def _render_stat_report_text(
     report: dict, *, requested_harness: str | None = None
 ) -> str:
@@ -5143,6 +5185,7 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "task",
         "stat",
         "entities",
+        "capacity-check",
         "trust-module",
         "register-module",
         "spec-web",
@@ -5693,6 +5736,115 @@ See also: `review --help` (overview), README's "Quorum" section, `review task CO
 """
 
 
+def _help_topic_capacity() -> str:
+    """The `review help capacity` deep reference (help-docs-sync): the
+    `review capacity-check` CLI/JSON contract and its evidence predicate (review-cli#472).
+    Keep in sync with `reviewlib/capacity_check.py`."""
+    from .capacity_check import (
+        DEFAULT_MAX_AGE_SECONDS,
+        REASONS,
+        SCHEMA,
+        SCHEMA_VERSION,
+    )
+
+    reasons = "\n".join(
+        f"    {reason:<28} -> {status}" for reason, status in REASONS.items()
+    )
+    return f"""\
+review capacity-check — is the active review board's whole capacity out of quota?
+
+  review capacity-check                  text report, exit 1 only if the board can't resolve
+  review capacity-check --json           JSON report, always exit 0
+  review capacity-check --preset heavy   evaluate the board `review diff --preset heavy` runs
+
+`gh ship` (agent-tools ci/ship/ship.sh) skips its manual review-hatch prompt only when
+`--json` says `"all_exhausted": true`. Nothing else in the report authorizes anything.
+
+WHAT IS EVALUATED
+  The board a no-`-m` `review diff` would run: --preset > config `models:` > config
+  `board:` > the default preset. Every seat counts (pool and reserve), each seat model
+  expands to the routes its provider failover dispatches (Claude CLI <-> omp twins
+  included), a Claude CLI route expands to one candidate per account it rotates
+  through, and an omp seat on omp's Anthropic accounts to one per account its pool may
+  dispatch on (omp's enabled Anthropic logins minus the `omp_accounts:` policy's
+  excluded ones; no agent.db: the route itself). A candidate is one
+  (route, account).
+
+THE PREDICATE
+  all_exhausted = at least one candidate AND every candidate has status `exhausted`.
+  A candidate is `exhausted` only on one of:
+    - a harness-cli limit card for ITS quota identity (the Claude or omp Anthropic
+      account's own card, matched by email; the codex card) with a 5-hour/weekly
+      window at >= 100% that has not reset, read within the freshness window;
+    - an active seat cooldown whose typed cause is `quota` (a session-limit /
+      usage-credits failure), recorded within the freshness window, on a route whose
+      quota identity is the route itself or its only account, or under one omp pool
+      account's own `omp-account:` key.
+  Checked in this order, first decisive answer wins: backend not runnable
+  (unavailable) -> the omp account policy leaves an omp Anthropic seat no account
+  (unavailable) -> the account's recorded login failure (unavailable, cause auth) ->
+  an active cooldown with a non-quota cause (unavailable) -> harness card (exhausted /
+  usable) -> quota cooldown (exhausted) -> unknown.
+  Freshness window: {DEFAULT_MAX_AGE_SECONDS}s, override with
+  $REVIEW_CAPACITY_MAX_AGE_SECONDS.
+
+  Statuses are separate: `usable` needs a card showing usage below 100% for that
+  identity; no evidence is `unknown`, never usable. Typed reasons:
+{reasons}
+
+JSON (schema "{SCHEMA}", schema_version {SCHEMA_VERSION})
+  schema, schema_version   identify this contract; a consumer refuses other versions
+  checked_at               when the report was built (UTC ISO-8601)
+  max_age_seconds          the freshness window applied
+  configuration            source ("preset:light", "config.yaml (models:)", ...), preset,
+                           config_path, config_present, board_fingerprint
+                           ("sha256:<16 hex>" over the seats), seats [{{model, role,
+                           display, effort}}]; null when the board failed to resolve
+  sources                  harness_limits {{status ok|missing|failed|malformed, origin,
+                           observed_at, cards, detail}}, seat_cooldown {{status
+                           ok|missing|unreadable|malformed, path}}, claude_accounts
+                           {{registry, accounts}}
+  candidates[]             seat_model, route, backend, access_method, account,
+                           quota_identity, quota_identity_basis (account|route), status,
+                           reason, cause, source, observed_at (when the evidence was
+                           observed), age_seconds, detail
+  coverage                 candidates, exhausted, usable, unavailable, unknown, complete
+                           (no unknown candidate)
+  models, exhausted[]      schema-1 fields kept: distinct seat models; one {{model,
+                           source, evidence}} per exhausted candidate
+  all_exhausted            the predicate above
+  error                    board-resolution error, else null
+
+COMPATIBILITY
+  Schema 1 (the unreleased first draft of this command that agent-tools ship.sh was
+  written against) had no schema/schema_version and listed every model without
+  exhaustion evidence under `available`. That key is gone:
+  missing evidence is not availability. A schema-1 consumer reading only
+  `all_exhausted` and `exhausted[].model/.evidence/.source` (ship.sh) keeps working, and
+  only ever gets a stricter `all_exhausted`.
+
+SOURCE LIMITS (each makes the affected candidates `unknown`, never exhausted)
+  - Only Claude Code (CLI) and Codex have quota data (harness-cli cards). opencode,
+    omp and the Claude API transport are covered only by a quota cooldown a real call
+    on that route recorded. z.ai, Gemini, OpenRouter and CommandCode record no
+    cooldowns, so their routes have no evidence path at all: a board using them can
+    never read all_exhausted.
+  - The cooldown store keys routes, not accounts, so a quota cooldown on a Claude CLI
+    route that rotates through several accounts is not attributed to any of them.
+  - A cooldown is recorded when the failing call returns; later runs skip the seat
+    without re-recording, so it goes stale after the freshness window even if the
+    quota is still out.
+  - Cooldowns recorded before review-cli#472 carry no typed cause and never count.
+  - tg-ctl usage samples carry no account and are not used.
+  - omp's own account pool windows (`omp usage`) are not read; an omp Anthropic account
+    is judged by its own quota cooldown or its Claude Code card (same email). With
+    several pool accounts the route cooldown a pool call also writes names none of them
+    and is not read.
+
+See also: `review status` (which seats can run now), `review entities`.
+"""
+
+
 # Deep help TOPICS advertised from the main `review --help` and served by `review help
 # <topic>` / `review --help <topic>` (ROADMAP "Topic-based help across the ecosystem").
 # topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
@@ -5710,6 +5862,10 @@ HELP_TOPICS: dict[str, tuple[str, "object"]] = {
         "run stats, the startup ETA line, why never to short-timeout `review`",
         _help_topic_runtime,
     ),
+    "capacity": (
+        "the `capacity-check --json` quota-outage contract and evidence predicate",
+        _help_topic_capacity,
+    ),
 }
 
 
@@ -5725,6 +5881,8 @@ def _subcommand_epilog() -> str:
             "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
             "\n  task        show review iterations and transcripts for one task code"
             "\n  stat        per-harness/per-model usage + health report from the real call logs"
+            "\n  capacity-check"
+            "\n              is the active board's whole capacity out of quota? (`review help capacity`)"
             "\n  jobs        list detached (--detach) review jobs"
             "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`);"
             "\n              bare `status`: which board seats can run now, why not, and their substitute"
@@ -6261,6 +6419,12 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # subcommand (like stat/task/dashboard/sessions), NOT a fan-out mode (review-cli#487).
     if argv and argv[0] == "entities":
         return _entities_subcommand(argv[1:])
+    # `review capacity-check` — report whether every configured review-board seat is
+    # confirmed exhausted right now (gh ship's review-quorum/external-review auto-bypass
+    # consults this before ever prompting for a manual hatch). A bare MANAGEMENT
+    # subcommand (like stat/task/dashboard/sessions), NOT a fan-out mode.
+    if argv and argv[0] == "capacity-check":
+        return _capacity_check_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the

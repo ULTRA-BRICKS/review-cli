@@ -167,32 +167,71 @@ def _run_harness_limits_json() -> str:
     return proc.stdout
 
 
+def load_harness_report(*, runner=None) -> dict:
+    """`{"status", "cards", "observed_at", "origin", "detail"}` for the harness limits
+    source, never raising (review-cli#472: a capacity report must tell a missing source
+    from a failed or malformed one, which `load_harness_cards`' plain `[]` cannot).
+
+    `status`: "ok", "missing" (no `harness` binary), "failed" (non-zero exit, timeout,
+    unreadable fixture file) or "malformed" (not JSON, or no card list). `observed_at` is
+    when the cards were read (UNIX time): the call time for a live `harness` run or an
+    inline `$REVIEW_HARNESS_LIMITS_JSON` value, the file's mtime for a fixture path.
+    `origin` is "harness", "env" or "env-file"."""
+    observed_at = time.time()
+    origin = "harness"
+    try:
+        raw = os.environ.get(_ENV_HARNESS_JSON)
+        if raw is not None and raw.strip():
+            text = raw.strip()
+            origin = "env"
+            if not text.startswith("{") and not text.startswith("["):
+                path = Path(text).expanduser()
+                origin = "env-file"
+                observed_at = path.stat().st_mtime
+                text = path.read_text(encoding="utf-8")
+        else:
+            run = runner if runner is not None else _run_harness_limits_json
+            text = run()
+    except FileNotFoundError as exc:
+        status = "missing" if origin == "harness" else "failed"
+        return _harness_report(status, [], observed_at, origin, str(exc))
+    except Exception as exc:  # noqa: BLE001 -- reported, never raised
+        return _harness_report("failed", [], observed_at, origin, str(exc))
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError) as exc:
+        return _harness_report("malformed", [], observed_at, origin, str(exc))
+    cards = data.get("cards") if isinstance(data, dict) else data
+    if not isinstance(cards, list):
+        return _harness_report(
+            "malformed", [], observed_at, origin, "no card list in harness JSON"
+        )
+    return _harness_report(
+        "ok", [c for c in cards if isinstance(c, dict)], observed_at, origin, None
+    )
+
+
+def _harness_report(
+    status: str, cards: list[dict], observed_at: float, origin: str, detail
+) -> dict:
+    return {
+        "status": status,
+        "cards": cards,
+        "observed_at": observed_at,
+        "origin": origin,
+        "detail": detail,
+    }
+
+
 def load_harness_cards(*, runner=None) -> list[dict]:
     """Cards from `$REVIEW_HARNESS_LIMITS_JSON` or `harness limits --all --json`.
 
     The env fixture is a JSON object (`{"cards":[...]}`), a JSON array of
     cards, or a path to either. `runner`, when given, is a zero-arg callable
     that returns that same JSON text — tests inject it so this never touches
-    the real binary. Missing harness / unusable JSON / any error -> []."""
-    try:
-        raw = os.environ.get(_ENV_HARNESS_JSON)
-        if raw is not None and raw.strip():
-            text = raw.strip()
-            if not text.startswith("{") and not text.startswith("["):
-                text = Path(text).expanduser().read_text(encoding="utf-8")
-        else:
-            run = runner if runner is not None else _run_harness_limits_json
-            text = run()
-        data = json.loads(text)
-        if isinstance(data, list):
-            return [c for c in data if isinstance(c, dict)]
-        if isinstance(data, dict):
-            cards = data.get("cards")
-            if isinstance(cards, list):
-                return [c for c in cards if isinstance(c, dict)]
-        return []
-    except Exception:  # noqa: BLE001 -- fail-open
-        return []
+    the real binary. Missing harness / unusable JSON / any error -> []
+    (`load_harness_report` says which)."""
+    return load_harness_report(runner=runner)["cards"]
 
 
 def _agent_family(model: str) -> str | None:

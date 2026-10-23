@@ -178,6 +178,7 @@ def record_login_failure(account_dir: Path | None, reason: str) -> None:
         _login_failure_key(account_dir),
         reason,
         access_method=_LOGIN_FAILURE_ACCESS_METHOD,
+        cause=seat_cooldown.CAUSE_AUTH,
     )
 
 

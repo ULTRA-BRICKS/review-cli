@@ -48,6 +48,10 @@ from .process import (
     write_sidecar_log,
 )
 from .seat_cooldown import (
+    CAUSE_AUTH,
+    CAUSE_QUOTA,
+    CAUSE_STALL,
+    CAUSE_UNAVAILABLE,
     CHRONIC_QUOTA_MARKERS,
     active_cooldown,
     clear_cooldown,
@@ -387,7 +391,9 @@ def review_with_images(
         admission.note_result(model, result)
         reason = _chronic_unavailable_reason(result)
         if reason is not None:
-            record_cooldown(model, reason, access_method="cli")
+            record_cooldown(
+                model, reason, access_method="cli", cause=_chronic_cause(reason)
+            )
         elif _clears_cooldown_history(result):
             clear_cooldown(model, access_method="cli")
         return result
@@ -940,6 +946,7 @@ def _run_opencode_with_stall_retry(
                 model,
                 f"opencode stalled with no output after {attempt} attempts",
                 access_method=_OPENCODE_ACCESS_METHOD,
+                cause=CAUSE_STALL,
             )
     assert proc is not None  # loop runs >= 1 time (_OPENCODE_MAX_STALL_RETRIES >= 1)
     return proc
@@ -1014,11 +1021,18 @@ def _record_true_silence_if_needed(model: str, proc, *, access_method: str) -> N
     above ("closes the false-clear ... rc=0 body") describes the round-12 FIX's
     motivating scenario, not the full scope of what this call now covers."""
     if getattr(proc, "true_silenced", False):
-        record_cooldown(model, "true-silence timeout", access_method=access_method)
+        record_cooldown(
+            model,
+            "true-silence timeout",
+            access_method=access_method,
+            cause=CAUSE_STALL,
+        )
         return
     reason = _chronic_unavailable_reason(proc)
     if reason is not None:
-        record_cooldown(model, reason, access_method=access_method)
+        record_cooldown(
+            model, reason, access_method=access_method, cause=_chronic_cause(reason)
+        )
     elif proc.returncode == 0 and proc.stdout.strip():
         clear_cooldown(model, access_method=access_method)
 
@@ -1432,14 +1446,21 @@ def _omp_accounts_limited_until(
     return out
 
 
-def _omp_account_failure(result: ReviewResult) -> str | None:
-    """Why `result` means the account that ran it cannot answer now (a limit, a quota
-    notice, a failed login), else None -- the next account is then tried."""
+def _omp_account_failure(result: ReviewResult) -> tuple[str, str | None] | None:
+    """Why `result` means the account that ran it cannot answer now, as (the failure
+    line, its typed cooldown cause), else None -- the next account is then tried. A
+    rate/usage limit or a chronic quota notice is `quota`, an administrative
+    "unavailable" sentinel is `unavailable`, a failed login is `auth`."""
     limit = omp_accounts.limit_failure(result.returncode, result.stdout, result.stderr)
     if limit is not None:
-        return limit
+        return limit, CAUSE_QUOTA
     if _account_should_advance(result):
-        return _chronic_unavailable_reason(result) or _login_failure_line(result)
+        chronic = _chronic_unavailable_reason(result)
+        if chronic is not None:
+            return chronic, _chronic_cause(chronic)
+        login = _login_failure_line(result)
+        if login is not None:
+            return login, CAUSE_AUTH
     return None
 
 
@@ -1531,20 +1552,22 @@ def _review_omp_with_anthropic_pool(
             oauth_token=token,
             launcher=launcher,
         )
-        failure = _omp_account_failure(result)
+        outcome = _omp_account_failure(result)
         key = _omp_account_cooldown_key(account)
-        if failure is None:
+        if outcome is None:
             if result.returncode == 0:
                 clear_cooldown(key, access_method=_OMP_ACCESS_METHOD)
             note = served + (
                 f"; failed before it: {'; '.join(failed)}" if failed else ""
             )
             return dataclasses.replace(result, account=note + skipped_note)
+        failure, cause = outcome
         record_cooldown(
             key,
             failure,
             access_method=_OMP_ACCESS_METHOD,
             ttl_seconds=omp_accounts.retry_after_seconds(result.stdout, result.stderr),
+            cause=cause,
         )
         failed.append(f"{account.label}: {failure}")
         last_result = result
@@ -3304,7 +3327,9 @@ def review_claude(
     )
     reason = _chronic_unavailable_reason(result)
     if reason is not None:
-        record_cooldown(model, reason, access_method=access_method)
+        record_cooldown(
+            model, reason, access_method=access_method, cause=_chronic_cause(reason)
+        )
     elif _clears_cooldown_history(result):
         clear_cooldown(model, access_method=access_method)
     return result
@@ -3337,6 +3362,23 @@ _UNAVAILABLE_MARKERS = (
 # The session/usage/weekly-limit quota markers live in `reviewlib.seat_cooldown`
 # (single source shared with the dashboard's retry-event classifier).
 _CHRONIC_QUOTA_MARKERS = CHRONIC_QUOTA_MARKERS
+# The two reasons `_chronic_unavailable_reason` returns, and the typed cooldown cause each
+# one proves (review-cli#472): a session-limit/usage-credits notice is the account's quota
+# running out; the administrative sentinel only says the model is unavailable, which is
+# not proof of quota exhaustion.
+_QUOTA_COOLDOWN_REASON = "session limit / usage credits"
+_SENTINEL_COOLDOWN_REASON = "unavailable sentinel"
+_CHRONIC_REASON_CAUSE = {
+    _QUOTA_COOLDOWN_REASON: CAUSE_QUOTA,
+    _SENTINEL_COOLDOWN_REASON: CAUSE_UNAVAILABLE,
+}
+
+
+def _chronic_cause(reason: str) -> str | None:
+    """The typed cooldown cause for a `_chronic_unavailable_reason` result."""
+    return _CHRONIC_REASON_CAUSE.get(reason)
+
+
 # The administrative sentinel is only trustworthy when the WHOLE body is short (a
 # one-liner notice) — a real, long review that happens to mention availability must
 # never be cached as a chronic failure. Shared by panel.result_is_usable and
@@ -3635,7 +3677,7 @@ def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
                 or _is_seat_fatal(stderr.lower(), result.returncode)
             ):
                 return None
-            return "unavailable sentinel"
+            return _SENTINEL_COOLDOWN_REASON
         return None  # a short rc=0 body that is NOT the sentinel is a real (if terse) answer
     # From here: a non-zero exit.
     stderr = (result.stderr or "").strip()
@@ -3708,7 +3750,7 @@ def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
     # this haystack stays length-gated even here (round-3 finding above) — only
     # stderr is unconditionally unbounded.
     if any(marker in error_channel for marker in _CHRONIC_QUOTA_MARKERS):
-        return "session limit / usage credits"
+        return _QUOTA_COOLDOWN_REASON
 
     # The broader, more generic _UNAVAILABLE_MARKERS check below reuses the SAME
     # `error_channel` for its transient/seat-fatal guard — so `_looks_transient`
@@ -3763,7 +3805,7 @@ def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
         p for p in (stderr, body) if p and len(p) <= _UNAVAILABLE_MAX_LEN
     ).lower()
     if any(marker in bounded_haystack for marker in _UNAVAILABLE_MARKERS):
-        return "unavailable sentinel"
+        return _SENTINEL_COOLDOWN_REASON
     return None
 
 

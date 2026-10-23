@@ -3,6 +3,34 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.52.0 — 2026-10-23
+
+- **New: `review capacity-check [--preset NAME] [--json]` — is the active board's whole
+  capacity out of quota?** ([review-cli#472](https://git.hyperide.ai/ultrabricks/review-cli/issues/472)).
+  `gh ship` (agent-tools#705) skips its manual review-hatch prompt when this says
+  `all_exhausted: true`, so it is asserted only on evidence:
+  - every seat of the board a no-`-m` `review diff` would run counts, expanded to each
+    provider-failover route (Claude CLI ↔ omp twins included) and each registered Claude
+    CLI account; each (route, account) is `exhausted`, `usable`, `unavailable` or
+    `unknown`, with a typed reason, its evidence and when that evidence was observed;
+  - `exhausted` needs a harness-cli card at 100% for that account's own quota (not reset
+    yet), or a cooldown whose typed cause is `quota` recorded within the last 30 minutes
+    (`$REVIEW_CAPACITY_MAX_AGE_SECONDS`) on a route that is its own quota identity. No
+    evidence is `unknown`, never usable;
+  - the JSON is versioned (`schema_version: 2`) and names the evaluated configuration
+    (source, preset, board fingerprint), each source's status, every candidate and the
+    coverage. `review help capacity` documents every field and what each source can't see.
+- **Seat cooldowns record a typed cause** (`quota`, `unavailable`, `stall`, `auth`) next
+  to their reason text; `active_cooldown` returns it. Cooldowns recorded by earlier
+  versions have none and never count as quota evidence.
+- **omp's Anthropic account pool is account-scoped in the report.** An omp seat on omp's
+  Anthropic accounts (review-cli#637) rotates through several logins and records each
+  limit under that account's own cooldown key, so `capacity-check` evaluates one candidate
+  per pool account (policy-excluded accounts dropped; its Claude Code card matched by
+  email) and, with several accounts, never reads the route-level cooldown a pool call
+  also writes as proof for any one of them. Every cooldown the omp pool records now
+  carries its cause: a rate or usage limit is `quota`, a failed login is `auth`.
+
 ## 0.51.1 — 2026-10-23
 
 - **Dashboard: session-detail no longer reads as an unbroken wall of stderr,

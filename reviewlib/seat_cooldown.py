@@ -170,6 +170,19 @@ _REASON_MAX_LEN = 200
 # review finding, Fable/Sonnet): add a transport here, not at a call site.
 ACCESS_METHODS: tuple[str, ...] = ("cli", "api", "opencode")
 
+# review-cli#472: WHY a cooldown was recorded, as a closed vocabulary stored next to the
+# free-text `reason`. Readers that must tell quota exhaustion apart from every other
+# chronic failure (`reviewlib.capacity_check`) branch on this field, never on the reason
+# text. An entry without a recognised cause (written before this field existed, or by a
+# caller that passed none) reads back as `cause: None` — "unclassified", never quota.
+CAUSE_QUOTA = "quota"  # a provider session/usage-limit notice (the account's quota)
+CAUSE_UNAVAILABLE = "unavailable"  # an administrative "model is unavailable" sentinel
+CAUSE_STALL = "stall"  # a call that produced no output (true silence / opencode stall)
+CAUSE_AUTH = "auth"  # a failed login on an account (claude_accounts, review-cli#596)
+COOLDOWN_CAUSES: frozenset[str] = frozenset(
+    {CAUSE_QUOTA, CAUSE_UNAVAILABLE, CAUSE_STALL, CAUSE_AUTH}
+)
+
 
 def cooldown_path() -> Path:
     """Where the cooldown store lives. Honors $REVIEW_SEAT_COOLDOWN_FILE (tests /
@@ -387,6 +400,27 @@ def _load(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def store_status() -> str:
+    """Whether the cooldown store could be read, for a reader that must report its own
+    coverage (review-cli#472, `reviewlib.capacity_check`): ``"ok"``, ``"missing"`` (no
+    file yet — nothing recorded), ``"unreadable"`` or ``"malformed"``. `_load` reads all
+    four as "no cooldowns" (correct for dispatch); this tells them apart. Never raises."""
+    try:
+        path = cooldown_path()
+        if not path.exists():
+            return "missing"
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, RuntimeError):
+        return "unreadable"
+    except ValueError:
+        return "malformed"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return "malformed"
+    return "ok" if isinstance(data, dict) else "malformed"
+
+
 def _write(path: Path, data: dict) -> None:
     """Atomic same-dir write (temp + os.replace) so a concurrent reader never sees a
     half-written file. Best-effort: any OS error is swallowed by the caller.
@@ -427,6 +461,7 @@ def record_cooldown(
     access_method: str,
     now: float | None = None,
     ttl_seconds: float | None = None,
+    cause: str | None = None,
 ) -> None:
     """Mark ``(model, access_method)`` as chronically unavailable until ``now + ttl``.
     Best-effort: never raises — a cooldown we failed to persist just means the next run
@@ -458,7 +493,12 @@ def record_cooldown(
     constant's comment for why. `fail_count` is read from any still-persisted PRIOR
     entry for this model (even one whose cooldown has since expired — expiry only
     means dispatch is allowed again, not that the failure history is forgotten) as
-    long as it isn't stale past `_ESCALATION_RESET_SECONDS`."""
+    long as it isn't stale past `_ESCALATION_RESET_SECONDS`.
+
+    review-cli#472: `cause` is the typed WHY (one of `COOLDOWN_CAUSES`), stored next to
+    the free-text `reason`. Every production recorder passes one (pinned by
+    tests/test_capacity_check.py); a value outside the vocabulary is not stored, so it
+    reads back as unclassified rather than as a cause the recorder never proved."""
     now = now if now is not None else time.time()
     try:
         # Cheap disable checks FIRST, before touching the store OR EVEN ACQUIRING THE
@@ -556,12 +596,15 @@ def record_cooldown(
             # review finding).
             if not isinstance(model_entry, dict) or "until" in model_entry:
                 model_entry = {}
-            model_entry[access_method] = {
+            entry = {
                 "until": now + ttl,
                 "reason": reason[:_REASON_MAX_LEN],
                 "recorded_at": now,
                 "fail_count": fail_count,
             }
+            if isinstance(cause, str) and cause in COOLDOWN_CAUSES:
+                entry["cause"] = cause
+            model_entry[access_method] = entry
             data[model] = model_entry
             _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
@@ -574,7 +617,7 @@ def active_cooldown(
     access_method: str,
     now: float | None = None,
 ) -> dict | None:
-    """``{"reason", "until", "remaining_seconds", "fail_count", "recorded_at"}`` if
+    """``{"reason", "until", "remaining_seconds", "fail_count", "recorded_at", "cause"}`` if
     ``(model, access_method)`` is currently cooling down, else ``None``. Never raises —
     a corrupt/missing store reads as "no cooldown", fail-open toward dispatching (never
     fail-closed toward silently starving a seat that would actually work). A store
@@ -645,12 +688,18 @@ def active_cooldown(
     recorded_at = entry.get("recorded_at")
     if type(recorded_at) not in (int, float) or not math.isfinite(recorded_at):
         recorded_at = None
+    # review-cli#472: the typed cause, or None for an entry without a recognised one
+    # (recorded before the field existed, or corrupt) — never guessed from `reason`.
+    cause = entry.get("cause")
+    if not isinstance(cause, str) or cause not in COOLDOWN_CAUSES:
+        cause = None
     return {
         "reason": reason,
         "until": until,
         "remaining_seconds": until - now,
         "fail_count": fail_count,
         "recorded_at": recorded_at,
+        "cause": cause,
     }
 
 
