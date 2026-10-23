@@ -39,6 +39,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_no_git_repo.py",
         "test_opencode_realrepo.py",
         "test_output_flag.py",
+        "test_review_gate_template.py",
         "test_qa_executor.py",
         "test_qa_mode.py",
         "test_review_marker.py",
@@ -800,7 +801,15 @@ _UNIT_FILES = [
     # Per-role fallback model lists + harness seat resolution (review-cli#445).
     ("test_role_models.py", {}),
     ("test_review_marker.py", {}),
+<<<<<<< HEAD
     ("test_review_remote.py", {}),
+||||||| parent of e92ffff (feat(gate): one review-gate template, merge/rebase/cherry-pick skip, review --version (#396))
+=======
+    # The composer-stage review gate driven through REAL git commit/rebase/cherry-pick
+    # (review-cli#396). Needs git; runs under pytest itself (see the file's own
+    # `if __name__ == "__main__":`) because it uses capsys/monkeypatch/parametrize.
+    ("test_review_gate_template.py", {}),
+>>>>>>> e92ffff (feat(gate): one review-gate template, merge/rebase/cherry-pick skip, review --version (#396))
     # `review diff --staged --commit` (the checkpoint-commit feature): the usage gate
     # (--commit requires --staged), the checkpoint gate shared with the marker/stamp
     # (ok/staged/not-piped), the real `git commit` it makes, and the distinct

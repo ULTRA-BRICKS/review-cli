@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 SKILL_NAME = "review"
@@ -911,6 +912,62 @@ if [ "$threshold" -gt 0 ]; then
     fi
   fi
 fi"""
+
+# review-cli#396: a commit that FINISHES an in-progress merge / rebase / cherry-pick is not a
+# new change -- it re-records content that was already committed (and already gated when it
+# was first committed) on the branches being combined. The exact-hash + trivial-delta gate
+# above cannot recognise that: the staged diff of a conflict-resolved merge is arbitrarily
+# large and was never `review diff --staged`-stamped, so the gate blocked EVERY such commit
+# and agents learned to finish merges with `git commit --no-verify` -- which also switches
+# off every other hook stage (secret scan, conventional-commit) for that commit. This block
+# runs BEFORE the hash gate and skips the staged-review requirement, saying so on stderr,
+# whenever git's own in-progress markers are present:
+#   * MERGE_HEAD        -- `git merge` stopped on conflicts (or `--no-commit`), finished by
+#                          `git commit`;
+#   * rebase-merge/ (the rebase STATE DIRECTORY) -- `git rebase` stopped
+#                          on a conflict, finished by `git commit` + `rebase --continue`.
+#                          `rebase-apply/` is deliberately NOT a marker: it is also `git am`'s
+#                          state dir, which holds third-party patch content, and an abandoned
+#                          `git am` leaves it behind indefinitely.
+#                          NOT `REBASE_HEAD`: git leaves that ref behind after the rebase
+#                          completes (verified on git 2.50), so keying on it would silently
+#                          skip the gate for every commit that follows a finished rebase.
+#                          The state directory is what `git status` itself keys "rebase in
+#                          progress" on, and it is removed the moment the rebase ends;
+#   * CHERRY_PICK_HEAD  -- `git cherry-pick` stopped on a conflict, `cherry-pick --continue`.
+# The markers are resolved with `git rev-parse --git-path`, NOT a literal `.git/<name>`: in
+# a linked worktree they live under `.git/worktrees/<name>/`, where a literal path would
+# never find them and the gate would silently keep blocking exactly the worktree-based flow
+# this ecosystem mandates. (`git merge` itself runs the `pre-merge-commit` hook, not
+# `pre-commit`, so a CLEAN merge never reached this gate in the first place -- only the
+# conflict-resolution / `--no-commit` commit did.)
+#
+# Trade-off, deliberate: this is "any merge/rebase/cherry-pick commit", not "a merge whose
+# index equals the clean auto-merge of two reviewed parents". Verifying the latter needs
+# `git merge-tree --write-tree` (git >= 2.38) plus a policy for hand-resolved conflicts, and
+# a hand-resolved conflict IS novel content that no earlier review covered -- but blocking it
+# only pushes the agent to `--no-verify`, which is strictly worse (it drops every hook, not
+# just this one). A `git merge --no-commit` followed by unrelated staged edits therefore
+# passes; that is the same trust class as `--no-verify` itself, and it is LOGGED (the reason
+# line names the marker) so a reader of the commit output can see the gate was skipped.
+_REPLAY_SKIP_BLOCK = """\
+_replay_reason=""
+# One `git rev-parse` for all four markers (it prints one path per line, in argument order):
+# this block runs on EVERY commit, so it must not spawn a git process per marker.
+if _replay_paths=$(command git rev-parse --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD \\
+    --git-path rebase-merge 2>/dev/null); then
+  { read -r _replay_merge; read -r _replay_pick; read -r _replay_rbm; } <<_REPLAY_EOF
+$_replay_paths
+_REPLAY_EOF
+  [ -f "$_replay_merge" ] && _replay_reason="MERGE_HEAD present (finishing an in-progress MERGE of already-committed history)"
+  [ -f "$_replay_pick" ] && _replay_reason="CHERRY_PICK_HEAD present (finishing an in-progress CHERRY_PICK of already-committed history)"
+  [ -d "$_replay_rbm" ] && _replay_reason="rebase-merge/ present (finishing an in-progress rebase of already-committed history)"
+fi
+if [ -n "$_replay_reason" ]; then
+  echo "review-before-commit: $_replay_reason -- skipping the staged-review requirement for this commit." >&2
+  exit 0
+fi
+unset _replay_paths _replay_merge _replay_pick _replay_rbm _replay_reason"""
 _PRECOMMIT = (
     """\
 #!/bin/sh
@@ -931,6 +988,9 @@ if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
 fi
 
 [ -n "$REVIEW_SKIP" ] && exit 0
+"""
+    + _REPLAY_SKIP_BLOCK
+    + """
 [ -z "$(command git diff --cached --name-only)" ] && exit 0
 h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
 stamp=$(command git rev-parse --git-path review-stamp)
@@ -945,6 +1005,141 @@ echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
 exit 1
 """
 )
+
+# The COMPOSER-STAGE gate (review-cli#396). This is the body rig installs as the
+# `review-gate` sibling of its composing global `pre-commit` (agent-tools
+# `git-hooks/global-dispatcher`), the setup every machine in this ecosystem actually runs;
+# `_PRECOMMIT` above is the self-contained fallback for a machine WITHOUT rig. Until #396 the
+# composer-stage body lived only as a hand-ported copy in agent-tools, so review-cli#211's
+# trivial-delta tolerance reached `_PRECOMMIT` and never the gate that was really installed:
+# every restage, even a one-line review fix, demanded a fresh full review. review-cli now
+# owns BOTH bodies from the same shared blocks; `review install-commit-hook --print-gate`
+# prints this one, and rig installs + drift-checks `review-gate` against that output (the
+# agent-tools copy is its fallback when `review` is not installed).
+#
+# Differences from `_PRECOMMIT`, all inherited from the composer setup: no repo-local hook
+# call (the composer already ran it, exactly once); no `REVIEW_SKIP` self-service bypass;
+# temp/scratch repos are exempt (test suites create throwaway repos under $TMPDIR and nobody
+# reviews those); documentation-only commits are exempt (`is_docs_path`).
+REVIEW_GATE = (
+    """\
+#!/bin/sh
+# review-before-commit-gate — composer stage, generated by `review install-commit-hook --print-gate`.
+#
+# Installed by rig as the LAST stage of the composing global pre-commit hook (./pre-commit),
+# AFTER the repo-local hook and the secret-scan. Do NOT edit this file by hand: rig
+# reinstalls it from the installed review-cli on `rig apply commit` and `rig status` reports
+# a hand edit as drift. The repo-local-hook invocation lives in the composer so it runs
+# exactly ONCE — do NOT add it here.
+#
+# Blocks a commit whose staged diff has not been reviewed. There is no REVIEW_SKIP
+# self-service bypass; `git commit --no-verify` remains Git's blanket hook bypass.
+#
+# `command git` bypasses shell aliases and functions (e.g. an rtk-style wrapper that
+# rewrites `git diff` output), so the hash matches the one written by review-cli, which
+# also calls the real git binary directly. Without this, a shell alias rewriting `git diff`
+# could produce a different hash and block a legitimately-reviewed commit.
+
+# Scratch/temp repos are exempt: gating throwaway repos created by test suites and
+# one-off sandboxes breaks third-party test runs (conloca's content-api git-operations
+# tests on this machine, 2026-08-04 — 12 failures from this gate alone) for zero value:
+# nobody reviews commits in a mktemp dir.
+repo_root="$(command git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+# `TMPDIR=/` would strip to "" and turn the first arm into `/*` (= every repo): only honour a
+# non-empty, non-root $TMPDIR that is not an ancestor of (or equal to) $HOME — a broad
+# ancestor like `TMPDIR=$HOME` would otherwise exempt every repo under it.
+_tmp_root="${TMPDIR:-/tmp}"; _tmp_root="${_tmp_root%/}"
+if [ -n "$_tmp_root" ]; then
+  case "${HOME%/}/" in "$_tmp_root"/*) _tmp_root="" ;; esac
+fi
+if [ -n "$_tmp_root" ]; then
+  case "$repo_root" in "$_tmp_root"/*) exit 0 ;; esac
+fi
+case "$repo_root" in
+  /tmp/*|/var/tmp/*|/var/folders/*|/private/tmp/*|/private/var/folders/*|*/AppData/Local/Temp/*) exit 0 ;;
+esac
+unset _tmp_root
+
+# A commit finishing an in-progress merge / rebase / cherry-pick re-records already-
+# committed history, not a new change — skip the staged-review requirement, and say so.
+"""
+    + _REPLAY_SKIP_BLOCK
+    + """
+
+if ! files="$(command git -c core.quotepath=false diff --cached --name-only --no-renames)"; then
+  echo "review-before-commit: could not list staged files; refusing to skip review." >&2
+  exit 1
+fi
+[ -z "$files" ] && exit 0
+
+# Takes an ALREADY-LOWERCASED path: the whole file list is lowercased once below, so a
+# large commit does not fork `tr` per staged file.
+is_docs_path() {
+  lower_path="$1"
+  lower_base="${lower_path##*/}"
+
+  case "$lower_path" in
+    agents.md|claude.md|*/agents.md|*/claude.md|skill.md|*/skill.md|skills/*|*/skills/*|agent-hooks/*|*/agent-hooks/*) return 1 ;;
+  esac
+
+  case "$lower_base" in
+    makefile|dockerfile|containerfile|jenkinsfile|vagrantfile|rakefile|gemfile|procfile|brewfile|justfile|cmakelists.txt|requirements.txt) return 1 ;;
+  esac
+
+  case "$lower_path" in
+    *.md|*.mdx|*.markdown|*.rst|*.adoc|*.rdoc|*.pod) return 0 ;;
+  esac
+
+  case "$lower_path" in
+    docs/*.txt|docs/*.text|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif|docs/*.webp|docs/*.avif|docs/*.pdf) return 0 ;;
+  esac
+
+  return 1
+}
+
+lower_files="$(printf '%s\\n' "$files" | tr '[:upper:]' '[:lower:]')"
+if printf '%s\\n' "$lower_files" | while IFS= read -r path; do
+  [ -z "$path" ] && continue
+  is_docs_path "$path" || exit 1
+done; then
+  exit 0
+fi
+
+# The `x` sentinel keeps the diff's trailing newlines through `$(...)`, so the hash matches
+# review-cli's; `&&` makes a failed `git diff` (e.g. a failing textconv after partial
+# output) fail CLOSED instead of hashing a truncated diff that could match a stale stamp.
+if ! staged_diff_x=$(command git diff --no-ext-diff --cached && printf x); then
+  echo "review-before-commit: could not read the staged diff; refusing to skip review." >&2
+  exit 1
+fi
+h=$(printf '%s' "${staged_diff_x%x}" | shasum -a 256 | cut -d' ' -f1)
+if [ -z "$h" ]; then
+  echo "review-before-commit: could not hash the staged diff; refusing to skip review." >&2
+  exit 1
+fi
+unset staged_diff_x
+stamp=$(command git rev-parse --git-path review-stamp)
+if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
+
+"""
+    + _TRIVIAL_DELTA_BLOCK
+    + """
+echo "review-before-commit: staged changes have not been reviewed." >&2
+echo "  run:  review diff --staged --task TASK-CODE      (then commit)" >&2
+echo "  skip: none in this gate (Git's --no-verify bypasses this and all other hooks)" >&2
+exit 1
+"""
+)
+
+
+def print_review_gate() -> int:
+    """`review install-commit-hook --print-gate`: print the composer-stage gate body
+    (`REVIEW_GATE`) to stdout for rig to install as the dispatcher's `review-gate` stage.
+    Pure output, no side effects — rig compares the installed file against this text for
+    drift, so the output must be byte-stable for a given review-cli version."""
+    sys.stdout.buffer.write(REVIEW_GATE.encode("utf-8"))
+    sys.stdout.buffer.flush()
+    return 0
 
 
 def _write_review_stamp(

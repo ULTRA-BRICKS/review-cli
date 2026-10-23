@@ -896,7 +896,8 @@ Before every commit, `review diff --staged --task CODE` is a multi-model gate,
 optionally *enforced* with `review install-commit-hook` (bypass with `REVIEW_SKIP=1
 git commit` or `--no-verify`); small trailing follow-ups on an already-reviewed
 baseline are tolerated (`$REVIEW_TRIVIAL_DELTA_LINES`, default 10 lines) without a
-full re-review — see `review help config` for the exact tolerance rules.
+full re-review — see `review help config` for the exact tolerance rules. Merge/rebase/cherry-pick
+commits skip it; `--print-gate` prints rig's gate.
 
 ---
 
