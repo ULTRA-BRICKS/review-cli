@@ -51,7 +51,7 @@ metadata from `--task CODE` is parsed from those logs, so a dashboard session ca
 same task code as the CLI stat record.
 
 **Panels:** Chat logs (per-run transcripts), Stats (runs over time, by task/mode/model/role),
-Models & roles, Metrics (durations, success/fail rates), Overseer feedback, Modes, Errors,
+Models & roles, Metrics (durations, success/fail rates, token usage and $ cost), Overseer feedback, Modes, Errors,
 Tasks (task-coded review history plus the **conscious** session marker), Prompts, and PR +
 ticket links. A task badge filters runs by code and the task view shows iterations, models,
 modes, related sessions, and drill-down links to the full conversations.
@@ -62,8 +62,22 @@ and PR/ticket associations — are the only NEW persistence: a small atomic JSON
 the deterministic session id so annotations stay pinned as logs age out. The server exposes
 small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feedback|conscious|links`).
 
-> Token/cost and an explicit run id are **not recorded** by review-core today; those panels
-> show a graceful empty-state noting what review-core would need to log, rather than faking data.
+**Tokens & cost (Metrics):** real per-call usage, as the provider reported it, for the REST
+backends that get a `usage` object back (gemini, z.ai, commandcode, openrouter, claude in API
+mode). Each REST sidecar log ends with a `[review-cli] USAGE prompt_tokens=N output_tokens=N`
+line before its EXIT footer on every call that has a provider reading, including a call the
+provider billed but that returned no review text (review-cli#369), so the dashboard totals
+match the run's own tally. A $ figure is computed only for claude API-mode calls to
+`https://api.anthropic.com` whose model has a verified list price (the same table as rig-cli's
+`riglib/usage.py`, including the default `claude-opus-4-8`). Every model is shown per row with
+an explicit state: a dollar figure, `+ N unpriced` for a partly-priced model, `unpriced` (real
+tokens, no verified price), or `not tracked` (CLI-mode backends such as codex, opencode, omp
+and claude CLI, which report no usage, and REST calls that timed out before an answer). An
+unknown cost is never shown as $0; a total that excludes some claude API spend is marked
+partial.
+
+> An explicit run id is **not recorded** by review-core today; sessions are inferred from
+> call timing rather than faked.
 
 ---
 

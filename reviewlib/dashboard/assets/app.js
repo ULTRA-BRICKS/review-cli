@@ -274,6 +274,24 @@ function fmtDur(s) {
     r = total % 60;
   return `${m}m ${r}s`;
 }
+function fmtTokens(n) {
+  if (n == null) return '—';
+  return n.toLocaleString();
+}
+function fmtCost(n) {
+  if (n == null) return '—';
+  return '$' + n.toFixed(n < 1 ? 4 : 2);
+}
+// review-cli#369: one model's cost cell. Never renders an unknown cost as $0 — a model
+// whose calls carried no usage reading is "not tracked", one with real tokens but no
+// verified list price is "unpriced", and a partly-priced one says how many calls are not
+// in its $ figure.
+function tokenCostCell(b) {
+  if (!b.tracked_calls) return '<span class="muted">not tracked</span>';
+  if (!b.priced_calls) return '<span class="muted">unpriced</span>';
+  const cost = fmtCost(b.cost_usd);
+  return b.unpriced_calls ? `${cost} <span class="muted">+ ${esc(b.unpriced_calls)} unpriced</span>` : cost;
+}
 function api(path, opts) {
   return fetch(path, opts).then((r) =>
     r.json().then((j) => {
@@ -701,12 +719,59 @@ PANELS.metrics = () => {
     <tr><td>Duration p90</td><td>${fmtDur(d.p90)}</td></tr>
     <tr><td>Duration max</td><td>${fmtDur(d.max)}</td></tr>
   </table>`;
-  if (!s.tokens_recorded || !s.cost_recorded) {
-    html += `<div class="empty note" style="margin-top:18px">
-      <strong>Token / cost not recorded.</strong> review-cli's streamed logs do not capture
-      token usage or $ cost today. To populate this, review-core would need to log per-call
-      token counts (e.g. parse the backend CLI's usage line) into the call log header or a
-      sidecar JSON. The dashboard will surface it automatically once present.</div>`;
+  html += `<div class="panel-head" style="margin-top:18px"><h3>Tokens &amp; cost</h3>
+    <p class="sub">Real per-call usage as reported by the provider, for the REST
+    backends that report it (gemini, z.ai, commandcode, openrouter, claude in API mode)
+    — including a call the provider billed even though it returned no review text.
+    Subprocess/CLI-mode backends (codex, opencode, omp, claude in CLI mode) stream plain
+    text with no usage object, so they are <em>not tracked</em>, never shown as zero; so
+    is a REST call that timed out before the provider answered. Only claude API-mode
+    calls to the real Anthropic endpoint with a verified list price get a $ figure;
+    every other model with real tokens is <em>unpriced</em>, never $0.</p></div>`;
+  if (!s.tokens_recorded) {
+    html += `<div class="empty note">
+      <strong>No token usage recorded in this window.</strong> Either no REST-backend
+      calls ran, or none of them reported usage.</div>`;
+  } else {
+    html += `<table class="kv">
+      <tr><td>Calls with real token usage</td><td>${esc(s.tracked_calls)}</td></tr>
+      <tr><td>Calls with no usage reading (not tracked)</td><td>${esc(s.untracked_calls)}</td></tr>
+      <tr><td>Calls with tokens but no verified price (unpriced)</td><td>${esc(s.unpriced_calls || 0)}</td></tr>
+      <tr><td>Total input tokens</td><td>${fmtTokens(s.total_input_tokens)}</td></tr>
+      <tr><td>Total output tokens</td><td>${fmtTokens(s.total_output_tokens)}</td></tr>
+      <tr><td>Total cost (priced calls only)</td><td>${s.total_cost_usd == null ? '<span class="muted">unpriced</span>' : fmtCost(s.total_cost_usd) + (s.cost_has_gap ? ' <span class="muted">(partial)</span>' : '')}</td></tr>
+    </table>`;
+  }
+  const models = Object.entries(s.by_model_tokens || {}).sort((a, b) => b[1].calls - a[1].calls);
+  if (models.length) {
+    html += `<table class="kv"><tr><th>Model</th><th>Calls</th><th>With usage</th><th>Input tok</th><th>Output tok</th><th>Cost</th></tr>`;
+    html += models
+      .map(
+        ([name, b]) =>
+          `<tr><td>${esc(name)}</td><td>${esc(b.calls)}</td><td>${esc(b.tracked_calls)}</td><td>${b.tracked_calls ? fmtTokens(b.input_tokens) : '—'}</td><td>${b.tracked_calls ? fmtTokens(b.output_tokens) : '—'}</td><td>${tokenCostCell(b)}</td></tr>`,
+      )
+      .join('');
+    html += `</table>`;
+  }
+  // Two independent notes: "nothing could be priced" and "some claude API spend is
+  // missing". The gap note must show whenever cost_has_gap is set, whatever else applies.
+  if (s.tokens_recorded && !s.cost_recorded) {
+    html += `<div class="empty note" style="margin-top:8px">
+      <strong>No $ cost could be computed for this window.</strong> Only claude API-mode
+      calls to the real Anthropic endpoint with a verified list price get a dollar figure
+      — token totals above are real, but every tracked call is unpriced.</div>`;
+  }
+  if (s.cost_has_gap && s.cost_recorded) {
+    html += `<div class="empty note" style="margin-top:8px">
+      <strong>Total cost above is a PARTIAL total.</strong> At least one claude API call
+      could not be priced — no usage reading (e.g. it timed out), an unrecognized model
+      id, or a non-Anthropic gateway — and is excluded rather than guessed. Tokens that
+      were reported are still counted in the totals above.</div>`;
+  } else if (s.cost_has_gap) {
+    html += `<div class="empty note" style="margin-top:8px">
+      <strong>Claude API spend in this window is unknown.</strong> At least one claude API
+      call ended without a usage reading or a verified price (e.g. it timed out after the
+      request was sent), so what it cost is not shown rather than guessed as $0.</div>`;
   }
   return html;
 };

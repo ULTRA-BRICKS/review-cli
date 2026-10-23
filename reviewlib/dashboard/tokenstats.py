@@ -4,13 +4,15 @@ logs — the data source behind ``review stat``.
 Background (2026-08 token-burn investigation)
 ----------------------------------------------
 review-cli has never recorded real token/cost numbers anywhere (``reviewlib.stats``'s
-JSONL schema has no such field, by design — see its module docstring; the dashboard's
-own ``compute_stats`` reports ``tokens_recorded: False`` / ``cost_recorded: False``
-rather than fabricate them). The only place ANY usage number ever lands on disk is a
-plain text line a handful of REST backends append to their own stdout
-(``backends.py``'s ``_openai_compatible_request`` / ``review_claude_api``): a
-``prompt_tokens=N output_tokens=N`` (or ``input_tokens=``) line. Nothing parsed that
-back into a structured number before this module.
+JSONL schema has no such field, by design — see its module docstring). The only place
+ANY usage number ever lands on disk is a plain text line a handful of REST backends
+append to their own stdout (``backends.py``'s ``_openai_compatible_request`` /
+``review_claude_api``): a ``prompt_tokens=N output_tokens=N`` (or ``input_tokens=``)
+line. This module (``extract_usage_tokens``) was the first to parse that back into a
+structured number, for ``review stat``; the dashboard's ``compute_stats`` (review-cli#337)
+now reuses this SAME function to report real ``tokens_recorded`` / ``cost_recorded``
+totals on the Metrics panel whenever real usage exists, rather than the earlier
+hardcoded-``False`` empty state.
 
 The three (really four, since `oc`/`omp`/`codex` are CLI-subprocess-backed and `cmd` is
 just an alias for `commandcode`, NOT a separate backend) agentic CLI harnesses — opencode
@@ -99,6 +101,10 @@ __all__ = [
     "list_retry_events",
     "list_call_logs",
     "extract_usage_tokens",
+    "call_cost_usd",
+    "is_price_capable",
+    "spend_unknown",
+    "PRICED_BACKENDS",
     "compute_harness_stats",
     "compute_model_stats",
     "compute_fable_report",
@@ -264,7 +270,17 @@ def list_call_logs(directory: Path, *, since: datetime | None = None) -> list[Ca
 # (backends.py _openai_compatible_request / review_claude_api): OpenAI-style
 # `prompt_tokens=N output_tokens=N` (z.ai, commandcode) or Anthropic-style
 # `input_tokens=N output_tokens=N` (claude in API mode) — always the LAST line(s).
-_USAGE_LINE_RE = re.compile(r"^(?:prompt|input)_tokens=(\d+)\s+output_tokens=(\d+)\s*$")
+# review-cli#337 review finding (codex, HIGH): digit groups are bounded to 9 (up to
+# ~1 billion -- generously above any real token count, which is bounded by the
+# provider's own max context/output limits) so a malformed or adversarial log can't
+# feed `int()` an unbounded digit string (`ValueError: Exceeds the limit ... for
+# integer string conversion` on Python 3.11+'s int-parsing guard) or, past that,
+# overflow the float division in `call_cost_usd`. A regex non-match here is treated
+# the same as "no usage line" -- the call becomes untracked, `/api/stats` never
+# crashes on a corrupt log.
+_USAGE_LINE_RE = re.compile(
+    r"^(?:prompt|input)_tokens=(\d{1,9})\s+output_tokens=(\d{1,9})\s*$"
+)
 
 # Backends whose body can carry a TRUSTWORTHY usage line: the keyed-HTTP REST backends
 # that write it themselves. Deliberately EXCLUDES every CLI/agentic backend (codex,
@@ -286,8 +302,19 @@ _REST_USAGE_BACKENDS = frozenset({"z.ai", "commandcode", "gemini", "openrouter"}
 
 def extract_usage_tokens(call: CallLog) -> tuple[int, int] | None:
     """`(prompt_tokens, output_tokens)` iff `call` is from a REST backend that emits
-    real usage AND the body's last non-blank line IS the usage line. `None` otherwise —
-    including for every agentic CLI backend, by design (see module + set docstrings).
+    real usage AND the log carries that reading. `None` otherwise — including for every
+    agentic CLI backend, by design (see module + set docstrings).
+
+    Source, in order (review-cli#369):
+      1. the writer-owned `[review-cli] USAGE ...` status line `parse_call_log` lifts into
+         `call.usage_prompt_tokens`/`usage_output_tokens`. It is written on EVERY REST
+         return path that has a provider reading, so a call the provider BILLED but that
+         came back with no assistant text (rc=1, empty stdout -- the large-prompt case)
+         is counted instead of silently dropped. Such a non-completed call legitimately
+         has output 0 while still having spent its prompt (`backends._validated_usage_
+         pair`), so output 0 is accepted there; prompt 0 never is.
+      2. legacy logs written before that line existed: the stdout usage line, which must
+         be the body's last non-blank line (rules below).
 
     codex/kimi review finding: the REST emitters (`_parse_openai_usage`,
     `review_claude_api`, the gemini path) always APPEND the `prompt_tokens=N
@@ -318,6 +345,11 @@ def extract_usage_tokens(call: CallLog) -> tuple[int, int] | None:
     )
     if not eligible:
         return None
+    if call.usage_prompt_tokens is not None and call.usage_output_tokens is not None:
+        prompt, output = call.usage_prompt_tokens, call.usage_output_tokens
+        if prompt == 0 or (output == 0 and call.exit_code == 0):
+            return None
+        return prompt, output
     lines = [ln for ln in call.body.splitlines() if ln.strip()]
     if not lines:
         return None
@@ -328,6 +360,124 @@ def extract_usage_tokens(call: CallLog) -> tuple[int, int] | None:
     if prompt == 0 or output == 0:
         return None
     return prompt, output
+
+
+# ---- $ cost (review-cli#337, #369) ------------------------------------------------------
+# Published Anthropic API list pricing (USD per 1M tokens) -- the same verified table as
+# `rig-cli`'s `riglib/usage.py` `PRICING_USD_PER_1M` (same pricing concept, different
+# repo; there is no shared import, so keep the two in sync). It includes
+# `claude-opus-4-8`, review-cli's default Opus seat (`config.MODEL_ALIASES["opus"]`,
+# `MODERATOR_CANDIDATES`, `DEFAULT_BOARD`), which the first version of this table lacked,
+# so most real API-mode Opus calls showed tokens but no $ figure. A model id not in this
+# table (exact, or after stripping a trailing `-YYYYMMDD` snapshot suffix -- a known
+# Anthropic naming convention for the SAME model) is reported as UNPRICED, never guessed.
+_CLAUDE_API_PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
+    # model_key: (input_price, output_price)
+    "claude-fable-5": (10.00, 50.00),
+    "claude-mythos-5": (10.00, 50.00),
+    "claude-opus-5": (5.00, 25.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-opus-4-7": (5.00, 25.00),
+    "claude-opus-4-6": (5.00, 25.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+_DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+
+
+def _claude_api_prices(model: str) -> tuple[float, float] | None:
+    prices = _CLAUDE_API_PRICING_USD_PER_1M.get(model)
+    if prices is None:
+        prices = _CLAUDE_API_PRICING_USD_PER_1M.get(_DATE_SUFFIX_RE.sub("", model))
+    return prices
+
+
+# Backends whose calls are EVER candidates for a $ figure -- kept as a single set so
+# "is this backend priced at all" is asked in exactly one place (fable review finding:
+# an earlier version checked `backend != "claude"` in the pricer AND separately
+# `backend == "claude"` in the caller's gap-detection, so adding a second priced backend
+# meant editing both or silently losing gap-flag coverage for it).
+PRICED_BACKENDS = frozenset({"claude"})
+
+# `argv0` for a completed claude-API-mode call is `"Anthropic API {model} @ {base}"`
+# (backends.py `review_claude_api`) -- only THIS shape (with the trailing `@ {base}`)
+# corresponds to a real priced dispatch; the no-key/error-path variant
+# (`"Anthropic API {model}"`, no `@`) never reaches here since it never emits a usage
+# line for `extract_usage_tokens` to match in the first place.
+_CLAUDE_ARGV0_RE = re.compile(r"^Anthropic API (\S+) @ (\S+)$")
+
+# codex review finding (P1): review-cli's claude backend supports ANY Anthropic-
+# compatible gateway via ANTHROPIC_BASE_URL (backends.py `_anthropic_api_config`,
+# default `https://api.anthropic.com`) -- e.g. CommandCode's own gateway. A call routed
+# through a non-Anthropic gateway is NOT billed at Anthropic's list price even if the
+# `model` string is a recognized Claude model id, so pricing must also check the base
+# URL and refuse to price anything but the real Anthropic endpoint.
+_OFFICIAL_ANTHROPIC_BASE = "https://api.anthropic.com"
+
+
+def _priced_dispatch(call: CallLog) -> tuple[str, str] | None:
+    """`(model, base)` iff `call` was a real dispatch on a backend that CAN carry a $
+    figure (a claude API-mode request, `Anthropic API {model} @ {base}`), else None. The
+    ONE definition of "priced dispatch" shared by `is_price_capable` and `call_cost_usd`.
+    A CLI-mode claude call (subscription-billed, no usage object) and the `@`-less
+    no-key/skip label (never dispatched) are not."""
+    if call.backend not in PRICED_BACKENDS:
+        return None
+    m = _CLAUDE_ARGV0_RE.match(call.argv0)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def is_price_capable(call: CallLog) -> bool:
+    """True iff `call` was a priced dispatch (see `_priced_dispatch`). Such a call that
+    may have been billed but ends up with no usage reading or no verified price is a
+    COST GAP the Metrics tab must flag."""
+    return _priced_dispatch(call) is not None
+
+
+# `review_claude_api`'s stderr for a 2xx whose body could not be read/parsed: the
+# request reached the model, so it may have been billed.
+_UNREADABLE_RESPONSE_MARKER = "malformed or unreadable response"
+
+
+def spend_unknown(call: CallLog) -> bool:
+    """True iff `call` is a priced dispatch with no usage reading that MAY still have
+    been billed: it timed out after the request was sent, or a 2xx response arrived but
+    could not be read. A definite HTTP 4xx/5xx rejection (the exit code IS the status:
+    a bad key, a rate limit, an overload) and a connection that never opened (refused,
+    DNS, TLS: exit 1 without the unreadable-response marker) were never billed."""
+    if not is_price_capable(call):
+        return False
+    if call.timed_out or call.exit_code == 124:
+        return True
+    if call.exit_code == 1:
+        return any(_UNREADABLE_RESPONSE_MARKER in ln for ln in call.stderr_lines)
+    return call.exit_code is None or not (400 <= call.exit_code <= 599)
+
+
+def call_cost_usd(call: CallLog, in_tok: int, out_tok: int) -> float | None:
+    """Dollar cost for one call given its already-extracted `(in_tok, out_tok)` usage
+    (see `extract_usage_tokens`), or `None` if this call has no verified price --
+    either an unpriced backend, an unrecognized model id, or (claude only) a
+    non-Anthropic gateway. Never fabricates a number for an unverified price."""
+    parsed = _priced_dispatch(call)
+    if parsed is None:
+        return None
+    model, base = parsed
+    if base.rstrip("/") != _OFFICIAL_ANTHROPIC_BASE:
+        return None
+    prices = _claude_api_prices(model)
+    if prices is None:
+        return None
+    in_price, out_price = prices
+    # Defense in depth: `extract_usage_tokens` already bounds the digit groups it
+    # parses (review-cli#337 review finding, codex HIGH), but this is a public,
+    # exported function -- a caller passing pathological values directly should still
+    # fail closed (untracked) rather than crash `/api/stats` on an OverflowError.
+    try:
+        return round(in_tok / 1_000_000 * in_price + out_tok / 1_000_000 * out_price, 6)
+    except OverflowError:
+        return None
 
 
 # ---- context-pollution + embedded-diff signals -----------------------------------------

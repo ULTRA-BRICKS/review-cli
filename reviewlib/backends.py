@@ -2033,6 +2033,8 @@ def review_gemini(
             stdout=stdout,
             stderr=stderr,
             started=started,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
         return ReviewResult(
             model=model,
@@ -2120,6 +2122,8 @@ def _emit_rest_log(
     started: datetime | None = None,
     timed_out: bool = False,
     timeout_secs: int | None = None,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> None:
     """Best-effort sidecar log for a NON-subprocess (REST) backend run.
 
@@ -2131,7 +2135,10 @@ def _emit_rest_log(
     "gemini"). Logging must never take down a review: a read-only log dir or write error
     is swallowed (the backend already produced its result). ``started`` is the call's
     START time so the dashboard reports an honest duration (codex P2); ``timed_out``
-    records a TIMEOUT marker so a REST timeout counts as a timeout, not a generic error."""
+    records a TIMEOUT marker so a REST timeout counts as a timeout, not a generic error.
+    ``prompt_tokens``/``output_tokens`` MUST be the same usage reading the returned
+    `ReviewResult` carries, on every path that has one -- the dashboard Metrics tab reads
+    usage only from this log (review-cli#369: a billed no-text failure used to log none)."""
     try:
         write_sidecar_log(
             backend,
@@ -2143,6 +2150,8 @@ def _emit_rest_log(
             started=started,
             timed_out=timed_out,
             timeout_secs=timeout_secs,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
     except Exception:  # noqa: BLE001 - logging is best-effort; it must NEVER change the
         # review outcome. Beyond OSError (read-only / full log dir), a provider can return
@@ -2406,6 +2415,8 @@ def _openai_compatible_request(
                 stdout="",
                 stderr=stderr,
                 started=started,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
             return ReviewResult(
                 model=model,
@@ -2427,6 +2438,8 @@ def _openai_compatible_request(
             stdout=stdout,
             stderr="",
             started=started,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
         return ReviewResult(
             model=model,
@@ -2999,6 +3012,8 @@ def review_claude_api(
             stdout=stdout,
             stderr="",
             started=started,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
         return ReviewResult(
             model=model,

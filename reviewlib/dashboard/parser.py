@@ -24,9 +24,11 @@ So this parser is a READER over those artifacts. It:
 
 The only writes here are `call_log_cache`'s own perf memo (derived data, keyed off
 the source logs' identity — never a source of truth); the actual overseer
-persistence (feedback/conscious/links) lives in ``store.py``. Anything review-core
-does not record yet (real token/cost numbers, an explicit run id) is reported as an
-empty/`null` field with a note rather than faked.
+persistence (feedback/conscious/links) lives in ``store.py``. Token usage and $ cost
+come from the REST call logs' provider usage readings (see `_USAGE_MARKER_RE` and
+`tokenstats.extract_usage_tokens`); anything review-core does not record (CLI-backend
+token counts, an explicit run id) is reported as untracked/`null` with a note rather
+than faked.
 """
 
 from __future__ import annotations
@@ -141,6 +143,23 @@ def extract_prompt_from_body(body: str) -> str | None:
             extracted_lines = extracted_lines[:i]
             break
     return "\n".join(extracted_lines).rstrip()
+
+
+# Writer-owned usage status line (review-cli#369, `process.write_sidecar_log`): the
+# provider's usage reading for a REST call, written directly before the EXIT footer on
+# EVERY return path that has one -- including a billed call that failed with no
+# assistant text, whose stdout (and so its legacy stdout usage line) is empty. Consumed
+# ONLY in that position (like the EXIT/TIMEOUT markers) and kept out of the body, into
+# `CallLog.usage_prompt_tokens`/`usage_output_tokens`. Digit runs are bounded the same
+# way as `tokenstats._USAGE_LINE_RE` so a corrupt log can't feed `int()` an unbounded
+# string. Token totals are still derived in ONE place,
+# `tokenstats.extract_usage_tokens` (backend scoping, zero-value guards, and the legacy
+# stdout-line fallback for logs written before this marker existed); `compute_stats`
+# below calls it via a deferred import (`tokenstats` imports FROM this module).
+_USAGE_MARKER_RE = re.compile(
+    r"^\[review-cli\] USAGE prompt_tokens=(?P<prompt>\d{1,9}) "
+    r"output_tokens=(?P<output>\d{1,9})\s*$"
+)
 
 
 # Default gap (seconds) that separates one session-burst from the next. Real logs show
@@ -298,6 +317,11 @@ class CallLog:
     # (HYP-742 finding 4: that grep inflated the Errors panel and tanked the success rate).
     exit_code: int | None = None
     task_code: str | None = None
+    # The provider usage reading from the writer's `[review-cli] USAGE ...` status line
+    # (review-cli#369), or None when the log has no such line (a CLI backend, a REST
+    # call with no usage reading, or a log written before the marker existed).
+    usage_prompt_tokens: int | None = None
+    usage_output_tokens: int | None = None
     # review-cli#326 review findings (Opus + Codex, all rounds): these seven used to be
     # `@property`s (or, for `has_real_content`, a free function reading `call.body`)
     # that re-derived from `self.body`/`self.stderr_lines` on every access. Once those
@@ -705,6 +729,25 @@ def parse_call_log(path: Path) -> CallLog | None:
             exit_code = int(em.group("code"))
             exit_line_idx = j
         break  # the last non-empty line is decisive either way
+    # review-cli#369: the writer's usage status line sits directly before the footer
+    # (`process.write_sidecar_log`). Same position discipline as the footer: only the
+    # last non-empty line before an actual EXIT footer counts, never a quoted line
+    # mid-body. The TIMEOUT/TRUE-SILENCE scans below then start above it.
+    usage_line_idx: int | None = None
+    usage_prompt_tokens: int | None = None
+    usage_output_tokens: int | None = None
+    status_idx = exit_line_idx
+    if exit_line_idx is not None:
+        for j in range(exit_line_idx - 1, -1, -1):
+            if not lines[j].strip():
+                continue
+            um = _USAGE_MARKER_RE.match(lines[j])
+            if um:
+                usage_line_idx = j
+                usage_prompt_tokens = int(um.group("prompt"))
+                usage_output_tokens = int(um.group("output"))
+                status_idx = j
+            break
     # The TIMEOUT marker must be tied to a real timeout. The writers ALWAYS emit it
     # together with the timeout return code 124 (process.py / write_sidecar_log), so a
     # marker is genuine only when the authoritative exit code is 124 — or absent (a legacy
@@ -716,9 +759,7 @@ def parse_call_log(path: Path) -> CallLog | None:
     # footer (or file end for a legacy log), never an arbitrary quoted line earlier in the body.
     timeout_line_idx: int | None = None
     if exit_code == 124 or exit_code is None:
-        scan_start = (
-            (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
-        )
+        scan_start = (status_idx - 1) if status_idx is not None else (len(lines) - 1)
         for j in range(scan_start, -1, -1):
             if not lines[j].strip():
                 continue  # skip blank lines between body and footer
@@ -730,9 +771,7 @@ def parse_call_log(path: Path) -> CallLog | None:
     # of 124 — same trailing-position discipline, same EXIT-0-quotes-the-marker guard.
     true_silence_line_idx: int | None = None
     if exit_code == 125 or exit_code is None:
-        scan_start = (
-            (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
-        )
+        scan_start = (status_idx - 1) if status_idx is not None else (len(lines) - 1)
         for j in range(scan_start, -1, -1):
             if not lines[j].strip():
                 continue  # skip blank lines between body and footer
@@ -740,8 +779,8 @@ def parse_call_log(path: Path) -> CallLog | None:
                 true_silence_line_idx = j
             break  # only the trailing-most non-body line is decisive
     for i, line in enumerate(lines):
-        if i == exit_line_idx:
-            continue  # the authoritative trailing status footer — kept out of the body
+        if i == exit_line_idx or i == usage_line_idx:
+            continue  # the authoritative trailing status lines — kept out of the body
         if pre_header and not header_seen:
             hm = _HEADER_RE.match(line)
             if hm:
@@ -819,6 +858,8 @@ def parse_call_log(path: Path) -> CallLog | None:
         true_silence_secs=true_silence_secs,
         exit_code=exit_code,
         task_code=task_code,
+        usage_prompt_tokens=usage_prompt_tokens,
+        usage_output_tokens=usage_output_tokens,
         completed=completed,
         has_error=has_error,
         error_summary=error_summary,
@@ -1772,6 +1813,17 @@ def invalidate_sessions_cache() -> None:
 
 def compute_stats(sessions: list[Session]) -> dict:
     """Aggregate counts/metrics across sessions for the Stats/Metrics/Models panels."""
+    # Deferred import: `tokenstats` imports FROM this module at its own top level, so a
+    # module-level import here would be circular. By the time compute_stats() actually
+    # RUNS, this module is already fully loaded, so the deferred import resolves fine —
+    # same pattern tokenstats.list_call_logs already uses for parse_call_log.
+    from .tokenstats import (
+        call_cost_usd,
+        extract_usage_tokens,
+        is_price_capable,
+        spend_unknown,
+    )
+
     by_mode: dict[str, int] = {}
     by_model: dict[str, int] = {}
     by_role: dict[str, int] = {}
@@ -1794,6 +1846,28 @@ def compute_stats(sessions: list[Session]) -> dict:
     # models (no board-assigned lens) are skipped here; they already surface via `by_model`.
     board_role_by_model = {b["model"]: b["role"] for b in _board_models()}
     by_dimension: dict[str, dict] = {}
+    # Token/cost tracking (review-cli#337): real per-call usage from REST backends that
+    # report it, via the SAME extraction `review stat` already uses (`extract_usage_
+    # tokens` — cross-contamination-guarded, excludes any zero-valued field as "not
+    # real"). Subprocess/CLI-mode backends never contribute here, tracked separately as
+    # "untracked_calls" so the Metrics panel can be honest about coverage instead of
+    # implying 100% visibility.
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost_usd = 0.0
+    any_priced_call = False  # distinct from total_cost_usd>0: a $0-priced call is
+    # impossible (extract_usage_tokens already excludes zero-token calls), but keeping
+    # this as its own flag makes "no call was ever priced" -> None explicit rather than
+    # incidental (fable review finding: nullability keyed to *tracked*, not *priced*,
+    # calls made an unpriced-but-tracked window show a fabricated-looking "$0.0000").
+    cost_has_gap = False  # True if ANY price-capable call's spend couldn't be priced
+    # Per MODEL (Kimi/Qwen/DeepSeek share the `commandcode` backend, Opus/Sonnet/Fable
+    # share `claude`), covering EVERY call so each model that ran has an explicit state
+    # in the Metrics tab: priced, partially priced, unpriced, or not tracked at all.
+    by_model_tokens: dict[str, dict] = {}
+    tracked_calls = 0
+    untracked_calls = 0
+    unpriced_calls = 0
     for s in sessions:
         by_mode[s.mode] = by_mode.get(s.mode, 0) + 1
         by_day[s.started.date().isoformat()] = (
@@ -1844,7 +1918,8 @@ def compute_stats(sessions: list[Session]) -> dict:
                 error_calls += 1
             else:
                 ok_calls += 1
-            dim = board_role_by_model.get(model_id_for_call(c))
+            model_id = model_id_for_call(c)
+            dim = board_role_by_model.get(model_id)
             if dim is not None and c.completed:
                 entry = by_dimension.setdefault(dim, {"calls": 0, "ok": 0, "error": 0})
                 entry["calls"] += 1
@@ -1857,6 +1932,53 @@ def compute_stats(sessions: list[Session]) -> dict:
                     entry["ok"] += 1
                 else:
                     entry["error"] += 1
+            usage = extract_usage_tokens(c)
+            bucket = by_model_tokens.setdefault(
+                model_id,
+                {
+                    "backend": c.backend,
+                    "calls": 0,
+                    "tracked_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": None,
+                    "priced_calls": 0,
+                    "unpriced_calls": 0,
+                },
+            )
+            bucket["calls"] += 1
+            if usage is None:
+                untracked_calls += 1
+                if spend_unknown(c):
+                    # review-cli#337 review finding (fable, round 2): a dispatched
+                    # API-mode claude call that timed out after sending, or whose 2xx
+                    # response could not be read, may still have SPENT unknown real
+                    # tokens -- the total below can't rule that spend out, so warn like
+                    # an unpriced-model gap. `tokenstats.spend_unknown` excludes the
+                    # never-billed failures (HTTP 4xx/5xx, a connection that never
+                    # opened) and CLI-mode claude calls (subscription-billed).
+                    cost_has_gap = True
+                continue
+            in_tok, out_tok = usage
+            tracked_calls += 1
+            total_input_tokens += in_tok
+            total_output_tokens += out_tok
+            bucket["tracked_calls"] += 1
+            bucket["input_tokens"] += in_tok
+            bucket["output_tokens"] += out_tok
+            call_cost = call_cost_usd(c, in_tok, out_tok)
+            if call_cost is not None:
+                any_priced_call = True
+                total_cost_usd += call_cost
+                bucket["priced_calls"] += 1
+                bucket["cost_usd"] = round((bucket["cost_usd"] or 0.0) + call_cost, 6)
+            else:
+                # Real tokens with no verified price (an unpriced backend, an unknown
+                # model id, a non-Anthropic gateway): reported as UNPRICED, never $0.
+                unpriced_calls += 1
+                bucket["unpriced_calls"] += 1
+                if is_price_capable(c):
+                    cost_has_gap = True
     durations.sort()
 
     def _pct(p: float) -> float | None:
@@ -1904,10 +2026,27 @@ def compute_stats(sessions: list[Session]) -> dict:
             "p90": _pct(0.9),
             "max": round(durations[-1], 3) if durations else None,
         },
-        # review-core does not record token usage or $ cost in the logs today; these are
-        # surfaced as nulls with a note rather than faked. See the Metrics panel.
-        "tokens_recorded": False,
-        "cost_recorded": False,
+        # review-cli#337/#369: token usage IS captured for REST backends (gemini, z.ai,
+        # commandcode, openrouter, claude in API mode) that report it in the provider
+        # response -- see `tokenstats.extract_usage_tokens`, which reads the writer's
+        # USAGE status line, so a billed call that returned no text still counts.
+        # `untracked_calls` counts every call with no usage reading (CLI-mode backends
+        # always land here, as can a REST call that timed out before the provider
+        # answered) -- never implying full coverage. Cost is only computed for a
+        # dispatched claude API-mode call to the real Anthropic endpoint whose model has
+        # a verified list price; every other tracked call is `unpriced_calls` (never $0),
+        # and `cost_has_gap` is set whenever a price-capable call's spend couldn't be
+        # priced, so the UI can warn even when SOME cost was found.
+        "tokens_recorded": tracked_calls > 0,
+        "cost_recorded": any_priced_call,
+        "tracked_calls": tracked_calls,
+        "untracked_calls": untracked_calls,
+        "unpriced_calls": unpriced_calls,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_cost_usd": round(total_cost_usd, 4) if any_priced_call else None,
+        "cost_has_gap": cost_has_gap,
+        "by_model_tokens": by_model_tokens,
         # Per-model health (ok-rate / dominant failure class / problematic flag) for the
         # Models & roles tab, plus the count of problematic BOARD models for the tab badge.
         "model_health": (_mh := compute_model_health(sessions))["models"],

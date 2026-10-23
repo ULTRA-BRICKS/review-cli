@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.55.0 — 2026-10-23
+
+- **Feat(dashboard): the Metrics tab shows real token usage and $ cost**
+  ([review-cli#344](https://git.hyperide.ai/ultrabricks/review-cli/issues/344)), instead of
+  a permanent "not recorded" empty state: calls with and without a usage reading, total
+  input/output tokens, total cost, and a per-model table. Each model row carries an explicit
+  state: a dollar figure, `+ N unpriced`, `unpriced` (real tokens, no verified price) or
+  `not tracked` (CLI-mode backends, which report no usage). An unknown cost is never shown
+  as $0. Only claude API-mode calls to `https://api.anthropic.com` get a $ figure, priced
+  from the same verified table as rig-cli's `riglib/usage.py`, which now includes the
+  default Opus seat `claude-opus-4-8` and resolves `-YYYYMMDD` snapshot ids.
+- **Fix(dashboard): large reviews no longer under-report tokens and cost**
+  ([review-cli#369](https://git.hyperide.ai/ultrabricks/review-cli/issues/369)). A REST
+  call that the provider billed but that returned no review text (common on large prompts)
+  wrote no usage to its call log, so the Metrics totals silently dropped its spend while
+  `run-stats.jsonl` counted it. REST call logs now end with a
+  `[review-cli] USAGE prompt_tokens=N output_tokens=N` line before the EXIT footer on every
+  call with a provider reading; the dashboard and `review stat` read it, falling back to
+  the old stdout usage line for older logs. The call-log cache re-parses once (parser
+  version 3).
+
+
 ## 0.54.0 — 2026-10-23
 
 - **Feat(availability): a dead seat or provider is excluded until the time its own error
@@ -82,6 +104,27 @@ semantic versioning.
   notice, "session limit", "usage credits") now never feeds the admission limit; the marker
   list is shared with the seat cooldown. Genuine 429 / 529 pushback still throttles. Excluding
   a quota-exhausted provider from the board plan up front stays open on #660.
+
+## 0.52.0 — 2026-10-23
+
+- **Feat(dashboard): the Metrics tab shows real token usage and $ cost**
+  ([review-cli#344](https://git.hyperide.ai/ultrabricks/review-cli/issues/344)), instead of
+  a permanent "not recorded" empty state: calls with and without a usage reading, total
+  input/output tokens, total cost, and a per-model table. Each model row carries an explicit
+  state: a dollar figure, `+ N unpriced`, `unpriced` (real tokens, no verified price) or
+  `not tracked` (CLI-mode backends, which report no usage). An unknown cost is never shown
+  as $0. Only claude API-mode calls to `https://api.anthropic.com` get a $ figure, priced
+  from the same verified table as rig-cli's `riglib/usage.py`, which now includes the
+  default Opus seat `claude-opus-4-8` and resolves `-YYYYMMDD` snapshot ids.
+- **Fix(dashboard): large reviews no longer under-report tokens and cost**
+  ([review-cli#369](https://git.hyperide.ai/ultrabricks/review-cli/issues/369)). A REST
+  call that the provider billed but that returned no review text (common on large prompts)
+  wrote no usage to its call log, so the Metrics totals silently dropped its spend while
+  `run-stats.jsonl` counted it. REST call logs now end with a
+  `[review-cli] USAGE prompt_tokens=N output_tokens=N` line before the EXIT footer on every
+  call with a provider reading; the dashboard and `review stat` read it, falling back to
+  the old stdout usage line for older logs. The call-log cache re-parses once (parser
+  version 3).
 
 ## 0.52.0 — 2026-10-23
 

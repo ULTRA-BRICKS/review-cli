@@ -116,7 +116,10 @@ _CACHE_ERRORS = (sqlite3.Error, ValueError)
 # (Fable review round 4 finding 3: lowering a cap without bumping this would leave
 # every cached row's retained-memory size unchanged on a warm 132k-log install, so the
 # fix would silently appear not to work).
-_PARSER_VERSION = 2
+# review-cli#369: bumped 2 -> 3 because `parse_call_log` now consumes the writer's
+# `[review-cli] USAGE ...` status line into `usage_prompt_tokens`/`usage_output_tokens`
+# (and keeps it out of `body`).
+_PARSER_VERSION = 3
 _CALLLOG_FIELDS: set[str] | None = None  # lazily computed -- see `_calllog_fields()`
 _CALLLOG_DATETIME_FIELDS: frozenset[str] | None = (
     None  # see `_calllog_datetime_fields()`

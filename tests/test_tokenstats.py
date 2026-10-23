@@ -296,6 +296,47 @@ def test_extract_usage_tokens_partial_zero_also_reads_as_absent():
         assert ts.extract_usage_tokens(parse_call_log(path_b)) is None
 
 
+def test_extract_usage_tokens_oversized_digit_string_is_untracked_not_a_crash():
+    """review-cli#337 review finding (codex, HIGH): a malformed or adversarial usage
+    line with an absurdly long digit run used to crash `int()` (Python 3.11+'s
+    integer-string-conversion limit) inside `extract_usage_tokens`, which `compute_stats`
+    calls for every call on every `/api/stats` request — one corrupt log could take the
+    whole dashboard down. A 5000-digit value must be treated the same as no usage line
+    at all, not raise."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        from reviewlib.dashboard.parser import parse_call_log
+
+        path = _write(
+            d,
+            "20260813T100000_000000Z-gemini-r0.log",
+            "[review-cli] gemini: gemini (args redacted) task=T1\n"
+            "A real review.\n\nprompt_tokens=" + ("9" * 5000) + " output_tokens=1\n"
+            "[review-cli] EXIT 0\n",
+        )
+        assert ts.extract_usage_tokens(parse_call_log(path)) is None
+
+
+def test_call_cost_usd_defends_against_pathological_direct_input():
+    """review-cli#337 review finding (codex, HIGH): `call_cost_usd` is a public,
+    exported function -- a caller (not just `extract_usage_tokens`, which now bounds
+    its own digit groups) passing a pathologically large token count directly must fail
+    closed (None) rather than raise `OverflowError` out of the float pricing math."""
+    from reviewlib.dashboard.parser import CallLog
+    from datetime import datetime, timezone
+
+    call = CallLog(
+        path="",
+        filename="x.log",
+        started=datetime.now(timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="Anthropic API claude-sonnet-5 @ https://api.anthropic.com",
+        body="",
+    )
+    assert ts.call_cost_usd(call, 10**400, 1) is None
+
+
 # ---- per-harness aggregation -----------------------------------------------------------
 def test_compute_harness_stats_groups_by_backend_and_tracks_bytes_and_tokens():
     with tempfile.TemporaryDirectory() as tmp:

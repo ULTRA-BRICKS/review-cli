@@ -988,3 +988,115 @@ test('render: the STATS_ONLY_PANELS exemption is honest — the REAL stats/model
 // independently, in the review-cli quorum gate for review-cli#362): the chat-detail branch
 // is the first statement in render() and returns unconditionally, so the guard below it is
 // unreachable whenever a detail is open.
+
+test('PANELS.metrics: per-model token/cost rows never show an unknown cost as $0 (review-cli#369)', () => {
+  const stats = {
+    duration_seconds: {},
+    tokens_recorded: true,
+    cost_recorded: true,
+    cost_has_gap: true,
+    tracked_calls: 4,
+    untracked_calls: 2,
+    unpriced_calls: 2,
+    total_input_tokens: 1170000,
+    total_output_tokens: 41000,
+    total_cost_usd: 4.71,
+    by_model_tokens: {
+      'claude:claude-opus-5': { backend: 'claude', calls: 2, tracked_calls: 2, input_tokens: 780000, output_tokens: 32000, cost_usd: 4.71, priced_calls: 2, unpriced_calls: 0 },
+      'claude:claude-experimental-9': { backend: 'claude', calls: 2, tracked_calls: 1, input_tokens: 1000, output_tokens: 1000, cost_usd: 0.01, priced_calls: 1, unpriced_calls: 1 },
+      'zai:glm-5.2': { backend: 'z.ai', calls: 1, tracked_calls: 1, input_tokens: 390000, output_tokens: 8000, cost_usd: null, priced_calls: 0, unpriced_calls: 1 },
+      codex: { backend: 'codex', calls: 1, tracked_calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: null, priced_calls: 0, unpriced_calls: 0 },
+    },
+  };
+  let html;
+  withRenderState({ panel: 'metrics', runs: [], stats }, () => {
+    html = PANELS.metrics();
+  });
+  const row = (name) => (html.split('<tr>').find((r) => r.includes(`<td>${name}</td>`)) || '').split('</tr>')[0];
+  assert.match(row('claude:claude-opus-5'), /\$4\.71/);
+  assert.match(row('claude:claude-experimental-9'), /\+ 1 unpriced/);
+  assert.match(row('zai:glm-5.2'), /unpriced/);
+  assert.doesNotMatch(row('zai:glm-5.2'), /\$/);
+  assert.match(row('codex'), /not tracked/);
+  assert.doesNotMatch(row('codex'), /\$/);
+  assert.match(html, /PARTIAL total/);
+});
+
+test('PANELS.metrics: a window with tokens but no priced call shows "unpriced", not $0', () => {
+  const stats = {
+    duration_seconds: {},
+    tokens_recorded: true,
+    cost_recorded: false,
+    cost_has_gap: false,
+    tracked_calls: 1,
+    untracked_calls: 0,
+    unpriced_calls: 1,
+    total_input_tokens: 10,
+    total_output_tokens: 5,
+    total_cost_usd: null,
+    by_model_tokens: {
+      gemini: { backend: 'gemini', calls: 1, tracked_calls: 1, input_tokens: 10, output_tokens: 5, cost_usd: null, priced_calls: 0, unpriced_calls: 1 },
+    },
+  };
+  let html;
+  withRenderState({ panel: 'metrics', runs: [], stats }, () => {
+    html = PANELS.metrics();
+  });
+  const row = (needle) => (html.split('<tr>').find((r) => r.includes(needle)) || '').split('</tr>')[0];
+  const total = row('Total cost');
+  assert.match(total, /unpriced/);
+  assert.doesNotMatch(total, /\$/);
+  const gemini = row('<td>gemini</td>');
+  assert.match(gemini, /unpriced/);
+  assert.doesNotMatch(gemini, /\$/);
+  assert.match(html, /No \$ cost could be computed/);
+});
+
+test('PANELS.metrics: a cost gap with no tracked tokens says the spend is unknown, not "partial total above" (review-cli#369)', () => {
+  const stats = {
+    duration_seconds: {},
+    tokens_recorded: false,
+    cost_recorded: false,
+    cost_has_gap: true,
+    tracked_calls: 0,
+    untracked_calls: 1,
+    unpriced_calls: 0,
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    total_cost_usd: null,
+    by_model_tokens: {
+      'claude:claude-opus-4-8': { backend: 'claude', calls: 1, tracked_calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: null, priced_calls: 0, unpriced_calls: 0 },
+    },
+  };
+  let html;
+  withRenderState({ panel: 'metrics', runs: [], stats }, () => {
+    html = PANELS.metrics();
+  });
+  assert.doesNotMatch(html, /PARTIAL total/);
+  assert.match(html, /spend in this window is unknown/);
+});
+
+test('PANELS.metrics: a claude API cost gap is reported even when every tracked call is unpriced (review-cli#369)', () => {
+  const stats = {
+    duration_seconds: {},
+    tokens_recorded: true,
+    cost_recorded: false,
+    cost_has_gap: true,
+    tracked_calls: 1,
+    untracked_calls: 1,
+    unpriced_calls: 1,
+    total_input_tokens: 10,
+    total_output_tokens: 5,
+    total_cost_usd: null,
+    by_model_tokens: {
+      gemini: { backend: 'gemini', calls: 1, tracked_calls: 1, input_tokens: 10, output_tokens: 5, cost_usd: null, priced_calls: 0, unpriced_calls: 1 },
+      'claude:claude-opus-4-8': { backend: 'claude', calls: 1, tracked_calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: null, priced_calls: 0, unpriced_calls: 0 },
+    },
+  };
+  let html;
+  withRenderState({ panel: 'metrics', runs: [], stats }, () => {
+    html = PANELS.metrics();
+  });
+  assert.match(html, /No \$ cost could be computed/);
+  assert.match(html, /spend in this window is unknown/);
+});

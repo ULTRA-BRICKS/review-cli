@@ -1344,6 +1344,21 @@ def _exit_line(returncode: int, *, preceding_text: str = "") -> str:
     return f"{lead}{_EXIT_PREFIX}{returncode}\n"
 
 
+# review-cli#369: the provider's usage reading for a REST call, written as its own
+# writer-owned status line right before the EXIT footer. Before this, the ONLY usage
+# record on disk was the `prompt_tokens=N output_tokens=N` line appended to a SUCCESSFUL
+# call's stdout, so a call the provider billed but that returned no assistant text (a
+# reasoning model that spent its whole budget on a large prompt, a text-less Anthropic
+# response) logged no usage at all and the dashboard Metrics tab silently dropped its
+# spend -- exactly the large-review case. The run tally (`ReviewResult.prompt_tokens`)
+# always had these numbers; this line puts the same numbers in the log.
+_USAGE_PREFIX = "[review-cli] USAGE "
+
+
+def _usage_line(prompt_tokens: int, output_tokens: int) -> str:
+    return f"{_USAGE_PREFIX}prompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+
+
 def write_sidecar_log(
     backend: str,
     *,
@@ -1355,6 +1370,8 @@ def write_sidecar_log(
     started: datetime | None = None,
     timed_out: bool = False,
     timeout_secs: int | None = None,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> Path:
     """Emit a per-call ``{stamp}-{backend}-r{n}.log`` for a NON-subprocess backend.
 
@@ -1379,6 +1396,12 @@ def write_sidecar_log(
     ``timed_out`` writes the same ``[review-cli] TIMEOUT after {N}s`` marker the
     subprocess runner uses, so the dashboard counts a REST timeout as a TIMEOUT (not a
     generic error) — keeping the timeout metric consistent across backends (codex P2).
+
+    ``prompt_tokens``/``output_tokens`` are the provider's usage reading for the call
+    (the same numbers carried on its `ReviewResult`). When either is non-zero they are
+    written as a ``[review-cli] USAGE ...`` line directly before the EXIT footer, on
+    EVERY return path -- including a billed call that failed with no assistant text,
+    whose stdout (and so its legacy stdout usage line) is empty (review-cli#369).
     """
     stamp = (started or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%fZ")
     path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
@@ -1395,6 +1418,8 @@ def write_sidecar_log(
         if timed_out:
             secs = timeout_secs if timeout_secs is not None else 0
             fh.write(f"[review-cli] TIMEOUT after {secs}s — partial output above]\n")
+        if prompt_tokens or output_tokens:
+            fh.write(_usage_line(prompt_tokens, output_tokens))
         fh.write(_exit_line(returncode))
     return path
 

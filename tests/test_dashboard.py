@@ -147,6 +147,500 @@ def test_parse_call_log_basic():
         assert c.has_error is False
 
 
+def test_compute_stats_tracks_real_token_usage_and_cost():
+    """review-cli#337: the Metrics panel must show REAL token/cost totals, reusing the
+    SAME extraction `review stat` already uses (`tokenstats.extract_usage_tokens`) —
+    not re-deriving it, and not stripping the usage line out of `CallLog.body` (that
+    would break `extract_usage_tokens`, which reads it straight out of the raw body).
+    One gemini call (untracked-cost backend, real tokens) + one claude REST call
+    (priced backend) exercise both the token aggregate and the $ aggregate."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "gemini",
+            0,
+            "a real review\n\nprompt_tokens=1000 output_tokens=500\n",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "claude",
+            0,
+            "a real review\n\ninput_tokens=1000000 output_tokens=1000000\n",
+            exit_code=0,
+            argv0="Anthropic API claude-sonnet-5 @ https://api.anthropic.com",
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 2
+        assert stats["untracked_calls"] == 0
+        assert stats["tokens_recorded"] is True
+        assert stats["total_input_tokens"] == 1000 + 1_000_000
+        assert stats["total_output_tokens"] == 500 + 1_000_000
+        # Only the claude call has verified pricing: 1M in @ $2/1M + 1M out @ $10/1M = $12.
+        assert stats["cost_recorded"] is True
+        assert stats["total_cost_usd"] == 12.0
+        assert stats["cost_has_gap"] is False
+        assert stats["unpriced_calls"] == 1  # gemini: real tokens, no verified price
+        gemini = stats["by_model_tokens"]["gemini"]
+        assert gemini["cost_usd"] is None and gemini["unpriced_calls"] == 1
+        sonnet = stats["by_model_tokens"]["claude:claude-sonnet-5"]
+        assert sonnet["cost_usd"] == 12.0 and sonnet["priced_calls"] == 1
+
+
+def test_compute_stats_tracks_usage_when_body_exceeds_cap():
+    """review-cli#337 review finding (opus + fable, independently): #326 (7f31799) caps
+    `CallLog.body` retention, and this feature reads the usage line straight out of
+    `body` -- so a large review whose output exceeds the cap must NOT silently lose its
+    trailing usage line. The cap (`_cap_body`) keeps head+TAIL (not head-only), and the
+    usage line is always the true last line, so it should survive in the tail -- this
+    pins that behavior with a real oversized body through the real parser, the same
+    fixture shape `test_parse_call_log_body_is_capped_for_a_huge_output` already uses."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        huge_review = "a real line of review output\n" * 5000  # >> CALL_BODY_STORE_CAP
+        body = huge_review + "\nprompt_tokens=1234 output_tokens=567\n"
+        assert len(body) > p.CALL_BODY_STORE_CAP, "fixture must actually exceed the cap"
+        _write_call_log(ld, "20260601T100000_000000", "gemini", 0, body, exit_code=0)
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 1, (
+            "the trailing usage line must survive the #326 body cap"
+        )
+        assert stats["total_input_tokens"] == 1234
+        assert stats["total_output_tokens"] == 567
+
+
+def test_compute_stats_priced_backend_call_with_no_usage_line_sets_gap():
+    """review-cli#337 review finding (fable, round 2): a claude call that timed out (or
+    otherwise errored) BEFORE emitting a usage line still may have spent real tokens --
+    it lands in `untracked_calls`, but `cost_has_gap` must ALSO fire so the Metrics
+    panel's "partial total" warning isn't silently skipped just because this call never
+    reached the point of being priced (as opposed to being priced and rejected)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "claude",
+            0,
+            "[review-cli] TIMEOUT after 120s — partial output above]\n",
+            argv0="Anthropic API claude-sonnet-5 @ https://api.anthropic.com",
+            exit_code=124,
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 0
+        assert stats["untracked_calls"] == 1
+        assert stats["cost_has_gap"] is True
+        assert stats["cost_recorded"] is False
+
+
+def test_compute_stats_http_rejected_claude_api_call_is_not_a_cost_gap():
+    """review-cli#369 re-review finding (Sonnet, quality): a claude API call the provider
+    REJECTED with an HTTP status (a stale key's 401, a 429, a 529 overload) was never
+    billed, so it must not mark the window's cost as partial/unknown -- otherwise a bad
+    key would put a permanent 'PARTIAL total' warning on every window. `review_claude_api`
+    records the HTTP status as the call's exit code."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "claude",
+            0,
+            '[stderr] {"type":"error","error":{"type":"authentication_error"}}\n',
+            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com",
+            exit_code=401,
+        )
+        # Connection never opened (round-3 Opus finding): exit 1, URLError text.
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "claude",
+            0,
+            "[stderr] <urlopen error [Errno 111] Connection refused>\n",
+            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com",
+            exit_code=1,
+        )
+        stats = p.compute_stats(p.load_sessions(ld, gap_seconds=90))
+        # A 2xx that arrived but could not be read MAY have been billed: still a gap.
+        _write_call_log(
+            ld,
+            "20260601T100020_000000",
+            "claude",
+            0,
+            "[stderr] claude API: malformed or unreadable response: Expecting value\n",
+            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com",
+            exit_code=1,
+        )
+        stats_unreadable = p.compute_stats(p.load_sessions(ld, gap_seconds=90))
+    assert stats["untracked_calls"] == 2
+    assert stats["cost_has_gap"] is False
+    assert stats_unreadable["cost_has_gap"] is True
+
+
+def test_compute_stats_gemini_only_window_has_no_dollar_cost():
+    """review-cli#337 review finding (fable, round 1): nullability of `total_cost_usd`
+    must key on whether ANY call was actually priced, not on whether any call was
+    merely tracked (tokens seen). A gemini-only window has real tracked tokens but zero
+    verified pricing anywhere -- `total_cost_usd` must be `None`, not a fabricated-
+    looking `0.0`."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "gemini",
+            0,
+            "a real review\n\nprompt_tokens=1000 output_tokens=500\n",
+            exit_code=0,
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 1
+        assert stats["tokens_recorded"] is True
+        assert stats["cost_recorded"] is False
+        assert stats["total_cost_usd"] is None
+        assert stats["cost_has_gap"] is False  # gemini isn't a priced-capable backend
+
+
+def test_compute_stats_mixed_priced_and_unpriced_claude_calls_sets_gap_flag():
+    """review-cli#337 review finding (fable, round 1): a window with one call review-cli
+    CAN price (claude-sonnet-5) and one it genuinely can't (a claude model id with no
+    verified list price) must set `cost_has_gap` so the UI can warn the total is
+    partial, even though `cost_recorded` is True (some cost WAS found)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "claude",
+            0,
+            "a real review\n\ninput_tokens=1000000 output_tokens=1000000\n",
+            exit_code=0,
+            argv0="Anthropic API claude-sonnet-5 @ https://api.anthropic.com",
+        )
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "claude",
+            0,
+            "a real review\n\ninput_tokens=1000 output_tokens=1000\n",
+            exit_code=0,
+            argv0="Anthropic API claude-experimental-9 @ https://api.anthropic.com",
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 2
+        assert stats["cost_recorded"] is True
+        assert stats["total_cost_usd"] == 12.0  # only the sonnet-5 call is priced
+        assert stats["cost_has_gap"] is True
+        unpriced = stats["by_model_tokens"]["claude:claude-experimental-9"]
+        assert unpriced["cost_usd"] is None and unpriced["unpriced_calls"] == 1
+
+
+def test_compute_stats_prices_the_default_opus_seat_and_dated_snapshots():
+    """review-cli#369: the default Opus seat (`claude-opus-4-8`, config.MODEL_ALIASES /
+    DEFAULT_BOARD / MODERATOR_CANDIDATES) has a verified list price (rig-cli's
+    `PRICING_USD_PER_1M`: $5 in / $25 out per 1M), so an API-mode call to it must get a
+    real $ figure, not be silently left out of the total. A dated snapshot id resolves to
+    its base model's price."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "claude",
+            0,
+            "a real review\n\ninput_tokens=1000000 output_tokens=100000\n",
+            exit_code=0,
+            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com",
+        )
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "claude",
+            0,
+            "a real review\n\ninput_tokens=1000000 output_tokens=1000000\n",
+            exit_code=0,
+            argv0="Anthropic API claude-haiku-4-5-20251001 @ https://api.anthropic.com",
+        )
+        stats = p.compute_stats(p.load_sessions(ld, gap_seconds=90))
+        assert stats["by_model_tokens"]["claude:claude-opus-4-8"]["cost_usd"] == 7.5
+        assert stats["total_cost_usd"] == 7.5 + 6.0
+        assert stats["unpriced_calls"] == 0
+        assert stats["cost_has_gap"] is False
+
+
+def test_compute_stats_non_anthropic_gateway_is_not_priced():
+    """review-cli#337 review finding (codex, P1): a claude-backend call routed through a
+    non-Anthropic gateway (ANTHROPIC_BASE_URL, e.g. CommandCode) is NOT billed at
+    Anthropic's list price even when the model id is a recognized Claude model — pricing
+    must check the base URL, not just the model string."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "claude",
+            0,
+            "a real review\n\ninput_tokens=1000000 output_tokens=1000000\n",
+            exit_code=0,
+            argv0="Anthropic API claude-sonnet-5 @ https://api.commandcode.ai/provider",
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 1
+        assert stats["cost_recorded"] is False
+        assert stats["total_cost_usd"] is None
+        assert stats["cost_has_gap"] is True
+
+
+def test_compute_stats_untracked_backend_stays_honestly_uncounted():
+    """codex/opencode/omp (subprocess/CLI-mode backends) never emit a usage line — their
+    token usage is genuinely unobservable from review-cli's side. `untracked_calls` must
+    count those honestly rather than the Metrics panel implying full coverage."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, "looks good\n", exit_code=0
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["tracked_calls"] == 0
+        assert stats["untracked_calls"] == 1
+        assert stats["tokens_recorded"] is False
+        assert stats["cost_recorded"] is False
+        assert stats["total_cost_usd"] is None
+
+
+def _stub_rest_urlopen(backends_mod, payload: dict):
+    """Point `backends.urllib.request.urlopen` at a canned 2xx JSON `payload`; returns
+    the undo callable."""
+    import io
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    saved = backends_mod.urllib.request.urlopen
+    backends_mod.urllib.request.urlopen = lambda req, timeout=None: _Resp(
+        json.dumps(payload).encode("utf-8")
+    )
+
+    def undo():
+        backends_mod.urllib.request.urlopen = saved
+
+    return undo
+
+
+def test_metrics_tokens_and_cost_match_the_run_tally_on_a_large_review():
+    """review-cli#369 regression: the Metrics tab silently under-reported token usage and
+    $ cost on large reviews.
+
+    Root cause: a REST call on a LARGE prompt can come back 2xx with no assistant text
+    (a reasoning model that spent its whole completion budget on hidden reasoning, an Anthropic
+    response with no text block) after the provider already BILLED the prompt + output
+    tokens. backends.py keeps those tokens on the failed `ReviewResult` (so the run tally
+    in `run-stats.jsonl` counts them), but the sidecar `.log` -- the dashboard's ONLY
+    source -- got an empty stdout and therefore no usage line at all, so the call fell
+    into `untracked_calls` and its (very large) spend vanished from the totals.
+
+    Drives a realistic large-review board round through the REAL REST backends (stubbed
+    HTTP only) into a real log dir, then asserts the dashboard totals equal the in-memory
+    per-call tally, and the $ figure equals the published-price cost of every priced
+    call. The oversized successful body also re-pins that the #326 body cap keeps the
+    trailing usage line (the hypothesis the original review rounds raised)."""
+    from reviewlib import backends as b
+    from reviewlib.dashboard import parser as p
+
+    huge_review = "\n".join(
+        f"- [P1] finding {i}: " + "x" * 90 for i in range(4000)
+    )  # >> CALL_BODY_STORE_CAP
+    claude_seat = "claude:claude-opus-5"
+    rounds = [
+        # (backend kind, payload) for one board round of a large review
+        (
+            "claude",
+            {
+                "content": [{"type": "text", "text": huge_review}],
+                "usage": {"input_tokens": 400_000, "output_tokens": 16_000},
+            },
+        ),
+        (
+            "claude",  # billed, but no text block came back
+            {
+                "content": [],
+                "usage": {"input_tokens": 380_000, "output_tokens": 16_000},
+            },
+        ),
+        (
+            "zai",  # reasoning model: whole completion budget spent, no text returned
+            {
+                "choices": [
+                    {
+                        "message": {"content": ""},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 390_000, "completion_tokens": 32_000},
+            },
+        ),
+        (
+            "zai",
+            {
+                "choices": [{"message": {"content": huge_review}}],
+                "usage": {"prompt_tokens": 390_000, "completion_tokens": 9_000},
+            },
+        ),
+    ]
+    saved_env = {
+        k: os.environ.get(k)
+        for k in ("REVIEW_LOG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+    }
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["REVIEW_LOG_DIR"] = d
+        os.environ["ANTHROPIC_API_KEY"] = "user_x"
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        tally_in = tally_out = 0
+        priced_cost = 0.0
+        try:
+            for kind, payload in rounds:
+                undo = _stub_rest_urlopen(b, payload)
+                try:
+                    if kind == "claude":
+                        res = b.review_claude_api(
+                            claude_seat, "Q?", "diff", Path("."), 30, round_no=1
+                        )
+                    else:
+                        res = b._openai_compatible_request(
+                            model="zai",
+                            api_model="glm-5.2",
+                            label="z.ai",
+                            base_url="https://api.z.ai/api/paas/v4",
+                            key="user_x",
+                            prompt="Q?",
+                            diff="diff",
+                            timeout=30,
+                            backend="z.ai",
+                            round_no=1,
+                        )
+                finally:
+                    undo()
+                assert res.prompt_tokens > 0, (kind, res)
+                tally_in += res.prompt_tokens
+                tally_out += res.output_tokens
+                if kind == "claude":  # claude-opus-5 list price: $5 in / $25 out per 1M
+                    priced_cost += (
+                        res.prompt_tokens * 5.0 + res.output_tokens * 25.0
+                    ) / 1_000_000
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        stats = p.compute_stats(p.load_sessions(Path(d), gap_seconds=90))
+    assert stats["call_count"] == len(rounds), stats["call_count"]
+    assert stats["tracked_calls"] == len(rounds), (
+        "every call that reported provider usage must be tracked",
+        stats["tracked_calls"],
+        stats["untracked_calls"],
+    )
+    assert stats["total_input_tokens"] == tally_in, (stats["total_input_tokens"], tally_in)
+    assert stats["total_output_tokens"] == tally_out, (
+        stats["total_output_tokens"],
+        tally_out,
+    )
+    assert stats["total_cost_usd"] == round(priced_cost, 4), (
+        stats["total_cost_usd"],
+        round(priced_cost, 4),
+    )
+    assert stats["cost_has_gap"] is False
+
+
+def test_usage_status_line_is_position_bound_and_backend_scoped():
+    """review-cli#369: the writer's `[review-cli] USAGE ...` line is honored ONLY directly
+    before the EXIT footer (a review quoting one mid-body is just body text), it never
+    leaks into `body`, and it only counts for the REST backends that write it -- an
+    agentic CLI seat whose own output ends with a forged USAGE line stays untracked. A
+    CLI-mode claude call (subscription-billed) is untracked but NOT an API cost gap."""
+    from reviewlib.dashboard import parser as p
+
+    usage = "[review-cli] USAGE prompt_tokens=5000 output_tokens=0\n"
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        failed = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "z.ai",
+            0,
+            "[stderr] z.ai API returned no assistant content: {}\n" + usage,
+            argv0="z.ai API glm-5.2",
+            exit_code=1,
+        )
+        quoted = _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "gemini",
+            0,
+            usage + "the log above shows the marker\n",
+            argv0="Gemini API gemini",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100020_000000",
+            "codex",
+            0,
+            "verdict\n[review-cli] USAGE prompt_tokens=999 output_tokens=999\n",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld, "20260601T100030_000000", "claude", 0, "verdict\n",
+            argv0="claude", exit_code=0,
+        )
+        c = p.parse_call_log(failed)
+        assert (c.usage_prompt_tokens, c.usage_output_tokens) == (5000, 0)
+        assert "USAGE" not in c.body
+        q = p.parse_call_log(quoted)
+        assert q.usage_prompt_tokens is None and "USAGE" in q.body
+        stats = p.compute_stats(p.load_sessions(ld, gap_seconds=90))
+    # Only the billed-but-failed z.ai call is tracked: its prompt spend counts, output 0
+    # is legitimate for a non-completed call.
+    assert stats["tracked_calls"] == 1, stats
+    assert stats["total_input_tokens"] == 5000
+    assert stats["total_output_tokens"] == 0
+    assert stats["untracked_calls"] == 3
+    assert stats["cost_has_gap"] is False
+    assert stats["by_model_tokens"]["claude:claude-opus-4-8"]["tracked_calls"] == 0
+
+
 def test_parse_call_log_body_is_capped_for_a_huge_output():
     """review-cli#326: CallLog kept the FULL streamed body for every one of ~132k calls
     on a real install, ballooning the dashboard process to 32.8GB RSS. `has_error`/
