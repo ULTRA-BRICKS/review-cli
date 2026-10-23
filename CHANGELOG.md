@@ -3,6 +3,31 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.51.1 — 2026-10-23
+
+- **Dashboard: session-detail no longer reads as an unbroken wall of stderr,
+  adds Round N grouping, and surfaces board role + a recovered prompt per
+  call ([review-cli#345](https://git.hyperide.ai/ultrabricks/review-cli/issues/345)).** codex genuinely streams its whole transcript
+  (including its own echo of the sent prompt) to real OS stderr and only the
+  terse final answer to stdout — review-cli's capture was already correct,
+  but the UI gave stdout no visual priority, so a healthy call read as
+  "everything is an error." Session-detail now splits each call into a
+  prominent "Result (stdout)" block and a collapsible "verbose transcript
+  (stderr, N lines)" section (auto-expanded only on a real error or when a
+  call produced no stdout at all). The Calls list groups under "Round N"
+  headers whenever a session genuinely carries more than one round
+  (brainstorm/quorum); a single-round session (the common diff-review shape)
+  still renders flat rather than a fabricated "Round 0" header. Each call now
+  also shows its board role/lens (e.g. `correctness`, `consistency`), joined
+  from the same board metadata the Errors tab already uses (a Claude seat that
+  ran on its `omp:anthropic/…` twin keeps the seat's role), and — when a
+  subprocess backend echoed it into its own transcript — its recovered
+  prompt, with an honest "no prompt recovered" note when it wasn't (REST
+  backends never carry one, by design; prompts are still not persisted as
+  their own field). A related finding — the two example sessions used to
+  investigate this turned out to be test-suite artifacts leaked into the
+  real log dir, not genuine runs — is tracked separately (review-cli#346).
+
 ## 0.51.0 — 2026-10-17
 
 - **Feat(models): bump board and alias pins to the newest models**

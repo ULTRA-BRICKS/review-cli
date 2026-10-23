@@ -1138,50 +1138,128 @@ function renderDetail(d) {
     html += `</div>`;
   }
 
-  // Per-call logs
+  // Per-call logs, grouped under "Round N" headers when the session actually carries more
+  // than one distinct round (brainstorm/quorum). See `groupCallsByRound`'s own comment for
+  // why a single-round session (every diff-review call is genuinely round 0 -- review-cli
+  // has no per-iteration round concept outside brainstorm/quorum) renders flat instead of a
+  // meaningless "Round 0" header repeated on every call.
   html += `<div class="section"><h3>Calls (${(d.calls || []).length})</h3>`;
   if (!(d.calls || []).length && !d.brainstorm)
     html += emptyState('calls', "This session's per-call logs aged out of the log dir.");
-  (d.calls || []).forEach((c, i) => {
-    // codex review finding, review-cli#243 round 6: a timeout (ordinary OR true-
-    // silence) is not a hard admin-level block, same distinction the Errors panel's
-    // classBadge already draws (degraded/amber) vs. a hard error (err/red) -- see that
-    // badge's own comment for why "retryable" is the wrong word for true-silence
-    // specifically (it's SEAT_FATAL in retry.py, not retried the same way rc=124 is).
-    // The per-call view was still showing both as "err" (pre-existing for timed_out; true_silenced
-    // faithfully mirrored it in round 3), inconsistent with that declared semantics.
-    const status = c.timed_out
-      ? `<span class="badge degraded">timeout ${c.timeout_secs}s</span>`
-      : c.true_silenced
-        ? `<span class="badge degraded">true-silence ${c.true_silence_secs}s</span>`
-        : c.has_error
-          ? `<span class="badge err">error</span>`
-          : c.completed === false
-            ? `<span class="badge running">running</span>`
-            : `<span class="badge ok">ok</span>`;
-    html += `<div class="call">
+  groupCallsByRound(d.calls || []).forEach((group) => {
+    if (group.grouped) {
+      html += `<div class="call-round-head"><span class="round-no">Round ${esc(group.round)}</span> <span class="muted">${group.calls.length} call${group.calls.length === 1 ? '' : 's'}</span></div>`;
+    }
+    group.calls.forEach(({ index: i, call: c }) => {
+      html += renderCall(c, i);
+    });
+  });
+  html += `</div>`;
+  return html;
+}
+
+// Groups per-call entries (in their existing chronological order) by `round` for the
+// session-detail Calls list, keeping each entry's ORIGINAL index into `d.calls` (needed by
+// `data-call`/`cb-${i}` toggling and the Errors-tab `focusCall` deep link, both of which
+// index into the flat, ungrouped array). When every call shares the same round -- the
+// common diff-review shape, since review-cli has no per-iteration round concept outside
+// brainstorm/quorum -- returns ONE ungrouped group so the caller renders a flat list
+// exactly as before, rather than fabricating a "Round 0" header with no information in it.
+function groupCallsByRound(calls) {
+  const arr = calls || [];
+  const indexed = arr.map((call, index) => ({ index, call }));
+  const rounds = new Set(arr.map((c) => c.round));
+  if (rounds.size <= 1) {
+    return [{ round: arr.length ? arr[0].round : 0, calls: indexed, grouped: false }];
+  }
+  const order = [];
+  const byRound = new Map();
+  indexed.forEach((entry) => {
+    const r = entry.call.round;
+    if (!byRound.has(r)) {
+      byRound.set(r, []);
+      order.push(r);
+    }
+    byRound.get(r).push(entry);
+  });
+  order.sort((a, b) => a - b);
+  return order.map((r) => ({ round: r, calls: byRound.get(r), grouped: true }));
+}
+
+// Splits a call's raw body into the backend's REAL stdout ("result") vs the verbose stderr
+// transcript some CLIs stream as progress logging (codex, in particular, writes its whole
+// session transcript -- tool calls, reasoning, its own echo of the prompt -- to stderr and
+// only the terse final answer to stdout; review-cli's capture is faithful to that real OS-
+// level split, see reviewlib/process.py's `_run_streamed`). This is a PRESENTATION split
+// only: it stops a genuinely successful call's real output from reading as "all errors"
+// just because most of its lines happen to originate on stderr.
+function splitBodyByStream(body) {
+  const resultLines = [];
+  const transcriptLines = [];
+  String(body || '')
+    .split('\n')
+    .forEach((ln) => {
+      if (ln.startsWith('[stderr] ')) transcriptLines.push(ln.slice('[stderr] '.length));
+      else resultLines.push(ln);
+    });
+  return { resultLines, transcriptLines };
+}
+
+function renderPlainLines(text) {
+  return String(text || '')
+    .split('\n')
+    .map(esc)
+    .join('\n');
+}
+
+function renderCall(c, i) {
+  // codex review finding, review-cli#243 round 6: a timeout (ordinary OR true-
+  // silence) is not a hard admin-level block, same distinction the Errors panel's
+  // classBadge already draws (degraded/amber) vs. a hard error (err/red) -- see that
+  // badge's own comment for why "retryable" is the wrong word for true-silence
+  // specifically (it's SEAT_FATAL in retry.py, not retried the same way rc=124 is).
+  // The per-call view was still showing both as "err" (pre-existing for timed_out; true_silenced
+  // faithfully mirrored it in round 3), inconsistent with that declared semantics.
+  const status = c.timed_out
+    ? `<span class="badge degraded">timeout ${c.timeout_secs}s</span>`
+    : c.true_silenced
+      ? `<span class="badge degraded">true-silence ${c.true_silence_secs}s</span>`
+      : c.has_error
+        ? `<span class="badge err">error</span>`
+        : c.completed === false
+          ? `<span class="badge running">running</span>`
+          : `<span class="badge ok">ok</span>`;
+  const { resultLines, transcriptLines } = splitBodyByStream(c.body);
+  const resultText = resultLines.join('\n').trim();
+  const transcriptText = transcriptLines.join('\n').trim();
+  const promptHtml = c.prompt
+    ? `<div class="call-prompt"><div class="call-sub-head">Prompt <span class="muted" title="recovered from this call's own transcript echo -- best-effort, not every backend/mode echoes it back">(recovered, best-effort)</span></div><pre class="log">${renderPlainLines(c.prompt)}</pre></div>`
+    : `<p class="muted call-prompt-missing">no prompt recovered for this call — its transcript did not echo the prompt (REST-mode backends never do), and prompts are not stored as their own field by design.</p>`;
+  const resultHtml = resultText
+    ? `<div class="call-result"><div class="call-sub-head">Result (stdout)</div><pre class="log">${renderPlainLines(resultText)}</pre></div>`
+    : `<p class="muted">no stdout captured for this call — see the transcript below.</p>`;
+  const transcriptHtml = transcriptText
+    ? `<details class="call-transcript"${c.has_error || !resultText ? ' open' : ''}>
+        <summary>verbose transcript (stderr, ${transcriptLines.length} line${transcriptLines.length === 1 ? '' : 's'})</summary>
+        <pre class="log">${renderPlainLines(transcriptText)}</pre>
+      </details>`
+    : '';
+  return `<div class="call">
       <div class="call-head" data-call="${i}">
         <span class="call-ix">▸</span>
         ${seatChip(c.model || c.backend, { small: true })}
+        ${c.role ? `<span class="badge role-badge" title="board role/lens">${esc(c.role)}</span>` : ''}
         <span class="muted">round ${esc(c.round)}</span>
         ${status}
         <span class="muted">${fmtDur(c.duration_seconds)} · ${esc(c.size_bytes)}B</span>
         ${c.argv0 ? `<code class="call-argv" title="recorded invocation (argv[0], args redacted)">${esc(c.argv0)}</code>` : ''}
       </div>
       <div class="call-body" id="cb-${i}" style="display:none">
-        <pre class="log">${renderBody(c.body)}</pre>
+        ${promptHtml}
+        ${resultHtml}
+        ${transcriptHtml}
       </div>
     </div>`;
-  });
-  html += `</div>`;
-  return html;
-}
-
-function renderBody(body) {
-  return String(body || '')
-    .split('\n')
-    .map((ln) => (ln.startsWith('[stderr] ') ? `<span class="stderr">${esc(ln)}</span>` : esc(ln)))
-    .join('\n');
 }
 
 function wireDetail(d) {
@@ -1605,5 +1683,18 @@ document.addEventListener('DOMContentLoaded', boot);
 // are harmless no-ops. Keeping the export here (not a separate module) means the tests
 // exercise the EXACT code the browser runs — no copy that can drift.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { resolveModel, filteredRuns, monogram, cap, state, PANELS, fmtDur, render, STATS_ONLY_PANELS, loadAll };
+  module.exports = {
+    resolveModel,
+    filteredRuns,
+    monogram,
+    cap,
+    state,
+    PANELS,
+    fmtDur,
+    render,
+    STATS_ONLY_PANELS,
+    loadAll,
+    groupCallsByRound,
+    splitBodyByStream,
+  };
 }

@@ -38,7 +38,20 @@ global.window = global.window || noopProxy();
 global.document = global.document || noopProxy();
 
 const APP = path.join(__dirname, '..', 'reviewlib', 'dashboard', 'assets', 'app.js');
-const { resolveModel, filteredRuns, monogram, cap, state, PANELS, fmtDur, render, STATS_ONLY_PANELS, loadAll } = require(APP);
+const {
+  resolveModel,
+  filteredRuns,
+  monogram,
+  cap,
+  state,
+  PANELS,
+  fmtDur,
+  render,
+  STATS_ONLY_PANELS,
+  loadAll,
+  groupCallsByRound,
+  splitBodyByStream,
+} = require(APP);
 
 // MUST run before any other test mutates `state` — pins the true module-load initializer,
 // not a value some other test's cleanup happened to restore. render()'s entire loading
@@ -284,6 +297,63 @@ test('monogram: two words → first letters; one word → first two chars', () =
 test('cap: capitalizes the first character only', () => {
   assert.equal(cap('qwen'), 'Qwen');
   assert.equal(cap(''), '');
+});
+
+// --- groupCallsByRound (session-detail "round 0" bug: add Round N headers) --------------
+test('groupCallsByRound: single-round session (diff review) stays ungrouped', () => {
+  // review-cli has no per-iteration round concept outside brainstorm/quorum, so a normal
+  // diff-review session's calls are ALL genuinely round 0 -- must render flat, not a
+  // meaningless "Round 0" header repeated on every call.
+  const calls = [{ round: 0 }, { round: 0 }, { round: 0 }];
+  const groups = groupCallsByRound(calls);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].grouped, false);
+  assert.equal(groups[0].calls.length, 3);
+  assert.deepEqual(groups[0].calls.map((e) => e.index), [0, 1, 2]);
+});
+
+test('groupCallsByRound: multi-round brainstorm groups by round, ascending, indices preserved', () => {
+  const calls = [
+    { round: 1, backend: 'codex' },
+    { round: 1, backend: 'gemini' },
+    { round: 2, backend: 'codex' },
+    { round: 3, backend: 'codex' },
+  ];
+  const groups = groupCallsByRound(calls);
+  assert.deepEqual(groups.map((g) => g.round), [1, 2, 3]);
+  assert.ok(groups.every((g) => g.grouped));
+  assert.equal(groups[0].calls.length, 2);
+  // Original array indices (needed by data-call/cb-${i} toggling and focusCall) survive
+  // grouping, even though the calls are now split across groups.
+  assert.deepEqual(groups[0].calls.map((e) => e.index), [0, 1]);
+  assert.deepEqual(groups[1].calls.map((e) => e.index), [2]);
+  assert.deepEqual(groups[2].calls.map((e) => e.index), [3]);
+});
+
+test('groupCallsByRound: empty calls list is tolerated', () => {
+  assert.deepEqual(groupCallsByRound([]), [{ round: 0, calls: [], grouped: false }]);
+  assert.deepEqual(groupCallsByRound(null), [{ round: 0, calls: [], grouped: false }]);
+});
+
+// --- splitBodyByStream (session-detail "everything ends up in stderr" bug) --------------
+test('splitBodyByStream: separates real stdout from the [stderr]-tagged transcript', () => {
+  const body = ['[stderr] user', '[stderr] the prompt', 'the real verdict', '[stderr] tokens used'].join(
+    '\n'
+  );
+  const { resultLines, transcriptLines } = splitBodyByStream(body);
+  assert.deepEqual(resultLines, ['the real verdict']);
+  assert.deepEqual(transcriptLines, ['user', 'the prompt', 'tokens used']);
+});
+
+test('splitBodyByStream: a pure-stdout REST body (no [stderr] lines) yields an empty transcript', () => {
+  const { resultLines, transcriptLines } = splitBodyByStream('The change looks correct.\nNo issues found.');
+  assert.deepEqual(resultLines, ['The change looks correct.', 'No issues found.']);
+  assert.deepEqual(transcriptLines, []);
+});
+
+test('splitBodyByStream: empty/null body is tolerated', () => {
+  assert.deepEqual(splitBodyByStream(''), { resultLines: [''], transcriptLines: [] });
+  assert.deepEqual(splitBodyByStream(null), { resultLines: [''], transcriptLines: [] });
 });
 
 // --- fmtDur (Metrics tab duration formatting) --------------------------------

@@ -63,6 +63,86 @@ _TRUE_SILENCE_RE = re.compile(
 _EXIT_RE = re.compile(r"^\[review-cli\] EXIT (?P<code>-?\d+)\s*$")
 _STDERR_PREFIX = "[stderr] "
 
+# Best-effort PROMPT RECOVERY (session-detail "where are the prompts?" gap): review-cli
+# deliberately does not persist the prompt as its own field (see the module docstring --
+# these logs are 0600 because they may carry secrets, and a dedicated prompt field was a
+# considered, rejected scope expansion). But a SUBPROCESS-mode backend (codex, the `claude`
+# CLI) echoes its own stdin back into the transcript it prints -- which review-cli already
+# captures faithfully into `body` -- so the prompt review-cli sent is often ALREADY present,
+# just buried in a wall of `[stderr] `-tagged transcript noise. This recovers it when it's
+# there, by matching on review-cli's OWN prompt wording (config.DEFAULT_PROMPT's fixed
+# opener, and the "You are a '<persona>'" opener shared by brainstorm.py/quorum.py's persona
+# prompts) rather than any vendor CLI's transcript format, which differs per tool/version and
+# would need separate, fragile per-backend parsing. A REST backend (gemini/z.ai/commandcode/
+# claude-api) returns only the verdict and never echoes the prompt, and opencode's transcript
+# doesn't echo it either -- both correctly yield no match here, never a fabricated guess.
+_PROMPT_OPENERS: tuple[str, ...] = (
+    "Review this uncommitted git diff for bugs, regressions, security issues, and",
+    "You are a '",
+)
+# Generous but bounded -- a recovered prompt can legitimately include a large embedded diff
+# (the same shape `_cap_body` already bounds for the whole call body).
+_PROMPT_EXTRACT_CHAR_CAP = 20_000
+# codex's own transcript convention prints a bare single-word line when the turn switches
+# speaker (`user`, `codex`, `exec`, ...). Once the echoed prompt is underway, the FIRST such
+# marker line is where the model's own reply/tool-call transcript resumes -- cutting there
+# keeps the recovered prompt from trailing off into the model's reasoning/verdict, which is
+# not part of what was actually SENT. Only a BARE marker line counts: an embedded diff's
+# context line (`" user"`, git's leading space kept) is part of the prompt and never cuts it.
+_TRANSCRIPT_TURN_MARKERS = ("codex", "user", "exec")
+# `self.body` (what this function receives) is ALREADY `_cap_body`'s output on a large log
+# -- head+tail with the middle dropped. The TAIL half is a disjoint chunk from LATER in the
+# same file, unrelated to the prompt that opens the head half (confirmed live: a real
+# ~211KB codex log's recovered prompt trailed off into unrelated mid-transcript git/debug
+# noise from the tail half before this guard was added). Cutting at the truncation marker
+# itself -- same regardless of `_cap_body`'s "chars"/"lines" cap -- keeps a long real prompt
+# honestly partial (with review-cli's OWN cap marker visible) instead of silently splicing
+# in unrelated later content.
+_TRUNCATION_MARKER_RE = re.compile(
+    r"^\.\.\. \[\d+ (?:chars|lines) truncated, review-cli#326 memory cap\] \.\.\.$"
+)
+
+
+def extract_prompt_from_body(body: str) -> str | None:
+    """Best-effort recovery of the prompt sent for this call, from its OWN transcript echo
+    (see the `_PROMPT_OPENERS` note above). Strips the `[stderr] ` tag from matched lines
+    before searching, since a subprocess CLI's echo of a multi-line prompt is itself
+    stderr-tagged line by line. Returns ``None`` -- never a guess -- when no known opener is
+    found (REST-mode calls, or a CLI whose transcript shape doesn't echo stdin)."""
+    if not body:
+        return None
+    lines = [
+        ln[len(_STDERR_PREFIX) :] if ln.startswith(_STDERR_PREFIX) else ln
+        for ln in body.splitlines()
+    ]
+    untagged = "\n".join(lines)
+    best_idx: int | None = None
+    for opener in _PROMPT_OPENERS:
+        # Only a line-initial opener counts: a prompt echo starts its own line, while an
+        # answer that merely quotes the opener mid-sentence is not a recovered prompt.
+        idx = untagged.find(opener)
+        while idx > 0 and untagged[idx - 1] != "\n":
+            idx = untagged.find(opener, idx + 1)
+        if idx != -1 and (best_idx is None or idx < best_idx):
+            best_idx = idx
+    if best_idx is None:
+        return None
+    extracted_lines = untagged[
+        best_idx : best_idx + _PROMPT_EXTRACT_CHAR_CAP
+    ].splitlines()
+    # Cut at the first turn-marker line OR `_cap_body`'s truncation marker found AFTER the
+    # opener -- whichever comes first (never at index 0 -- a persona prompt legitimately
+    # starts "You are a '...'" and must not self-truncate).
+    for i, ln in enumerate(extracted_lines[1:], start=1):
+        stripped = ln.rstrip()
+        if stripped in _TRANSCRIPT_TURN_MARKERS or _TRUNCATION_MARKER_RE.match(
+            stripped
+        ):
+            extracted_lines = extracted_lines[:i]
+            break
+    return "\n".join(extracted_lines).rstrip()
+
+
 # Default gap (seconds) that separates one session-burst from the next. Real logs show
 # intra-session gaps of a few-to-~30s and inter-session gaps of 60s+, so 90s is a safe
 # default; override via ?gap= on the API for re-clustering.
@@ -340,6 +420,7 @@ class CallLog:
         return self.mtime
 
     def to_dict(self) -> dict:
+        model = model_id_for_call(self)
         return {
             "filename": self.filename,
             "started": self.started.isoformat(),
@@ -347,7 +428,13 @@ class CallLog:
             # The resolved MODEL id (gateway model split out of the shared commandcode/z.ai
             # backends, Fable-vs-Opus split) so the detail view's call chip wears the right
             # brand logo/label (e.g. "Qwen", not the generic "gateway" backend name).
-            "model": model_id_for_call(self),
+            "model": model,
+            # Board role/lens for this seat (e.g. "correctness"), joined from the same board
+            # metadata the Errors tab / Models & roles view already use -- None for an
+            # off-board/ad-hoc model id. Brainstorm personas carry their own role via
+            # `Session.roles()` / the brainstorm transcript, so this mainly closes the gap for
+            # diff/panel/quorum calls, which previously showed no role at all.
+            "role": _board_role_for_model(model),
             "round": self.round,
             "argv0": self.argv0,
             "duration_seconds": self.duration_seconds,
@@ -363,6 +450,10 @@ class CallLog:
             "size_bytes": self.size_bytes,
             "body": self.body,
             "stderr_lines": self.stderr_lines,
+            # Best-effort prompt recovery from this call's own transcript echo -- see
+            # `extract_prompt_from_body`'s docstring. None (never a guess) when this
+            # call's backend/mode doesn't echo it.
+            "prompt": extract_prompt_from_body(self.body),
         }
 
 
@@ -2129,6 +2220,31 @@ def _board_models_cached() -> tuple[dict, ...]:
         {"model": b.model, "role": b.role, "display": b.display, "priority": i + 1}
         for i, b in enumerate(DEFAULT_BOARD)
     )
+
+
+@lru_cache(maxsize=1)
+def _board_role_by_model() -> dict[str, str | None]:
+    """Model id -> board role/lens (e.g. "correctness", "consistency") -- the SAME source
+    the Errors tab and Models & roles view already join on (`_board_models_cached`).
+    Session-detail's per-call role gap ("роли моделей не пишутся") is closed by joining
+    THIS at render time in `CallLog.to_dict` -- a serve-time join over the already-parsed
+    CallLog, so it needs no schema change and no `_PARSER_VERSION` bump (nothing here is
+    cached by `call_log_cache`; `to_dict()` runs fresh on every request)."""
+    return {b["model"]: b["role"] for b in _board_models_cached()}
+
+
+def _board_role_for_model(model: str | None) -> str | None:
+    """Board role for `model`, or for its Anthropic twin executor (`claude:claude-X` <->
+    `omp:anthropic/claude-X`, review-cli#594): a Claude seat that failed over to its omp
+    twin is still the same seat, so it keeps the seat's role. None for an off-board id."""
+    if not model:
+        return None
+    roles = _board_role_by_model()
+    if model in roles:
+        return roles[model]
+    from ..provider_failover import anthropic_twin
+
+    return roles.get(anthropic_twin(model) or "")
 
 
 def _call_is_clean_ok(call: "CallLog") -> bool:

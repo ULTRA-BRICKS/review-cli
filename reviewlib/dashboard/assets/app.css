@@ -409,13 +409,27 @@ table.kv td:last-child { font-family: var(--mono); font-weight: 600; }
 }
 .call-body { padding: 0 15px 15px; }
 
+/* "Round N" header grouping the calls list (only rendered when a session actually carries
+   more than one distinct round — see groupCallsByRound). Mirrors .bs-round-head so a diff-
+   review's round grouping and a brainstorm's round grouping read as the same idiom. */
+.call-round-head { display: flex; align-items: center; gap: 9px; margin: 18px 0 10px; }
+.call-round-head:first-child { margin-top: 0; }
+
+.call-sub-head { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); margin-bottom: 6px; }
+.call-prompt, .call-result { margin-bottom: 10px; }
+.call-prompt-missing { margin: 0 0 10px; }
+.badge.role-badge { color: var(--muted); border-style: dashed; }
+
+.call-transcript summary { cursor: pointer; font-size: 12px; color: var(--muted); padding: 4px 0; user-select: none; }
+.call-transcript summary:hover { color: var(--text); }
+.call-transcript pre.log { margin-top: 6px; }
+
 pre.log {
   background: #080b12; border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 13px 15px; overflow-x: auto; font-family: var(--mono); font-size: 12px;
   white-space: pre-wrap; word-break: break-word; max-height: 460px; line-height: 1.6;
   color: #c9d3e6;
 }
-pre.log .stderr { color: var(--amber); }
 
 textarea {
   width: 100%; min-height: 92px; background: #080b12; color: var(--text);

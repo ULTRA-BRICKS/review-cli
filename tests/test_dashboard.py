@@ -2726,6 +2726,179 @@ def test_call_to_dict_carries_resolved_model_for_the_detail_chip():
         assert c.to_dict()["model"] == "commandcode:Qwen/Qwen3.8-Max", c.to_dict()
 
 
+def test_call_to_dict_carries_board_role_for_diff_panel_calls():
+    """(session-detail bug: 'роли моделей не пишутся' -- roles were only ever surfaced for
+    brainstorm personas; an ordinary diff/panel call's `role` was missing from `to_dict()`
+    entirely, so the session-detail view had nothing to render.) A `codex -m gpt-6-astra`
+    call resolves to the Astra board seat (role "consistency") via the SAME board metadata
+    the Errors tab already joins on."""
+    from reviewlib.config import ASTRA_SEAT, DEFAULT_BOARD
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "looks good\n",
+            argv0="codex -m gpt-6-astra",
+            exit_code=0,
+        )
+        c = p.parse_call_log(path)
+        expected_role = next(b.role for b in DEFAULT_BOARD if b.model == ASTRA_SEAT)
+        assert c.to_dict()["role"] == expected_role, c.to_dict()
+
+
+def test_call_to_dict_role_follows_anthropic_twin_executor():
+    """A board Claude seat that ran on its omp twin (`omp:anthropic/claude-X`, review-cli#594
+    failover) still wears the seat's board role -- the twin is the same seat."""
+    from reviewlib.config import DEFAULT_BOARD
+    from reviewlib.dashboard import parser as p
+    from reviewlib.provider_failover import anthropic_twin
+
+    seat = next(
+        b
+        for b in DEFAULT_BOARD
+        if b.model.startswith("claude:")
+        and not any(o.model == anthropic_twin(b.model) for o in DEFAULT_BOARD)
+    )
+    twin = anthropic_twin(seat.model)
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_call_log(
+            Path(d),
+            "20260601T100000_000000",
+            "omp",
+            0,
+            "looks good\n",
+            argv0="omp -m " + twin.split(":", 1)[1],
+            exit_code=0,
+        )
+        c = p.parse_call_log(path)
+        assert c.to_dict()["model"] == twin, c.to_dict()
+        assert c.to_dict()["role"] == seat.role, c.to_dict()
+
+
+def test_call_to_dict_role_is_none_for_off_board_model():
+    """An ad-hoc/off-board model id (not a recognized board seat) must yield `role: None`,
+    never a wrong/fabricated role."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "x\n",
+            argv0="opencode -m some/totally-unknown-model",
+            exit_code=0,
+        )
+        c = p.parse_call_log(path)
+        assert c.to_dict()["role"] is None, c.to_dict()
+
+
+def test_call_to_dict_recovers_prompt_from_subprocess_transcript_echo():
+    """(session-detail bug: 'где промпты?' -- prompts are deliberately not persisted as
+    their own field, but a subprocess-mode backend like codex echoes its own stdin back
+    into the transcript review-cli already captures. `to_dict()['prompt']` should recover
+    that echoed prompt rather than leaving it undiscoverable inside a wall of
+    `[stderr]`-tagged transcript noise.)"""
+    from reviewlib.dashboard import parser as p
+
+    body = (
+        "[stderr] --------\n"
+        "[stderr] user\n"
+        "[stderr] Review this uncommitted git diff for bugs, regressions, security "
+        "issues, and missing tests. Some more instructions.\n"
+        "[stderr] \n"
+        "[stderr] ```diff\n"
+        "[stderr] diff --git a/x b/x\n"
+        "[stderr] ```\n"
+        "[stderr] codex\n"
+        "[stderr] the real transcript continues here\n"
+        "the actual verdict on real stdout\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            body,
+            argv0="codex -m gpt-5.6-terra",
+            exit_code=0,
+        )
+        c = p.parse_call_log(path)
+        prompt = c.to_dict()["prompt"]
+        assert prompt is not None, c.to_dict()
+        assert prompt.startswith(
+            "Review this uncommitted git diff for bugs, regressions, security issues,"
+        ), prompt
+        assert "[stderr]" not in prompt, "the stderr tag must be stripped from the echo"
+        assert "```diff" in prompt, "the embedded diff fence must survive extraction"
+        assert "the real transcript continues here" not in prompt, (
+            "extraction must cut at the codex turn-marker line, not trail into the "
+            "model's own reply/tool-call transcript"
+        )
+
+
+def test_extract_prompt_keeps_diff_context_lines_that_look_like_turn_markers():
+    """A diff context line whose content is `user`/`exec`/`codex` carries git's leading
+    space, so it is part of the echoed prompt -- only a bare marker line cuts it."""
+    from reviewlib.dashboard import parser as p
+
+    body = (
+        "[stderr] Review this uncommitted git diff for bugs, regressions, security "
+        "issues, and missing tests.\n"
+        "[stderr] ```diff\n"
+        "[stderr]  user\n"
+        "[stderr]  ... [12 chars truncated, review-cli#326 memory cap] ...\n"
+        "[stderr]  exec\n"
+        "[stderr] +tail of the diff\n"
+        "[stderr] ```\n"
+        "[stderr] codex\n"
+        "[stderr] model reply\n"
+    )
+    prompt = p.extract_prompt_from_body(body)
+    assert "+tail of the diff" in prompt, prompt
+    assert "model reply" not in prompt, prompt
+
+
+def test_extract_prompt_ignores_opener_quoted_mid_line_in_an_answer():
+    """An answer that quotes the opener mid-sentence is not an echoed prompt."""
+    from reviewlib.dashboard import parser as p
+
+    body = (
+        "The reviewer was told: Review this uncommitted git diff for bugs, "
+        "regressions, security issues, and missing tests. Then it discusses it.\n"
+    )
+    assert p.extract_prompt_from_body(body) is None
+
+
+def test_call_to_dict_prompt_is_none_when_not_echoed():
+    """A REST-mode call (or any backend whose CLI doesn't echo stdin) returns only the
+    verdict -- `to_dict()['prompt']` must be None, never a fabricated guess."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "z.ai",
+            0,
+            "The change looks correct. No issues found.\n",
+            argv0="z.ai API glm-5.2",
+            exit_code=0,
+        )
+        c = p.parse_call_log(path)
+        assert c.to_dict()["prompt"] is None, c.to_dict()
+
+
 def test_stats_exposes_priority_ordered_board():
     """compute_stats carries the priority-ordered board so the UI can show failover order."""
     from reviewlib.dashboard import parser as p
