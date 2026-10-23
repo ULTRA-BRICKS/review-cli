@@ -30,6 +30,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+# Parser tests exercise on-disk `.log` artifacts; default SQLite archival writes to the
+# archive DB instead of creating files under REVIEW_LOG_DIR.
+os.environ.setdefault("REVIEW_LOG_SQLITE", "0")
+
 
 # --- fixtures: write logs in the real on-disk format ------------------------
 def _write_call_log(

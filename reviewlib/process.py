@@ -31,6 +31,7 @@ from .portable import (
     kill_process_tree,
     new_process_group_kwargs,
 )
+from . import log_archive
 from .stats import normalize_task_code
 
 _LOG_HEADER_CONTROL_TRANSLATION = {
@@ -1050,6 +1051,45 @@ def _open_log(backend: str, round_no: int) -> Path:
     return log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
 
 
+def _archive_finished_log(path: Path) -> None:
+    """Move one FINISHED per-call log into `log_dir()`'s SQLite archive (review-cli#480),
+    then unlink the file. The file stays on disk whenever archival is off
+    (`REVIEW_LOG_SQLITE=0`), the log fell back outside `log_dir()` (review-cli#162 temp
+    dir or `os.devnull`), the archive write fails, or the name is already archived (a
+    stamp collision: the archive keeps the first call, this file keeps this one, and
+    readers prefer the file). `store_call` commits before this unlinks, so a failure at
+    any step can leave a duplicate (deduplicated by filename on read) but never a lost
+    log. Archival must never take down a review: errors are reported on stderr and
+    otherwise swallowed."""
+    if not log_archive.use_sqlite_logs():
+        return
+    ld = log_dir()
+    if path.parent != ld:
+        return
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        mtime = path.stat().st_mtime
+        if not log_archive.store_call(ld, path.name, content, mtime=mtime):
+            return
+    except Exception as exc:  # noqa: BLE001 - archival is best-effort; the file stays
+        print(
+            f"[review-cli] log archive skipped for {path.name} ({exc}); the log stays "
+            "on disk",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    try:
+        path.unlink()
+    except OSError as exc:
+        print(
+            f"[review-cli] {path.name} is archived but its file could not be removed "
+            f"({exc}); readers count it once",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 # The `timeout_marker_kind` value stamped (via the `timeout_kind` result attribute,
 # see `_run_streamed`'s return) when a call times out via the LIVENESS/stall path
 # specifically — review-cli#153/#159/#179. A named constant, not a literal re-typed at
@@ -1356,7 +1396,9 @@ _USAGE_PREFIX = "[review-cli] USAGE "
 
 
 def _usage_line(prompt_tokens: int, output_tokens: int) -> str:
-    return f"{_USAGE_PREFIX}prompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+    return (
+        f"{_USAGE_PREFIX}prompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+    )
 
 
 def write_sidecar_log(
@@ -1402,25 +1444,49 @@ def write_sidecar_log(
     written as a ``[review-cli] USAGE ...`` line directly before the EXIT footer, on
     EVERY return path -- including a billed call that failed with no assistant text,
     whose stdout (and so its legacy stdout usage line) is empty (review-cli#369).
+
+    With archival on (`REVIEW_LOG_SQLITE`, default; review-cli#480) the finished log goes
+    straight into `log_dir()`'s SQLite archive — no file is created — and the returned
+    path is the name it is archived under. If the archive write fails, the file is
+    written as before.
     """
     stamp = (started or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%fZ")
     path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
+    parts = [
+        f"[review-cli] {_safe_log_header(backend)}: {_safe_log_header(argv0)} "
+        f"(args redacted){_task_header_suffix()}\n"
+    ]
+    if stdout:
+        parts.append(stdout if stdout.endswith("\n") else stdout + "\n")
+    for line in stderr.splitlines():
+        parts.append("[stderr] " + line + "\n")
+    if timed_out:
+        secs = timeout_secs if timeout_secs is not None else 0
+        parts.append(f"[review-cli] TIMEOUT after {secs}s — partial output above]\n")
+    if prompt_tokens or output_tokens:
+        parts.append(_usage_line(prompt_tokens, output_tokens))
+    parts.append(_exit_line(returncode))
+    content = "".join(parts)
+    if log_archive.use_sqlite_logs():
+        try:
+            # mtime = now: the parser reads a call's END time from its mtime. False = this
+            # exact name (same microsecond stamp, backend, round) is already archived: the
+            # file below then holds this call, and readers prefer the on-disk copy — the
+            # same last-write-wins a colliding O_TRUNC open always had.
+            if log_archive.store_call(
+                path.parent, path.name, content, mtime=time.time()
+            ):
+                return path
+        except Exception as exc:  # noqa: BLE001 - fall back to the on-disk file below
+            print(
+                f"[review-cli] log archive skipped for {path.name} ({exc}); writing the "
+                "log file instead",
+                file=sys.stderr,
+                flush=True,
+            )
     fd, path = _open_log_with_fallback(path)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(
-            f"[review-cli] {_safe_log_header(backend)}: {_safe_log_header(argv0)} "
-            f"(args redacted){_task_header_suffix()}\n"
-        )
-        if stdout:
-            fh.write(stdout if stdout.endswith("\n") else stdout + "\n")
-        for line in stderr.splitlines():
-            fh.write("[stderr] " + line + "\n")
-        if timed_out:
-            secs = timeout_secs if timeout_secs is not None else 0
-            fh.write(f"[review-cli] TIMEOUT after {secs}s — partial output above]\n")
-        if prompt_tokens or output_tokens:
-            fh.write(_usage_line(prompt_tokens, output_tokens))
-        fh.write(_exit_line(returncode))
+        fh.write(content)
     return path
 
 
@@ -2287,3 +2353,6 @@ def _run_streamed(
             concurrency_sem.release()
         with log_lock:
             log_fh.close()
+        # Only now that the handle is closed (no drain thread can still append) does the
+        # finished log move into the archive (review-cli#480).
+        _archive_finished_log(path)

@@ -75,9 +75,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .. import log_archive
 from ..process import log_dir as _dashboard_log_dir
 from ..seat_cooldown import CHRONIC_QUOTA_MARKERS
 from . import call_log_cache
@@ -232,8 +233,10 @@ def list_retry_events(
 
 
 def list_call_logs(directory: Path, *, since: datetime | None = None) -> list[CallLog]:
-    """All per-call logs in `directory`, oldest first. Same cheap-filename-prefilter
-    pattern as `list_retry_events`."""
+    """All per-call logs in `directory`, oldest first — on-disk files plus finished calls
+    moved into the directory's SQLite archive (review-cli#480). Same cheap-filename-
+    prefilter pattern as `list_retry_events`; the archive applies `since` to its chunk
+    ranges before decompressing anything."""
     from .parser import (
         parse_call_log,
     )  # local import: avoids a hard cycle at module load
@@ -262,6 +265,15 @@ def list_call_logs(directory: Path, *, since: datetime | None = None) -> list[Ca
         if call is not None:
             calls.append(call)
     call_log_cache.save(directory)
+    on_disk = {c.filename for c in calls}
+    cutoff = (
+        since.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S") if since is not None else None
+    )
+    for call in log_archive.load_calls(directory, since=cutoff):
+        if call.filename in on_disk or (since is not None and call.started < since):
+            continue
+        calls.append(call)
+    calls.sort(key=lambda c: c.filename)
     return calls
 
 

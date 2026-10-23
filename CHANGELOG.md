@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.57.0 — 2026-10-23
+
+- **Feat(logs): finished call logs move into a SQLite archive inside the log dir**
+  ([review-cli#480](https://git.hyperide.ai/ultrabricks/review-cli/issues/480)). A long-lived
+  log dir held one file per call (~154k files / 4.4GB observed), and the dashboard and
+  `review stat` listed and parsed all of them. Now:
+  - a call still streams to its own `.log` file (`tail -f`, the dashboard's live view and
+    crash safety are unchanged). When it finishes, its full text is committed to
+    `<log dir>/logs-archive.sqlite3` and the file is deleted. A REST backend's sidecar log
+    is written to the archive directly. Rows are compressed into chunks of up to 1000 calls
+    or 1MB per (day, backend). `REVIEW_LOG_SQLITE=0` keeps the old file-per-call behavior.
+    If archival fails, the file stays on disk;
+  - the dashboard (`/api/runs`, `/api/stats`, live updates), `review task` and `review stat`
+    read archived calls together with on-disk files. The `days` window covers both sources
+    and is anchored on the newest stamp from either one. Chunks older than the window are
+    not decompressed;
+  - `python -m reviewlib.log_archive_migrate [--log-dir DIR] [--skip-delete]` archives an
+    existing log dir, then runs four proofs: every call is archived, sampled entries are
+    byte-identical, per-day token and call totals match, and brainstorm copies are
+    identical. Call files are deleted only when all four pass. Brainstorm `.md` files are
+    kept because `review sessions` resumes from them.
+
 ## 0.56.0 — 2026-10-23
 
 - **Add `review feedback <run_id>` and close the overseer-feedback 0% fill-rate gap.**

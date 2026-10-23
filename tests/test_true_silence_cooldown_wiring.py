@@ -28,6 +28,9 @@ sys.path.insert(0, str(REPO_ROOT))
 from reviewlib import backends as review_backends  # noqa: E402
 from reviewlib import seat_cooldown as sc  # noqa: E402
 
+# Sidecar-log assertions require on-disk `.log` files.
+os.environ.setdefault("REVIEW_LOG_SQLITE", "0")
+
 # An UNWATCHED opencode seat: for a model under the zai/glm stall watchdog
 # (`_opencode_model_needs_stall_watchdog`) the liveness bound is the sole owner of the
 # zero-output signal and `true_silence_timeout` is deliberately NOT forwarded (see

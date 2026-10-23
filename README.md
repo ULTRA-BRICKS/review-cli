@@ -264,7 +264,8 @@ to a per-call log in the OS-standard per-user log dir — **macOS** `~/Library/L
 **Linux** `$XDG_STATE_HOME/review-cli/logs/` (default `~/.local/state/review-cli/logs/`);
 override with `$REVIEW_LOG_DIR`; files are private, mode 0600. Panel modes print the
 log path to stderr at the start of each call, so you can `tail -f` it to watch a long
-run progress instead of staring at a frozen terminal. Review/panel agent CLI calls use
+run progress instead of staring at a frozen terminal. Finished logs move into
+`logs-archive.sqlite3` there (`REVIEW_LOG_SQLITE=0`: keep files). Review/panel agent CLI calls use
 `--timeout` as a **silence** timeout: if the backend writes stdout/stderr, the timer
 resets; if it stays quiet for the idle window, the partial output captured so far is
 still returned (with a `[review-cli] TIMEOUT after Ns without output]` marker and exit

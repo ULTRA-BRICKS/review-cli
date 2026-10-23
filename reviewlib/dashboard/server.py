@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .. import log_archive
 from ..process import log_dir
 from . import parser as dparser
 from . import store as dstore
@@ -159,9 +160,18 @@ def _log_dir_fingerprint(ld: Path) -> tuple[int, float, int]:
     HONEST LIMITATION (see `_dir_signature`'s docstring, parser.py): an external, non-review-
     cli process modifying an old out-of-window file in place, without a create/delete, won't
     move this fingerprint either — the write-once safety argument is unenforced in code,
-    asserted, not verified, and this function inherits that exposure via delegation."""
+    asserted, not verified, and this function inherits that exposure via delegation.
+
+    review-cli#480: the directory's SQLite call-log archive is folded in exactly as in
+    `dparser._dir_signature` (archived row count into the count, newest archived mtime into
+    the mtime), so a call stored only in the archive still invalidates the summary cache."""
+    arch_count, arch_mtime = log_archive.archive_signature(ld)
     scan = dparser._scan_log_dir_entries(ld)
-    return (scan.total_count, scan.max_mtime, scan.total_size)
+    return (
+        scan.total_count + arch_count,
+        max(scan.max_mtime, arch_mtime),
+        scan.total_size,
+    )
 
 
 # Recompute the parsed session list at most once per this window, even while the log dir keeps
@@ -1093,9 +1103,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         front-end) — not a false "removed" signal reaching the browser. A future change that
         starts using `removed` as more than a trigger (e.g. to explicitly report deletions)
         would need to re-derive it from `total_count`/an actual listing, not from this
-        windowed snapshot's key set."""
+        windowed snapshot's key set.
+
+        review-cli#480: one extra pseudo-entry keyed `log_archive.ARCHIVE_FILENAME` carries
+        the archive's (newest mtime, row count) when an archive exists, so a call that lands
+        only in the archive (a REST sidecar) still wakes `_emit_activity`; the per-file loop
+        there skips that key."""
         scan = dparser._scan_log_dir_entries(ld)
-        return {e.name: (e.mtime, e.size) for e in scan.entries}
+        snapshot = {e.name: (e.mtime, e.size) for e in scan.entries}
+        arch_count, arch_mtime = log_archive.archive_signature(ld)
+        if arch_count:
+            snapshot[log_archive.ARCHIVE_FILENAME] = (arch_mtime, arch_count)
+        return snapshot
 
     def _emit_activity(
         self,
@@ -1110,6 +1129,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
         # Per-file `log` events: cheapest, most immediate signal that a call is streaming.
         for name in changed_files:
+            if name == log_archive.ARCHIVE_FILENAME:
+                continue  # archive pseudo-entry: only a wake-up trigger, not a file event
             grew = name in last
             payload = {"filename": name, "grew": grew}
             c = dparser.parse_call_log(ld / name)

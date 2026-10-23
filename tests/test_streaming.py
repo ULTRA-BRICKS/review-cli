@@ -34,6 +34,9 @@ import reviewlib as review  # noqa: E402  (package façade re-exports the public
 from reviewlib import backends as review_backends  # noqa: E402  (backends patch target)
 import reviewlib.process as process  # noqa: E402
 
+# Streaming tests assert on live on-disk log files.
+os.environ.setdefault("REVIEW_LOG_SQLITE", "0")
+
 
 def _with_env(**env):
     class _Ctx:

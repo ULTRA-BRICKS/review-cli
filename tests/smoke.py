@@ -1036,6 +1036,11 @@ _UNIT_FILES = [
     # Fable dispatch/failure report, and byte-proxy stats. Deterministic — synthetic
     # CallLog fixtures, no real log dir, no network, no backend.
     ("test_tokenstats.py", {}),
+    # The SQLite call-log archive (review-cli#480): store/seal/load round-trip, durability
+    # across process exit, process.py's archive-on-finish write paths, the dashboard and
+    # `review stat` read paths under the `days` window, and the migration's proofs. Every
+    # test uses its own temp log dir (the archive lives inside it).
+    ("test_log_archive.py", {}),
     # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
     # text rendering, --harness table filtering). Deterministic, no network/backend.
     ("test_stat_subcommand.py", {}),

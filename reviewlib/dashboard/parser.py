@@ -43,6 +43,7 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
+from .. import log_archive
 from . import call_log_cache
 
 # Per-call log filename: 20260613T040611_516399Z-claude-r0.log
@@ -680,16 +681,16 @@ def _classify_from_full_text(
     )
 
 
-def parse_call_log(path: Path) -> CallLog | None:
-    """Parse one ``*-r{n}.log`` file. Returns None if the name doesn't match, INCLUDING
-    a name that matches the shape but carries a date `_parse_stamp` can't parse (a
-    corrupted/restored/typo'd filename) — review-cli#323 review finding: this used to
-    raise ValueError straight out of `_parse_stamp`, which is fatal to every caller that
-    doesn't specifically guard for it (both `load_sessions`'s directory scan AND the SSE
-    `_emit_activity` path reach this function with no such guard). Matching the
-    documented "Returns None if the name doesn't match" contract for an invalid date too
-    means every caller gets the fix for free, instead of needing its own guard."""
-    m = _CALL_RE.match(path.name)
+def parse_call_log_text(
+    filename: str,
+    raw: str,
+    *,
+    size: int | None = None,
+    mtime: datetime | None = None,
+    path: str | None = None,
+) -> CallLog | None:
+    """Parse one call log from ``filename`` + raw body (archive or in-memory)."""
+    m = _CALL_RE.match(filename)
     if not m:
         return None
     try:
@@ -698,10 +699,6 @@ def parse_call_log(path: Path) -> CallLog | None:
         return None
     backend = m.group(3)
     round_no = int(m.group(4))
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        raw = ""
     lines = raw.splitlines()
     argv0 = ""
     body_lines: list[str] = []
@@ -811,13 +808,8 @@ def parse_call_log(path: Path) -> CallLog | None:
         if line.startswith(_STDERR_PREFIX):
             stderr_lines.append(line[len(_STDERR_PREFIX) :])
         body_lines.append(line)
-    try:
-        st = path.stat()
-        size = st.st_size
-        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
-    except OSError:
+    if size is None:
         size = len(raw.encode("utf-8"))
-        mtime = None
     full_body = "\n".join(body_lines).strip()
     (
         completed,
@@ -836,9 +828,10 @@ def parse_call_log(path: Path) -> CallLog | None:
         true_silenced,
         true_silence_secs,
     )
+    resolved_path = path if path is not None else filename
     return CallLog(
-        path=str(path),
-        filename=path.name,
+        path=resolved_path,
+        filename=filename,
         started=started,
         backend=backend,
         round=round_no,
@@ -872,6 +865,28 @@ def parse_call_log(path: Path) -> CallLog | None:
     )
 
 
+def parse_call_log(path: Path) -> CallLog | None:
+    """Parse one ``*-r{n}.log`` file from disk."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    try:
+        st = path.stat()
+        size = st.st_size
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    except OSError:
+        size = len(raw.encode("utf-8"))
+        mtime = None
+    return parse_call_log_text(
+        path.name,
+        raw,
+        size=size,
+        mtime=mtime,
+        path=str(path),
+    )
+
+
 _BS_HEADER_RE = re.compile(r"panel=(?P<panel>[^ ]*) moderator=(?P<mod>[^ ]*)")
 _BS_TASK_RE = re.compile(r"\btask=(?P<task>\S+)")
 _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
@@ -885,22 +900,21 @@ _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
 _BS_SECTION_RE = re.compile(r"^(?:## Moderator \(round \d+\)|# Final synthesis)\s*$")
 
 
-def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
-    """Returns None if the name doesn't match, INCLUDING a name that matches the shape
-    but carries a date `_parse_stamp` can't parse — same fix and rationale as
-    `parse_call_log` (review-cli#323 review finding: a `.log`-only guard left this
-    `.md` sibling still fatal to `load_sessions`'s directory scan)."""
-    m = _BRAINSTORM_RE.match(path.name)
+def parse_brainstorm_log_text(
+    filename: str,
+    raw: str,
+    *,
+    mtime: datetime | None = None,
+    path: str | None = None,
+) -> BrainstormLog | None:
+    """Parse one brainstorm log from ``filename`` + raw body."""
+    m = _BRAINSTORM_RE.match(filename)
     if not m:
         return None
     try:
         started = _parse_stamp(m.group(1), m.group(2))
     except ValueError:
         return None
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        raw = ""
     topic = ""
     panel: list[str] = []
     moderator: str | None = None
@@ -967,13 +981,10 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
     for rnd in rounds:
         for p in rnd["personas"]:
             p["text"] = p["text"].strip()
-    try:
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    except OSError:
-        mtime = None
+    resolved_path = path if path is not None else filename
     return BrainstormLog(
-        path=str(path),
-        filename=path.name,
+        path=resolved_path,
+        filename=filename,
         started=started,
         topic=topic,
         panel=panel,
@@ -982,6 +993,24 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
         rounds=rounds,
         body=raw,
         mtime=mtime,
+    )
+
+
+def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
+    """Parse one ``*-brainstorm.md`` file from disk."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        mtime = None
+    return parse_brainstorm_log_text(
+        path.name,
+        raw,
+        mtime=mtime,
+        path=str(path),
     )
 
 
@@ -1282,13 +1311,25 @@ def load_sessions(
     so fixture dirs whose stamps sit in the past (e.g. 2026-06) stay inside a finite
     window instead of being dropped by a raw ``now - 7d`` floor. Files whose stamp is
     older than the window are not walked, stated, or parsed.
+
+    Finished calls that moved into the directory's SQLite archive (review-cli#480,
+    `log_archive`) are read alongside the files under the SAME window: the archive's
+    newest stamp joins the anchor candidates, and only chunks/rows at or after the
+    resulting cutoff are decompressed and parsed. A name present both on disk and in
+    the archive (the instant between archival and unlink) is taken from disk once.
     """
     calls: list[CallLog] = []
     brainstorms: list[BrainstormLog] = []
     if not log_dir_path.exists():
         return []
     window_seconds = 0.0 if days <= 0 else float(days) * 86400.0
-    scan = _scan_log_dir_entries(log_dir_path, window_seconds=window_seconds)
+    scan = _scan_log_dir_entries(
+        log_dir_path,
+        window_seconds=window_seconds,
+        extra_newest_stamp=(
+            log_archive.newest_stamp(log_dir_path) if window_seconds > 0 else None
+        ),
+    )
     for item in scan.entries:
         entry = log_dir_path / item.name
         if entry.suffix == ".log":
@@ -1312,6 +1353,15 @@ def load_sessions(
             if b:
                 brainstorms.append(b)
     call_log_cache.save(log_dir_path)
+    on_disk = {item.name for item in scan.entries}
+    calls.extend(
+        c for c in log_archive.load_calls(log_dir_path, since=scan.cutoff)
+        if c.filename not in on_disk
+    )
+    brainstorms.extend(
+        b for b in log_archive.load_brainstorms(log_dir_path, since=scan.cutoff)
+        if b.filename not in on_disk
+    )
     return cluster_sessions(calls, brainstorms, gap_seconds)
 
 
@@ -1483,10 +1533,13 @@ class LogDirScan(NamedTuple):
     window, without paying for a `.stat()` of it. Without this, deleting an old (out-of-
     window) file would never move `_dir_signature`/`_log_dir_fingerprint` (it was never
     counted to begin with), leaving a stale cached session pointing at a now-gone file
-    (review-cli#151 review finding)."""
+    (review-cli#151 review finding).
+    `cutoff`: the `YYYYMMDDTHHMMSS` window cutoff this scan applied (None = unbounded), so a
+    caller can apply the IDENTICAL window to archived rows (review-cli#480)."""
 
     entries: list[LogEntry]
     total_count: int
+    cutoff: str | None = None
 
     @property
     def max_mtime(self) -> float:
@@ -1533,6 +1586,7 @@ def _scan_log_dir_entries(
     window_seconds: float = _SIGNATURE_WINDOW_SECONDS,
     *,
     now: datetime | None = None,
+    extra_newest_stamp: str | None = None,
 ) -> LogDirScan:
     """A `LogDirScan` of `log_dir_path`'s `.log`/`.md` artifacts, `.stat()`-ing only the ones
     that could plausibly still be changing. `window_seconds <= 0` disables the bound (stats
@@ -1658,6 +1712,17 @@ def _scan_log_dir_entries(
         newest_stamp = next(
             (stamp for stamp in shape_matching if _valid_stamp_prefix(stamp)), None
         )
+        # review-cli#480: finished calls move from this directory into its SQLite archive,
+        # so the archive's newest stamp is an anchor candidate too (validated the same way);
+        # otherwise a directory whose recent files were all archived would anchor on stale
+        # leftovers and the window would drift away from the real newest activity.
+        extra = (extra_newest_stamp or "")[:_STAMP_PREFIX_LEN]
+        if (
+            _STAMP_PREFIX_RE.match(extra)
+            and _valid_stamp_prefix(extra)
+            and (newest_stamp is None or extra > newest_stamp)
+        ):
+            newest_stamp = extra
         if newest_stamp is not None:
             newest_dt = datetime.strptime(newest_stamp, "%Y%m%dT%H%M%S").replace(
                 tzinfo=timezone.utc
@@ -1715,7 +1780,7 @@ def _scan_log_dir_entries(
             except OSError:
                 continue
             entries.append(LogEntry(name, st.st_mtime, st.st_size))
-    return LogDirScan(entries=entries, total_count=len(names))
+    return LogDirScan(entries=entries, total_count=len(names), cutoff=cutoff)
 
 
 def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
@@ -1747,9 +1812,17 @@ def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
     event (a new write from a live review), not indefinitely and not for a live-streaming
     session (which is always within the window) -- never a crash or systemic drift. Not
     covered by a test (the scenario requires simulating an external process, not just this
-    module's own write path); flagged here rather than silently assumed away."""
+    module's own write path); flagged here rather than silently assumed away.
+
+    review-cli#480: finished calls move into the directory's SQLite archive (deliberately
+    NOT a `.log`/`.md` name, so the scan above ignores it). Its own cheap aggregate
+    (`log_archive.archive_signature`: archived row count, newest archived mtime) is folded
+    in, so a call archived without ever having a file (a REST sidecar) still invalidates.
+    A call MOVING from file to archive leaves the signature unchanged (count -1 +1, same
+    mtime) -- correct, since the parsed sessions are unchanged by the move."""
+    arch_count, arch_mtime = log_archive.archive_signature(log_dir_path)
     scan = _scan_log_dir_entries(log_dir_path)
-    return (scan.total_count, scan.max_mtime)
+    return (scan.total_count + arch_count, max(scan.max_mtime, arch_mtime))
 
 
 def load_sessions_cached(
