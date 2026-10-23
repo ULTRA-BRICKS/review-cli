@@ -269,6 +269,74 @@ def test_import_installs_records_marker_and_stamp_only_when_they_match():
         assert meta["stamp"] is False and not stamp.exists()
 
 
+def test_importing_the_same_job_twice_never_double_counts_an_iteration():
+    # a retried import (or `review task --import` of the same box) must not turn one review
+    # into two iterations of the quorum
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        root = (
+            _repo_with_staged_change(Path(td) / "repo")
+            if (Path(td) / "repo").mkdir() is None
+            else None
+        )
+        stats = Path(td) / "stats.jsonl"
+        good = json.dumps({"duration_seconds": 1.0, "task_code": "T", "passed": True})
+        _stub_remote(rr, {"stats.jsonl": (good + "\n").encode()})
+        for _ in range(2):
+            meta: dict = {}
+            with (
+                _env(REVIEW_STATS_FILE=str(stats), REVIEW_MARKER=str(Path(td) / "m")),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                rr.import_results("box", str(root), "20261022T182746Z-33b75c", meta)
+        assert len(stats.read_text().splitlines()) == 1
+        assert meta["imported_records"] == 0
+
+
+def test_an_unwritable_run_stats_store_is_recorded_on_the_job_and_fails_wait_but_keeps_the_stamp():
+    # the box's review finished: the stamp still installs, but the records that would make it
+    # count for the quorum did not land, and the caller must be told with a non-zero exit
+    rr = _load()
+    with tempfile.TemporaryDirectory() as td:
+        root = (
+            _repo_with_staged_change(Path(td) / "repo")
+            if (Path(td) / "repo").mkdir() is None
+            else None
+        )
+        head = _git(root, "rev-parse", "HEAD").strip()
+        digest = hashlib.sha256(
+            _git(root, "diff", "--no-ext-diff", "--cached").encode()
+        ).hexdigest()
+        blocker = Path(td) / "not-a-dir"
+        blocker.write_text("x")
+        good = json.dumps({"duration_seconds": 1.0, "task_code": "T", "passed": True})
+        _stub_remote(
+            rr,
+            {
+                "stats.jsonl": (good + "\n").encode(),
+                "review-stamp-diff": f"{head}\nDIFF".encode(),
+                "review-stamp)": f"{digest}\n".encode(),
+            },
+        )
+        meta: dict = {}
+        err = io.StringIO()
+        with (
+            _env(
+                REVIEW_STATS_FILE=str(blocker / "stats.jsonl"),
+                REVIEW_MARKER=str(Path(td) / "m"),
+            ),
+            contextlib.redirect_stderr(err),
+        ):
+            rr.import_results("box", str(root), "20261022T182746Z-33b75c", meta)
+        stamp = Path(_git(root, "rev-parse", "--git-path", "review-stamp").strip())
+        stamp = stamp if stamp.is_absolute() else root / stamp
+        assert meta["stamp"] is True and stamp.exists()
+        # the box's real exit code survives; the failed import is its own field and fails wait
+        meta["remote_rc"] = 0
+        assert "import_error" in meta and rr._rc_of(meta) == 1
+        assert "NOT imported" in err.getvalue() and "imported 0" not in err.getvalue()
+
+
 def _main_exit(rr, argv: list[str]) -> tuple[int, str]:
     """Run rr.main() with argv, returning (exit code, stderr); any ssh/git work is a failure."""
 

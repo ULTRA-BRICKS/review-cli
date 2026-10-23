@@ -89,6 +89,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -602,6 +603,156 @@ def iterations_for_task(task_code: str) -> list[dict]:
         item["iteration"] = index
         out.append(item)
     return out
+
+
+def _task_code_in(record: dict, keys: frozenset[str]) -> bool:
+    """A record's task_code is one of `keys` (a hand-edited store may hold a list or object)."""
+    code = record.get("task_code")
+    return isinstance(code, str) and code in keys
+
+
+def export_records(task_code: str) -> list[dict]:
+    """The raw run-stats records of one task (both spellings of an all-digit code), oldest
+    first, without the derived ``iteration`` number: what ``import_records`` takes on another
+    machine so the iterations count there without being re-run (review-cli#659). OSError when
+    the store cannot be read: an unreadable store is not an empty one."""
+    try:
+        path = stats_path()
+    except RuntimeError as exc:
+        raise OSError(f"no run-stats store: {exc}") from exc
+    code = normalize_task_code(task_code)
+    if code is None:
+        return []
+    keys = _github_issue_task_keys(code)
+    records = [r for r in _strict_records(path) if _task_code_in(r, keys)]
+    records.sort(key=_record_ts_str)
+    return records
+
+
+def _record_identity(record: dict) -> str:
+    """Two records are the same iteration when they match field for field, whichever host
+    imported them: the import tag is not part of the identity."""
+    return json.dumps(
+        {k: v for k, v in record.items() if k != "remote_host"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _ends_mid_line(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except OSError:
+        return False
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """os.write may accept fewer bytes (full disk, quota): keep going until all landed. A
+    concurrent `record_run` append (not under the import lock) could still land between two
+    partial writes; short writes are rare on local disks and the torn line is then skipped
+    by every reader, so the cost is one retry of the import."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
+def _strict_records(path: Path) -> list[dict]:
+    """Every record of the store, or OSError when it cannot be read exactly. `_load_records`
+    answers "no history" for an unreadable store, which is right for a check but would switch
+    deduplication off for an import."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except UnicodeDecodeError as exc:
+        raise OSError(f"{path} is not valid UTF-8: {exc}") from exc
+    out: list[dict] = []
+    for line in raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and "duration_seconds" in rec:
+            out.append(rec)
+    return out
+
+
+def import_records(
+    lines: Iterable[str],
+    *,
+    remote_host: str | None = None,
+    task_code: str | None = None,
+) -> dict:
+    """Append run-stats records made on another machine to the local store, once each.
+
+    ``lines`` are JSONL as ``review task CODE --export`` prints them. A line that is not a
+    record (not JSON, not an object, no ``duration_seconds``) is rejected; a record already in
+    the store is skipped, so importing twice never double-counts an iteration. ``remote_host``
+    tags records that carry no tag yet; ``task_code`` keeps only that task's records (the rest
+    count as rejected). The records keep their ``repo_id`` / ``diff_files``,
+    so ``review task --check`` verifies them against the local checkout exactly as it does
+    its own. Returns ``{"imported": n, "skipped": n, "rejected": n}``; raises OSError when
+    the store cannot be written."""
+    try:
+        path = stats_path()  # RuntimeError: no HOME / unexpandable ~user
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except RuntimeError as exc:
+        raise OSError(f"no run-stats store: {exc}") from exc
+    keys = (
+        _github_issue_task_keys(normalize_task_code(task_code)) if task_code else None
+    )
+    # The read-check-append must not interleave with another import of the same records
+    # (a retried `review-remote` import next to `--import-from`): a sidecar lock held across it.
+    lock_fd = os.open(str(path) + ".import.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        portable.lock_file(lock_fd, blocking=True)
+        seen = {_record_identity(r) for r in _strict_records(path)}
+        fresh: list[str] = []
+        skipped = rejected = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                rejected += 1
+                continue
+            if (
+                not isinstance(rec, dict)
+                or "duration_seconds" not in rec
+                or (keys is not None and not _task_code_in(rec, keys))
+            ):
+                rejected += 1
+                continue
+            identity = _record_identity(rec)
+            if identity in seen:
+                skipped += 1
+                continue
+            seen.add(identity)
+            if remote_host and "remote_host" not in rec:
+                rec["remote_host"] = remote_host
+            fresh.append(json.dumps(rec, separators=(",", ":")))
+        if fresh:
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                portable.fchmod(fd, 0o600)
+                payload = ("\n".join(fresh) + "\n").encode("utf-8")
+                if _ends_mid_line(
+                    path
+                ):  # a torn earlier write must not swallow our first record
+                    payload = b"\n" + payload
+                _write_all(fd, payload)
+            finally:
+                os.close(fd)
+    finally:
+        os.close(lock_fd)  # closing the descriptor releases the lock
+    return {"imported": len(fresh), "skipped": skipped, "rejected": rejected}
 
 
 def _store_unreadable_error() -> str | None:

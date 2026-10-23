@@ -43,3 +43,16 @@ is the usual limit), not by the box. `review-remote queue` shows the lane (`REVI
 set). `--commit`, `--visual` and `--before` are refused (they act on local state the box lacks).
 
 ---
+
+## Moving iterations between machines
+
+Reviews recorded on another machine (the build box) count here once their records are
+imported; each record keeps its repo and diff identity, so `review task CODE --check`
+verifies it against THIS checkout like a local one, and importing twice never double-counts:
+
+```bash
+review task HYP-742 --import-from ultra@build-box   # ssh, `review task CODE --export` there, import here
+review task HYP-742 --export > hyp-742.jsonl        # or move the JSONL by hand ...
+review task --import hyp-742.jsonl --from-host box  # ... and import it (- reads stdin)
+```
+

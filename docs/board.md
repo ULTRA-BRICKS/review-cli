@@ -257,7 +257,11 @@ processes, host-wide admission (next paragraph) bounds how many reviews and seat
 and the AI providers can sustain, keeping a safety margin (`headroom`, default 20%). There
 is no fixed slot count and nothing to wrap `review` in — an old
 `flock -o /tmp/review-cli.lock review ...` wrapper still works but only serializes its own
-callers.
+callers. Do not hold a lock around `review`: it stays held for the whole queue wait, so
+every other caller waits behind that one holder's queue ETA, one after another, while the
+host has free capacity (seen 2026-10-23: a per-session slot flock timed out twice without a
+single review starting, while the admission queue itself was moving). The admission queue is
+the only host-wide gate.
 
 - **Machine budget (per run).** A run starts only if `load average(1m) + estimates of runs
   admitted in the last ramp_seconds + its own estimate <= (1 - headroom) × CPUs`, and the

@@ -15,6 +15,7 @@ import io
 import math
 import os
 import select
+import shlex
 import subprocess
 import sys
 import time
@@ -96,9 +97,11 @@ from .stats import (
     STATS_VERSION,
     announce_eta,
     diff_content_hash,
+    export_records as stats_export_records,
     extract_diff_files,
     find_by_run_id,
     fmt_duration,
+    import_records as stats_import_records,
     iterations_for_task,
     load_run_records,
     mode_summary,
@@ -1209,6 +1212,127 @@ def _iteration_for_session(session, iterations: list[dict]) -> int | None:
     return _closest_iteration_for_session(session, iterations)
 
 
+def _ssh_review(host: str, remote_args: list[str]) -> tuple[int, str, str]:
+    """Run `review <remote_args>` on `host` over a non-interactive ssh; (rc, stdout, stderr)."""
+    cmd = (
+        'export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"; exec review '
+        + " ".join(shlex.quote(a) for a in remote_args)
+    )
+    try:
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+                host,
+                cmd,
+            ],
+            stdin=subprocess.DEVNULL,  # ssh must not slurp the caller's stdin (host lists)
+            capture_output=True,
+            text=True,
+            errors="replace",  # a login banner / locale error is not always UTF-8
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 255, "", f"ssh {host} failed: {exc}"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _task_transfer(ns: argparse.Namespace) -> int:
+    """`review task CODE --export` / `--import FILE` / `--import-from HOST` (review-cli#659)."""
+    modes = [bool(ns.export), ns.import_file is not None, ns.import_from is not None]
+    if sum(modes) != 1:
+        print(
+            "[review task] use exactly one of --export, --import, --import-from",
+            file=sys.stderr,
+        )
+        return 2
+    if ns.from_host is not None and ns.import_file is None:
+        print(
+            "[review task] --from-host tags records of --import FILE; --import-from "
+            "tags them with its own host",
+            file=sys.stderr,
+        )
+        return 2
+    if ns.import_file is not None and ns.code:
+        print(
+            "[review task] --import takes no task CODE: it imports every record in the "
+            "file (to pull one task: review task CODE --import-from HOST)",
+            file=sys.stderr,
+        )
+        return 2
+    if (ns.export or ns.import_from) and not ns.code:
+        flag = "--export" if ns.export else "--import-from"
+        print(f"[review task] {flag} requires a task CODE", file=sys.stderr)
+        return 2
+    code = None
+    if ns.code:
+        try:
+            code = normalize_task_code(ns.code)
+        except ValueError as exc:
+            print(f"[review task] invalid task code: {exc}", file=sys.stderr)
+            return 2
+    if ns.export:
+        import json as _json
+
+        try:
+            records = stats_export_records(code)
+        except OSError as exc:
+            print(
+                f"[review task] cannot read the run-stats store: {exc}", file=sys.stderr
+            )
+            return 1
+        for record in records:
+            print(_json.dumps(record, separators=(",", ":")))
+        return 0
+    origin = ns.from_host
+    if ns.import_from is not None:
+        if not ns.import_from or ns.import_from.startswith("-"):
+            print(
+                "[review task] --import-from takes a host, not an option",
+                file=sys.stderr,
+            )
+            return 2
+        rc, out, err = _ssh_review(ns.import_from, ["task", code, "--export"])
+        if rc != 0:
+            print(
+                f"[review task] `review task {code} --export` failed on {ns.import_from} "
+                f"(rc={rc}): {err.strip() or 'no output'}",
+                file=sys.stderr,
+            )
+            return rc if rc > 0 else 1
+        lines = out.splitlines()
+        origin = origin or ns.import_from
+    elif ns.import_file == "-":
+        try:
+            lines = sys.stdin.buffer.read().decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            print(f"[review task] cannot read stdin: {exc}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            lines = Path(ns.import_file).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"[review task] cannot read {ns.import_file}: {exc}", file=sys.stderr)
+            return 1
+    try:
+        result = stats_import_records(
+            lines, remote_host=origin, task_code=code if ns.import_from else None
+        )
+    except OSError as exc:
+        print(f"[review task] cannot write the run-stats store: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"[review task] imported {result['imported']}, skipped {result['skipped']} "
+        f"already recorded, rejected {result['rejected']} line(s) "
+        "(not a record, or another task's)"
+    )
+    return 0
+
+
 def _task_subcommand(rest: list[str]) -> int:
     """`review task CODE [--detail N|SESSION] [--json]` — task-scoped review history.
 
@@ -1305,7 +1429,64 @@ def _task_subcommand(rest: list[str]) -> int:
         "touched. For a caller like `gh ship` that checks a PR from a checkout "
         "whose own diff is unrelated to it (review-cli#589).",
     )
+    transfer = parser.add_argument_group(
+        "moving iterations between machines (review-cli#659)",
+        "A review recorded on another machine (the build box) counts for --check here "
+        "once its records are imported; each record keeps its repo/diff identity, so "
+        "--check verifies it against THIS checkout like any local one.",
+    )
+    transfer.add_argument(
+        "--export",
+        action="store_true",
+        help="print the task's run-stats records as JSONL (needs CODE)",
+    )
+    transfer.add_argument(
+        "--import",
+        dest="import_file",
+        metavar="FILE|-",
+        help="append records printed by --export (a file, or - for stdin) to the local "
+        "store; records already there are skipped, so importing twice is safe",
+    )
+    transfer.add_argument(
+        "--import-from",
+        dest="import_from",
+        metavar="USER@HOST",
+        help="ssh to HOST, run `review task CODE --export` there and import the result "
+        "(needs CODE)",
+    )
+    transfer.add_argument(
+        "--from-host",
+        metavar="NAME",
+        help="--import only: tag imported records with this origin (remote_host)",
+    )
     ns = parser.parse_args(rest)
+
+    if (
+        ns.export
+        or ns.import_file is not None
+        or ns.import_from is not None
+        or ns.from_host is not None
+    ):
+        # --check is a gate: it must run or fail, never be dropped for a transfer's rc 0
+        clash = [
+            flag
+            for flag, given in (
+                ("--check", ns.check),
+                ("--json", ns.json),
+                ("--detail", ns.detail),
+                ("--no-verify-identity", ns.no_verify_identity),
+                ("--verify-repo-only", ns.verify_repo_only),
+            )
+            if given
+        ]
+        if clash:
+            print(
+                f"[review task] {', '.join(clash)} cannot be combined with --export/"
+                "--import/--import-from; transfer first, then run the check",
+                file=sys.stderr,
+            )
+            return 2
+        return _task_transfer(ns)
 
     if ns.check:
         if not ns.code:
@@ -5957,7 +6138,10 @@ HOST-WIDE ADMISSION (parallel reviews up to machine + provider capacity, review-
   Every review run (diff/visual/brainstorm/just-ask/quorum/qa) takes a host-wide slot
   before its seats dispatch; there is no fixed slot count and no external lock to add
   (old `flock /tmp/review-cli.lock review ...` wrappers still work, they just serialize
-  themselves). A run is admitted, oldest waiter first (FIFO), only while
+  themselves). Do not hold a lock around `review`: the lock stays held for the whole
+  queue wait, so every other caller waits behind that one holder's queue ETA, one after
+  another, while the host has free capacity. The admission queue is the only host-wide
+  gate. A run is admitted, oldest waiter first (FIFO), only while
     load average(1m) + estimates of runs admitted < ramp_seconds ago + this run's estimate
       <= (1 - headroom) x CPU count, and
     (MemTotal - MemAvailable) + the same estimates <= (1 - headroom) x MemTotal, and

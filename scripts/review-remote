@@ -423,7 +423,7 @@ def _lib() -> None:
 def import_results(host: str, top: str, job: str, meta: dict) -> None:
     _lib()
     from reviewlib.install import _touch_review_marker
-    from reviewlib.stats import stats_path
+    from reviewlib.stats import import_records
 
     jdir = f"$HOME/{REMOTE_ROOT}/jobs/{job}"
     raw = remote_sh(
@@ -431,25 +431,19 @@ def import_results(host: str, top: str, job: str, meta: dict) -> None:
         f"cat {jdir}/stats.jsonl 2>/dev/null || true",
         check=False,
     ).decode()
-    lines = []
-    for line in raw.splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and "duration_seconds" in rec:
-            rec["remote_host"] = host
-            lines.append(json.dumps(rec, separators=(",", ":")))
-    if lines:
-        path = stats_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, ("\n".join(lines) + "\n").encode())
-        finally:
-            os.close(fd)
-    meta["imported_records"] = len(lines)
-    log(f"imported {len(lines)} run-stats record(s) into the local store")
+    import_error = None
+    try:
+        counts = import_records(raw.splitlines(), remote_host=host)
+    except OSError as exc:
+        import_error = str(exc)
+        counts = {"imported": 0, "skipped": 0, "rejected": 0}
+        log(f"run-stats records NOT imported: {exc}")
+    meta["imported_records"] = counts["imported"]
+    if import_error is None:
+        log(
+            f"imported {counts['imported']} run-stats record(s) into the local store"
+            + (f" ({counts['skipped']} already there)" if counts["skipped"] else "")
+        )
 
     marker = (
         remote_sh(host, f"test -f {jdir}/marker && echo yes || true", check=False)
@@ -499,6 +493,16 @@ def import_results(host: str, top: str, job: str, meta: dict) -> None:
                 "remote review-stamp NOT installed: it does not match the current local staged diff/HEAD "
                 "(the index changed during the review, or the review was not a passing staged run)"
             )
+    if import_error is not None:
+        # The review ran, but its iteration will not count for `review task --check`: keep the
+        # box's real exit code, record the failure beside it (`wait`/`status` then fail), and
+        # name the way to import the records later.
+        meta["import_error"] = import_error
+        log(
+            f"the review itself finished and its records stay in ~/{REMOTE_ROOT}/jobs/{job}/"
+            f"stats.jsonl on {host} — copy that file here and run "
+            "`review task --import FILE --from-host HOST` once the store is writable"
+        )
 
 
 def run(host: str, req: dict, job: str, jobdir: Path) -> int:
@@ -624,6 +628,8 @@ def _run(host: str, req: dict, job: str, jobdir: Path, meta: dict) -> int:
         )
     else:
         import_results(host, top, job, meta)
+        if meta.get("import_error"):
+            rc = rc or 1
     log(
         f"done rc={rc}; remote job dir ~/{REMOTE_ROOT}/jobs/{job} on {host}; "
         f"local record {jobdir}/meta.json, stdout {jobdir}/review.out"
@@ -634,7 +640,9 @@ def _run(host: str, req: dict, job: str, jobdir: Path, meta: dict) -> int:
 def _rc_of(meta: dict) -> int:
     """A job with no recorded remote exit code did NOT succeed (never report 0 for it)."""
     rc = meta.get("remote_rc")
-    return 1 if rc is None else rc
+    if rc is None:
+        return 1
+    return rc or (1 if meta.get("import_error") else 0)
 
 
 def _pid_alive(pid: int) -> bool:
