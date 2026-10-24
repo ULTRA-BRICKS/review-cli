@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -4760,12 +4761,16 @@ def test_cli_recorded_task_pool_zero_default_board_does_not_warn():
 
 
 def _capture_panel_task_dispatch(
-    argv: list[str], *, config: dict | None = None, available: bool = True
+    argv: list[str],
+    *,
+    config: dict | None = None,
+    available: bool | Callable[[str], bool] = True,
 ) -> dict:
     """Run `cli.main(argv)` for a panel mode, capturing the ModeContext the
     handler actually received. Offline: empty config by default (or `config`
     when given), every backend live by default (or dead everywhere when
-    `available=False`, for exercising an all-unreachable fallback), handler
+    `available=False`, for exercising an all-unreachable fallback; a
+    `model -> bool` callable marks only some engines live), handler
     stubbed so no model is called.
 
     Also monkeypatches `cli._chain_aware_available` (not just
@@ -4819,8 +4824,9 @@ def _capture_panel_task_dispatch(
         for m in orig_modes
     )
     cli.load_config = lambda: dict(config) if config is not None else {}
-    backends.backend_available = lambda _m: available
-    cli._chain_aware_available = lambda _m: available
+    is_live = available if callable(available) else (lambda _m: available)
+    backends.backend_available = is_live
+    cli._chain_aware_available = is_live
     sys.stdin = io.StringIO("")
     os.environ.pop("REVIEW_TASK_CODE", None)
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -4897,6 +4903,195 @@ def test_cli_panel_task_one_model_pads_to_ship_min_roles():
             roles,
             models,
         )
+
+
+def test_cli_default_brainstorm_task_pads_live_engines_to_ship_floor():
+    """review-cli#444: a default `brainstorm --task` (no `-m`) used to dispatch
+    literary personas with ZERO recorded roles -- below the ship floor with one
+    live engine or five. Its live panel now gets REVIEW_ROLES slots: one or two
+    live engines pad to SHIP_MIN_ROLES distinct roles (no dead engine is cloned),
+    a wider panel keeps one distinct role per engine, `--pool 0` still pads,
+    and `--pool 1` opts out."""
+    from reviewlib import cli
+    from reviewlib.config import SHIP_MIN_ROLES
+
+    defaults = [cli._expand_alias(x) for x in DEFAULT_MODELS]
+    argv = ["brainstorm", "topic", "--task", "444", "-C", str(REPO_ROOT)]
+    for live in (defaults[:1], defaults[:2], defaults):
+        captured = _capture_panel_task_dispatch(
+            argv, available=lambda m, live=live: m in live
+        )
+        assert captured.get("rc") == 0, (live, captured)
+        models = captured.get("models") or []
+        roles = captured.get("roles") or []
+        assert set(models) == set(live), (live, models)
+        assert len(models) == len(roles) == max(SHIP_MIN_ROLES, len(live)), (
+            live,
+            models,
+            roles,
+        )
+        assert len(set(roles)) == len(roles), roles
+        assert all(r in REVIEW_ROLES for r in roles), roles
+        assert "--task brainstorm:" in captured.get("stderr", ""), captured
+
+    opted_out = _capture_panel_task_dispatch(
+        [*argv, "--pool", "1"], available=lambda m: m == defaults[0]
+    )
+    assert opted_out.get("rc") == 0, opted_out
+    assert opted_out.get("models") == [defaults[0]], opted_out
+    assert opted_out.get("roles") == [], opted_out
+
+    # `--pool 0` ("all seats") still pads to the ship floor, as review's does.
+    all_seats = _capture_panel_task_dispatch(
+        [*argv, "--pool", "0"], available=lambda m: m == defaults[0]
+    )
+    assert all_seats.get("rc") == 0, all_seats
+    assert all_seats.get("models") == [defaults[0]] * SHIP_MIN_ROLES, all_seats
+    assert len(set(all_seats.get("roles") or [])) == SHIP_MIN_ROLES, all_seats
+
+    # All engines unreachable: the unfiltered fallback panel is not role-padded,
+    # so dead engines are never cloned into extra slots.
+    all_dead = _capture_panel_task_dispatch(argv, available=False)
+    assert all_dead.get("rc") == 0, all_dead
+    assert all_dead.get("models") == defaults, all_dead
+    assert all_dead.get("roles") == [], all_dead
+
+    # A deliberate pool size never adds calls: brainstorm relabels its own
+    # max(3, live engines) slots (no duplicate-role reserve seats either).
+    for pool in ("2", "4", "6"):
+        sized = _capture_panel_task_dispatch(
+            [*argv, "--pool", pool], available=lambda m: m == defaults[0]
+        )
+        assert sized.get("rc") == 0, (pool, sized)
+        assert sized.get("models") == [defaults[0]] * SHIP_MIN_ROLES, (pool, sized)
+        assert len(set(sized.get("roles") or [])) == SHIP_MIN_ROLES, (pool, sized)
+
+
+def test_default_brainstorm_task_one_live_engine_meets_ship_floor_check():
+    """review-cli#444 end to end: a default `brainstorm --task` with ONE live
+    DEFAULT_MODELS engine prompts every slot with its REVIEW_ROLES lens, records
+    SHIP_MIN_ROLES completed roles, and `quorum_check(min_roles=SHIP_MIN_ROLES)`
+    -- the gate `review task CODE --check` / gh ship applies -- passes from that
+    single run. Only the model boundary (slot dispatch + moderator) is faked."""
+    import contextlib
+    import io
+    import json
+    import tempfile
+
+    from reviewlib import cli
+    from reviewlib import panel as p
+    from reviewlib import stats as _stats
+    from reviewlib.config import SHIP_MIN_ROLES
+    from reviewlib.modes import brainstorm as bs_mod
+
+    live = cli._expand_alias(DEFAULT_MODELS[0])
+    prompted: list[tuple[str, str]] = []
+
+    def _fake_slots(jobs, cwd, timeout, roles=None):
+        role_list = list(roles or [])
+        results = []
+        for i, job in enumerate(jobs):
+            role = role_list[i] if i < len(role_list) else ""
+            assert role and REVIEW_ROLES[role] in job.prompt, (role, job.prompt)
+            prompted.append((job.model, role))
+            result = ReviewResult(
+                model=job.label or job.model,
+                command="fake",
+                returncode=0,
+                stdout="ideas",
+                stderr="",
+            )
+            results.append(result)
+            p._tally_result(0)
+        return results
+
+    def _fake_moderator(candidates, prompt, cwd, timeout, diff="", round_no=0):
+        p._tally_result(0)
+        return ReviewResult(
+            model=candidates[0],
+            command="fake",
+            returncode=0,
+            stdout="summary\nDECISION: STOP",
+            stderr="",
+        )
+
+    env_keys = (
+        "REVIEW_TASK_CODE",
+        "GEMINI_ENV_FILE",
+        "REVIEW_FAKE_BACKEND",
+        "REVIEW_LOG_DIR",
+        "REVIEW_STATS_FILE",
+        "REVIEW_USAGE_LIMITS_DIR",
+        "REVIEW_HARNESS_LIMITS_JSON",
+    )
+    saved_env = {k: os.environ.get(k) for k in env_keys}
+    saved_slots, saved_mod = bs_mod.run_role_slots, bs_mod.run_moderator
+    saved_load = cli.load_config
+    saved_avail = backends.backend_available
+    saved_chain = cli._chain_aware_available
+    saved_stdin = sys.stdin
+    bs_mod.run_role_slots = _fake_slots
+    bs_mod.run_moderator = _fake_moderator
+    cli.load_config = lambda: {}
+    backends.backend_available = lambda m: m == live
+    cli._chain_aware_available = lambda m: m == live
+    sys.stdin = io.StringIO("")
+    os.environ.pop("REVIEW_TASK_CODE", None)
+    os.environ.pop("REVIEW_FAKE_BACKEND", None)
+    os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    os.environ["REVIEW_USAGE_LIMITS_DIR"] = "/nonexistent/review-cli/.usage"
+    os.environ["REVIEW_HARNESS_LIMITS_JSON"] = "{}"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            stats_path = Path(tmp) / "run-stats.jsonl"
+            os.environ["REVIEW_LOG_DIR"] = tmp
+            os.environ["REVIEW_STATS_FILE"] = str(stats_path)
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                rc = cli.main(
+                    [
+                        "brainstorm",
+                        "topic",
+                        "--task",
+                        "444",
+                        "--rounds",
+                        "3",
+                        "--max-rounds",
+                        "3",
+                        "-C",
+                        str(REPO_ROOT),
+                    ]
+                )
+            assert rc == 0, rc
+            recs = [
+                json.loads(ln)
+                for ln in stats_path.read_text().splitlines()
+                if ln.strip()
+            ]
+            assert recs, "expected a recorded brainstorm iteration"
+            rec = recs[-1]
+            assert rec.get("passed") is True, rec
+            assert len(set(rec.get("roles") or [])) >= SHIP_MIN_ROLES, rec
+            result = _stats.quorum_check(
+                rec["task_code"], min_iter=1, min_roles=SHIP_MIN_ROLES
+            )
+    finally:
+        bs_mod.run_role_slots = saved_slots
+        bs_mod.run_moderator = saved_mod
+        cli.load_config = saved_load
+        backends.backend_available = saved_avail
+        cli._chain_aware_available = saved_chain
+        sys.stdin = saved_stdin
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert {m for m, _ in prompted} == {live}, prompted
+    assert result["passed"] is True, result
+    assert result["distinct_roles_passed"] >= SHIP_MIN_ROLES, result
 
 
 def test_cli_panel_task_pad_recovers_from_typo_role_in_config_board():
