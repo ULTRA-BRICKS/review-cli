@@ -25,3 +25,7 @@ uv.lock
 
 # Live tier-2 bot credentials (never commit)
 .env.live
+
+# Live-gate test repos (tests/test_review_gate_template.py): created OUTSIDE the OS temp dirs
+# on purpose (the review gate exempts those), removed after each test. Never commit.
+.test-repos/

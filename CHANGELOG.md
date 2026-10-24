@@ -3,6 +3,21 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.63.0 — 2026-10-24
+
+- **Feat(gate): one review-gate template, merge/rebase/cherry-pick skip, `review --version`**
+  ([review-cli#396](https://git.hyperide.ai/ultrabricks/review-cli/issues/396)). review-cli
+  now owns both gate bodies; `review install-commit-hook --print-gate` prints the
+  composer-stage gate rig installs (rig-cli#382: exit 0 and a `#!` body on stdout, a usage
+  error and non-zero exit for any other arguments). A commit that finishes a merge, a
+  `rebase-merge/` rebase or a cherry-pick skips the staged-review requirement with a logged
+  reason, including in linked worktrees; `git am` state (`rebase-apply/`) does not. The
+  rig-installed gate also gains the trivial-delta tolerance. `review --version` reads
+  `[project] version` from a checkout's pyproject, then the installed `hyper-review`
+  metadata. `TMPDIR=/`, or a `TMPDIR` that is `$HOME` or an ancestor of it, no longer widens
+  the temp-repo exemption to every path; the gate refuses to skip review when it cannot
+  hash the staged diff.
+
 ## 0.62.0 — 2026-10-23
 
 - **Feat(install): `review install-skill` links `scripts/review-remote` into `~/.local/bin`**

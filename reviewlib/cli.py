@@ -74,7 +74,13 @@ from .pool_guard import (
     default_distinct_key,
     evaluate_selection,
 )
-from .install import install_commit_hook, install_hook_tg, install_skill
+from ._version import resolve_version
+from .install import (
+    install_commit_hook,
+    install_hook_tg,
+    install_skill,
+    print_review_gate,
+)
 from .modes.brainstorm import mode_brainstorm
 from .modes.contract import ModeContext, ModeSpec
 from .modes.just_ask import mode_just_ask
@@ -6070,6 +6076,13 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           submodule-gitlink content is unmeasurable by a
                                           line-count ruler, so it always forces a fresh
                                           full review.
+    (pre-commit gate)                   — a commit that finishes an in-progress merge, rebase
+                                          (`rebase-merge/`) or cherry-pick skips the
+                                          staged-review requirement, with the marker named on
+                                          stderr. `git am` (`rebase-apply/`) does not skip.
+                                          `review install-commit-hook --print-gate` prints the
+                                          composer-stage gate body for rig; `review --version`
+                                          prints the installed version.
     REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
                                           seat gets before it is reaped as stuck rather
                                           than silently thinking (default 5min, per-model
@@ -6610,7 +6623,8 @@ def _subcommand_epilog() -> str:
             "\n  wait        block until a detached job finishes (`wait <job-id>`)"
             "\n  feedback    attach overseer feedback/usefulness/ticket-link to a recorded run (run_id from the end-of-run nudge)"
             "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
-            "\n  install-skill / install-commit-hook / install-hook tg / register-module"
+            "\n  install-skill / install-commit-hook [--print-gate] / install-hook tg / register-module"
+            "\n  --version   print the review-cli version (checkout pyproject, else installed metadata)"
             "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
             + topics
             + "\n  see `review help config` for configuration."
@@ -7085,10 +7099,24 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         # Pass ALL tokens after --help (not just argv[1]) so extra trailing args are caught
         # by _help_subcommand's usage check rather than silently dropped (codex review).
         return _help_subcommand(argv[1:])
+    # `review --version` — the one-line freshness signal every ecosystem CLI has (rig's
+    # tools/drift checks and scripts key on it). Resolved from pyproject first so a live
+    # checkout (the install.sh symlink / editable install) never reports a stale egg-info.
+    if argv == ["--version"]:
+        print(f"review {resolve_version()}")
+        return 0
     if argv == ["install-skill"]:
         return install_skill()
-    if argv == ["install-commit-hook"]:
-        return install_commit_hook()
+    if argv and argv[0] == "install-commit-hook":
+        if not argv[1:]:
+            return install_commit_hook()
+        # `--print-gate` prints the composer-stage gate body for rig to install as the
+        # dispatcher's `review-gate` stage. Pure output; the install stays with the bare
+        # form / `rig apply`.
+        if argv[1:] == ["--print-gate"]:
+            return print_review_gate()
+        print("usage: review install-commit-hook [--print-gate]", file=sys.stderr)
+        raise SystemExit(2)
     if argv and argv[0] == "install-hook":
         if argv[1:] == ["tg"]:
             return install_hook_tg()
