@@ -483,10 +483,14 @@ def _quorum_moderators(config: dict, extra: list[str]) -> list[str]:
         captured["moderators"] = list(moderators)
         return 0
 
-    saved = (quorum_mod.mode_quorum, cli._read_stdin_if_piped, panel.backend_available)
+    saved = (quorum_mod.mode_quorum, cli._read_stdin_if_piped,
+             panel.backend_available, cli._run_mode_with_stats)
     quorum_mod.mode_quorum = fake_quorum
     cli._read_stdin_if_piped = lambda: None
     panel.backend_available = lambda m: True
+    # This tests moderator selection, not live host admission or persistent stats.
+    # A fake transport must not queue behind the owner's real reviews.
+    cli._run_mode_with_stats = lambda mode, models, run, *a, **k: run()
     env = {k: os.environ.get(k) for k in ("REVIEW_FAKE_BACKEND", "GEMINI_ENV_FILE")}
     os.environ["REVIEW_FAKE_BACKEND"] = "1"
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -499,9 +503,8 @@ def _quorum_moderators(config: dict, extra: list[str]) -> list[str]:
         assert rc == 0, (rc, out, err)
         return captured["moderators"]
     finally:
-        quorum_mod.mode_quorum, cli._read_stdin_if_piped, panel.backend_available = (
-            saved
-        )
+        (quorum_mod.mode_quorum, cli._read_stdin_if_piped,
+         panel.backend_available, cli._run_mode_with_stats) = saved
         for k, v in env.items():
             if v is None:
                 os.environ.pop(k, None)
