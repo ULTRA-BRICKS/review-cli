@@ -22,6 +22,7 @@ has no bin/review). Same plain-test_*-with-__main__ harness as the other unit fi
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -300,7 +301,11 @@ def test_no_arg_deploys_the_scripts_own_checkout_rig_style() -> None:
         # A bare system PATH: no fake `review` symlink anywhere — the script-dir
         # default must not need one. (The untracked scripts/ copy also proves
         # untracked files don't block the pull.)
-        env = {**_ENV, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"}
+        # git may live outside the system dirs (e.g. a conda env bin on the heavy
+        # host), so its own directory joins the PATH; it never holds `review`.
+        git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+        bare_path = f"{git_dir}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+        env = {**_ENV, "PATH": bare_path}
         p = subprocess.run(
             ["bash", str(script)],
             capture_output=True, text=True, timeout=120, env=env, cwd=str(clone),
