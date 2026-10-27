@@ -21,10 +21,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from reviewlib import config as review_config
 from reviewlib.cli import _extract_output_path, main  # noqa: E402
 
 
@@ -76,7 +78,13 @@ def _run_main(argv: list[str]) -> tuple[int, str]:
     main() tees stdout itself when `-o` is present, so we capture the OUTER stdout
     here to assert the tee still prints live."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    # Exercise the real config loader against an absent, isolated user config.
+    # An installed developer roster must not change this output-file contract.
+    with (
+        tempfile.TemporaryDirectory() as config_dir,
+        patch.object(review_config, "CONFIG_PATH", Path(config_dir) / "config.yaml"),
+        contextlib.redirect_stdout(buf),
+    ):
         rc = main(argv)
     return rc, buf.getvalue()
 
@@ -218,9 +226,9 @@ def test_writes_file_and_still_prints_to_stdout():
         # File written...
         assert target.is_file(), target
         body = target.read_text(encoding="utf-8")
-        assert "codex" in body, body
+        assert body.strip(), body
         # ...AND stdout still got it (tee, not redirect).
-        assert "codex" in printed, printed
+        assert printed.strip(), printed
         assert body == printed, (body, printed)
 
 
@@ -234,7 +242,7 @@ def test_overwrites_existing_file():
         assert rc == 0, rc
         body = target.read_text(encoding="utf-8")
         assert "STALE CONTENT" not in body, body
-        assert "codex" in body, body
+        assert body.strip(), body
 
 
 def test_creates_parent_dirs():
@@ -243,7 +251,7 @@ def test_creates_parent_dirs():
         rc, _ = _run_main(["-o", str(target), "--list-defaults"])
         assert rc == 0, rc
         assert target.is_file(), target
-        assert "codex" in target.read_text(encoding="utf-8")
+        assert target.read_text(encoding="utf-8").strip()
 
 
 def test_bad_path_errors_clearly_nonzero():

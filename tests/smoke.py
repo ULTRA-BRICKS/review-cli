@@ -563,42 +563,43 @@ def test_dashboard_managed_surface_and_lib_absent_fallback():
                 f"dashboard status (nothing running) expected exit 3, got {p.returncode}"
             )
         assert_not_in("Traceback (most recent call last)", p.stdout + p.stderr)
-    else:
-        # A genuine lifecycle action without the lib: stable exit 4 + actionable error, no
-        # traceback. EVERY managed action (not just `status`) must take the same actionable
-        # exit-4 path — a regression where one action slipped to a raw ImportError (exit 1,
-        # the review-cli#45 symptom) would otherwise pass a status-only check. `run` is the
-        # ad-hoc foreground server (it works WITHOUT the lib) and is excluded here.
-        for action in ("status", "start", "stop", "enable", "disable"):
-            p = run("dashboard", action)
-            if p.returncode != 4:
-                raise SmokeError(
-                    f"lib-absent `dashboard {action}` expected exit 4, got {p.returncode}\n"
-                    f"{p.stdout}\n{p.stderr}"
-                )
-            out = p.stdout + p.stderr
-            assert_in("agenttools_service", out, what=f"(dashboard {action})")
-            assert_in("pip install", out.lower(), what=f"(dashboard {action})")
-            assert_not_in(
-                "Traceback (most recent call last)", out, what=f"(dashboard {action})"
-            )
-        # The bare-HELP contract does NOT depend on the lib: bare `review dashboard` AND a
-        # help-only `review dashboard --help` print help + launch nothing (exit 0), advertising
-        # every action — this is the lib-absent fallback the CI gate exercises.
-        bare = run("dashboard")
-        if bare.returncode != 0:
+        return
+
+    # A genuine lifecycle action without the lib: stable exit 4 + actionable error, no
+    # traceback. EVERY managed action (not just `status`) must take the same actionable
+    # exit-4 path — a regression where one action slipped to a raw ImportError (exit 1,
+    # the review-cli#45 symptom) would otherwise pass a status-only check. `run` is the
+    # ad-hoc foreground server (it works WITHOUT the lib) and is excluded here.
+    for action in ("status", "start", "stop", "enable", "disable"):
+        p = run("dashboard", action)
+        if p.returncode != 4:
             raise SmokeError(
-                f"lib-absent bare `dashboard` expected exit 0, got {bare.returncode}"
+                f"lib-absent `dashboard {action}` expected exit 4, got {p.returncode}\n"
+                f"{p.stdout}\n{p.stderr}"
             )
-        for action in ("run", "start", "stop", "status", "enable", "disable"):
-            assert_in(action, bare.stdout + bare.stderr)
-        assert_not_in("Traceback (most recent call last)", bare.stdout + bare.stderr)
-        help_out = run("dashboard", "--help")
-        if help_out.returncode != 0:
-            raise SmokeError(
-                f"lib-absent `dashboard --help` expected exit 0, got {help_out.returncode}"
-            )
-        assert_in("status", help_out.stdout + help_out.stderr)
+        out = p.stdout + p.stderr
+        assert_in("agenttools_service", out, what=f"(dashboard {action})")
+        assert_in("pip install", out.lower(), what=f"(dashboard {action})")
+        assert_not_in(
+            "Traceback (most recent call last)", out, what=f"(dashboard {action})"
+        )
+    # The bare-HELP contract does NOT depend on the lib: bare `review dashboard` AND a
+    # help-only `review dashboard --help` print help + launch nothing (exit 0), advertising
+    # every action — this is the lib-absent fallback the CI gate exercises.
+    bare = run("dashboard")
+    if bare.returncode != 0:
+        raise SmokeError(
+            f"lib-absent bare `dashboard` expected exit 0, got {bare.returncode}"
+        )
+    for action in ("run", "start", "stop", "status", "enable", "disable"):
+        assert_in(action, bare.stdout + bare.stderr)
+    assert_not_in("Traceback (most recent call last)", bare.stdout + bare.stderr)
+    help_out = run("dashboard", "--help")
+    if help_out.returncode != 0:
+        raise SmokeError(
+            f"lib-absent `dashboard --help` expected exit 0, got {help_out.returncode}"
+        )
+    assert_in("status", help_out.stdout + help_out.stderr)
 
 
 # --- dashboard SPA pure-logic JS unit tests -------------------------------------------------
@@ -830,6 +831,7 @@ _UNIT_FILES = [
     # `_PRECOMMIT` shell script via subprocess against real temp git repos.
     ("test_review_stamp_delta_tolerance.py", {}),
     ("test_failover_pool.py", {}),
+    ("test_levels.py", {}),
     # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
     # switchover (provider A fails on the call, the model completes via B, board not degraded).
     # Offline — availability/unpaid injected, cache is a throwaway temp file.
