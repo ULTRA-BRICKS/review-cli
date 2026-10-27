@@ -63,14 +63,13 @@ from reviewlib.config import (  # noqa: E402
     GROK_SEAT,
     OMP_CLAUDE_SEAT,
     MIMO_SEAT,
-    HEAVY_PRESET_BOARD,
     KIMI_SEAT,
-    LIGHT_PRESET_BOARD,
     SOL_SEAT,
     SONNET_SEAT,
     LUNA_SEAT,
     BoardReviewer,
     _agentic,
+    preset_board,
     preset_pool_size,
     split_pool_reserve,
 )
@@ -78,6 +77,11 @@ from reviewlib.panel import (  # noqa: E402
     result_is_usable,
     run_board_with_failover,
 )
+
+# The former preset boards are the shipped capability levels (reviewlib/levels.yaml):
+# deep == `heavy`, routine == `light`, standard == `default`.
+HEAVY_PRESET_BOARD = tuple(preset_board("deep"))
+LIGHT_PRESET_BOARD = tuple(preset_board("routine"))
 
 # review-cli#382 (round 5 review finding): shared by both the heavy- and light-preset
 # double-failure tests below, so a future commandcode seat addition/removal/rename is a
@@ -260,112 +264,47 @@ def test_glm_cc_unavailable_backfills_a_new_lens_not_astras_duplicate():
     assert reserve[0].model == ASTRA_SEAT, [r.model for r in reserve]
 
 
-def test_heavy_preset_double_failure_still_beats_pre_382_board():
-    """codex review finding (review-cli#382): `--preset heavy` (which keeps Sol, unlike
-    `DEFAULT_PRESET_BOARD`) with commandcode ALSO disabled used to dispatch its raw
-    top-4-available, Sol/Opus/Astra/Terra — `consistency` twice, `quality` and `security`
-    pushed to reserve. review-cli#588 picks distinct roles first, so the pool is
-    Sol/Opus/Terra/Sonnet: four lenses. This stays true in the ACTUAL incident shape (the
-    z.ai GLM seat — the one that hit the real 2026-09-05 quota exhaustion — also down),
-    and Astra heads the reserve as the `consistency` backfill. Before review-cli#382 that
-    double failure left heavy with only 3 available seats (Sol, Opus, Astra) and ZERO
-    reserve."""
+def test_deep_level_double_failure_keeps_four_lenses_and_a_reserve():
+    """The 2026-09-05 incident shape (review-cli#382) on the `deep` level: commandcode and
+    gemini disabled, then the z.ai GLM seat also down. The pool still has four distinct
+    lenses (Opus, Sol, Sonnet, Grok) and a non-empty reserve, all from the SAME level —
+    nothing outside the level's roster is promoted."""
     board = list(HEAVY_PRESET_BOARD)
-    pool_size = preset_pool_size("heavy")
+    pool_size = preset_pool_size("deep")
     available = {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS
 
-    expected_pool_models = [SOL_SEAT, "claude:claude-opus-5-5", LUNA_SEAT, SONNET_SEAT]
-    expected_roles = ["consistency", "correctness", "performance", "quality"]
+    expected_pool_models = ["claude:claude-opus-5-5", SOL_SEAT, SONNET_SEAT, GROK_SEAT]
+    expected_roles = ["correctness", "consistency", "quality", "security"]
 
-    # commandcode/gemini disabled only -- the routine incident precursor.
     pool, reserve = split_pool_reserve(board, pool_size, _avail(available))
     assert [r.model for r in pool] == expected_pool_models
     assert [r.role for r in pool] == expected_roles
     reserve_models = [r.model for r in reserve]
-    assert reserve_models[0] == ASTRA_SEAT and "omp:zai/glm-5.3" in reserve_models
+    assert reserve_models[0] == MIMO_SEAT and "omp:zai/glm-5.3" in reserve_models
+    assert set(reserve_models) <= {r.model for r in board}
 
-    # The z.ai GLM seat ALSO down, mirroring the real incident shape exactly.
     available_double_failure = available - {"omp:zai/glm-5.3"}
     pool_double_failure, reserve_double_failure = split_pool_reserve(
         board, pool_size, _avail(available_double_failure)
     )
     assert [r.model for r in pool_double_failure] == expected_pool_models
-    assert reserve_double_failure and reserve_double_failure[0].model == ASTRA_SEAT
-
-    # Pre-#382 comparison (drop LUNA_SEAT/SONNET_SEAT -- the two seats #382 added -- and
-    # GROK_SEAT/MIMO_SEAT/OMP_CLAUDE_SEAT, which review-cli#165/#450/#168 added on top of
-    # #382 and which are likewise available reserves here): the equivalent double failure
-    # left only Sol/Opus/Astra available (3, one seat short of the pool, with
-    # `consistency` duplicated) and NO reserve whatsoever.
-    pre_382_board = [
-        r
-        for r in board
-        if r.model
-        not in {LUNA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT, OMP_CLAUDE_SEAT}
-    ]
-    pre_382_available = {
-        r.model for r in pre_382_board if r.model in available_double_failure
-    }
-    pre_382_pool, pre_382_reserve = split_pool_reserve(
-        pre_382_board, pool_size, _avail(pre_382_available)
-    )
-    assert len(pre_382_pool) == 3, pre_382_pool  # degraded pool, one seat short
-    assert not pre_382_reserve, pre_382_reserve  # nothing left to backfill with
+    assert reserve_double_failure and reserve_double_failure[0].model == MIMO_SEAT
+    assert "omp:zai/glm-5.3" not in [r.model for r in reserve_double_failure]
 
 
-def test_light_preset_double_failure_pool_unchanged_but_reserve_deepens():
-    """codex review finding (review-cli#382, round 4): a bare `review diff` runs the
-    `light` preset at `pool: 2` (Alex, 2026-08-28 -- cheap-by-default). With only 2 seats
-    in the pool, it can NEVER show more than 2 of the 8 board roles at once, incident or
-    not -- that is a deliberate, pre-existing cost/behavior choice (out of scope for #382
-    to change; see the KNOWN LIMIT comment above DEFAULT_BOARD) and not something a live
-    fallback seat can fix. What #382 DOES change for light: in the exact 2026-09-05
-    incident shape (commandcode/gemini disabled AND the z.ai GLM seat also down), the
-    DISPATCHED pool is IDENTICAL before and after this change (Opus/Astra --
-    correctness/consistency), but the RESERVE is no longer empty -- Terra and Sonnet now
-    backfill if Opus or Astra ALSO fail mid-run, where pre-#382 there was nothing left at
-    all."""
+def test_routine_level_with_glm_down_keeps_its_pool_and_a_cheap_reserve():
+    """A bare `review diff` runs the `routine` level at `pool: 2` (a recorded `--task`
+    floors that to 3 distinct roles). With the z.ai GLM seat down the pool is the two
+    Sonnet seats and the reserve is the rest of the ROUTINE roster, cheapest first: a
+    heavier level's seats (Opus, Codex) are never promoted."""
     board = list(LIGHT_PRESET_BOARD)
-    pool_size = preset_pool_size("light")
-    available_double_failure = (
-        {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS - {"omp:zai/glm-5.3"}
-    )
+    pool_size = preset_pool_size("routine")
+    available = {r.model for r in board} - {"omp:zai/glm-5.3"}
 
-    pool, reserve = split_pool_reserve(
-        board, pool_size, _avail(available_double_failure)
-    )
-    assert [r.model for r in pool] == ["claude:claude-opus-5-5", ASTRA_SEAT]
+    pool, reserve = split_pool_reserve(board, pool_size, _avail(available))
+    assert [r.model for r in pool] == [OMP_CLAUDE_SEAT, SONNET_SEAT]
     assert [r.role for r in pool] == ["correctness", "consistency"]
-    reserve_models = [r.model for r in reserve]
-    # GROK_SEAT (review-cli#165) and MIMO_SEAT (review-cli#450) are live reserves behind
-    # Terra/Sonnet, and OMP_CLAUDE_SEAT (review-cli#168) sits between Sonnet and Grok:
-    # agentic/oauth routes the commandcode/gemini disable and the z.ai GLM outage never
-    # touch.
-    assert reserve_models == [
-        LUNA_SEAT,
-        SONNET_SEAT,
-        OMP_CLAUDE_SEAT,
-        GROK_SEAT,
-        MIMO_SEAT,
-    ]
-
-    # Pre-#382 comparison: same board minus LUNA_SEAT/SONNET_SEAT (and GROK_SEAT/
-    # MIMO_SEAT/OMP_CLAUDE_SEAT, added later still) -- the dispatched pool is
-    # byte-identical, but the reserve was empty (nothing left to backfill Opus/Astra).
-    pre_382_board = [
-        r
-        for r in board
-        if r.model
-        not in {LUNA_SEAT, SONNET_SEAT, GROK_SEAT, MIMO_SEAT, OMP_CLAUDE_SEAT}
-    ]
-    pre_382_available = {
-        r.model for r in pre_382_board if r.model in available_double_failure
-    }
-    pre_382_pool, pre_382_reserve = split_pool_reserve(
-        pre_382_board, pool_size, _avail(pre_382_available)
-    )
-    assert [r.model for r in pre_382_pool] == [r.model for r in pool]  # unchanged
-    assert not pre_382_reserve, pre_382_reserve  # nothing left to backfill with
+    assert [r.model for r in reserve] == [GROK_SEAT, MIMO_SEAT]
 
 
 def test_startup_failover_respects_priority_order():

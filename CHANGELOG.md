@@ -3,6 +3,28 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.65.0 — 2026-10-27
+
+- **Feat(levels): config-driven capability levels with shipped defaults and user overrides;
+  moderator chain from the level**
+  ([review-cli#697](https://git.hyperide.ai/ultrabricks/review-cli/issues/697),
+  [review-cli#695](https://git.hyperide.ai/ultrabricks/review-cli/issues/695)). The preset
+  boards, pool sizes, efforts and the quorum/brainstorm moderator chain were Python constants
+  (`PRESET_BOARDS`, `PRESET_POOL_SIZES`, `DEFAULT_PRESET`, `MODERATOR_CANDIDATES`); they are now
+  DATA in the shipped `reviewlib/levels.yaml` (levels `routine` = old `light`, `standard` =
+  `default`, `deep` = `heavy`: pool, effort, role -> priority-ordered seats, moderators,
+  `escalate_to`), merged with the user's `levels:` / `default_level:` config (mappings merge,
+  lists and scalars replace, `null` deletes; a bad key, effort, pool or role is an error naming
+  the key). The default is the lowest sufficient level, `routine` (Sonnet-class seats, low
+  effort); `--level NAME` selects another and `--preset` stays as its alias (light/default/heavy
+  still work). A missing seat is replaced from the same level's roster only: nothing escalates
+  to a heavier level unless asked. Opus and Codex are in `standard`/`deep`; Fable is in no
+  shipped level. Quorum/brainstorm take `--level` for the moderator chain, `moderator_candidates:`
+  overrides it and an explicit `--moderator` still wins. run-stats records `level` (additive).
+  Behavior changes: a config-less `review diff` now runs `routine` instead of the old light
+  board; `capacity-check` JSON `configuration.source` reads `level:<name>` and `preset` holds the
+  canonical level name. Configs without `levels:` behave as before.
+
 ## 0.64.0 — 2026-10-24
 
 - **Fix(brainstorm): a default `brainstorm --task` can meet the ship floor**

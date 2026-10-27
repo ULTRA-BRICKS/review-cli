@@ -16,6 +16,7 @@ cheap exit-0 command (`--list-defaults`) works — proving the shim found review
 its own, without cwd/PYTHONPATH help. Same plain-test_*-with-__main__ harness as
 tests/test_cwd.py.
 """
+
 from __future__ import annotations
 
 import os
@@ -60,9 +61,9 @@ def test_shim_imports_reviewlib_from_outside_repo_without_pythonpath():
         f"shim failed to run from {d!r} with cleared PYTHONPATH\n"
         f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
     )
-    # --list-defaults prints the default backends; `codex` is always present. Its
-    # presence proves cli.py ran, which means `import reviewlib` succeeded.
-    assert "codex" in proc.stdout, proc.stdout
+    # --list-defaults prints the default level's seats; the routine Sonnet seat is always
+    # present. Its presence proves cli.py ran, which means `import reviewlib` succeeded.
+    assert "claude:claude-sonnet-5-5" in proc.stdout, proc.stdout
     assert "ModuleNotFoundError" not in proc.stderr, proc.stderr
     assert "No module named 'reviewlib'" not in proc.stderr, proc.stderr
 
@@ -85,7 +86,7 @@ def test_shim_imports_reviewlib_when_invoked_VIA_A_SYMLINK():
         f"shim invoked via a symlink failed to resolve reviewlib\n"
         f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
     )
-    assert "codex" in proc.stdout, proc.stdout
+    assert "claude:claude-sonnet-5-5" in proc.stdout, proc.stdout
     assert "No module named 'reviewlib'" not in proc.stderr, proc.stderr
 
 
@@ -111,7 +112,7 @@ def test_shim_does_not_inject_cwd_into_sys_path():
         f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
     )
     assert "decoy reviewlib in cwd was imported" not in proc.stderr, proc.stderr
-    assert "codex" in proc.stdout, proc.stdout
+    assert "claude:claude-sonnet-5-5" in proc.stdout, proc.stdout
 
 
 if __name__ == "__main__":

@@ -38,14 +38,10 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
-    DEFAULT_PRESET,
-    DEFAULT_PRESET_BOARD,
     GLM_COMMANDCODE_SEAT,
     GROK_SEAT,
     MIMO_SEAT,
-    HEAVY_PRESET_BOARD,
     KIMI_SEAT,
-    LIGHT_PRESET_BOARD,
     SOL_SEAT,
     SONNET_SEAT,
     LUNA_SEAT,
@@ -58,12 +54,21 @@ from reviewlib.config import (  # noqa: E402
     board_from_models,
     lens_override_text,
     load_board,
+    default_level_name,
     preset_board,
     select_pool,
 )
 from reviewlib.panel import build_board_jobs  # noqa: E402
 
 DEFAULT_PROMPT = "Review this diff."
+
+# The pre-levels preset constants were data of the shipped levels now; these names keep the
+# many board tests below readable (routine = the former `light`, standard = `default`,
+# deep = `heavy`).
+DEFAULT_PRESET = default_level_name()
+LIGHT_PRESET_BOARD = tuple(preset_board("routine"))
+DEFAULT_PRESET_BOARD = tuple(preset_board("standard"))
+HEAVY_PRESET_BOARD = tuple(preset_board("deep"))
 
 
 class _BackendStateSandbox:
@@ -531,65 +536,51 @@ def test_default_board_has_fifteen_seats():
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
-    # Bare `review diff` defaults to the "light" preset (Alex, 2026-08-28); "default"
-    # and "heavy" stay real, selectable presets with their own board/effort below.
-    assert DEFAULT_PRESET == "light"
-    assert all(r.effort == "high" for r in DEFAULT_PRESET_BOARD)
+    # The built-in boards are the capability levels of reviewlib/levels.yaml (routine ==
+    # the former `light`, standard == `default`, deep == `heavy`); a bare `review diff` runs
+    # the lowest sufficient one, routine. Their full contract is in tests/test_levels.py.
+    assert DEFAULT_PRESET == "routine"
+    assert all(r.effort == "medium" for r in DEFAULT_PRESET_BOARD)
     assert SOL_SEAT not in [r.model for r in DEFAULT_PRESET_BOARD]
-    assert "claude:claude-fable-5-1" not in [r.model for r in DEFAULT_PRESET_BOARD]
     assert [r.model for r in DEFAULT_PRESET_BOARD[:4]] == [
         "claude:claude-opus-5-5",
-        GLM_COMMANDCODE_SEAT,
-        "oc:commandcode/moonshotai/Kimi-K3",
-        ASTRA_SEAT,
+        "omp:openai-codex/gpt-6-luna",
+        "omp:zai/glm-5.3",
+        GROK_SEAT,
     ]
     assert len({r.role for r in DEFAULT_PRESET_BOARD[:4]}) == 4
 
-    assert all(r.effort == "medium" for r in LIGHT_PRESET_BOARD)
-    assert [r.model for r in LIGHT_PRESET_BOARD] == [
-        r.model for r in DEFAULT_PRESET_BOARD
+    assert all(r.effort == "low" for r in LIGHT_PRESET_BOARD)
+    assert [r.model for r in LIGHT_PRESET_BOARD[:3]] == [
+        "omp:anthropic/claude-sonnet-5-5",
+        SONNET_SEAT,
+        "omp:zai/glm-5.3",
     ]
 
-    # Fable is EXCLUDED from HEAVY_PRESET_BOARD entirely (review-cli#fable-seat-reliability,
-    # mirrors the existing DEFAULT_PRESET_BOARD exclusion above) — a "heavy" preset must not
-    # pay for a seat with a confirmed ~100% dispatch failure rate. Kimi is promoted into the
-    # xhigh top-4 in its place (Fable's old DEFAULT_BOARD slot is now the LAST index, so
-    # dropping it doesn't shift anyone else's tier — see HEAVY_PRESET_BOARD's own comment).
-    assert "claude:claude-fable-5-1" not in [r.model for r in HEAVY_PRESET_BOARD]
+    # Fable is in NO level (review-cli#fable-seat-reliability): a level must not pay for a
+    # seat with a confirmed ~100% dispatch failure rate unless the user adds it.
+    for board in (LIGHT_PRESET_BOARD, DEFAULT_PRESET_BOARD, HEAVY_PRESET_BOARD):
+        assert "claude:claude-fable-5-1" not in [r.model for r in board]
     assert [(r.model, r.effort) for r in HEAVY_PRESET_BOARD[:4]] == [
-        (SOL_SEAT, "xhigh"),
         ("claude:claude-opus-5-5", "xhigh"),
-        (GLM_COMMANDCODE_SEAT, "xhigh"),
-        ("oc:commandcode/moonshotai/Kimi-K3", "xhigh"),
+        (SOL_SEAT, "xhigh"),
+        (SONNET_SEAT, "xhigh"),
+        (GROK_SEAT, "xhigh"),
     ]
-    assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
+    assert all(r.effort == "xhigh" for r in HEAVY_PRESET_BOARD)
 
-    # Grok joins both presets automatically (derived from DEFAULT_BOARD) since it's not
-    # excluded like Fable/Sol above (review of #166 — membership was implicit via the
-    # derivation, not pinned by any assertion until this one).
-    assert GROK_SEAT in [r.model for r in DEFAULT_PRESET_BOARD]
-    assert GROK_SEAT in [r.model for r in LIGHT_PRESET_BOARD]
-    assert GROK_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
-    assert MIMO_SEAT in [r.model for r in DEFAULT_PRESET_BOARD]
-    assert MIMO_SEAT in [r.model for r in LIGHT_PRESET_BOARD]
-    assert MIMO_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
-    # review-cli#382 (round 4 review finding): explicitly pin Terra's/Sonnet's effort at
-    # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
-    # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
-    # bare say-so this actually asserts it.
-    terra_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == LUNA_SEAT)
-    sonnet_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == SONNET_SEAT)
-    assert terra_entry.effort == "max", terra_entry
-    assert sonnet_entry.effort == "max", sonnet_entry
+    # Grok and MiMo (the `security` / `tests` lenses) are in every level.
+    for board in (LIGHT_PRESET_BOARD, DEFAULT_PRESET_BOARD, HEAVY_PRESET_BOARD):
+        assert GROK_SEAT in [r.model for r in board]
+        assert MIMO_SEAT in [r.model for r in board]
+    assert LUNA_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
+    assert SONNET_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
 
 
 def test_package_facade_exports_preset_surface():
     import reviewlib
 
-    assert reviewlib.DEFAULT_PRESET == DEFAULT_PRESET
-    assert reviewlib.DEFAULT_PRESET_BOARD == DEFAULT_PRESET_BOARD
-    assert reviewlib.LIGHT_PRESET_BOARD == LIGHT_PRESET_BOARD
-    assert reviewlib.HEAVY_PRESET_BOARD == HEAVY_PRESET_BOARD
+    assert reviewlib.default_level_name() == DEFAULT_PRESET
     assert reviewlib.SOL_SEAT == SOL_SEAT
     # review-cli#382 (codex review finding, round 3): LUNA_SEAT/SONNET_SEAT must be
     # re-exported through the facade too, like every other seat constant (SOL_SEAT/
@@ -597,23 +588,22 @@ def test_package_facade_exports_preset_surface():
     # got an ImportError before this was added to reviewlib/__init__.py.
     assert reviewlib.LUNA_SEAT == LUNA_SEAT
     assert reviewlib.SONNET_SEAT == SONNET_SEAT
-    assert reviewlib.preset_names() == ("default", "heavy", "light")
+    assert reviewlib.preset_names() == ("routine", "standard", "deep")
     assert reviewlib.preset_pool_size("light") == 2
-    # preset_board(None) resolves via DEFAULT_PRESET, which is "light" (Alex,
-    # 2026-08-28) — same model order as DEFAULT_PRESET_BOARD, but LIGHT's effort.
+    # preset_board(None) resolves via the default level (routine == the former `light`).
     assert [r.model for r in reviewlib.preset_board(None)] == [
-        r.model for r in DEFAULT_PRESET_BOARD
+        r.model for r in LIGHT_PRESET_BOARD
     ]
     assert [r.model for r in preset_board(None)] == [
-        r.model for r in DEFAULT_PRESET_BOARD
+        r.model for r in LIGHT_PRESET_BOARD
     ]
     assert preset_board(None)[0] == LIGHT_PRESET_BOARD[0]
     assert preset_board(None)[0] is not LIGHT_PRESET_BOARD[0]
     # Review finding (4 review rounds, multiple reviewers): preset_pool_size(None) must
-    # STAY at DEFAULT_POOL_SIZE (4), deliberately NOT tracking DEFAULT_PRESET the way
+    # STAY at DEFAULT_POOL_SIZE (4), deliberately NOT tracking the default level the way
     # preset_board(None) does — cli.py's pool guard (`preset_pool_size(active_preset)`)
     # relies on this exact disagreement to give a config `models:`/`board:` roster (no
-    # explicit `pool:`) its correct no-override pool of 4, not the light preset's 2. A
+    # explicit `pool:`) its correct no-override pool of 4, not the routine level's 2. A
     # future "consistency" cleanup that makes these agree would silently re-break that
     # path with the whole suite otherwise green — this assertion is the guard against it.
     assert reviewlib.preset_pool_size(None) == DEFAULT_POOL_SIZE == 4
@@ -623,13 +613,13 @@ def test_explicit_preset_board_overrides_config_board():
     cfg = {"board": [{"model": "gemini", "role": "tests", "effort": "medium"}]}
     board = load_board(cfg, preset="heavy")
     assert [r.model for r in board[:4]] == [
-        SOL_SEAT,
         "claude:claude-opus-5-5",
-        GLM_COMMANDCODE_SEAT,
-        "oc:commandcode/moonshotai/Kimi-K3",
+        SOL_SEAT,
+        SONNET_SEAT,
+        GROK_SEAT,
     ]
     assert all(r.effort == "xhigh" for r in board[:4])
-    assert all(r.effort == "max" for r in board[4:])
+    assert all(r.effort == "xhigh" for r in board[4:])
     assert "claude:claude-fable-5-1" not in [r.model for r in board]
 
 
@@ -650,7 +640,7 @@ def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_eff
     assert board[0].model == "gemini"
     assert board[0].role == "tests"
     assert board[0].display == "Configured Gemini"
-    assert board[0].effort == "max"
+    assert board[0].effort == "xhigh"
 
 
 def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat():
@@ -660,9 +650,9 @@ def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat()
 
     assert [r.model for r in board] == ["claude:claude-fable-5-1", "custom:model"]
     assert board[0].role == "architect"
-    assert board[0].effort == "medium"
+    assert board[0].effort == "low"
     assert board[1].role == ""
-    assert board[1].effort == "medium"
+    assert board[1].effort == "low"
 
 
 def test_bare_codex_explicit_model_no_longer_matches_board_metadata_after_astra_pin():
@@ -724,7 +714,7 @@ def test_unknown_preset_name_fails_fast_for_api_callers():
     try:
         load_board({}, preset="bogus")
     except ValueError as exc:
-        assert "unknown preset" in str(exc)
+        assert "unknown level" in str(exc)
     else:
         raise AssertionError("unknown preset should not fall back to DEFAULT_BOARD")
 
@@ -733,7 +723,7 @@ def test_unknown_preset_name_fails_fast_for_api_callers():
     try:
         preset_pool_size("bogus")
     except ValueError as exc:
-        assert "unknown preset" in str(exc)
+        assert "unknown level" in str(exc)
     else:
         raise AssertionError("unknown preset should not fall back to DEFAULT_POOL_SIZE")
 
@@ -1929,16 +1919,16 @@ def test_build_board_job_prompt_carries_project_lens_override():
 
 # === config.yaml board parsing ==================================================
 def test_no_board_key_falls_back_to_default():
-    assert [r.model for r in load_board({})] == [r.model for r in DEFAULT_PRESET_BOARD]
+    assert [r.model for r in load_board({})] == [r.model for r in LIGHT_PRESET_BOARD]
     assert [r.model for r in load_board({"models": ["codex"]})] == [
-        r.model for r in DEFAULT_PRESET_BOARD
+        r.model for r in LIGHT_PRESET_BOARD
     ]
 
 
 def test_empty_or_wrong_typed_board_falls_back_to_default():
     for bad in ([], {"board": []}, {"board": "codex"}, {"board": 42}):
         cfg = bad if isinstance(bad, dict) else {"board": bad}
-        assert len(load_board(cfg)) == len(DEFAULT_PRESET_BOARD), cfg
+        assert len(load_board(cfg)) == len(LIGHT_PRESET_BOARD), cfg
 
 
 def test_board_config_overrides_default():
@@ -2079,11 +2069,11 @@ def test_present_board_all_malformed_raises_not_silent_default():
 
 
 def test_absent_board_key_uses_default_not_error():
-    """Absent `board:` -> DEFAULT_PRESET_BOARD (no error): no preference was expressed."""
-    assert [r.model for r in load_board({})] == [r.model for r in DEFAULT_PRESET_BOARD]
+    """Absent `board:` -> the default level's board (no error): no preference was expressed."""
+    assert [r.model for r in load_board({})] == [r.model for r in LIGHT_PRESET_BOARD]
     # An explicitly empty list is "no preference" too -> default, not an error.
     assert [r.model for r in load_board({"board": []})] == [
-        r.model for r in DEFAULT_PRESET_BOARD
+        r.model for r in LIGHT_PRESET_BOARD
     ]
 
 
@@ -2702,7 +2692,7 @@ def test_cli_explicit_models_override_preset_and_config_models():
             "gemini",
             "claude:claude-opus-5-5",
         ], captured
-        assert [r.effort for r in captured["board"]] == ["max", "xhigh"], captured
+        assert [r.effort for r in captured["board"]] == ["xhigh", "xhigh"], captured
         assert captured["pool_size"] == 2, captured
         assert captured["exact_board"] is True, captured
     finally:
@@ -3130,11 +3120,11 @@ def _capture_default_review_board(argv: list[str]) -> dict:
 
     def _load_board(_cfg, **kw):
         preset = kw.get("preset")
-        if preset == "default":
+        if preset == "standard":
             return list(DEFAULT_PRESET_BOARD)
-        if preset == "light":
+        if preset == "routine":
             return list(LIGHT_PRESET_BOARD)
-        if preset == "heavy":
+        if preset == "deep":
             return list(HEAVY_PRESET_BOARD)
         return list(DEFAULT_BOARD)
 
@@ -3182,7 +3172,7 @@ def test_cli_builtin_default_uses_light_preset_board():
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
     )
     assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
-    assert all(r.effort == "medium" for r in captured["board"])
+    assert all(r.effort == "low" for r in captured["board"])
     assert captured["pool_size"] == 3
 
 
@@ -3199,7 +3189,7 @@ def test_cli_light_and_heavy_presets_set_board_and_default_pool():
         ]
     )
     assert [r.model for r in light["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
-    assert all(r.effort == "medium" for r in light["board"])
+    assert all(r.effort == "low" for r in light["board"])
     assert light["pool_size"] == 3
 
     heavy = _capture_default_review_board(
@@ -3213,17 +3203,15 @@ def test_cli_light_and_heavy_presets_set_board_and_default_pool():
             str(REPO_ROOT),
         ]
     )
-    # review-cli#fable-seat-reliability: Fable is EXCLUDED from the heavy preset (a
-    # confirmed ~100% dispatch failure rate makes it pure waste at any effort tier) —
-    # Sol now leads, with Kimi promoted into the vacated 4th xhigh slot.
+    # review-cli#fable-seat-reliability: Fable is in NO level (a confirmed ~100% dispatch
+    # failure rate makes it pure waste at any effort tier) — deep leads with Opus and Sol.
     assert [r.model for r in heavy["board"][:4]] == [
-        SOL_SEAT,
         "claude:claude-opus-5-5",
-        GLM_COMMANDCODE_SEAT,
-        "oc:commandcode/moonshotai/Kimi-K3",
+        SOL_SEAT,
+        SONNET_SEAT,
+        GROK_SEAT,
     ]
-    assert all(r.effort == "xhigh" for r in heavy["board"][:4])
-    assert all(r.effort == "max" for r in heavy["board"][4:])
+    assert all(r.effort == "xhigh" for r in heavy["board"])
     assert "claude:claude-fable-5-1" not in [r.model for r in heavy["board"]]
     assert heavy["pool_size"] == 4
 
@@ -3353,12 +3341,12 @@ def test_cli_explicit_preset_overrides_config_board():
         cli.main(
             ["diff", "--task", "TEST-1", "--preset", "heavy", "-C", str(REPO_ROOT)]
         )
-        # review-cli#fable-seat-reliability: Fable is excluded from the heavy preset.
+        # review-cli#fable-seat-reliability: Fable is in no level.
         assert [r.model for r in captured["board"][:4]] == [
-            SOL_SEAT,
             "claude:claude-opus-5-5",
-            GLM_COMMANDCODE_SEAT,
-            "oc:commandcode/moonshotai/Kimi-K3",
+            SOL_SEAT,
+            SONNET_SEAT,
+            GROK_SEAT,
         ], captured
         assert captured["board"][0].effort == "xhigh", captured
         assert captured["pool_size"] == 4, captured
@@ -3377,7 +3365,7 @@ def test_cli_pool_flag_threads_pool_size():
         ["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)]
     )
     assert cap2["pool_size"] == 2, cap2["pool_size"]
-    assert len(cap2["board"]) == len(DEFAULT_PRESET_BOARD), "full board still passed"
+    assert len(cap2["board"]) == len(LIGHT_PRESET_BOARD), "full board still passed"
     cap_all = _capture_default_review_board(
         ["diff", "--task", "TEST-1", "--pool", "0", "-C", str(REPO_ROOT)]
     )
@@ -3447,7 +3435,7 @@ def test_cli_leading_meta_flags_before_subcommand_are_honored():
     assert rc == 0
     assert captured["pool_size"] == 2, captured
     assert captured["cwd"] == REPO_ROOT, captured
-    assert captured["preset"] == "heavy", captured
+    assert captured["preset"] == "deep", captured
     assert captured["explicit_models"] == ["codex"], captured
 
 
@@ -3500,14 +3488,14 @@ def test_show_board_honors_pool_flag_tagging():
     seat_lines = [
         ln for ln in _show_board_lines(2) if "[pool" in ln or "[reserve]" in ln
     ]
-    assert len(seat_lines) == len(DEFAULT_PRESET_BOARD)
+    assert len(seat_lines) == len(LIGHT_PRESET_BOARD)
     pool_lines = [ln for ln in seat_lines if "[pool" in ln]
     reserve_lines = [ln for ln in seat_lines if "[reserve]" in ln]
     assert len(pool_lines) == 2, pool_lines
-    assert len(reserve_lines) == len(DEFAULT_PRESET_BOARD) - 2, reserve_lines
-    # The default preset excludes Fable/Sol, so the first two preset seats are the pool.
-    assert "Opus" in pool_lines[0]
-    assert "GLM-cc" in pool_lines[1]
+    assert len(reserve_lines) == len(LIGHT_PRESET_BOARD) - 2, reserve_lines
+    # The default level is routine: its first two seats are the pool.
+    assert "Sonnet-omp" in pool_lines[0]
+    assert "Sonnet " in pool_lines[1]
 
 
 def test_show_board_explicit_model_is_exact():
@@ -3523,16 +3511,14 @@ def test_show_board_explicit_model_is_exact():
 
 
 def test_show_board_explicit_model_with_preset_keeps_exact_model_and_preset_effort_metadata():
-    # Astra (codex:gpt-6-astra) is the preset seat now outside the xhigh top-4 (the bare
-    # `"codex"` seat this test used before ASTRA_SEAT was pinned no longer appears in the
-    # heavy preset at all), so -m'ing it exactly is what exercises "explicit model reuses
-    # the matching preset entry's effort metadata".
-    lines = _show_board_lines(4, preset="heavy", explicit_models=[ASTRA_SEAT])
+    # Astra (codex:gpt-6-astra) is a deep-level seat, so -m'ing it exactly is what
+    # exercises "explicit model reuses the matching level entry's effort metadata".
+    lines = _show_board_lines(4, preset="deep", explicit_models=[ASTRA_SEAT])
     seat_lines = [ln for ln in lines if "[explicit]" in ln]
     assert len(seat_lines) == 1, lines
     assert f"{ASTRA_SEAT}  [available]" in seat_lines[0], lines
-    assert "effort=max" in seat_lines[0], lines
-    assert "source: explicit -m + preset:heavy" in lines[0], lines
+    assert "effort=xhigh" in seat_lines[0], lines
+    assert "source: explicit -m + level:deep" in lines[0], lines
 
 
 def test_show_board_explicit_models_are_all_live_and_pool_is_ignored():
@@ -3556,13 +3542,12 @@ def test_show_board_explicit_models_are_all_live_and_pool_is_ignored():
 def test_show_board_startup_failover_skips_unavailable_top_seat():
     """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
     priority seat is tagged `unavail` and the next available seat fills the pool."""
-    # Sol (#1 in the heavy preset — review-cli#fable-seat-reliability demoted Fable to
-    # LAST, so Fable is no longer in HEAVY_PRESET_BOARD at all) unavailable -> the pool
-    # of 2 is Opus (#2) + GLM-cc (#3); Sol is unavail.
+    # Opus (#1 in the deep level), Sol (#2): Sol unavailable -> the pool of 2 is Opus (#1)
+    # + Sonnet (#3); Sol is unavail.
     avail = {r.model for r in DEFAULT_BOARD if r.model != SOL_SEAT}
     seat_lines = [
         ln
-        for ln in _show_board_lines(2, available=avail, preset="heavy")
+        for ln in _show_board_lines(2, available=avail, preset="deep")
         if "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln
     ]
     by_tier = {"pool": [], "reserve": [], "unavail": []}
@@ -3574,7 +3559,7 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
     assert len(by_tier["pool"]) == 2, by_tier["pool"]
     assert "Sol" in by_tier["unavail"][0], by_tier["unavail"]
     assert "Opus" in by_tier["pool"][0]
-    assert "GLM-cc" in by_tier["pool"][1]
+    assert "Sonnet" in by_tier["pool"][1]
 
 
 def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
@@ -3627,12 +3612,10 @@ def test_show_board_pool_zero_marks_all_seats_pool():
     assert all("[pool" in ln for ln in seat_lines), seat_lines
 
 
-def test_show_board_heavy_preset_displays_effort_values():
-    """review-cli#fable-seat-reliability: Fable is excluded from the heavy preset
-    entirely (a confirmed ~100% dispatch failure rate), so it no longer has a row
-    here at all — Sol (the new #1) and Astra (still outside the xhigh top-4) stand
-    in as the xhigh/max examples instead."""
-    lines = _show_board_lines(4, preset="heavy")
+def test_show_board_deep_level_displays_effort_values():
+    """Fable is in no level (a confirmed ~100% dispatch failure rate), so it has no row
+    here; Sol and Astra both show the deep level's xhigh."""
+    lines = _show_board_lines(4, preset="deep")
     assert not any("claude:claude-fable-5-1" in ln for ln in lines), lines
     sol = next(ln for ln in lines if SOL_SEAT in ln)
     # Match the DISPLAY name ("Astra"), not the bare model string — "codex" is also a
@@ -3640,7 +3623,7 @@ def test_show_board_heavy_preset_displays_effort_values():
     # `codex:gpt-6-astra`), which would false-match here.
     astra = next(ln for ln in lines if "Astra" in ln)
     assert "effort=xhigh" in sol, sol
-    assert "effort=max" in astra, astra
+    assert "effort=xhigh" in astra, astra
 
 
 def test_show_board_tags_by_seat_not_model_for_duplicate_models():
@@ -3900,12 +3883,12 @@ def test_diff_model_help_reports_config_board_without_models():
 
 
 def test_cli_list_defaults_empty_config_uses_code_defaults():
-    """An effectively-empty config `models:` -> --list-defaults shows the default preset."""
+    """An effectively-empty config `models:` -> --list-defaults shows the default level."""
     import io
     import contextlib
 
     from reviewlib import cli
-    from reviewlib.config import DEFAULT_PRESET_BOARD
+    from reviewlib.config import preset_board
 
     old_load_config = cli.load_config
     cli.load_config = lambda: {"models": ["", "  "]}
@@ -3916,7 +3899,7 @@ def test_cli_list_defaults_empty_config_uses_code_defaults():
         out = buf.getvalue().strip().splitlines()
     finally:
         cli.load_config = old_load_config
-    assert out == [r.model for r in DEFAULT_PRESET_BOARD], out
+    assert out == [r.model for r in preset_board()], out
 
 
 def test_cli_panel_list_defaults_do_not_use_diff_preset():
@@ -3938,11 +3921,12 @@ def test_cli_panel_list_defaults_do_not_use_diff_preset():
     assert out == [_expand_alias(m) for m in DEFAULT_MODELS], out
 
 
-def test_cli_rejects_preset_outside_diff_review():
+def test_cli_level_flag_is_for_diff_review_and_moderator_modes_only():
     import contextlib
     import io
 
     from reviewlib import cli
+    from reviewlib.config import DEFAULT_MODELS, _expand_alias
 
     old_load_config = cli.load_config
     cli.load_config = lambda: {}
@@ -3951,17 +3935,24 @@ def test_cli_rejects_preset_outside_diff_review():
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
-                cli.main(
-                    ["brainstorm", "topic", "--preset", "heavy", "--list-defaults"]
-                )
+                cli.main(["just-ask", "topic", "--preset", "heavy", "--list-defaults"])
             except SystemExit as exc:
                 code = exc.code
             else:
                 code = 0
+        # brainstorm takes --level only to pick the moderator chain; its PANEL (and
+        # --list-defaults) is untouched by the level.
+        ok_out = io.StringIO()
+        with contextlib.redirect_stdout(ok_out):
+            rc = cli.main(["brainstorm", "topic", "--level", "deep", "--list-defaults"])
     finally:
         cli.load_config = old_load_config
     assert code == 2
     assert "unrecognized arguments: --preset" in stderr.getvalue()
+    assert rc == 0
+    assert ok_out.getvalue().strip().splitlines() == [
+        _expand_alias(m) for m in DEFAULT_MODELS
+    ]
 
 
 def test_cli_list_defaults_explicit_models_win_over_preset():

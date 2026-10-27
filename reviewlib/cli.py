@@ -34,19 +34,19 @@ from .process import _open_log_with_fallback, install_signal_reaper
 from .modes import refuse_oversized_diff
 from .config import (
     CONFIG_PATH,
-    DEFAULT_PRESET,
     DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
     SHIP_MIN_ROLES,
     DEFAULT_PROMPT,
-    MODERATOR_CANDIDATES,
+    default_level_name,
+    resolve_level_name,
+    resolve_moderator_candidates,
     PANEL_TIMEOUT_DEFAULT,
     QA_TIMEOUT_DEFAULT,
     VISUAL_MODELS,
     BoardConfigError,
     BoardReviewer,
-    DEFAULT_PRESET_BOARD,
     EffortValueError,
     _drop_malformed_board_entries,
     _expand_alias,
@@ -1084,7 +1084,7 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     mod_seed = ns.moderator or (saved_mod or None)
     if mod_seed:
         mod_seed = _expand_alias(mod_seed)
-    moderators = pick_moderators(mod_seed, models)
+    moderators = pick_moderators(mod_seed, models, _moderator_candidates(config, None))
     timeout = ns.timeout if ns.timeout is not None else PANEL_TIMEOUT_DEFAULT
 
     # Optional grounding diff for the resumed rounds: --diff / --staged re-attach the
@@ -2177,10 +2177,13 @@ def _capacity_check_subcommand(rest: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--level",
         "--preset",
+        dest="preset",
+        type=_level_arg,
         default=None,
-        help="evaluate this preset's board instead of the config/default board "
-        "(the board `review diff --preset NAME` would run)",
+        help="evaluate this level's board instead of the config/default board "
+        "(the board `review diff --level NAME` would run; `--preset` is the older spelling)",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     ns = parser.parse_args(rest)
@@ -2715,7 +2718,12 @@ def _health_subcommand(rest: list[str]) -> int:
         help="seat to check (repeatable); default: every seat of the active board",
     )
     parser.add_argument(
-        "--preset", default=None, help="check this preset's board instead"
+        "--level",
+        "--preset",
+        dest="preset",
+        type=_level_arg,
+        default=None,
+        help="check this level's board instead (`--preset` is the older spelling)",
     )
     parser.add_argument(
         "--host",
@@ -2756,7 +2764,7 @@ def _health_subcommand(rest: list[str]) -> int:
     for seat in ns.seat:
         remote_args += ["--seat", seat]
     if ns.preset:
-        remote_args += ["--preset", ns.preset]
+        remote_args += ["--level", ns.preset]
     if timeout is not None:
         remote_args += ["--timeout", f"{timeout:g}"]
     if ns.cached:
@@ -4150,6 +4158,7 @@ def _run_mode_with_stats(
     needs_slot: bool = True,
     direct_seats: bool = False,
     later_models: list[str] | None = None,
+    level: str | None = None,
 ) -> int:
     """Wait for a host-wide admission slot (reviewlib.admission, review-cli#614), then run
     `_run_admitted_mode_with_stats`. Queue time is outside the recorded duration, so it
@@ -4180,6 +4189,7 @@ def _run_mode_with_stats(
             repo_id=repo_id,
             diff_files=diff_files,
             diff_sha256=diff_sha256,
+            level=level,
         )
 
 
@@ -4195,6 +4205,7 @@ def _run_admitted_mode_with_stats(
     repo_id: str | None = None,
     diff_files: list[str] | None = None,
     diff_sha256: str | None = None,
+    level: str | None = None,
 ) -> int:
     """Announce the ETA, time the run on a monotonic clock, and append a stat record.
 
@@ -4435,6 +4446,7 @@ def _run_admitted_mode_with_stats(
                 prompt_tokens=prompt_tokens,
                 output_tokens=output_tokens,
                 run_id=this_run_id,
+                level=level,
             )
             # Review finding (Codex): this used to print the nudge UNCONDITIONALLY,
             # ignoring `record_run`'s own success/failure return. With an unwritable
@@ -4610,6 +4622,7 @@ _VALUE_TAKING_OPTS = frozenset(
         "--timeout",
         "--pool",
         "--preset",
+        "--level",
         "--moderator",
         "--rounds",
         "--max-rounds",
@@ -4736,6 +4749,7 @@ _LEADING_MODE_VALUE_OPTS = frozenset(
         "--timeout",
         "--pool",
         "--preset",
+        "--level",
     }
 )
 _LEADING_MODE_FLAG_OPTS = frozenset({"--list-defaults", "--show-board"})
@@ -5440,21 +5454,73 @@ def _model_default_help(mode: ModeSpec | None) -> str:
         if board_models:
             return f"your config.yaml board: {_fmt(board_models)}"
     return (
-        f"the {DEFAULT_PRESET!r} preset reviewer board "
+        f"the {_default_level_for_help()!r} level reviewer board "
         "(run `review --show-board`; see `review help config`)"
     )
 
 
+def _default_level_for_help() -> str:
+    """The default level's name for `--help` text; `--help` must never crash on a bad
+    config, so a levels error shows the shipped default."""
+    try:
+        return default_level_name(load_config())
+    except Exception:  # noqa: BLE001
+        return default_level_name(None)
+
+
+def _levels_help() -> str:
+    """One line per level (pool, effort, aliases, next heavier) for `--help`, from the
+    shipped + user levels data; a broken user config falls back to the shipped levels."""
+    from .levels import resolve_levels
+
+    try:
+        level_set = resolve_levels(load_config())
+    except Exception:  # noqa: BLE001 — --help must never crash on a bad config
+        level_set = resolve_levels(None)
+    parts = []
+    for lv in level_set.levels.values():
+        alias = f", alias {'/'.join(lv.aliases)}" if lv.aliases else ""
+        parts.append(f"{lv.name} (pool {lv.pool}, {lv.effort} effort{alias})")
+    return "; ".join(parts).replace("%", "%%")
+
+
+def _level_arg(value: str) -> str:
+    """argparse `type` of `--level`/`--preset`: the canonical level name (the legacy preset
+    names light/default/heavy are level aliases), or an argparse error naming the known levels."""
+    try:
+        return resolve_level_name(value, load_config())
+    except BoardConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _moderator_default_help() -> str:
-    """The EFFECTIVE auto-picked `--moderator` default, for `--help`. The moderator is
-    chosen from MODERATOR_CANDIDATES (opus -> codex -> gemini) filtered to availability at
-    run time; the help names that priority chain so the default is concrete, not vague.
+    """The EFFECTIVE auto-picked `--moderator` default, for `--help`: the chain
+    `config.resolve_moderator_candidates` yields for the user's config (their
+    `moderator_candidates:`, else the default level's `moderators`), filtered to
+    availability at run time.
 
     Escape `%` -> `%%`: this is interpolated into an argparse `help=`, where `%` is
-    formatting syntax. The candidates are hardcoded today (no `%`), but escaping keeps the
-    same defensive guarantee as `_model_default_help` so a future `%`-bearing candidate id
-    can't crash `review --help` (gemini review)."""
-    return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
+    formatting syntax, and config values are untrusted (same guarantee as
+    `_model_default_help`). Best-effort: a config read failure shows the shipped chain."""
+    try:
+        chain, _ = resolve_moderator_candidates(load_config())
+    except Exception:  # noqa: BLE001 — --help must never crash on a bad config
+        chain, _ = resolve_moderator_candidates({})
+    return " -> ".join(chain).replace("%", "%%")
+
+
+_MODERATOR_NOTICES_SHOWN: set[str] = set()
+
+
+def _moderator_candidates(config: dict, level: str | None) -> tuple[str, ...]:
+    """The moderator chain for this run: `moderator_candidates:` > the level's chain
+    (`level` None = the default level); a malformed `moderator_candidates:` value is
+    reported once on stderr, then ignored."""
+    chain, notice = resolve_moderator_candidates(config, level)
+    if notice and notice not in _MODERATOR_NOTICES_SHOWN:
+        _MODERATOR_NOTICES_SHOWN.add(notice)
+        print(f"[review] {notice}", file=sys.stderr, flush=True)
+    return chain
 
 
 def _add_global_options(
@@ -5529,18 +5595,31 @@ def _add_global_options(
         action="store_true",
         help="print the active reviewer board (model -> role, availability) plus per-role fallback model ids and exit",
     )
-    if mode is None or mode.name == "review":
+    if mode is None or mode.name in ("review", "quorum", "brainstorm"):
+        review_level = mode is None or mode.name == "review"
         parser.add_argument(
+            "--level",
             "--preset",
-            choices=preset_names(),
+            dest="level",
+            type=_level_arg,
             default=None,
+            metavar="LEVEL",
             help=(
-                "diff-review preset: light = quick/cheap preflight (pool 2, medium effort; "
-                "a recorded `--task` run floors that to 3 distinct roles so gh ship can pass); "
-                "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, excludes "
-                "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
-                f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
+                "capability level: how much review this task needs; the lowest sufficient "
+                "level is the default and a heavier one is used only when you ask for it "
+                "(never because a seat is unavailable). `--preset` is the same option "
+                f"under its older name (light/default/heavy = routine/standard/deep). "
+                f"Levels: {_levels_help()}. "
+                + (
+                    "Selects the board, pool and effort of this diff review "
+                    "(a recorded `--task` run floors the pool to 3 distinct roles so gh ship "
+                    "can pass). "
+                    if review_level
+                    else "Selects the level whose moderator chain this run uses "
+                    "(`--moderator` still wins). "
+                )
+                + f"Default: {_default_level_for_help()!r}, definitions in the shipped "
+                "reviewlib/levels.yaml plus your config `levels:`."
             ),
         )
     parser.add_argument(
@@ -5549,10 +5628,8 @@ def _add_global_options(
         default=None,
         metavar="N",
         help=(
-            "how many of the board's seats to run (default "
-            f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
-            f"for light — a bare `review diff` uses {preset_pool_size(DEFAULT_PRESET)}, the "
-            f"{DEFAULT_PRESET!r} preset's pool; a recorded `--task` run floors that to "
+            "how many of the board's seats to run (default: the level's pool, see --level "
+            f"({_levels_help()}); a recorded `--task` run floors that to "
             f"{SHIP_MIN_ROLES} so gh ship can pass; {DEFAULT_POOL_SIZE} is only the fallback "
             "for a custom config `models:`/`board:` roster with no `pool:` key set); the "
             "first N seats participate, the rest are kept in reserve. The board is "
@@ -5861,11 +5938,9 @@ def _help_topic_config() -> str:
     reviewer board + model selection resolve. Kept in sync with config.py / backends.py
     behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit.
 
-    NOTE: the "REVIEWER BOARD + PRESETS" section below derives its stated effort from
-    `preset_board(DEFAULT_PRESET)[0].effort` — correct only because DEFAULT_PRESET's board
-    has UNIFORM effort across all seats (true for "light"/"default", not for "heavy",
-    which mixes xhigh/max). If DEFAULT_PRESET ever becomes "heavy", that line needs a
-    real fix, not just re-pointing the same expression."""
+    NOTE: the "LEVELS" section below prints every level straight from the shipped
+    `levels.yaml` merged with the user's config (`_levels_help`), so its numbers cannot drift
+    from the data."""
     adm = admission.Settings()
     return f"""\
 review — configuration reference
@@ -5881,6 +5956,16 @@ CONFIG FILE
     brainstorm_models: list[str]  default panel for `review brainstorm` (falls back to
                        `models:`, then the built-in defaults). Unreachable backends are
                        dropped gracefully.
+    levels:            mapping    per-level overrides of the shipped capability levels
+                       (pool, effort, roles, moderators, escalate_to, aliases); see
+                       CAPABILITY LEVELS below. default_level: str picks the default level.
+    moderator_candidates: list[str]  ordered seat ids tried as the quorum/brainstorm
+                       moderator (aliases expand; unavailable seats are skipped; a failing
+                       one falls to the next). Not set -> the `moderators` chain of the
+                       active level (`--level`, else the default level; the shipped routine
+                       chain is Sonnet-class, so a roster-less config never starts on Opus).
+                       An explicit --moderator always goes first. A malformed value (empty /
+                       not a list of strings) is ignored with a stderr notice.
     visual_models:     list[str]  ordered vision backends for `review visual` and companion
                        visual fan-out. Separate from the text reviewer board; runtime
                        failures skip to the next vision backend.
@@ -5936,16 +6021,18 @@ CONFIG FILE
   `terra`/`gpt56terra` -> codex:gpt-5.6-terra.
 
 SELECTION CASCADE, by mode:
-  review diff           : explicit -m requested models  >  explicit --preset  >
+  review diff           : explicit -m requested models  >  explicit --level/--preset  >
                           config `models:` priority roster  >  config `board:`  >
-                          default preset.
+                          the default level (routine unless `default_level:` says otherwise).
                           With configured `models:`/`board:` metadata, -m narrows that
                           board metadata to only the requested models; without config it is
-                          the legacy flat exact panel unless an explicit preset supplies
+                          the legacy flat exact panel unless an explicit level supplies
                           metadata/effort for the requested models.
   review visual         : explicit -m  >  `visual_models:`  >  visual defaults.
   review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
   review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
+  quorum/brainstorm moderator: --moderator  >  `moderator_candidates:`  >  the `moderators`
+                          chain of --level (default: the default level).
   review qa             : IGNORES config `models:` / `brainstorm_models:` / the defaults.
                           It picks ONE write/exec tester: `REVIEW_QA_TESTER=claude|codex`  >
                           a bare `-m claude|codex`  >  the `claude` default. (opencode is not
@@ -5954,22 +6041,50 @@ SELECTION CASCADE, by mode:
   Visual defaults:  {", ".join(_expand_alias(x) for x in VISUAL_MODELS)}.
   See the live default for each subcommand in `review <mode> --help` (the --model line).
 
-REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints it live)
-  A priority-ordered panel of seats, each model carrying its own
-  role/lens. The listing also prints per-role fallback model ids (bare names; harness auto-resolved). A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
-  {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
-  Fable/Sol. A recorded `review diff --task CODE` floors that pool to {SHIP_MIN_ROLES}
+CAPABILITY LEVELS (the diff-review default; `review --show-board` prints the board live)
+  A level says how much review a task needs: pool size, reasoning effort, a roster of
+  role -> priority-ordered seats, the quorum/brainstorm moderator chain and the next
+  heavier level. The defaults are DATA in the shipped file
+  {Path(__file__).with_name("levels.yaml")} (no model or provider is hard-coded in the
+  engine): {_levels_help()}. Default: `{_default_level_for_help()}`, the lowest sufficient
+  level. `review diff --level NAME` (`--preset NAME` is the same option, with the old
+  names light/default/heavy as aliases of routine/standard/deep) asks for another level;
+  nothing is ever dispatched on a heavier level because a seat of the lighter one is
+  unavailable: a missing seat is replaced from the SAME level's reserve (its roster order),
+  and an explicit `--level` is the only way up (the pool guard may PROPOSE one).
+  Fable is in no shipped level (a ~100% dispatch failure rate on the owner's account); add it to
+  a level of your own, or use `-m fable`.
+
+  Override per user in config.yaml `levels:` (review-cli has no project-level config, the
+  user config is the one override layer): a mapping inherits from the shipped level and a key overrides one field;
+  mappings merge key by key, lists and scalars replace, `null` deletes a key; a new level name
+  defines a new level (it needs pool, effort, roles, moderators). Example:
+    levels:
+      routine:
+        effort: medium                    # one field, everything else inherited
+        roles:
+          correctness: ["claude:claude-opus-5-5"]   # replaces that role's seats only
+          tests: null                      # drops the role
+        moderators: ["omp:zai/glm-5.3"]
+    default_level: standard               # optional: another level as the default
+  A seat is a model string or alias, or {{model, name, effort}}. Roles are the REVIEW_ROLES
+  keys. A bad level (unknown key, effort, pool, escalate_to, role) is an error naming the key,
+  e.g. `levels.routine.effort`. `models:` / `board:` keep working exactly as before and keep
+  precedence over the default level (an explicit --level wins over both). paid-provider
+  limits (`unpaid_providers:`) and the `omp_accounts:` usage ceiling apply to every level.
+  The level used is recorded in run-stats (`level`).
+
+  The listing also prints per-role fallback model ids (bare names; harness auto-resolved). A
+  recorded `review diff --task CODE` floors the pool to {SHIP_MIN_ROLES}
   distinct roles so `review task CODE --check` / gh ship can pass from one run; explicit
   `--pool N` still wins (warns if N<{SHIP_MIN_ROLES}). `-m one-model` with `--task` pads
   that model across {SHIP_MIN_ROLES} roles for review, quorum, and brainstorm (quorum and
   brainstorm announce the role slots on stderr, one call each); just-ask never pads — one
   `-m` model is one call. A default (no `-m`) brainstorm `--task` gives its live panel
   max({SHIP_MIN_ROLES}, engines) distinct role slots per round; `--pool 1` opts out.
-  Use `--preset default` for a routine change
-  review (pool 4, high effort) or `--preset heavy` for release/risky changes
-  (Sol/Opus/GLM-cc/Kimi at highest effort; Fable is excluded from every preset — a
-  confirmed ~100% dispatch failure rate, see DEFAULT_BOARD's own comment — and sits
-  last-resort in the raw board instead). `--pool N` sizes the selected board (`--pool 0`
+  `review task CODE --check` reports distinct ROLES and distinct MODELS separately (3 roles
+  can be 2 models); the ship floor counts roles, `--min-models N` counts models.
+  `--pool N` sizes the selected board (`--pool 0`
   = all available; recorded `--task --pool 0` still pads a same-role config roster
   to the ship floor). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel (unless `--task`
@@ -6526,7 +6641,7 @@ JSON (schema "{SCHEMA}", schema_version {SCHEMA_VERSION})
   schema, schema_version   identify this contract; a consumer refuses other versions
   checked_at               when the report was built (UTC ISO-8601)
   max_age_seconds          the freshness window applied
-  configuration            source ("preset:light", "config.yaml (models:)", ...), preset,
+  configuration            source ("level:routine", "config.yaml (models:)", ...), preset,
                            config_path, config_present, board_fingerprint
                            ("sha256:<16 hex>" over the seats), seats [{{model, role,
                            display, effort}}]; null when the board failed to resolve
@@ -6889,25 +7004,20 @@ def _board_from_models_lenient(
         )
 
 
-def _default_review_board(
-    config: dict, config_models: list[str], config_has_board: bool, default_pool: int
-):
+def _default_review_board(config: dict, config_models: list[str], default_pool: int):
     """The board a no-`-m`/no-`--pool` run would use, with its default pool size — the
     precedence the guard offers as the 'drop your override' fallback (config `models:` >
-    config `board:` > the default preset). `default_pool` is the pool size a no-override run
-    would ACTUALLY use (config `pool:` > preset default), so a proposal's promised size
+    config `board:` > the default level). `default_pool` is the pool size a no-override run
+    would ACTUALLY use (config `pool:` > level default), so a proposal's promised size
     matches what re-running would do."""
     if config_models:
         return board_from_models(config_models, config), default_pool
-    if config_has_board:
-        return load_board(config), default_pool
-    return load_board(config, preset=DEFAULT_PRESET), default_pool
+    return load_board(config), default_pool  # a config `board:`, else the default level
 
 
 def _pool_guard_candidates(
     config: dict,
     config_models: list[str],
-    config_has_board: bool,
     default_pool: int,
 ) -> list[Candidate]:
     """Fallback options the guard proposes when a selection can't converge: the default
@@ -6917,9 +7027,7 @@ def _pool_guard_candidates(
     candidates: list[Candidate] = []
     default_seats: tuple[tuple[str, str], ...] | None = None
     try:
-        board, pool = _default_review_board(
-            config, config_models, config_has_board, default_pool
-        )
+        board, pool = _default_review_board(config, config_models, default_pool)
         default_seats = _seats_of(board)
         candidates.append(
             Candidate(
@@ -6931,7 +7039,7 @@ def _pool_guard_candidates(
         )
     except BoardConfigError:
         pass
-    for name in preset_names():
+    for name in preset_names(config):
         try:
             seats = _seats_of(load_board(config, preset=name))
         except BoardConfigError:
@@ -6940,10 +7048,10 @@ def _pool_guard_candidates(
             continue
         candidates.append(
             Candidate(
-                label=f"preset:{name}",
-                why=f"use the {name!r} preset (`review diff --preset {name}`)",
+                label=f"level:{name}",
+                why=f"use the {name!r} level (`review diff --level {name}`)",
                 board=seats,
-                pool_size=preset_pool_size(name),
+                pool_size=preset_pool_size(name, config),
             )
         )
     return candidates
@@ -7011,7 +7119,6 @@ def _chain_aware_available(model: str) -> bool:
 def _evaluate_pool_or_bail(
     config: dict,
     config_models: list[str],
-    config_has_board: bool,
     user_seats: tuple[tuple[str, str], ...],
     explicit_models: list[str],
     pool_arg: int | None,
@@ -7064,9 +7171,7 @@ def _evaluate_pool_or_bail(
         # THUNK: the fallback boards (default + presets) are re-resolved only on the
         # non-converge path, so a converging happy-path run never rebuilds them (and never
         # re-emits load_board's stderr warnings for a malformed config board — glm review).
-        candidates=lambda: _pool_guard_candidates(
-            config, config_models, config_has_board, default_pool
-        ),
+        candidates=lambda: _pool_guard_candidates(config, config_models, default_pool),
         available=_chain_aware_available,
         reason=_guard_reason,
         reuse_eligible=reuse_eligible,
@@ -7292,6 +7397,13 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))
+    # One validation point for the shipped + user `levels:` data: every later level lookup
+    # (default level, moderator chain, guard proposals) can then rely on it resolving.
+    try:
+        preset_names(config)
+    except BoardConfigError as exc:
+        print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
+        return 2
 
     # `models:` / `visual_models:` from config, stripped + alias-expanded + blanks dropped
     # (same rule as _split_models for -m). An "effectively empty" list — absent, or only
@@ -7302,31 +7414,35 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         config.get("board")
     )
     explicit_models = _split_models(args.model)
-    explicit_preset = getattr(args, "preset", None) is not None
+    explicit_preset = getattr(args, "level", None) is not None
     preset_applies = mode.name == "review"
     if explicit_preset and preset_applies:
-        active_preset = args.preset
+        active_preset = args.level
     elif (
         preset_applies
         and not explicit_models
         and not config_models
         and not config_has_board
     ):
-        active_preset = DEFAULT_PRESET
+        active_preset = default_level_name(config)
     else:
         active_preset = None
-    # Default pool size precedence: explicit `--pool N` > an explicit `--preset` > a
-    # config `pool:` default > the preset/built-in default. The config key lets a personal
+    # What run-stats records as this run's level: the diff review's level board, or the
+    # level an explicit `--level` picked for a quorum/brainstorm moderator chain; none for a
+    # config roster or a mode that has no level.
+    recorded_level = active_preset or getattr(args, "level", None)
+    # Default pool size precedence: explicit `--pool N` > an explicit `--level` > a
+    # config `pool:` default > the level/built-in default. The config key lets a personal
     # config.yaml pin a smaller board (e.g. 3 while a provider is disabled) without passing
     # `--pool` every call; an explicit flag/preset still wins.
     if args.pool is not None:
         effective_pool_size = args.pool
     elif explicit_preset and preset_applies:
-        effective_pool_size = preset_pool_size(active_preset)
+        effective_pool_size = preset_pool_size(active_preset, config)
     elif _config_default_pool(config) is not None:
         effective_pool_size = _config_default_pool(config)
     else:
-        effective_pool_size = preset_pool_size(active_preset)
+        effective_pool_size = preset_pool_size(active_preset, config)
 
     if args.list_defaults:
         if explicit_models:
@@ -7865,7 +7981,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
             # deliberate `--pool N` or a configured-role collision never adds calls or
             # drops an engine (review-cli#444).
             slot_roles = list(
-                dict.fromkeys(r.role for r in DEFAULT_PRESET_BOARD if r.role_lens)
+                dict.fromkeys(r.role for r in preset_board(None, config) if r.role_lens)
             )
             slot_count = max(SHIP_MIN_ROLES, len(models))
             models = [models[i % len(models)] for i in range(slot_count)]
@@ -8168,7 +8284,13 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         moderator_arg = getattr(args, "moderator", None)
         if moderator_arg:
             moderator_arg = _expand_alias(moderator_arg)
-        return pick_moderators(moderator_arg, models) if panel_mode else []
+        if not panel_mode:
+            return []
+        return pick_moderators(
+            moderator_arg,
+            models,
+            _moderator_candidates(config, getattr(args, "level", None)),
+        )
 
     def _moderator_seat() -> list[str]:
         # The moderator a quorum/brainstorm runs after its panel, reserved with it.
@@ -8360,6 +8482,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
             repo_id=repo_id,
             diff_files=diff_files,
             diff_sha256=diff_sha256,
+            level=recorded_level,
             later_models=moderators[:1],
             **bs_roles_kw,
         )
@@ -8415,6 +8538,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
                 repo_id=repo_id,
                 diff_files=diff_files,
                 diff_sha256=diff_sha256,
+                level=recorded_level,
                 later_models=moderators[:1] if mode.name == "quorum" else None,
                 **panel_roles_kw,
             )
@@ -8437,22 +8561,21 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         #     not preempt that no-op with an EXIT_UNSATISFIED. Inert on the happy path + fake
         #     backend.
         if mode.name == "review" and diff.strip():
-            # `preset_pool_size(active_preset)`, NOT `preset_pool_size(DEFAULT_PRESET)`
+            # `preset_pool_size(active_preset, config)`, NOT the default level's pool
             # (2 review-round finding, all 3 reviewers, after the light-default change):
             # `active_preset` is `None` for a custom config `models:`/`board:` roster —
             # in that case a no-override run ACTUALLY resolves pool via
-            # `preset_pool_size(None) == DEFAULT_POOL_SIZE` (4, cli.py ~4218), not the
-            # preset system's own default (2). Passing the literal `DEFAULT_PRESET` here
-            # would silently halve the guard's promised pool for every config-roster user,
-            # contradicting the very comment/help text this same change added elsewhere.
+            # `preset_pool_size(None) == DEFAULT_POOL_SIZE` (4), not the level system's
+            # own default. Passing the default level here would silently change the
+            # guard's promised pool for every config-roster user, contradicting the
+            # very comment/help text this same change added elsewhere.
             guard_rc = _evaluate_pool_or_bail(
                 config,
                 config_models,
-                config_has_board,
                 _seats_of(board),
                 [] if task_role_pad else explicit_models,
                 effective_pool_size if task_role_pad else args.pool,
-                _config_default_pool(config) or preset_pool_size(active_preset),
+                _config_default_pool(config) or preset_pool_size(active_preset, config),
                 # Reuse-eligible iff the real dispatch below will actually use
                 # `select_pool_and_reserve_with_reuse` on this board AND that selector
                 # will actually pad it: never for an exact `-m` board (dispatched
@@ -8607,6 +8730,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
                 repo_id=repo_id,
                 diff_files=diff_files,
                 diff_sha256=diff_sha256,
+                level=recorded_level,
                 needs_slot=mode.name != "review" or bool(diff.strip()),
             )
         finally:
@@ -8624,16 +8748,15 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
     # whose panels keep their own behaviour and never see review-specific proposal text) AND
     # to a non-empty diff (an empty diff runs no panel — see the board-path note above).
     if mode.name == "review" and diff.strip():
-        # See the matching `preset_pool_size(active_preset)` comment above — same
+        # See the matching `preset_pool_size(active_preset, config)` comment above — same
         # config-roster-vs-preset-system distinction applies here.
         guard_rc = _evaluate_pool_or_bail(
             config,
             config_models,
-            config_has_board,
             tuple((m, m) for m in models),
             explicit_models,
             args.pool,
-            _config_default_pool(config) or preset_pool_size(active_preset),
+            _config_default_pool(config) or preset_pool_size(active_preset, config),
         )
         if guard_rc is not None:
             return guard_rc
@@ -8647,6 +8770,7 @@ def _dispatch_scoped(argv: list[str] | None = None) -> int:
         repo_id=repo_id,
         diff_files=diff_files,
         diff_sha256=diff_sha256,
+        level=recorded_level,
         needs_slot=mode.name != "review" or bool(diff.strip()),
     )
 
@@ -8698,8 +8822,8 @@ def _show_board(
 ) -> int:
     """Print the active reviewer board as a PRIORITY-ordered failover pool.
 
-    The selected board (explicit preset, else config.yaml `models:`/`board:`, else the
-    raw built-in DEFAULT_BOARD) is listed in priority order (strongest first). Each seat
+    The selected board (explicit level, else config.yaml `models:`/`board:`, else the
+    default level's board) is listed in priority order (strongest first). Each seat
     shows its display name, role, model, backend availability (key/CLI present), and a
     failover TIER:
       * `pool`    — one of the top-`pool_size` AVAILABLE seats that a plain `review`
@@ -8719,10 +8843,10 @@ def _show_board(
     try:
         if exact_models:
             board = _board_from_models_lenient(exact_models, config, preset=preset)
-            source = f"explicit -m{f' + preset:{preset}' if preset else ''}"
+            source = f"explicit -m{f' + level:{preset}' if preset else ''}"
         elif preset:
             board = load_board(config, preset=preset)
-            source = f"preset:{preset}"
+            source = f"level:{preset}"
         elif config_models:
             board = board_from_models(config_models, config)
             source = "config.yaml (models:)"
@@ -8775,7 +8899,7 @@ def _show_board(
     # 2026-08-28): every unadorned invocation would misleadingly claim to be "sized".
     # `preset_pool_size(None)` already returns DEFAULT_POOL_SIZE (review finding: a
     # prior `if preset else DEFAULT_POOL_SIZE` ternary duplicated that same fallback).
-    bare_default_pool = preset_pool_size(preset)
+    bare_default_pool = preset_pool_size(preset, config)
     sized = " (sized by preset/--pool)" if pool_size != bare_default_pool else ""
     if exact_board:
         print(

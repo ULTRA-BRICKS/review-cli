@@ -269,7 +269,7 @@ def _require_git(context: str) -> None:
 
 # --- CLI surface: subcommands, removed flags, meta ------------------------------------------
 def test_list_defaults_and_help():
-    assert_in("codex", review_out("--list-defaults"))
+    assert_in("claude:claude-sonnet-5-5", review_out("--list-defaults"))
     review_out("--help")  # exit 0 is the assertion
 
 
@@ -292,7 +292,7 @@ def test_shim_bootstrap_from_outside_repo_with_pythonpath_cleared():
         raise SmokeError(
             f"shim from outside repo exited {p.returncode}\n{p.stdout}\n{p.stderr}"
         )
-    assert_in("codex", p.stdout)
+    assert_in("claude:claude-sonnet-5-5", p.stdout)
 
 
 def test_modes_are_subcommands_not_flags():
@@ -336,8 +336,8 @@ def test_diff_subcommand_and_review_review_pointer():
     # `review review`). A bare meta `review --list-defaults` still works; `review diff
     # --list-defaults` works explicitly; bare `review` (no subcommand) points at `review diff`;
     # the removed `review review` verb errors (exit 2) pointing at the new verb.
-    assert_in("codex", review_out("--list-defaults"))
-    assert_in("codex", review_out("diff", "--list-defaults"))
+    assert_in("claude:claude-sonnet-5-5", review_out("--list-defaults"))
+    assert_in("claude:claude-sonnet-5-5", review_out("diff", "--list-defaults"))
     assert_in("review diff", review_out())  # bare review points at the new verb
     p = assert_fails("review")  # `review review` is gone -> usage exit 2
     assert_in("review diff", p.stdout + p.stderr)
@@ -360,7 +360,7 @@ def test_non_git_dir_fails_gracefully_with_stable_code():
     assert_not_in("RuntimeError", out)
     # A no-git mode + meta flags still work from a non-git dir.
     assert_in("the question to ask", review_out("just-ask", "-C", nongit, "--help"))
-    assert_in("codex", review_out("-C", nongit, "--list-defaults"))
+    assert_in("claude:claude-sonnet-5-5", review_out("-C", nongit, "--list-defaults"))
 
 
 def test_commit_flag_requires_staged():
@@ -397,42 +397,38 @@ def test_board_flags_and_listing():
     assert_not_in("--no-board", top)
     board = review_out("--show-board")
     for needle in (
-        # Bare `--show-board` now resolves to the "light" preset (Alex, 2026-08-28:
-        # cheap/quick preflight is the default; "default"/"heavy" are opt-in).
-        "source: preset:light",
-        "claude:claude-opus-5-5",
-        "oc:commandcode/deepseek/deepseek-v4-pro",
+        # Bare `--show-board` resolves to the default capability level, the cheapest
+        # sufficient one (reviewlib/levels.yaml: routine); standard/deep are opt-in.
+        "source: level:routine",
+        "omp:anthropic/claude-sonnet-5-5",
+        "claude:claude-sonnet-5-5",
         "omp:zai/glm-5.3",
-        # Grok — verifies the 13-seat count below is actually seats with Grok present,
-        # not merely a matching total (review of #166). MIMO_SEAT (review-cli#450) is the
-        # 12th light-preset seat; OMP_CLAUDE_SEAT (review-cli#168) makes it 13.
         "oc:xai/grok-4.7",
         "omp:opencode-go/mimo-v2.6-pro",
-        "contracts",
-        "13 seats",
+        "5 seats",
         "#1",
-        # The CTO-directed GLM-5.3-via-commandcode seat (light preset, diff-only keyed HTTP).
-        "commandcode:zai-org/GLM-5.3",
-        "GLM-cc",
+        "Sonnet-omp",
     ):
         assert_in(needle, board, "in --show-board")
+    # Routine carries no heavy seat; Opus and Codex live in the standard/deep levels.
+    for needle in ("claude:claude-opus-5-5", "codex:", "claude:claude-fable"):
+        assert_not_in(needle, board)
+    # `--preset` is the older spelling of `--level`: heavy == deep.
     heavy = review_out("--show-board", "--preset", "heavy")
-    # review-cli#fable-seat-reliability: claude:claude-fable-5-1 is EXCLUDED from the
-    # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
-    # (Fable was the only seat carrying it). review-cli#382 added LUNA_SEAT/SONNET_SEAT,
-    # so heavy is now 13 seats (with GROK_SEAT, review-cli#165, and MIMO_SEAT,
-    # review-cli#450); OMP_CLAUDE_SEAT (review-cli#168) makes it 14.
+    assert review_out("--show-board", "--level", "deep") == heavy
+    # claude:claude-fable-5-1 is in no level (a confirmed ~100% dispatch failure rate),
+    # so there is no "architect" seat. deep = Sol/Opus/Astra/Luna/Kimi/Qwen/... at xhigh.
     for needle in (
-        "source: preset:heavy",
+        "source: level:deep",
         "codex:gpt-6.1-sol",
-        # Grok — same rationale as the default-board needle above.
+        "claude:claude-opus-5-5",
         "oc:xai/grok-4.7",
         "omp:opencode-go/mimo-v2.6-pro",
-        "14 seats",
+        "15 seats",
+        "effort=xhigh",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_not_in("claude:claude-fable-5-1", heavy)
-    # Heavy has no architect SEAT (Fable is the only seat that carried that lens).
     # `--show-board` also prints a Fallbacks-per-role footer that lists every
     # REVIEW_ROLES key, including architect — so this check is seat lines only.
     seat_blob = "\n".join(
@@ -445,12 +441,12 @@ def test_board_flags_and_listing():
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
     # The Astra seat (codex:gpt-6-astra, the agentic codex CLI route) is agentic.
-    astra_line = next((ln for ln in board.splitlines() if "Astra" in ln), "")
+    astra_line = next((ln for ln in heavy.splitlines() if "Astra" in ln), "")
     assert_in("codex:gpt-6-astra", astra_line)
     assert_in("agentic", astra_line)
-    # In the default preset, GLM-cc sits directly under Opus at #2 and is diff-only.
-    glmcc_line = next((ln for ln in board.splitlines() if "GLM-cc" in ln), "")
-    assert_in("#2", glmcc_line)
+    # In the deep level, GLM-cc is the diff-only `performance` seat (#6).
+    glmcc_line = next((ln for ln in heavy.splitlines() if "GLM-cc" in ln), "")
+    assert_in("#6", glmcc_line)
     assert_in("diff-only", glmcc_line)
 
 
@@ -506,8 +502,12 @@ def test_output_flag():
     assert_in("-o FILE", top)
     assert_in("noclobber", top.lower())
     out_path = Path(_tmp()) / "sub" / "out.txt"  # parent does not exist yet
-    assert_in("codex", review_out("-o", str(out_path), "--list-defaults"))
-    assert_in("codex", out_path.read_text())  # parent dir made + file written
+    assert_in(
+        "claude:claude-sonnet-5-5", review_out("-o", str(out_path), "--list-defaults")
+    )
+    assert_in(
+        "claude:claude-sonnet-5-5", out_path.read_text()
+    )  # parent dir made + file written
     # Overwrite must work even under the shell's noclobber (the bug -o fixes) — a fresh write.
     review_out("-o", str(out_path), "--show-board")
     assert_in("priority", out_path.read_text())

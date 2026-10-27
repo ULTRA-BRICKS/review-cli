@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests for moderator selection + runtime fallback (panel.py).
 
-pick_moderators() builds the ordered candidate list (explicit, then available
-MODERATOR_CANDIDATES, then panel[0]); run_moderator() walks it at run time and
+pick_moderators() builds the ordered candidate list (explicit, then the available seats of
+the level's moderator chain, then panel[0]); run_moderator() walks it at run time and
 falls back to the next candidate when one fails (non-zero exit OR empty output).
 So a moderator that passes the cheap availability probe but dies at run time
 (e.g. an Anthropic-disabled model) never leaves the panel without a synthesis.
@@ -47,11 +47,22 @@ def _with_stubs(*, available=None, runner=None):
     return restore
 
 
+def _standard_chain():
+    """The `standard` level's shipped moderator chain (opus -> codex -> gemini, the chain
+    these tests were written against before moderators became level data)."""
+    from reviewlib.config import resolve_moderator_candidates
+
+    chain, _ = resolve_moderator_candidates({}, "standard")
+    return chain
+
+
 def test_explicit_is_first_then_priority_then_panel():
     restore = _with_stubs(available=lambda m: True)
     try:
-        got = _panel.pick_moderators("oc:custom", ["codex", "gemini"])
-        # explicit first, then MODERATOR_CANDIDATES (opus, codex, gemini), then panel[0]
+        got = _panel.pick_moderators(
+            "oc:custom", ["codex", "gemini"], _standard_chain()
+        )
+        # explicit first, then the level chain (opus, codex, gemini), then panel[0]
         assert got[0] == "oc:custom", got
         assert "claude:claude-opus-5-5" in got
         assert "codex" in got and "gemini" in got
@@ -59,10 +70,10 @@ def test_explicit_is_first_then_priority_then_panel():
         restore()
 
 
-def test_opus_is_default_first_when_no_explicit():
+def test_opus_is_first_of_the_standard_chain_when_no_explicit():
     restore = _with_stubs(available=lambda m: True)
     try:
-        got = _panel.pick_moderators(None, ["codex", "gemini"])
+        got = _panel.pick_moderators(None, ["codex", "gemini"], _standard_chain())
         assert got[0] == "claude:claude-opus-5-5", got
     finally:
         restore()
@@ -72,7 +83,7 @@ def test_unavailable_candidates_are_filtered():
     # opus binary missing -> drops out; codex/gemini remain in priority order
     restore = _with_stubs(available=lambda m: m != "claude:claude-opus-5-5")
     try:
-        got = _panel.pick_moderators(None, ["oc:x"])
+        got = _panel.pick_moderators(None, ["oc:x"], _standard_chain())
         assert "claude:claude-opus-5-5" not in got, got
         assert got[0] == "codex", got
     finally:
@@ -83,7 +94,7 @@ def test_dedup_preserves_order():
     restore = _with_stubs(available=lambda m: True)
     try:
         # explicit == panel[0] == a candidate: must appear once, first
-        got = _panel.pick_moderators("codex", ["codex"])
+        got = _panel.pick_moderators("codex", ["codex"], _standard_chain())
         assert got.count("codex") == 1, got
         assert got[0] == "codex", got
     finally:
@@ -217,15 +228,16 @@ def test_run_moderator_accepts_single_string():
 
 def test_cli_moderator_grok_alias_expands_before_pick_moderators():
     """`--moderator grok` expands to GROK_SEAT before pick_moderators. grok is not
-    an auto-moderator candidate (MODERATOR_CANDIDATES stays opus/codex/gemini)."""
+    in any shipped level's moderator chain."""
     from contextlib import redirect_stderr, redirect_stdout
 
     from reviewlib import cli
-    from reviewlib.config import GROK_SEAT, MODERATOR_CANDIDATES
+    from reviewlib.config import GROK_SEAT
+    from reviewlib.levels import resolve_levels
     from reviewlib.modes import quorum as quorum_mod
 
-    assert GROK_SEAT not in MODERATOR_CANDIDATES
-    assert "grok" not in MODERATOR_CANDIDATES
+    for level in resolve_levels().levels.values():
+        assert GROK_SEAT not in level.moderators and "grok" not in level.moderators
     captured: dict = {}
 
     def fake_quorum(question, models, diff, cwd, timeout, moderators, *a, **k):
@@ -293,9 +305,9 @@ def test_sessions_resume_moderator_grok_alias_expands():
     captured: dict = {}
     real_pick = cli.pick_moderators
 
-    def fake_pick(explicit, panel):
+    def fake_pick(explicit, panel, candidates=None):
         captured["explicit"] = explicit
-        return real_pick(explicit, panel)
+        return real_pick(explicit, panel, candidates=candidates)
 
     class FakeSess:
         session_id = "s1"
@@ -332,6 +344,11 @@ def test_sessions_resume_moderator_grok_alias_expands():
         sessions.find_session = saved_find
         sessions.resume_session = saved_resume
         cli.load_config = saved_cfg
+
+
+# The level/`moderator_candidates:` resolution itself (shipped chains, user overrides,
+# `--level`, explicit `--moderator` winning through the CLI) is covered in
+# tests/test_levels.py.
 
 
 if __name__ == "__main__":

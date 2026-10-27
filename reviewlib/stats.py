@@ -387,6 +387,7 @@ def record_run(
     prompt_tokens: int = 0,
     output_tokens: int = 0,
     run_id: str | None = None,
+    level: str | None = None,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -438,6 +439,11 @@ def record_run(
     parallel ``models`` list, it is simply "the roles this run actually
     satisfied". ``None`` (the default) means "no seat-granular credit to report"
     and the key is omitted entirely, same convention as ``roles``/``passed``.
+
+    ``level`` is the capability level the run used (review-cli#697: the diff review's level
+    board, or the level an explicit ``--level`` picked for a moderator chain). ``None`` — a
+    config roster, a mode with no level, every record written before levels existed — omits
+    the key, same "unknown, not written as null" convention as ``passed``.
 
     ``passed`` is the run's VERDICT — the caller's own success/failure criterion
     (e.g. the mode handler's exit code), NOT ``ok_count``/``fail_count`` (those are
@@ -500,6 +506,8 @@ def record_run(
         record["diff_files"] = list(diff_files)
     if diff_sha256 is not None:
         record["diff_sha256"] = diff_sha256
+    if level is not None:
+        record["level"] = level
     if roles is not None:
         # Round-7 review finding (Fable): `_distinct_roles` (the ENFORCING counter
         # behind --min-roles) has no reference to `models` at all — it just iterates

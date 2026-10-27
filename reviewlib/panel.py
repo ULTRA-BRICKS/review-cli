@@ -14,6 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from .backends import (
@@ -27,7 +28,7 @@ from .backends import (
     resolve_backend,
     review_with_images,
 )
-from .config import MODERATOR_CANDIDATES, REVIEW_ROLES, BoardReviewer, _expand_alias
+from .config import REVIEW_ROLES, BoardReviewer, _expand_alias
 from .process import (
     cap_line,
     run_deadline_expired,
@@ -326,11 +327,16 @@ def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
     return "\n\n".join(parts)
 
 
-def pick_moderators(explicit: str | None, panel: list[str]) -> list[str]:
+def pick_moderators(
+    explicit: str | None,
+    panel: list[str],
+    candidates: Sequence[str],
+) -> list[str]:
     """Ordered moderator candidates (highest priority first).
 
-    explicit (``--moderator``) goes first when given, then the configured
-    MODERATOR_CANDIDATES filtered to backends that pass the cheap availability
+    explicit (``--moderator``) goes first when given, then ``candidates`` (the level's
+    chain from ``config.resolve_moderator_candidates``) filtered to backends that pass
+    the cheap availability
     probe, then panel[0] as a guaranteed last resort. Order-preserving de-dup.
     ``run_moderator`` walks this list at run time and falls back to the next
     candidate when one FAILS — so even an explicitly requested moderator, or one
@@ -340,18 +346,12 @@ def pick_moderators(explicit: str | None, panel: list[str]) -> list[str]:
     ordered: list[str] = []
     if explicit:
         ordered.append(explicit)
-    ordered.extend(c for c in MODERATOR_CANDIDATES if backend_available(c))
+    ordered.extend(c for c in candidates if backend_available(c))
     if panel:
         ordered.append(panel[0])
     seen: set[str] = set()
     deduped = [c for c in ordered if not (c in seen or seen.add(c))]
     return deduped or list(panel[:1]) or ["codex"]
-
-
-def pick_moderator(explicit: str | None, panel: list[str]) -> str:
-    """Single best moderator (first of pick_moderators). Kept for callers that
-    only need one; new code should prefer pick_moderators + run_moderator."""
-    return pick_moderators(explicit, panel)[0]
 
 
 def run_moderator(

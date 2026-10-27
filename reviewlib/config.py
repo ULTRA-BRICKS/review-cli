@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from pathlib import Path
 
+from .levels import EFFORT_LEVELS, Level, LevelError, LevelSet, resolve_levels
 from .portable import O_NOFOLLOW, O_NONBLOCK
 from .usage_limits import DEFAULT_LIMIT_THRESHOLD
 
@@ -236,13 +237,6 @@ PANEL_TIMEOUT_DEFAULT = 240
 # gets its own long per-run default (45 min) and still leans on the <=4h run backstop, so a
 # real qa run is never cut off by the short panel cap (review-qa.md §3 timeout carve-out).
 QA_TIMEOUT_DEFAULT = 2700
-# Moderator priority for --quorum/--brainstorm. opus first now that the headless
-# claude backend works reliably (deterministic workspace auto-trust); codex and
-# gemini are the fallbacks. pick_moderators() filters this to available backends
-# and run_moderator() walks it at run time, so a candidate that passes the cheap
-# availability probe but dies at run time (e.g. an Anthropic-disabled model like
-# fable) never leaves the panel without a synthesis.
-MODERATOR_CANDIDATES = ("claude:claude-opus-5-5", "codex", "gemini")
 
 
 def _expand_alias(model: str) -> str:
@@ -264,6 +258,49 @@ def load_config() -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def resolve_moderator_candidates(
+    config: dict, level: str | None = None
+) -> tuple[tuple[str, ...], str | None]:
+    """Ordered moderator chain for quorum/brainstorm, plus an optional notice.
+
+    Precedence (an explicit ``--moderator`` still goes ahead of all of this, in
+    ``panel.pick_moderators``):
+
+    1. config ``moderator_candidates:`` (ordered list of seat ids; aliases expand,
+       comma-separated items split, duplicates dropped);
+    2. the ``moderators`` chain of the active level (``level``, else the default level),
+       i.e. the shipped ``levels.yaml`` data with the user's ``levels:`` override merged in.
+       The default level is the cheapest one, so a roster-less config no longer starts
+       its moderator turns on Opus.
+
+    ``pick_moderators`` filters the chain to available backends and ``run_moderator`` walks
+    it at run time, so a candidate that passes the cheap availability probe but dies at run
+    time never leaves the panel without a synthesis.
+
+    A ``moderator_candidates`` value that is not a non-empty list of non-empty strings is
+    ignored (fall through to 2) and the returned notice names it, so a typo is loud.
+    """
+    notice: str | None = None
+    raw = config.get("moderator_candidates")
+    if "moderator_candidates" in config:
+        if (
+            isinstance(raw, list)
+            and raw
+            and all(isinstance(x, str) for x in raw)
+            and _split_models(raw)
+        ):
+            return tuple(dict.fromkeys(_split_models(raw))), None
+        notice = (
+            "config moderator_candidates must be a non-empty list of seat ids "
+            f"(got {raw!r}); ignoring it"
+        )
+    chosen = _level(config, level)
+    chain = tuple(dict.fromkeys(_split_models(list(chosen.moderators))))
+    return chain, (
+        f"{notice}; using the {chosen.name!r} level's moderators" if notice else None
+    )
 
 
 # --- Reviewer board (HYP-741) ---------------------------------------------------
@@ -483,9 +520,10 @@ class BoardReviewer:
         return f"{base}\n\n{override}"
 
 
-# DEFAULT_BOARD: the raw 14-seat board used as the source of truth for built-in presets
-# and for custom/config fallback paths. A plain `review diff` runs the default preset,
-# not this tuple directly. The board is ordered by *priority* — strongest WORKING model
+# DEFAULT_BOARD: the raw 14-seat catalog, the metadata source (role/name per model) for
+# config `models:` rosters and the dashboard. The built-in review boards are NOT cut from it
+# any more: they are the capability levels of reviewlib/levels.yaml. The board is ordered by
+# *priority* — strongest WORKING model
 # first, weakest (or least-reliable, review-cli#fable-seat-reliability) last — NOT by
 # role. Priority drives the FAILOVER pool: the selected board runs the top-N AVAILABLE
 # seats, skipping a higher-priority seat whose backend isn't reachable (startup failover),
@@ -551,7 +589,7 @@ class BoardReviewer:
 DEFAULT_BOARD = (
     # priority 1 — Sol through Codex CLI.
     BoardReviewer(SOL_SEAT, "consistency", "Sol"),
-    # priority 2 — Opus 5.5. Also the moderator (MODERATOR_CANDIDATES[0]).
+    # priority 2 — Opus 5.5.
     BoardReviewer("claude:claude-opus-5-5", "correctness", "Opus"),
     # priority 3 — GLM-5.3 via the Command Code gateway (CTO directive: directly under Opus).
     # DIFF-ONLY (keyed HTTP through review_commandcode, like Gemini): opencode's commandcode
@@ -654,58 +692,79 @@ DEFAULT_BOARD = (
     BoardReviewer(FABLE_SEAT, "architect", "Fable"),
 )
 
-# Presets are named, opinionated board+pool bundles for day-to-day review selection.
-# They deliberately sit above the raw DEFAULT_BOARD: custom config still owns custom
-# boards/models, while `--preset` gives the CLI a predictable canned roster.
-DEFAULT_PRESET_BOARD = tuple(
-    BoardReviewer(r.model, r.role, r.display, "high")
-    for r in DEFAULT_BOARD
-    if r.model not in {FABLE_SEAT, SOL_SEAT}
-)
-# review-cli#fable-seat-reliability: FABLE_SEAT is excluded here too (mirrors
-# `DEFAULT_PRESET_BOARD` above), for the same reason documented on its `DEFAULT_BOARD` entry
-# — a ~100% dispatch failure rate makes a "heavy" preset's paying for it pure waste, on top of
-# the DEFAULT_PRESET_BOARD gap this closes (that comprehension already excluded Fable; this one
-# didn't). GLM review finding: filter FIRST, into a named intermediate, THEN `enumerate` it —
-# the earlier version enumerated the unfiltered `DEFAULT_BOARD` and filtered Fable's row out
-# afterward (buried inside `enumerate(...)`, easy to misread as a late filter), which only
-# produced the correct xhigh/max split because Fable happened to sit LAST; a future re-rank
-# moving Fable anywhere else would have silently shifted every later seat's tier by one slot
-# with no test catching it (the tuple-order pin would read as a membership change, not a
-# tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
-# first ordering and the resulting seat-count invariant self-documenting (14 seats as of
-# review-cli#168's OMP_CLAUDE_SEAT on top of review-cli#450's MIMO_SEAT, review-cli#165's
-# GROK_SEAT and review-cli#382's TERRA_SEAT (now LUNA_SEAT)/SONNET_SEAT — first 4 get `xhigh` effort: Sol, Opus,
-# GLM-cc, Kimi (unchanged from before #382 — the Luna/Sonnet seats were inserted at raw
-# priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the
-# rest get `max`).
-_heavy_eligible_seats = tuple(r for r in DEFAULT_BOARD if r.model != FABLE_SEAT)
-HEAVY_PRESET_BOARD = tuple(
-    BoardReviewer(r.model, r.role, r.display, "xhigh" if i < 4 else "max")
-    for i, r in enumerate(_heavy_eligible_seats)
-)
-LIGHT_PRESET_BOARD = tuple(
-    BoardReviewer(r.model, r.role, r.display, "medium") for r in DEFAULT_PRESET_BOARD
-)
+# Capability levels (reviewlib/levels.py + the shipped reviewlib/levels.yaml, merged with
+# the user's config `levels:`) replace the former preset constants (PRESET_BOARDS,
+# PRESET_POOL_SIZES, DEFAULT_PRESET, MODERATOR_CANDIDATES). The `preset_*` functions below
+# keep their names because `--preset` is still accepted as an alias of `--level`; each
+# takes the loaded user config (None = the shipped defaults only) and returns the level's
+# data. Custom config `models:`/`board:` rosters keep owning custom boards.
 
-PRESET_BOARDS = {
-    "default": DEFAULT_PRESET_BOARD,
-    "heavy": HEAVY_PRESET_BOARD,
-    "light": LIGHT_PRESET_BOARD,
-}
-PRESET_POOL_SIZES = {
-    "default": 4,
-    "heavy": 4,
-    "light": 2,
-}
-DEFAULT_PRESET = "light"
-EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
+
+def _level_set(config: dict | None) -> LevelSet:
+    try:
+        return resolve_levels(config)
+    except LevelError as exc:
+        raise BoardConfigError(f"config.yaml levels: {exc}") from exc
+
+
+def _level(config: dict | None, name: str | None) -> Level:
+    """The level called `name` (alias aware); None -> the configured default level."""
+    levels = _level_set(config)
+    try:
+        return levels.get(name or levels.default)
+    except LevelError as exc:
+        raise BoardConfigError(str(exc)) from exc
+
+
+def level_board(level: Level) -> list[BoardReviewer]:
+    """The level's priority-ordered board, rank-major: every role's first seat (roles in
+    the order the level lists them), then every role's second seat, and so on. The first
+    `pool` available seats with distinct roles run; the rest are this level's reserve."""
+    for role in level.roles:
+        if role not in REVIEW_ROLES:
+            raise BoardConfigError(
+                f"config.yaml levels.{level.name}.roles.{role}: unknown role {role!r} — "
+                f"valid roles are: {', '.join(sorted(REVIEW_ROLES))}"
+            )
+    board: list[BoardReviewer] = []
+    for rank in range(max(len(seats) for seats in level.roles.values())):
+        for role, seats in level.roles.items():
+            if rank >= len(seats):
+                continue
+            seat = seats[rank]
+            model = _expand_alias(seat.model)
+            board.append(
+                BoardReviewer(
+                    model=model,
+                    role=role,
+                    display=seat.name or _display_name(model),
+                    effort=seat.effort or level.effort,
+                )
+            )
+    return board
+
+
+def preset_names(config: dict | None = None) -> tuple[str, ...]:
+    """Canonical level names, shipped first, in definition order."""
+    return _level_set(config).names()
+
+
+def default_level_name(config: dict | None = None) -> str:
+    """The level a review uses when nothing asks for another: the lowest sufficient one
+    unless the user's `default_level:` says otherwise."""
+    return _level_set(config).default
+
+
+def resolve_level_name(name: str, config: dict | None = None) -> str:
+    """Canonical name of the level `name` (or an alias of it, e.g. `light` -> `routine`);
+    BoardConfigError naming the known levels when there is none."""
+    return _level(config, name).name
 
 
 # DEFAULT_POOL_SIZE: the pool-size fallback ONLY for a custom config `board:` with no
 # `pool:` key set (not the bare-`review`-with-no-config-at-all case — that resolves via
-# DEFAULT_PRESET's own pool, PRESET_POOL_SIZES[DEFAULT_PRESET] = 2 as of Alex's
-# 2026-08-28 "light" default; see preset_pool_size()). The board (DEFAULT_BOARD or a
+# the default level's own pool, see `preset_pool_size(default_level_name(config))` and
+# reviewlib/levels.yaml). The board (DEFAULT_BOARD or a
 # config `board:`) is a priority-ordered list; the top N AVAILABLE seats participate and
 # the remaining (lower-priority) seats are the RESERVE that backfills a skipped/failed
 # seat. The board is NEVER disabled — `--pool` only sizes how many seats run. See
@@ -739,30 +798,19 @@ def recorded_task_pool_size(
     return max(resolved, min_roles)
 
 
-def preset_names() -> tuple[str, ...]:
-    return tuple(PRESET_BOARDS)
-
-
-def preset_pool_size(name: str | None) -> int:
+def preset_pool_size(name: str | None, config: dict | None = None) -> int:
+    """Pool size of level `name` (alias aware). `None` is the no-level case of a custom
+    config roster, whose fallback is DEFAULT_POOL_SIZE."""
     if not name:
         return DEFAULT_POOL_SIZE
-    try:
-        return PRESET_POOL_SIZES[name]
-    except KeyError as exc:
-        raise ValueError(
-            f"unknown preset {name!r}; expected one of {', '.join(preset_names())}"
-        ) from exc
+    return _level(config, name).pool
 
 
-def preset_board(name: str | None) -> list[BoardReviewer]:
-    if not name:
-        return [replace(r) for r in PRESET_BOARDS[DEFAULT_PRESET]]
-    try:
-        return [replace(r) for r in PRESET_BOARDS[name]]
-    except KeyError as exc:
-        raise ValueError(
-            f"unknown preset {name!r}; expected one of {', '.join(preset_names())}"
-        ) from exc
+def preset_board(
+    name: str | None = None, config: dict | None = None
+) -> list[BoardReviewer]:
+    """Fresh board of level `name` (alias aware; None -> the default level)."""
+    return level_board(_level(config, name))
 
 
 def _normalize_effort(value: object) -> str | None:
@@ -1517,7 +1565,7 @@ def load_board(
     manifest isn't reachable, so a manifest-less host still runs its literal seats.
     Validation degrades gracefully but is cost-safe — it never silently substitutes
     the paid default board for a board the user explicitly configured:
-      * an ABSENT / non-list / empty `board:`  -> fall back to DEFAULT_PRESET_BOARD
+      * an ABSENT / non-list / empty `board:`  -> fall back to the default level's board
         (no preference expressed, the safe default is intended);
       * a PRESENT non-empty `board:` with SOME valid entries -> keep the valid
         ones; each bad entry is skipped with a warning;
@@ -1530,15 +1578,15 @@ def load_board(
         error, no warning;
       * a PRESENT non-empty `board:` whose entries are ALL malformed (no usable
         reviewer survives) -> raise BoardConfigError. This is NOT a silent
-        fall-back to DEFAULT_PRESET_BOARD: the user asked for a specific board and got
+        fall-back to the default level's board: the user asked for a specific board and got
         nothing parseable, so erroring loudly beats secretly running the paid
         default board."""
     config = load_config() if config is None else config
     if preset:
-        return preset_board(preset)
+        return preset_board(preset, config)
     raw = config.get("board")
     if not isinstance(raw, list) or not raw:
-        return list(DEFAULT_PRESET_BOARD)
+        return preset_board(None, config)
     board: list[BoardReviewer] = []
     for entry in raw:
         reviewer = _parse_board_entry(entry)
@@ -1588,7 +1636,7 @@ def board_from_models(
     preset_effort_by_model: dict[str, str | None] = {}
     preset_default_effort: str | None = None
     if preset:
-        preset_reviewers = preset_board(preset)
+        preset_reviewers = preset_board(preset, config)
         preset_effort_by_model = {
             reviewer.model: reviewer.effort for reviewer in preset_reviewers
         }
@@ -1648,9 +1696,7 @@ def ensure_min_distinct_roles(
     """
     if not board or min_roles <= 0:
         return list(board)
-    source = (
-        list(role_source) if role_source is not None else list(DEFAULT_PRESET_BOARD)
-    )
+    source = list(role_source) if role_source is not None else preset_board()
     out = [replace(r) for r in board]
     donor = out[0]
     source_roles = [r.role for r in source if r.role_lens]
@@ -1702,20 +1748,19 @@ def _split_models(raw: list[str]) -> list[str]:
 def resolve_review_board(
     config: dict, *, preset: str | None = None
 ) -> tuple[list[BoardReviewer], str, str | None]:
-    """`(board, source, preset)` for a `review diff` run with no `-m`: an explicit
-    `preset` > config `models:` > config `board:` > DEFAULT_PRESET, the precedence the
-    CLI's dispatch uses. `source` names which one won (`preset:<name>`,
-    `config.yaml (models:)`, `config.yaml (board:)`); `preset` is the preset whose board
-    it is, or None for a config roster. Raises BoardConfigError like `load_board`."""
+    """`(board, source, level)` for a `review diff` run with no `-m`: an explicit level
+    (`--level`, or its `--preset` spelling) > config `models:` > config `board:` > the
+    default level, the precedence the CLI's dispatch uses. `source` names which one won
+    (`level:<name>`, `config.yaml (models:)`, `config.yaml (board:)`); `level` is the
+    canonical level name whose board it is, or None for a config roster. Raises
+    BoardConfigError like `load_board`."""
     if preset:
-        return load_board(config, preset=preset), f"preset:{preset}", preset
+        name = _level(config, preset).name
+        return load_board(config, preset=name), f"level:{name}", name
     config_models = _split_models(config.get("models") or [])
     if config_models:
         return board_from_models(config_models, config), "config.yaml (models:)", None
     if isinstance(config.get("board"), list) and config.get("board"):
         return load_board(config), "config.yaml (board:)", None
-    return (
-        load_board(config, preset=DEFAULT_PRESET),
-        f"preset:{DEFAULT_PRESET}",
-        DEFAULT_PRESET,
-    )
+    name = default_level_name(config)
+    return load_board(config, preset=name), f"level:{name}", name

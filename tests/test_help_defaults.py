@@ -70,7 +70,7 @@ def test_model_help_shows_the_default_preset_when_no_config_models():
         line = _model_line(_top_level_help())
     finally:
         cli.load_config = saved
-    assert "default" in line and "preset reviewer board" in line, line
+    assert "default" in line and "level reviewer board" in line, line
     assert "--show-board" in line, line
 
 
@@ -105,7 +105,7 @@ def test_model_default_is_mode_aware_not_board_for_panel_modes():
             assert "built-in defaults" in line, (sub, line)
         # And the diff subcommand DOES claim the default preset board on its --model line.
         line = _model_line(_mode_help("diff"))
-        assert "default" in line and "preset reviewer board" in line, line
+        assert "default" in line and "level reviewer board" in line, line
     finally:
         cli.load_config = saved
 
@@ -129,8 +129,11 @@ def test_moderator_help_shows_the_autopick_chain():
     # on those subcommands — assert the concrete auto-pick chain there, not the bare phrasing.
     text = _mode_help("quorum")
     assert "--moderator" in text
-    assert "claude:claude-opus-5-5" in text, text
-    assert "codex" in text and "gemini" in text, text
+    assert "claude:claude-sonnet-5-5" in text, (
+        text
+    )  # the default (routine) level's chain
+    assert "claude-opus-5-5" not in text, text
+    assert "--level" in text, text
 
 
 def test_config_help_documents_grok_aliases():
@@ -160,20 +163,21 @@ def test_numeric_defaults_are_concrete():
     # --pool / --timeout are global (top-level); --vision-timeout is a visual flag scoped to
     # the subcommands. Assert each shows its concrete numeric default on the right surface.
     top = _top_level_help()
-    assert "default 4" in top, top  # --pool
+    assert "standard (pool 4" in top, top  # --pool: the level pools
     assert "1200" in top and "240" in top, top  # --timeout (review / panel)
     assert "default 60" in _mode_help("diff"), _mode_help(
         "diff"
     )  # --vision-timeout (visual)
 
 
-def test_preset_help_recommends_when_to_use_each_preset():
+def test_level_help_recommends_when_to_use_each_level():
     text = _mode_help("diff")
-    assert "--preset" in text, text
+    assert "--level" in text and "--preset" in text, text
     low = " ".join(text.lower().split())
-    assert "light" in low and "quick" in low, text
-    assert "default" in low and "routine" in low, text
-    assert "heavy" in low and "release" in low, text
+    assert "routine (pool 2" in low and "standard (pool 4" in low, text
+    assert "deep (pool 4" in low and "alias heavy" in low, text
+    assert "lowest sufficient" in low, text
+    assert "never because a seat is unavailable" in low, text
 
 
 def test_model_help_does_not_crash_on_unreadable_config():
@@ -188,7 +192,7 @@ def test_model_help_does_not_crash_on_unreadable_config():
         line = _model_line(_top_level_help())
     finally:
         cli.load_config = saved
-    assert "default" in line and "preset reviewer board" in line, line
+    assert "default" in line and "level reviewer board" in line, line
 
 
 def test_model_help_does_not_crash_on_percent_in_config_model_id():
@@ -356,7 +360,7 @@ def test_help_end_to_end_via_cli_shows_model_default():
             env=env,
         )
         assert proc.returncode == 0, (proc.returncode, proc.stderr)
-        assert "preset reviewer board" in proc.stdout, proc.stdout
+        assert "level reviewer board" in proc.stdout, proc.stdout
 
 
 if __name__ == "__main__":

@@ -497,9 +497,9 @@ def test_light_preset_one_reachable_with_ship_pool_covers_three_roles():
     """Once a recorded `--task` floors light to pool 3, one reachable light-preset
     seat must cover 3 distinct roles (the #309 ship-gate gap). usage_percent is
     required: without it, select_pool_with_reuse clamps to len(reachable)=1."""
-    from reviewlib.config import LIGHT_PRESET_BOARD
+    from reviewlib.config import preset_board
 
-    board = list(LIGHT_PRESET_BOARD)
+    board = preset_board("routine")
     live = board[0].model
     result = select_pool_with_reuse(
         board, 3, available=lambda r: r.model == live, usage_percent=_usage({})

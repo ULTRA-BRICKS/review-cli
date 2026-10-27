@@ -295,7 +295,7 @@ def test_meta_flag_without_subcommand_works():
     finally:
         cli.load_config = saved_cfg
     assert rc == 0
-    assert "codex" in out.getvalue(), out.getvalue()
+    assert "claude:claude-sonnet-5-5" in out.getvalue(), out.getvalue()
 
 
 def test_visual_list_defaults_works_without_image():
@@ -320,7 +320,9 @@ def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
     grounding = "diff --git a/g b/g\n@@\n+grounded\n"
     captured: dict = {}
 
-    def _fake(topic, models, cwd, timeout, moderators, rounds, max_rounds, diff="", **_k):
+    def _fake(
+        topic, models, cwd, timeout, moderators, rounds, max_rounds, diff="", **_k
+    ):
         captured["diff"] = diff
         return 0
 
