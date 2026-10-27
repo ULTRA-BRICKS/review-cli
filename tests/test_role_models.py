@@ -138,8 +138,13 @@ def test_show_board_includes_fallback_section():
     assert "Fallbacks per role" in out
     for role in REVIEW_ROLES:
         assert role in out, role
-    assert "claude:claude-opus-5-5" in out
-    assert "oc:xai/grok-4.7" in out
+    # The displayed board follows the shipped default capability level; the
+    # fallback section above still covers every role independently of that level.
+    seats = load_board({})
+    assert seats, "the shipped default board must not be empty"
+    board_part = out.split("Fallbacks per role", 1)[0]
+    for seat in seats:
+        assert seat.model in board_part, (seat.model, board_part)
 
 
 def test_bare_model_id_strips_harness_prefix():

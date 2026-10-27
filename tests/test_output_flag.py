@@ -26,7 +26,7 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from reviewlib import config as review_config
+from reviewlib import config as review_config  # noqa: E402
 from reviewlib.cli import _extract_output_path, main  # noqa: E402
 
 
