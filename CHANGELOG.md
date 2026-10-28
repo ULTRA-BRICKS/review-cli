@@ -3,6 +3,21 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.6 — 2026-10-28
+
+- **Refactor(stats): `reviewlib/stats.py` split into focused modules, behavior unchanged**
+  ([review-cli#721](https://git.hyperide.ai/ultrabricks/review-cli/issues/721)). The run-stats
+  store was a 2551-line file whose `quorum_check` alone was 960 lines (cognitive complexity 155),
+  so `rig lint` refused any commit that touched it. It is now `stats_identity` (repo/diff/task
+  identity), `stats_store` (reading), `stats_writer` (`record_run`, now a record builder plus an
+  appender), `stats_import`, `stats_quorum_evidence` / `stats_quorum_model` /
+  `stats_quorum_fallback` / `stats_quorum` (the gate as a pipeline) and `stats_summaries`, with
+  `reviewlib.stats` kept as the import path and re-exporting every name it had, so no caller
+  changes. No lint limit was relaxed: every function is within 15 cognitive / 20 cyclomatic and
+  every module under 1200 lines. Golden vectors generated from the old implementation
+  (`tests/test_stats_characterization.py`) pin the quorum verdicts, key sets and error text, the
+  writer's bytes and mode, import/export and the summaries. Unblocks #717 and #718.
+
 ## 0.66.5 — 2026-10-28
 
 - **Fix(budget): an account-cap hold starts no seat cooldown**

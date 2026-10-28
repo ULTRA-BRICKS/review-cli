@@ -398,11 +398,14 @@ def _read_vectors(name: str) -> dict:
 
 def _compare_or_write(name: str, actual: dict) -> None:
     tmp_root = re.escape(tempfile.gettempdir().rstrip("/"))
-    scrubbed = re.sub(tmp_root + r"/tmp\w+", "<TMP>", json.dumps(actual, sort_keys=True))
+    scrubbed = re.sub(
+        tmp_root + r"/tmp\w+", "<TMP>", json.dumps(actual, sort_keys=True)
+    )
     if REGEN:
         VECTOR_DIR.mkdir(parents=True, exist_ok=True)
         (VECTOR_DIR / name).write_text(
-            json.dumps(json.loads(scrubbed), indent=1, sort_keys=True) + "\n", encoding="utf-8"
+            json.dumps(json.loads(scrubbed), indent=1, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
         return
     # Canonical JSON text, not `==` on parsed values: `True == 1` in Python, but a
@@ -1051,10 +1054,7 @@ if __name__ == "__main__":
             try:
                 fn()
                 print(f"PASS {fn_name}")
-            except AssertionError as exc:
+            except (AssertionError, KeyError, TypeError, ValueError, OSError) as exc:
                 failures += 1
-                print(f"FAIL {fn_name}: {exc}")
-            except Exception as exc:
-                failures += 1
-                print(f"ERROR {fn_name}: {type(exc).__name__}: {exc}")
+                print(f"FAIL {fn_name}: {type(exc).__name__}: {exc}")
     sys.exit(1 if failures else 0)

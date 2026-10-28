@@ -115,7 +115,11 @@ cascade + keys/auth + board).
 ## Architecture: `lib | cli | mcp`
 
 - **lib** — `reviewlib/` is the engine (`panel.py`, `backends.py`, `config.py`,
-  `stats.py`, `features/visual/`). No argparse dependency; callable directly.
+  `stats.py` (facade over `stats_identity` / `stats_store` / `stats_writer` / `stats_import` /
+  `stats_quorum*` / `stats_summaries`: add logic to the module that owns it, keep
+  `stats.py` the import path; `tests/test_run_stats.py` parses the `result[...]` keys of
+  `stats_quorum.quorum_check` / `_finalize_quorum_result`, so assign payload keys there),
+  `features/visual/`). No argparse dependency; callable directly.
 - **cli** — `reviewlib/cli.py` is a **thin** argparse front-end: it resolves the diff,
   models, and `--visual` context, then dispatches to a mode handler. It owns no review
   logic of its own.
