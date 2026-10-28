@@ -246,18 +246,57 @@ def _expand_alias(model: str) -> str:
     return seat_for_model(token)
 
 
+class ConfigError(Exception):
+    """config.yaml exists but cannot be loaded (review-cli#705). The message names the
+    file, the real cause and the fix; the CLI prints it and exits 2."""
+
+
 def load_config() -> dict:
     """Read ~/.config/review-cli/config.yaml (keys: models, brainstorm_models, board).
-    Returns {} if absent/unparseable so the code default always applies."""
-    if not CONFIG_PATH.exists():
+
+    An ABSENT or empty file is {} so the code defaults apply. A file that EXISTS but cannot
+    be loaded -- PyYAML missing from the running interpreter, a syntax error, a top level
+    that is not a mapping, an unreadable path -- raises ConfigError: falling back to the
+    defaults silently would drop the owner's roster and usage ceilings without a word
+    (review-cli#705)."""
+    try:
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"cannot read {CONFIG_PATH}: {exc}") from exc
     try:
         import yaml
-
-        data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    except ImportError as exc:
+        raise ConfigError(
+            f"cannot load {CONFIG_PATH}: PyYAML is not installed for the Python running "
+            f"review ({sys.executable}). Install it there "
+            f"(`{sys.executable} -m pip install pyyaml`, or `brew install pyyaml` for a "
+            "Homebrew Python) or run review with an interpreter that has it. Refusing to "
+            "fall back to the built-in defaults, which would ignore your configured "
+            "roster and usage ceilings."
+        ) from exc
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        problem = (
+            getattr(exc, "problem", None)
+            or (str(exc).splitlines() or [type(exc).__name__])[0]
+        )
+        raise ConfigError(
+            f"cannot parse {CONFIG_PATH}{where}: {problem}. Fix the YAML; the built-in "
+            "defaults are not used in its place."
+        ) from exc
+    if data is None:
         return {}
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"{CONFIG_PATH} must be a YAML mapping at the top level, got "
+            f"{type(data).__name__}."
+        )
+    return data
 
 
 def resolve_moderator_candidates(

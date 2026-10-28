@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .config import ConfigError
+
 if TYPE_CHECKING:
     from .cli import Path
 
@@ -633,6 +635,17 @@ def _spawn_detached_job(_api, /, raw: list[str]) -> int:
 
 
 def _main_dispatch(_api, /, raw: list[str]) -> int:
+    """`_main_dispatch_unguarded` with a config.yaml that exists but cannot be loaded
+    (PyYAML missing, a syntax error) turned into one stderr message and exit 2
+    (review-cli#705): never a traceback, never a silent fall back to the defaults."""
+    try:
+        return _main_dispatch_unguarded(_api, raw)
+    except ConfigError as exc:
+        print(f"[review] {exc}", file=_api.sys.stderr, flush=True)
+        return 2
+
+
+def _main_dispatch_unguarded(_api, /, raw: list[str]) -> int:
     """The body of a normal (non-`--detach`) `main()` call: `-o` handling, the
     reentrancy marker, the backstop, and dispatch. Split out of `main()` so a
     detached child (see `_spawn_detached_job`) can run the identical path while

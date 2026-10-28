@@ -3,6 +3,18 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.1 — 2026-10-28
+
+- **Fix(config): an unreadable config.yaml is a loud error, not silent defaults**
+  ([review-cli#705](https://git.hyperide.ai/ultrabricks/review-cli/issues/705)).
+  `load_config()` returned `{}` on any exception, so under an interpreter without PyYAML
+  (Homebrew `python3` here) the whole `~/.config/review-cli/config.yaml` -- the roster,
+  `omp_accounts` and its usage ceiling -- was ignored while `review seats` looked normal.
+  A config file that exists but cannot be loaded (PyYAML missing, a syntax error with its
+  line, a non-mapping top level, an unreadable path) now stops the command with exit 2
+  and one message naming the file, the cause and the fix. An absent or empty file still
+  means defaults; `--help` never reads the config strictly.
+
 ## 0.66.0 — 2026-10-27
 
 - Apply capability levels consistently to `diff`, `just-ask`, `quorum` and

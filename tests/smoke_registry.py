@@ -329,6 +329,8 @@ _UNIT_FILES = [
     ("test_codex_recursion_guard_rules.py", {}),
     # From main's review-UX-chain (review-cli#44): help defaults, install hook text / state, topic help.
     ("test_help_defaults.py", {}),
+    # review-cli#705: an unreadable config.yaml is a loud error, never silent defaults.
+    ("test_config_loud.py", {}),
     ("test_install_hook_text.py", {}),
     ("test_install_state.py", {}),
     ("test_topic_help.py", {}),

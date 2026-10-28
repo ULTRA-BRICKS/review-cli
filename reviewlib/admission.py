@@ -259,8 +259,10 @@ def load_settings(config: dict | None = None, env: dict | None = None) -> Settin
     """Resolve the admission settings: env var > config.yaml `admission:` > default.
 
     An invalid value at one layer is reported on stderr and that layer is skipped (the
-    next layer, ultimately the built-in default, applies) — a typo never disables the
-    controller or crashes a run."""
+    next layer, ultimately the built-in default, applies) — a typo in a VALUE never
+    disables the controller or crashes a run. A config.yaml that cannot be loaded at all
+    (no PyYAML, a syntax error) is different: `config.ConfigError` propagates to the CLI,
+    which stops with exit 2 (review-cli#705)."""
     if config is None:
         from .config import load_config
 
