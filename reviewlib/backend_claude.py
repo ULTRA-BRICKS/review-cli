@@ -121,13 +121,25 @@ def _redacted_claude_account(_api, /, email: str | None, config_dir: str | None)
 def _review_claude_cli_with_account_fallback(
     _api, /, model, prompt, diff, cwd, timeout, round_no, *, effort
 ) -> _shared.ReviewResult:
-    """Try each registered Claude account (CLAUDE_CONFIG_DIR) in rotation order, current
-    first, until one produces a result that is neither chronic nor a failed login
-    (`_account_should_advance`) or every account is exhausted
-    (review-cli#168/#170: the OLD gate blocked every claude:* seat when ANY ONE
-    configured account reported 100% usage, even when the account actually in use was
-    fine). A host with no `~/.claude-accounts` registry gets exactly one (None, None)
-    candidate and behaves byte-identically to before this function existed."""
+    """Text transport uses the same account budget and login rotation as images."""
+
+    def execute(config_dir):
+        return _api.review_claude_cli(
+            model,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            round_no,
+            effort=effort,
+            config_dir=config_dir,
+        )
+
+    return _review_checked_claude_accounts(_api, model, round_no, execute)
+
+
+def _review_checked_claude_accounts(_api, model, round_no, execute):
+    """Only execute an account after checking that exact account's live budget."""
     from . import claude_accounts as _accts
 
     candidates = _api._claude_account_candidates()
@@ -149,16 +161,7 @@ def _review_claude_cli_with_account_fallback(
             refusals.append(refusal)
             skipped.append(_api._redacted_claude_account(email, config_dir))
             continue
-        result = _api.review_claude_cli(
-            model,
-            prompt,
-            diff,
-            cwd,
-            timeout,
-            round_no,
-            effort=effort,
-            config_dir=config_dir,
-        )
+        result = execute(config_dir)
         _api._remember_claude_login(config_dir, result)
         if not _api._account_should_advance(result):
             return result
@@ -649,7 +652,14 @@ def review_claude_cli_with_images(
         staged = _api._stage_panel_images(images, tmp)
         if not staged:
             return _api.review_claude_cli(
-                model, prompt, diff, cwd, timeout, round_no, effort=effort
+                model,
+                prompt,
+                diff,
+                cwd,
+                timeout,
+                round_no,
+                effort=effort,
+                config_dir=config_dir,
             )
         _api._ensure_workspace_trusted(tmp)
         argv = _api._claude_cli_argv(binary, claude_model, image_dir=tmp, effort=effort)
@@ -694,3 +704,24 @@ def _prioritized_claude_accounts(_api, accounts_module, candidates):
         failure = accounts_module.login_failure(_api._claude_account_dir(candidate[0]))
         (fresh if failure is None else failed).append(candidate)
     return (fresh, failed) if fresh else (failed, [])
+
+
+def review_cli_images_with_accounts(
+    _api, model, prompt, diff, cwd, timeout, round_no, images, effort
+):
+    """Images do not silently change the account selected by the budget gate."""
+
+    def execute(config_dir):
+        return _api.review_claude_cli_with_images(
+            model,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            round_no,
+            images,
+            effort=effort,
+            config_dir=config_dir,
+        )
+
+    return _review_checked_claude_accounts(_api, model, round_no, execute)

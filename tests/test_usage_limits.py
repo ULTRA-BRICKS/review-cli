@@ -55,7 +55,6 @@ def _sample(
     }
 
 
-
 def _window(name, used_percent, window_seconds):
     return {
         "name": name,
@@ -281,9 +280,7 @@ def test_harness_session_100_refuses_claude_spawn():
             ],
         )
     ]
-    assert (
-        usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
-    )
+    assert usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is False
 
 
@@ -311,9 +308,7 @@ def test_harness_missing_card_fails_open():
         )
     ]
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=missing) is True
-    unknown = [
-        _harness_card("Claude Code", [_window("Session", None, 18000)])
-    ]
+    unknown = [_harness_card("Claude Code", [_window("Session", None, 18000)])]
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=unknown) is True
 
 
@@ -327,9 +322,7 @@ def test_harness_identifies_windows_by_seconds_not_name():
             ],
         )
     ]
-    assert (
-        usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
-    )
+    assert usage_percent_for_model("claude:claude-opus-4-8", cards=cards) == 100
     assert allow_spawn_for_model("claude:claude-opus-4-8", cards=cards) is False
 
 
@@ -434,18 +427,12 @@ def test_composition_closure_with_session_100_excludes_claude_family():
         return usage_percent_for_model(model, samples=samples, now=NOW)
 
     def with_cards(model: str) -> float | None:
-        return usage_percent_for_model(
-            model, samples=samples, cards=cards, now=NOW
-        )
+        return usage_percent_for_model(model, samples=samples, cards=cards, now=NOW)
 
-    kept = expand_flat_models_with_reuse(
-        roster, 2, usage_percent=samples_only
-    )
+    kept = expand_flat_models_with_reuse(roster, 2, usage_percent=samples_only)
     assert "claude:claude-opus-4-8" in kept
 
-    excluded = expand_flat_models_with_reuse(
-        roster, 2, usage_percent=with_cards
-    )
+    excluded = expand_flat_models_with_reuse(roster, 2, usage_percent=with_cards)
     assert "claude:claude-opus-4-8" not in excluded
     assert excluded  # gemini remains
 
@@ -953,6 +940,55 @@ def test_budget_holds_the_images_transport_and_a_promoted_reserve_seat_too():
     assert _spawns(spawn_log) == []
     for outcome in (with_image, promoted):
         assert _BLOCKED in outcome.stdout, outcome.stdout
+
+
+def test_images_without_staged_files_keep_the_checked_account():
+    cards = [_both(10, 10, account="one@example.com")]
+    with _claude_world(cards, accounts=("one",)) as (root, spawn_log), _budget():
+        result = backends.review_with_images(
+            _SONNET, "prompt", "diff", root, 60, images=(root / "missing.png",)
+        )
+        spawned = _spawns(spawn_log)
+    assert result.returncode == 0, result.stderr
+    assert [Path(path).name for path in spawned] == ["account-one"], spawned
+
+
+def test_images_skip_an_over_budget_account_and_use_the_next_one():
+    cards = [
+        _both(90, 10, account="one@example.com"),
+        _both(10, 10, account="two@example.com"),
+    ]
+    with _claude_world(cards, accounts=("one", "two")) as (root, spawn_log), _budget():
+        shot = root / "shot.png"
+        shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+        result = backends.review_with_images(
+            _SONNET, "prompt", "diff", root, 60, images=(shot,)
+        )
+        spawned = _spawns(spawn_log)
+    assert result.returncode == 0 and "the claude CLI answered" in result.stdout, (
+        result.stdout
+    )
+    assert [Path(path).name for path in spawned] == ["account-two"], spawned
+
+
+def test_images_api_transport_does_not_consume_the_cli_subscription_budget():
+    from unittest.mock import patch
+
+    cards = [_both(95, 95, account="one@example.com")]
+    result_api = backends.ReviewResult(_SONNET, "fixture API", 0, "API answered", "")
+    with _claude_world(cards, accounts=("one",)) as (root, spawn_log), _budget():
+        shot = root / "shot.png"
+        shot.write_bytes(b"\x89PNG")
+        with (
+            _env(REVIEW_CLAUDE_MODE="api"),
+            patch.object(backends, "review_claude_api", return_value=result_api) as api,
+        ):
+            result = backends.review_with_images(
+                _SONNET, "prompt", "diff", root, 60, images=(shot,)
+            )
+            api.assert_called_once()
+        assert _spawns(spawn_log) == []
+    assert result.stdout == "API answered"
 
 
 if __name__ == "__main__":

@@ -272,6 +272,12 @@ def review_with_images(
     """
     backend = _api.resolve_backend(model)
     if images and backend is _api.review_claude:
+        # The API uses separate billing, so subscription admission/cooldowns do
+        # not apply. The existing API/text fallback owns its transport checks.
+        if _api.claude_access_method() == "api":
+            return _api.call_backend(
+                backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
+            )
         unpaid = _api.unpaid_provider_result(
             model,
             backend="claude",
@@ -293,29 +299,17 @@ def review_with_images(
             return _api._cooldown_skip_result(
                 model, round_no, cooldown, backend="claude"
             )
-        # the images transport runs on ONE account (the registry's current one, or the
-        # implicit account): name it so the budget reads that account's usage only
-        config_dir, email = _api._claude_account_candidates()[0]
-        refusal = _api.spawn_refuse_reason(model, account=email)
-        if refusal is not None:
-            return _api._usage_limit_skip_result(
-                model, round_no, refusal, backend="claude"
-            )
         with _api.admission.seat_slot(model) as denied:
             if denied is not None:
                 return _api._admission_skip_result(model, round_no, denied)
-            result = _api.review_claude_cli_with_images(
-                model,
-                prompt,
-                diff,
-                cwd,
-                timeout,
-                round_no,
-                images,
-                effort=effort,
-                config_dir=config_dir,
+            from .backend_claude import review_cli_images_with_accounts
+
+            result = review_cli_images_with_accounts(
+                _api, model, prompt, diff, cwd, timeout, round_no, images, effort
             )
         _api.admission.note_result(model, result)
+        if result.command.endswith(_api._BUDGET_SKIP_SUFFIX):
+            return result
         reason = _api._chronic_unavailable_reason(result)
         if reason is not None:
             _api.record_cooldown(
