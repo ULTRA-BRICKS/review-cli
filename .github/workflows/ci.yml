@@ -29,8 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # The runner executes jobs one after another (review-cli#710): a pull request runs the
+      # full matrix, a push to main (the same tree, already tested as the PR) re-checks one
+      # version, so a merge no longer queues four more 8-minute jobs ahead of the next PR.
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ${{ github.event_name == 'push' && fromJSON('["3.12"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
