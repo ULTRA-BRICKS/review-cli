@@ -3,6 +3,16 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.5 — 2026-10-28
+
+- **Fix(budget): an account-cap hold starts no seat cooldown**
+  ([review-cli#696](https://git.hyperide.ai/ultrabricks/review-cli/issues/696)). Found by the
+  live check of 0.66.4: a direct claude seat refused by review-cli's own cap was recorded as a
+  10-minute `unavailable sentinel` cooldown, so `review seats` kept showing the seat UNUSABLE
+  after the cap or the usage moved. The hold now carries its own result label (`account-cap
+  hold`) that the cooldown classifier ignores, while failover still sees the seat as unusable
+  and a provider's real quota notice still cools it down.
+
 ## 0.66.4 — 2026-10-28
 
 - **Feat(budget): one account usage cap (default 80%) on every Claude route, direct CLI included**

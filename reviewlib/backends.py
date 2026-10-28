@@ -3279,7 +3279,9 @@ def _review_claude_cli_with_account_fallback(
     )
     if len(candidates) > 1:
         reason = f"{reason} on all {len(candidates)} configured accounts ({', '.join(skipped)})"
-    return _usage_limit_skip_result(model, round_no, reason, backend="claude")
+    return _usage_limit_skip_result(
+        model, round_no, reason, backend="claude", cap_hold=bool(cap_reasons)
+    )
 
 
 def claude_access_method() -> str:
@@ -3671,6 +3673,10 @@ def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
     stderr="upstream 503 while proxying")` — is now pinned as WITHHELD (not cached)
     by `test_review_claude_does_not_cache_an_rc0_sentinel_with_transient_stderr`. The
     guarantee now holds on both branches, not just rc!=0."""
+    if (getattr(result, "command", "") or "").startswith(_CAP_HOLD_COMMAND):
+        # review-cli's own account cap is a hold, not a provider's chronic unavailability:
+        # the next call re-reads usage, so it must not start (or escalate) a cooldown
+        return None
     body = (result.stdout or "").strip()
     if result.returncode == 0:
         if not body or len(body) > _UNAVAILABLE_MAX_LEN:
@@ -3927,10 +3933,14 @@ def _bounded_cooldown_skip_body(model: str, reason: str, remaining: int) -> str:
     return _build(model[:model_budget], "")
 
 
+_CAP_HOLD_COMMAND = "account-cap hold"
+
+
 def _usage_limit_skip_result(
-    model: str, round_no: int, reason: str, *, backend: str
+    model: str, round_no: int, reason: str, *, backend: str, cap_hold: bool = False
 ) -> ReviewResult:
-    """Synthetic skip when a family's 5-hour or 7-day window is exhausted.
+    """Synthetic skip when a family's 5-hour or 7-day window is exhausted, or (`cap_hold`)
+    review-cli's own account cap holds the account (`account_cap`; no cooldown starts).
 
     Mirrors `_cooldown_skip_result`'s sentinel shape (rc=0 + unavailable
     marker) so failover/dashboard treat it as unusable, without Popen."""
@@ -3938,7 +3948,11 @@ def _usage_limit_skip_result(
     stdout = f"{model} {marker} ({reason}).\n"
     if len(stdout) > _UNAVAILABLE_MAX_LEN:
         stdout = f"{marker} ({reason}).\n"[:_UNAVAILABLE_MAX_LEN]
-    command = f"usage-limit skip ({backend})"
+    command = (
+        f"{_CAP_HOLD_COMMAND} ({backend})"
+        if cap_hold
+        else f"usage-limit skip ({backend})"
+    )
     _emit_rest_log(
         backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr=""
     )
@@ -5332,7 +5346,9 @@ def _claude_images_gate(model: str, round_no: int) -> ReviewResult | None:
         or spawn_refuse_reason(model)
         or "harness 5-hour window exhausted (100%)"
     )
-    return _usage_limit_skip_result(model, round_no, reason, backend="claude")
+    return _usage_limit_skip_result(
+        model, round_no, reason, backend="claude", cap_hold=cap_reason is not None
+    )
 
 
 def _omp_profiles_policy_reason(omp_model: str | None) -> str | None:

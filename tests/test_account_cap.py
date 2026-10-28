@@ -320,5 +320,54 @@ def test_unconfigured_library_use_is_unchanged(monkeypatch):
     assert len(seen) == 1
 
 
+def test_a_cap_hold_is_unusable_but_never_a_chronic_cooldown_cause(monkeypatch):
+    """The hold is review-cli's own rule: the next call re-reads usage, so it must not start
+    a 10-minute (escalating) seat cooldown the way a provider's exhausted-quota notice does."""
+    account_cap.configure(80, {})
+    monkeypatch.setattr(backends, "_claude_account_candidates", lambda: [(None, "a@x")])
+    monkeypatch.setattr(backends, "allow_spawn_for_model", lambda *a, **k: True)
+    monkeypatch.setattr(
+        backends,
+        "_claude_usage_readings",
+        lambda model, email: (windows(90, 10, live=True), None),
+    )
+    try:
+        held = backends._review_claude_cli_with_account_fallback(
+            MODEL, "p", "d", ".", 30, 1, effort=None
+        )
+    finally:
+        account_cap.configure_unset()
+    from reviewlib.panel import result_is_usable
+
+    assert held.command.startswith("account-cap hold")
+    assert not result_is_usable(held), (
+        "a held seat must still read as unusable to failover"
+    )
+    assert backends._chronic_unavailable_reason(held) is None
+    provider = backends._usage_limit_skip_result(
+        MODEL, 1, "harness 5-hour window exhausted (100%)", backend="claude"
+    )
+    assert backends._chronic_unavailable_reason(provider) is not None, (
+        "a provider limit still cools down"
+    )
+
+
+def test_the_images_gate_hold_is_also_not_a_cooldown_cause(monkeypatch):
+    account_cap.configure(80, {})
+    monkeypatch.setattr(backends, "allow_spawn_for_model", lambda *a, **k: True)
+    monkeypatch.setattr(
+        backends,
+        "_claude_usage_readings",
+        lambda model, email: (windows(90, 10, live=True), None),
+    )
+    monkeypatch.setattr(backends.account_cap, "default_claude_email", lambda: "a@x")
+    try:
+        held = backends._claude_images_gate(MODEL, 1)
+    finally:
+        account_cap.configure_unset()
+    assert held is not None and held.command.startswith("account-cap hold")
+    assert backends._chronic_unavailable_reason(held) is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))
