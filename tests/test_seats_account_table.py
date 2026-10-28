@@ -24,6 +24,7 @@ def _usage(**pairs):
                 {
                     "provider": "anthropic",
                     "metadata": {"email": f"{name}@example.com"},
+                    "fetchedAt": int(time.time() * 1000),
                     "limits": [
                         {
                             "label": label,
