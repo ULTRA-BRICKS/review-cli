@@ -216,6 +216,60 @@ def test_table_line_for_refusal_shows_reset_and_reason():
     )
 
 
+def _claude_cli_pool(five, seven):
+    p = pool([state(1, "a@x", 10, 10)])
+    usage = {"a@x": windows(five, seven)}
+    return OmpPoolState(p.launcher, None, p.db, p.accounts, p.policy, usage)
+
+
+def _with_cap(monkeypatch, cap=80):
+    from reviewlib import account_cap
+
+    account_cap.configure(cap, {})
+    monkeypatch.setattr(account_cap, "default_claude_email", lambda: "a@x")
+    return account_cap
+
+
+def test_direct_claude_seat_shows_its_account_usage_and_the_cap(monkeypatch):
+    cap = _with_cap(monkeypatch)
+    try:
+        v = view("claude:claude-sonnet-5-5", _claude_cli_pool(30, 40))
+    finally:
+        cap.configure_unset()
+    assert v.status == "usable" and v.executor == "claude CLI login"
+    assert v.account == "a@x" and (v.five_hour_pct, v.seven_day_pct, v.cap_pct) == (
+        30,
+        40,
+        80,
+    )
+
+
+def test_direct_claude_seat_over_the_cap_is_refused_with_the_rule(monkeypatch):
+    cap = _with_cap(monkeypatch)
+    try:
+        v = view("claude:claude-sonnet-5-5", _claude_cli_pool(83, 40))
+    finally:
+        cap.configure_unset()
+    assert v.status == "refused"
+    assert v.reason.startswith(
+        "ограничение review-cli (config account_usage_cap_percent=80)"
+    )
+    assert "аккаунт a@x использован на 83% окна 5ч, сброс в 03:30" in v.reason
+
+
+def test_direct_claude_seat_without_any_reading_is_refused_conservatively(monkeypatch):
+    cap = _with_cap(monkeypatch)
+    try:
+        v = view("claude:claude-sonnet-5-5", pool([state(1, "a@x", 10, 10)]))
+    finally:
+        cap.configure_unset()
+    assert (
+        v.status == "refused"
+        and "usage неизвестен" in v.reason
+        and "консервативно" in v.reason
+    )
+
+
 if __name__ == "__main__":
     # smoke.py runs each unit file as a script; delegate to pytest (tests/conftest.py isolation applies).
     import pytest

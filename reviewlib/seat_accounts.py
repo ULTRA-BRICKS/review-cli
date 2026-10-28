@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import tzinfo
 
-from . import omp_accounts, seat_budget
+from . import account_cap, omp_accounts, seat_budget
 from .seat_health import OmpAccountState, OmpPoolState, SeatHealth
 
 EXECUTOR_OMP = "omp account pool"
@@ -222,7 +222,46 @@ def seat_view(
     executor = EXECUTOR_CLAUDE_CLI if seat.startswith("claude:") else EXECUTOR_NONE
     if health.reason is not None and health.substitute is None:
         return _no_account(seat, executor, UNUSABLE, health.reason)
+    cap = account_cap.current().percent
+    if executor == EXECUTOR_CLAUDE_CLI and cap is not None:
+        return _claude_cli_view(seat, pool, cap, now, tz)
     return _no_account(seat, executor, USABLE, _NO_READING)
+
+
+def _claude_cli_view(seat, pool, cap, now, tz) -> SeatAccountView:
+    """The direct claude CLI seat against the account cap: the login's email, its omp
+    `omp usage` windows (the same account, read once for the whole report) and the verdict
+    `backends._claude_cap_refusal` would reach (the harness card is not read here, so
+    unknown usage reads conservatively)."""
+    email = account_cap.default_claude_email()
+    windows = ((pool.usage if pool is not None else None) or {}).get(
+        (email or "").lower()
+    )
+    reading = seat_budget.AccountReading(
+        name=email or "claude (аккаунт по умолчанию)",
+        windows=account_cap.omp_windows_to_budget(windows, seat.split(":", 1)[-1]),
+        read_at=now,
+    )
+    verdict = seat_budget.judge(
+        reading,
+        cap_percent=cap,
+        cap_key=account_cap.CONFIG_KEY,
+        now=now,
+        tz=tz,
+    )
+    status = USABLE if verdict.usable else REFUSED
+    return SeatAccountView(
+        seat,
+        status,
+        EXECUTOR_CLAUDE_CLI,
+        verdict.name,
+        verdict.five_hour_pct,
+        verdict.seven_day_pct,
+        verdict.cap_pct,
+        verdict.reset_at,
+        verdict.reason,
+        (),
+    )
 
 
 def _pct(value: float | None) -> str:

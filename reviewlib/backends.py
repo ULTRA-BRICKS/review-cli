@@ -36,7 +36,7 @@ from .config import _agentic
 from . import availability
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
-from . import admission, omp_accounts
+from . import account_cap, admission, omp_accounts
 from .portable import lock_file, unlock_file
 from .process import (
     TIMEOUT_KIND_STALL,
@@ -387,11 +387,9 @@ def review_with_images(
         cooldown = _cooldown_after_recovery_probe(model, access_method="cli")
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
-        if not allow_spawn_for_model(model):
-            reason = (
-                spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
-            )
-            return _usage_limit_skip_result(model, round_no, reason, backend="claude")
+        gate = _claude_images_gate(model, round_no)
+        if gate is not None:
+            return gate
         with admission.seat_slot(model) as denied:
             if denied is not None:
                 return _admission_skip_result(model, round_no, denied)
@@ -3253,8 +3251,9 @@ def _review_claude_cli_with_account_fallback(
         f"{email or config_dir or 'default'} (login failed)"
         for config_dir, email in login_failed
     ]
+    cap_reasons: list[str] = []
     for config_dir, email in fresh:
-        if not allow_spawn_for_model(model, account=email):
+        if _claude_account_blocked(model, email, cap_reasons):
             skipped.append(email or config_dir or "default")
             continue
         result = review_claude_cli(
@@ -3274,7 +3273,7 @@ def _review_claude_cli_with_account_fallback(
         skipped.append(email or config_dir or "default")
     if last_result is not None:
         return last_result
-    reason = (
+    reason = "; ".join(cap_reasons) or (
         spawn_refuse_reason(model, account=candidates[0][1])
         or "harness 5-hour window exhausted (100%)"
     )
@@ -5248,7 +5247,92 @@ def configure_omp_accounts(raw: object) -> None:
 
 
 def _omp_account_policy() -> omp_accounts.AccountPolicy:
-    return omp_accounts.account_policy(_CONFIG_OMP_ACCOUNTS, os.environ)
+    policy = omp_accounts.account_policy(_CONFIG_OMP_ACCOUNTS, os.environ)
+    cap = account_cap.current()
+    if policy.max_usage_percent is None and cap.percent is not None:
+        # the shared account cap is the pool's usage threshold unless omp_accounts sets its
+        # own (a per-account entry still wins over both)
+        policy = dataclasses.replace(
+            policy,
+            max_usage_percent=cap.percent,
+            max_usage_source=f"config.yaml {account_cap.CONFIG_KEY}"
+            if cap.source.startswith("config.yaml")
+            else cap.source,
+        )
+    return policy
+
+
+_OMP_USAGE_TTL_SECONDS = 60.0
+_omp_usage_cache: list = [0.0, None]  # [fetched at (monotonic), usage_by_email result]
+
+
+def _omp_usage_for_gate():
+    """`omp usage` by email for the account gate, read at most once a minute so rotating
+    over N Claude accounts costs one omp call, not N. None when omp cannot answer."""
+    fetched_at, cached = _omp_usage_cache
+    if cached is not None and time.monotonic() - fetched_at < _OMP_USAGE_TTL_SECONDS:
+        return cached
+    try:
+        usage = omp_accounts.usage_by_email(_omp_launcher())
+    except Exception:  # noqa: BLE001 - an unreadable source means "unknown", never a crash
+        return None
+    _omp_usage_cache[:] = [time.monotonic(), usage]
+    return usage
+
+
+def _claude_usage_readings(model: str, email: str | None):
+    """(omp usage windows, harness highest-window percent) of the Claude account `email`
+    (None: the implicit login), each None when it cannot be read; no model is called."""
+    account = email or account_cap.default_claude_email()
+    by_email = _omp_usage_for_gate()
+    omp_windows = (
+        by_email.get(account.lower()) if by_email is not None and account else None
+    )
+    return omp_windows, usage_percent_for_model(model, account=account)
+
+
+def _claude_cap_refusal(model: str, email: str | None) -> str | None:
+    """review-cli's own account cap for the direct claude CLI seat (account_cap): why this
+    account must not be spent, else None. Nothing is read when no cap is configured."""
+    cap = account_cap.current().percent
+    if cap is None:
+        return None
+    account = email or account_cap.default_claude_email()  # resolved once for both uses
+    omp_windows, harness = _claude_usage_readings(model, account)
+    return account_cap.claude_refusal(
+        model,
+        account,
+        cap_percent=cap,
+        omp_windows=omp_windows,
+        harness_percent=harness,
+        now=time.time(),
+    )
+
+
+def _claude_account_blocked(
+    model: str, email: str | None, cap_reasons: list[str]
+) -> bool:
+    """True when this Claude account must not be spawned now: review-cli's own cap (its
+    message is appended to `cap_reasons`) or the harness 100% window gate."""
+    cap_reason = _claude_cap_refusal(model, email)
+    if cap_reason is not None:
+        cap_reasons.append(cap_reason)
+        return True
+    return not allow_spawn_for_model(model, account=email)
+
+
+def _claude_images_gate(model: str, round_no: int) -> ReviewResult | None:
+    """The pre-spawn usage gate of the images-capable claude CLI path: a skip result when
+    the account cap or the harness 100% window refuses, else None."""
+    cap_reason = _claude_cap_refusal(model, None)
+    if cap_reason is None and allow_spawn_for_model(model):
+        return None
+    reason = (
+        cap_reason
+        or spawn_refuse_reason(model)
+        or "harness 5-hour window exhausted (100%)"
+    )
+    return _usage_limit_skip_result(model, round_no, reason, backend="claude")
 
 
 def _omp_profiles_policy_reason(omp_model: str | None) -> str | None:

@@ -75,6 +75,8 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "REVIEW_ADMISSION_DIR": str(Path(home) / "admission"),
         # no pre-dispatch seat probe against the stub CLIs smoke drives (review-cli#663)
         "REVIEW_HEALTH_PREFLIGHT": "0",
+        # shipped default account usage cap off for the stub claude/omp smoke drives (#696)
+        "REVIEW_ACCOUNT_USAGE_CAP_PERCENT": "off",
         # Synthetic codes (SMOKE-1, TEST-1, ...) must not hit a real tracker (review-cli#427);
         # test_taskref.py turns validation back on per test.
         "REVIEW_TASKREF_VALIDATE": "0",

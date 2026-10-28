@@ -281,12 +281,13 @@ def _resume_session_cli(_api, /, ns: argparse.Namespace) -> int:
     `reviewlib.sessions.resume_session`; resolves the panel/moderator (saved unless
     overridden) and reports the clean errors (unknown id / ambiguous prefix / already
     complete) with actionable messages + meaningful exit codes."""
-    from . import backends, sessions as _sessions
+    from . import account_cap, backends, sessions as _sessions
 
     config = _api.load_config()
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
     backends.configure_omp_bin(config.get("omp_bin"))
     backends.configure_omp_accounts(config.get("omp_accounts"))
+    account_cap.apply(config)
 
     try:
         sess = _sessions.find_session(ns.resume)

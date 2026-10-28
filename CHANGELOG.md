@@ -3,6 +3,22 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.4 — 2026-10-28
+
+- **Feat(budget): one account usage cap (default 80%) on every Claude route, direct CLI included**
+  ([review-cli#696](https://git.hyperide.ai/ultrabricks/review-cli/issues/696)).
+  New config key `account_usage_cap_percent` (default 80, `$REVIEW_ACCOUNT_USAGE_CAP_PERCENT`
+  overrides, `off` disables). It is the usage threshold of omp's Anthropic account pool unless
+  `omp_accounts.max_usage_percent` / a per-account entry sets a more specific one, and it now
+  also gates the direct `claude` CLI seat per registered account before the CLI is spawned,
+  using that account's `omp usage` windows (by email) and harness card; either at or over the
+  cap refuses, and an account with no reading at all is refused conservatively. The refusal
+  reads `ограничение review-cli (config account_usage_cap_percent=80): аккаунт X использован
+  на 83% окна 5ч, сброс в HH:MM`, never a provider-quota claim, and records no cooldown. An
+  invalid value stops the command (exit 2). `review seats` shows the direct claude seat's
+  account, usage and verdict against the cap. Behavior change: with no `omp_accounts:` setting
+  the omp pool is now capped at 80% (before: used up to the provider limit).
+
 ## 0.66.3 — 2026-10-28
 
 - **Feat(omp): omp:anthropic seats take the lowest-usage account first**

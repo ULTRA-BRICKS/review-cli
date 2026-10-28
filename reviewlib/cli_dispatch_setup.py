@@ -121,6 +121,7 @@ def load_runtime_policy(_api, state):
     _api.backends.configure_unpaid_providers(state.config.get("unpaid_providers"))
     _api.backends.configure_omp_bin(state.config.get("omp_bin"))
     _api.backends.configure_omp_accounts(state.config.get("omp_accounts"))
+    _api.account_cap.apply(state.config)
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(state.config.get("provider_chains"))

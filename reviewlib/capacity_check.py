@@ -59,6 +59,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
+    account_cap,
     availability,
     backends,
     claude_accounts,
@@ -654,6 +655,7 @@ def board_capacity_report(
         backends.configure_unpaid_providers(config.get("unpaid_providers"))
         backends.configure_omp_bin(config.get("omp_bin"))
         backends.configure_omp_accounts(config.get("omp_accounts"))
+        account_cap.apply(config)
         configure_provider_chains(config.get("provider_chains"))
         board, source, used_preset = resolve_review_board(config, preset=preset)
     except Exception as exc:  # noqa: BLE001 - reported in the JSON, never raised

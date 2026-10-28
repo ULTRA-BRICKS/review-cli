@@ -80,6 +80,18 @@ CONFIG FILE
                        the cap, the reset time and the reason; a refusal names the rule
                        ("ограничение review-cli (config ...)" vs "лимит провайдера");
                        usage that is unknown or stale is refused conservatively.
+    account_usage_cap_percent: number   the ONE usage cap (default 80): review-cli never
+                       spends a subscription-backed Claude account at or above this share of
+                       its 5-hour or 7-day window, on the omp account pool AND the direct
+                       `claude` CLI seat (before any process is spawned). `omp_accounts:
+                       max_usage_percent` / a per-account entry, when set, stays the more
+                       specific word for omp accounts. A refusal says it is review-cli's own
+                       rule ("ограничение review-cli (config account_usage_cap_percent=80):
+                       аккаунт X использован на 83% окна 5ч, сброс в HH:MM"), never that the
+                       provider ran out of quota. An account whose usage cannot be read (no
+                       `omp usage` entry for its email and no harness card) is refused
+                       conservatively and the message says so. Env override:
+                       REVIEW_ACCOUNT_USAGE_CAP_PERCENT=65, or `off` to disable it.
     timeout:           int         per-call timeout seconds for `review diff` (replaces the
                        configured/default request timeout; still overrideable
                        per-invocation by --timeout). Review/panel agent CLI backends treat

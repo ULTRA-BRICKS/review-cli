@@ -125,6 +125,10 @@ def _isolate_seat_cooldown(tmp_path, monkeypatch):
     # The automatic pre-dispatch health check would probe the stub CLIs/servers a test
     # drives and consume their scripted answers; tests/test_health.py turns it on itself.
     monkeypatch.setenv("REVIEW_HEALTH_PREFLIGHT", "0")
+    # The shipped default account usage cap (80%, review-cli#696) refuses an account whose
+    # usage it cannot read, which no stub claude/omp a test drives can answer; the cap's
+    # own tests (tests/test_account_cap.py) configure it explicitly.
+    monkeypatch.setenv("REVIEW_ACCOUNT_USAGE_CAP_PERCENT", "off")
 
 
 @pytest.fixture(autouse=True)
