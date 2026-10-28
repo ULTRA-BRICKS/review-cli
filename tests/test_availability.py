@@ -113,6 +113,63 @@ def test_claude_cli_weekly_limit_with_a_date():
     assert until == datetime(2026, 10, 28, 5, 0, tzinfo=timezone.utc).timestamp()
 
 
+@contextlib.contextmanager
+def _local_zone(name):
+    saved = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
+
+
+CODEX_WEEKLY = (
+    "You've hit your usage limit. Upgrade to Pro or try again at Oct 30th, 2026 6:43 PM."
+)
+
+
+def test_codex_weekly_limit_is_read_in_the_local_zone():
+    with _local_zone("Europe/Belgrade"):  # CET on Oct 30: UTC+1
+        until = availability.parse_reset_time(CODEX_WEEKLY, now=NOW)
+        found = availability.classify("", CODEX_WEEKLY, 1, now=NOW)
+    assert until == datetime(2026, 10, 30, 17, 43, tzinfo=timezone.utc).timestamp()
+    assert found is not None and found.source == "reset-time" and found.until == until
+
+
+def test_codex_reset_ordinals_and_midnight_noon_edges():
+    with _local_zone("UTC"):
+        for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (11, "th"), (30, "th")):
+            text = f"try again at Oct {day}{suffix}, 2026 6:43 PM."
+            want = datetime(2026, 10, day, 18, 43, tzinfo=timezone.utc).timestamp()
+            now = want - 86400
+            assert availability.parse_reset_time(text, now=now) == want
+        for clock, hour in (("12:00 AM", 0), ("12:00 PM", 12)):
+            text = f"try again at Oct 25th, 2026 {clock}"
+            want = datetime(2026, 10, 25, hour, 0, tzinfo=timezone.utc).timestamp()
+            assert availability.parse_reset_time(text, now=NOW) == want
+
+
+def test_codex_reset_in_the_past_or_malformed_is_not_a_window():
+    with _local_zone("UTC"):
+        assert (
+            availability.parse_reset_time("try again at Oct 1st, 2026 6:43 PM", now=NOW)
+            is None
+        )
+        for bad in (
+            "try again at Foo 30th, 2026 6:43 PM",
+            "try again at Oct 32nd, 2026 6:43 PM",
+            "try again at Oct 30th, 2026 13:43 PM",
+        ):
+            assert availability.parse_reset_time(bad, now=NOW) is None
+            found = availability.classify("", "usage limit; " + bad, 1, now=NOW)
+            assert found is not None and found.source == "timer"
+
+
 def test_epoch_reset_header_seconds_and_millis():
     seconds = int(NOW) + 7200
     assert (

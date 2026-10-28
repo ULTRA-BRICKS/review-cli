@@ -170,6 +170,12 @@ _CLI_RESET_RE = re.compile(
     r"(?:\s*\((?P<tz>[A-Za-z_]+(?:/[A-Za-z_+\-0-9]+)*)\))?",
     re.IGNORECASE,
 )
+# The codex CLI's wording: "try again at Oct 30th, 2026 6:43 PM." — local time, no zone.
+_CODEX_RESET_RE = re.compile(
+    r"try again at\s+(?P<mon>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"(?P<year>\d{4})\s+(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<ap>[ap]m)\b",
+    re.IGNORECASE,
+)
 _MONTHS = {
     name: index + 1
     for index, name in enumerate(
@@ -295,7 +301,8 @@ def parse_reset_time(text: str, *, now: float) -> float | None:
     """The epoch time an error says the limit resets, else None. Understands ISO
     timestamps ("reset at 2026-10-26 05:58:34", zone-less = UTC), epoch seconds/ms
     (`x-ratelimit-reset: 1760000000`) and the Claude CLI's "resets 7:30pm (Europe/Moscow)"
-    / "resets Oct 18, 5am". A time already past, or implausibly far away, is not a reset."""
+    / "resets Oct 18, 5am", and codex's "try again at Oct 30th, 2026 6:43 PM" (host local
+    zone). A time already past, or implausibly far away, is not a reset."""
     match = _ISO_RESET_RE.search(text)
     if match:
         year, month, day, hour, minute, second, zone = match.groups()
@@ -330,7 +337,29 @@ def parse_reset_time(text: str, *, now: float) -> float | None:
     match = _CLI_RESET_RE.search(text)
     if match:
         return _cli_reset(match, now)
+    match = _CODEX_RESET_RE.search(text)
+    if match:
+        return _codex_reset(match, now)
     return None
+
+
+def _codex_reset(match: re.Match, now: float) -> float | None:
+    month = _MONTHS.get(match["mon"][:3].lower())
+    hour, minute = int(match["h"]), int(match["m"])
+    if month is None or not 1 <= hour <= 12 or minute > 59:
+        return None
+    try:
+        moment = datetime(
+            int(match["year"]),
+            month,
+            int(match["day"]),
+            hour % 12 + (12 if match["ap"].lower() == "pm" else 0),
+            minute,
+            tzinfo=_zone(None),
+        )
+    except ValueError:
+        return None
+    return _sane(moment.timestamp(), now)
 
 
 def _cli_reset(match: re.Match, now: float) -> float | None:

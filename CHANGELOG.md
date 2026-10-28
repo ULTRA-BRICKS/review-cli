@@ -3,6 +3,14 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## Unreleased
+
+- **Fix(availability): codex weekly-limit reset time is parsed**
+  ([review-cli#693](https://git.hyperide.ai/ultrabricks/review-cli/issues/693)).
+  `try again at Oct 30th, 2026 6:43 PM` (host local zone) now sets the seat cooldown to
+  that instant (source `reset-time`) instead of a guessed 8 h timer, so `review seats`
+  shows the real recovery time and the seat is not re-dispatched days early.
+
 ## 0.64.0 — 2026-10-24
 
 - **Fix(brainstorm): a default `brainstorm --task` can meet the ship floor**
