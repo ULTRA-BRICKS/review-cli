@@ -40,6 +40,14 @@ semantic versioning.
   board; `capacity-check` JSON `configuration.source` reads `level:<name>` and `preset` holds the
   canonical level name. Configs without `levels:` behave as before.
 
+## 0.64.1 — 2026-10-28
+
+- **Fix(availability): codex weekly-limit reset time is parsed**
+  ([review-cli#693](https://git.hyperide.ai/ultrabricks/review-cli/issues/693)).
+  `try again at Oct 30th, 2026 6:43 PM` (host local zone) now sets the seat cooldown to
+  that instant (source `reset-time`) instead of a guessed 8 h timer, so `review seats`
+  shows the real recovery time and the seat is not re-dispatched days early.
+
 ## 0.64.0 — 2026-10-24
 
 - **Fix(brainstorm): a default `brainstorm --task` can meet the ship floor**

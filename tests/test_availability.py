@@ -113,6 +113,93 @@ def test_claude_cli_weekly_limit_with_a_date():
     assert until == datetime(2026, 10, 28, 5, 0, tzinfo=timezone.utc).timestamp()
 
 
+@contextlib.contextmanager
+def _local_zone(name):
+    saved = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
+
+
+CODEX_WEEKLY = (
+    "You've hit your usage limit. Upgrade to Pro or try again at Oct 30th, 2026 6:43 PM."
+)
+
+
+def test_codex_weekly_limit_is_read_in_the_local_zone():
+    with _local_zone("Europe/Belgrade"):  # CET on Oct 30: UTC+1
+        until = availability.parse_reset_time(CODEX_WEEKLY, now=NOW)
+        found = availability.classify("", CODEX_WEEKLY, 1, now=NOW)
+    assert until == datetime(2026, 10, 30, 17, 43, tzinfo=timezone.utc).timestamp()
+    assert found is not None and found.source == "reset-time" and found.until == until
+
+
+def _codex_reset_with_wall_clock(text, wall_clock):
+    from unittest.mock import patch
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return wall_clock if tz is None else wall_clock.astimezone(tz)
+
+    with patch.object(availability, "datetime", Clock):
+        return availability.parse_reset_time(text, now=wall_clock.timestamp())
+
+
+def test_codex_reset_uses_target_offset_after_autumn_transition():
+    with _local_zone("Europe/Belgrade"):
+        found = _codex_reset_with_wall_clock(
+            CODEX_WEEKLY, datetime(2026, 10, 24, 12)
+        )
+    assert found == datetime(2026, 10, 30, 17, 43, tzinfo=timezone.utc).timestamp()
+
+
+def test_codex_reset_uses_target_offset_after_spring_transition():
+    with _local_zone("Europe/Belgrade"):
+        found = _codex_reset_with_wall_clock(
+            "try again at Mar 30th, 2026 6:43 PM", datetime(2026, 3, 27, 12)
+        )
+    assert found == datetime(2026, 3, 30, 16, 43, tzinfo=timezone.utc).timestamp()
+
+
+def test_codex_reset_ordinals_and_midnight_noon_edges():
+    with _local_zone("UTC"):
+        for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (11, "th"), (30, "th")):
+            text = f"try again at Oct {day}{suffix}, 2026 6:43 PM."
+            want = datetime(2026, 10, day, 18, 43, tzinfo=timezone.utc).timestamp()
+            now = want - 86400
+            assert availability.parse_reset_time(text, now=now) == want
+        for clock, hour in (("12:00 AM", 0), ("12:00 PM", 12)):
+            text = f"try again at Oct 25th, 2026 {clock}"
+            want = datetime(2026, 10, 25, hour, 0, tzinfo=timezone.utc).timestamp()
+            assert availability.parse_reset_time(text, now=NOW) == want
+
+
+def test_codex_reset_in_the_past_or_malformed_is_not_a_window():
+    with _local_zone("UTC"):
+        assert (
+            availability.parse_reset_time("try again at Oct 1st, 2026 6:43 PM", now=NOW)
+            is None
+        )
+        for bad in (
+            "try again at Foo 30th, 2026 6:43 PM",
+            "try again at Oct 32nd, 2026 6:43 PM",
+            "try again at Oct 30th, 2026 13:43 PM",
+            "try again at Jan 1st, 0001 1:00 AM",
+            "try again at Dec 31st, 9999 11:00 PM",
+        ):
+            assert availability.parse_reset_time(bad, now=NOW) is None
+            found = availability.classify("", "usage limit; " + bad, 1, now=NOW)
+            assert found is not None and found.source == "timer"
+
+
 def test_epoch_reset_header_seconds_and_millis():
     seconds = int(NOW) + 7200
     assert (

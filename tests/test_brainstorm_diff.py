@@ -346,11 +346,15 @@ def _capture_cli_brainstorm_diff(
     # cli.mode_brainstorm attribute).
     old_mb = brainstorm_mod.mode_brainstorm
     old_git = cli._git_diff
+    old_available = cli._chain_aware_available
     old_load_config = cli.load_config
     old_env = os.environ.get("GEMINI_ENV_FILE")
     old_task = os.environ.get("REVIEW_TASK_CODE")
     brainstorm_mod.mode_brainstorm = _fake_brainstorm
     cli._git_diff = _wrapped_git_diff
+    # Offline diff-acquisition tests exercise a fake handler, not real providers.
+    # Keep production account/level admission intact and restore this stub below.
+    cli._chain_aware_available = lambda _model: True
     cli.load_config = lambda: {}  # no config models, deterministic
     old_stdin = sys.stdin
     try:
@@ -369,6 +373,7 @@ def _capture_cli_brainstorm_diff(
     finally:
         brainstorm_mod.mode_brainstorm = old_mb
         cli._git_diff = old_git
+        cli._chain_aware_available = old_available
         cli.load_config = old_load_config
         sys.stdin = old_stdin
         # Restore the env var instead of leaking it across tests (GLM finding 15).
