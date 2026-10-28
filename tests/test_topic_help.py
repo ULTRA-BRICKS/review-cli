@@ -15,6 +15,7 @@ ship DEEP help topics advertised from the main help. Pinned here:
 In-process via the CLI dispatch (offline; no backend). Topic content is asserted on the
 rendered text, robust to argparse line-wrapping where relevant.
 """
+
 from __future__ import annotations
 
 import io
@@ -146,11 +147,38 @@ def test_help_task_documents_moving_iterations_between_machines_review_cli_659()
         assert needle in flat, (needle, out)
 
 
+def test_help_config_documents_levels_and_moderator_chain_697_695():
+    rc, out, _ = _run(["help", "config"])
+    assert rc == 0, rc
+    flat = " ".join(out.split())
+    for needle in (
+        "CAPABILITY LEVELS",
+        "levels.yaml",
+        "levels:",
+        "default_level:",
+        "--level",
+        "--preset",
+        "routine (pool 2",
+        "standard (pool 4",
+        "deep (pool 4",
+        "nothing is ever dispatched on a heavier level",
+        "`null` deletes a key",
+        "run-stats",
+        "moderator_candidates:",
+        "the `moderators` chain of the active level",
+        "quorum/brainstorm moderator: --moderator",
+        "distinct MODELS separately",
+    ):
+        assert needle in flat, (needle, out)
+
+
 def test_help_config_alias_via_dashdash_help():
     rc_a, out_a, _ = _run(["help", "config"])
     rc_b, out_b, _ = _run(["--help", "config"])
     assert rc_a == 0 and rc_b == 0, (rc_a, rc_b)
-    assert out_a == out_b, "review --help config must render the same as review help config"
+    assert out_a == out_b, (
+        "review --help config must render the same as review help config"
+    )
     rc_c, out_c, _ = _run(["-h", "config"])
     assert rc_c == 0 and out_c == out_a, "the -h alias too"
 

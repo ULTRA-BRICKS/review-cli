@@ -305,29 +305,9 @@ def parse_reset_time(text: str, *, now: float) -> float | None:
     zone). A time already past, or implausibly far away, is not a reset."""
     match = _ISO_RESET_RE.search(text)
     if match:
-        year, month, day, hour, minute, second, zone = match.groups()
-        try:
-            moment = datetime(
-                int(year),
-                int(month),
-                int(day),
-                int(hour),
-                int(minute),
-                int(second or 0),
-            )
-        except ValueError:
-            moment = None
-        if moment is not None:
-            tz = timezone.utc
-            if zone and zone.upper() not in ("Z", "UTC", "GMT"):
-                sign = 1 if zone[0] == "+" else -1
-                digits = zone[1:].replace(":", "")
-                tz = timezone(
-                    sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
-                )
-            found = _sane(moment.replace(tzinfo=tz).timestamp(), now)
-            if found is not None:
-                return found
+        found = _iso_reset(match, now)
+        if found is not None:
+            return found
     match = _EPOCH_RESET_RE.search(text)
     if match:
         raw = int(match.group(1))
@@ -343,7 +323,28 @@ def parse_reset_time(text: str, *, now: float) -> float | None:
     return None
 
 
+def _iso_reset(match: re.Match, now: float) -> float | None:
+    """Decode the ISO candidate while retaining the caller's fallback order."""
+    year, month, day, hour, minute, second, zone = match.groups()
+    try:
+        moment = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second or 0)
+        )
+    except ValueError:
+        return None
+    tz = timezone.utc
+    if zone and zone.upper() not in ("Z", "UTC", "GMT"):
+        sign = 1 if zone[0] == "+" else -1
+        digits = zone[1:].replace(":", "")
+        tz = timezone(
+            sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
+        )
+    return _sane(moment.replace(tzinfo=tz).timestamp(), now)
+
+
 def _codex_reset(match: re.Match, now: float) -> float | None:
+    # A naive timestamp uses the host's offset on the reset date, including DST,
+    # rather than freezing the offset at the real wall-clock instant.
     month = _MONTHS.get(match["mon"][:3].lower())
     hour, minute = int(match["h"]), int(match["m"])
     if month is None or not 1 <= hour <= 12 or minute > 59:
@@ -355,11 +356,10 @@ def _codex_reset(match: re.Match, now: float) -> float | None:
             int(match["day"]),
             hour % 12 + (12 if match["ap"].lower() == "pm" else 0),
             minute,
-            tzinfo=_zone(None),
         )
-    except ValueError:
+        return _sane(moment.timestamp(), now)
+    except (ValueError, OverflowError, OSError):
         return None
-    return _sane(moment.timestamp(), now)
 
 
 def _cli_reset(match: re.Match, now: float) -> float | None:
@@ -432,6 +432,46 @@ def _short(text: str, limit: int = 160) -> str:
     return (message.group(1) if message else line)[:limit]
 
 
+def _quota_unavailability(
+    channel: str, now: float, *, is_quota: bool, is_credits: bool
+) -> Unavailability | None:
+    """Preserve explicit resets, short throttles and credit-exhaustion precedence."""
+    if is_quota:
+        reset = parse_reset_time(channel, now=now)
+        if reset is not None:
+            return Unavailability(
+                CAUSE_QUOTA,
+                reset,
+                f"quota exhausted: {_short(_snippet(channel, 'reset'))}",
+                "reset-time",
+                provider_wide=True,
+                probe_after=_reprobe_at(now, reset),
+            )
+        wait = parse_retry_after(channel, now=now)
+        if wait is not None and wait >= MIN_RETRY_AFTER_EXCLUDE_SECONDS:
+            return Unavailability(
+                CAUSE_QUOTA,
+                now + min(wait, MAX_WINDOW_SECONDS),
+                f"quota exhausted, retry after {int(wait)}s",
+                "retry-after",
+                probe_after=_reprobe_at(now, now + wait),
+            )
+        if wait is not None:
+            return None  # a short, named wait is a throttle, not an exclusion
+        if not is_credits:
+            return Unavailability(
+                CAUSE_QUOTA, None, "session limit / usage credits", "timer"
+            )
+    return Unavailability(
+        CAUSE_QUOTA,
+        now + CREDITS_WINDOW_SECONDS,
+        f"credits exhausted: {_short(channel, 100)}",
+        "credits",
+        provider_wide=True,
+        probe_after=now + CREDITS_REPROBE_SECONDS,
+    )
+
+
 def classify(
     stdout: str,
     stderr: str,
@@ -462,40 +502,9 @@ def classify(
         or _QUOTA_RE.search(channel) is not None
     )
     is_credits = returncode == 402 or any(m in lowered for m in _CREDIT_MARKERS)
-    if is_quota:
-        reset = parse_reset_time(channel, now=now)
-        if reset is not None:
-            return Unavailability(
-                CAUSE_QUOTA,
-                reset,
-                f"quota exhausted: {_short(_snippet(channel, 'reset'))}",
-                "reset-time",
-                provider_wide=True,
-                probe_after=_reprobe_at(now, reset),
-            )
-        wait = parse_retry_after(channel, now=now)
-        if wait is not None and wait >= MIN_RETRY_AFTER_EXCLUDE_SECONDS:
-            return Unavailability(
-                CAUSE_QUOTA,
-                now + min(wait, MAX_WINDOW_SECONDS),
-                f"quota exhausted, retry after {int(wait)}s",
-                "retry-after",
-                probe_after=_reprobe_at(now, now + wait),
-            )
-        if wait is not None:
-            return None  # a short, named wait is a throttle, not an exclusion
-        if not is_credits:
-            return Unavailability(
-                CAUSE_QUOTA, None, "session limit / usage credits", "timer"
-            )
-    if is_credits:
-        return Unavailability(
-            CAUSE_QUOTA,
-            now + CREDITS_WINDOW_SECONDS,
-            f"credits exhausted: {_short(channel, 100)}",
-            "credits",
-            provider_wide=True,
-            probe_after=now + CREDITS_REPROBE_SECONDS,
+    if is_quota or is_credits:
+        return _quota_unavailability(
+            channel, now, is_quota=is_quota, is_credits=is_credits
         )
     if _SUSPENDED_RE.search(channel):
         # the provider turned the account/service off (Fireworks "account suspended"): it
@@ -517,6 +526,11 @@ def classify(
             probe_after=now + AUTH_REPROBE_SECONDS,
             watch=watch,
         )
+    return _retry_unavailability(channel, now)
+
+
+def _retry_unavailability(channel: str, now: float) -> Unavailability | None:
+    """Classify only a long explicit retry after quota/auth checks have failed."""
     wait = parse_retry_after(channel, now=now)
     if wait is not None and wait >= MIN_RETRY_AFTER_EXCLUDE_SECONDS:
         reset = now + min(wait, MAX_WINDOW_SECONDS)

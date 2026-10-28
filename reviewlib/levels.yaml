@@ -1,0 +1,112 @@
+# review-cli SHIPPED DEFAULT capability levels (version-controlled; the code only loads, validates
+# and resolves them, see reviewlib/levels.py). A user's ~/.config/review-cli/config.yaml `levels:`
+# key inherits from this file and overrides single fields (deep merge: a mapping merges key by
+# key, a list or scalar replaces, `null` deletes a key), so changing one seat, one effort or the
+# moderator chain never means restating a level. `review help config` documents the merge.
+#
+# A level is a task CAPABILITY, not a provider list:
+#   aliases      other names accepted by `--level` / `--preset` (`light`, `default`, `heavy` are
+#                the pre-levels preset spellings and stay valid)
+#   pool         seats that run per review (a recorded `--task` run floors it to the 3 distinct
+#                roles `review task CODE --check` needs)
+#   effort       reasoning effort for every seat: minimal|low|medium|high|xhigh|max
+#   escalate_to  the next heavier level. A suggestion for people and the pool guard's
+#                proposals ONLY: nothing is ever dispatched on a heavier level because a seat of
+#                this one was unavailable. Heavier = an explicit `--level` (or this file edited).
+#   roles        provider-neutral role -> priority-ordered seats. A seat is a model string
+#                (`provider:model`, or an alias such as `sonnet`) or `{model, name?, effort?}`.
+#                The board order is rank-major: every role's first seat (in the order the roles
+#                are listed), then every role's second seat, ... The first `pool` available seats
+#                with distinct roles run; the rest are THIS level's reserve, so a seat that
+#                fails mid-run is replaced from the same level and never from a heavier one.
+#   moderators   ordered seat chain of the quorum/brainstorm moderator at this level; an
+#                unavailable seat is skipped, a failing one falls to the next.
+#
+# Cost policy: routine = Sonnet-class seats at low effort (the default, the lowest sufficient
+# level); standard adds the Opus and Codex families as the first seats; deep adds Sol and every
+# commandcode route at xhigh. Fable (a 97-100% dispatch failure rate on the owner's account,
+# review-cli#fable-seat-reliability) is in NO level: reach it with `-m fable` or by adding it to
+# a level in your own config.
+
+default_level: routine
+
+levels:
+  routine:
+    aliases: [light]
+    pool: 2
+    effort: low
+    escalate_to: standard
+    roles:
+      correctness:
+        - { model: "omp:anthropic/claude-sonnet-5-5", name: Sonnet-omp }
+      consistency:
+        - { model: "claude:claude-sonnet-5-5", name: Sonnet }
+      quality:
+        - { model: "omp:zai/glm-5.3", name: GLM }
+      security:
+        - { model: "oc:xai/grok-4.7", name: Grok }
+      tests:
+        - { model: "omp:opencode-go/mimo-v2.6-pro", name: MiMo }
+    moderators:
+      - "claude:claude-sonnet-5-5"
+      - "omp:anthropic/claude-sonnet-5-5"
+      - "omp:zai/glm-5.3"
+
+  standard:
+    aliases: [default]
+    pool: 4
+    effort: medium
+    escalate_to: deep
+    roles:
+      correctness:
+        - { model: "claude:claude-opus-5-5", name: Opus }
+        - { model: "omp:anthropic/claude-opus-5-5", name: Opus-omp }
+        - { model: "omp:anthropic/claude-sonnet-5-5", name: Sonnet-omp }
+      consistency:
+        - { model: "omp:openai-codex/gpt-6-luna", name: Luna-omp }
+        - { model: "codex:gpt-6-luna", name: Luna }
+        - { model: "codex:gpt-6-astra", name: Astra }
+        - { model: "claude:claude-sonnet-5-5", name: Sonnet }
+      quality:
+        - { model: "omp:zai/glm-5.3", name: GLM }
+      security:
+        - { model: "oc:xai/grok-4.7", name: Grok }
+      tests:
+        - { model: "omp:opencode-go/mimo-v2.6-pro", name: MiMo }
+    # The chain quorum/brainstorm used before levels existed (opus, then codex, then gemini).
+    moderators:
+      - "claude:claude-opus-5-5"
+      - "codex"
+      - "gemini"
+
+  deep:
+    aliases: [heavy]
+    pool: 4
+    effort: xhigh
+    escalate_to: null
+    roles:
+      correctness:
+        - { model: "claude:claude-opus-5-5", name: Opus }
+        - { model: "omp:anthropic/claude-opus-5-5", name: Opus-omp }
+        - { model: "omp:anthropic/claude-sonnet-5-5", name: Sonnet-omp }
+      consistency:
+        - { model: "codex:gpt-6.1-sol", name: Sol }
+        - { model: "codex:gpt-6-astra", name: Astra }
+        - { model: "omp:openai-codex/gpt-6-luna", name: Luna-omp }
+        - { model: "codex:gpt-6-luna", name: Luna }
+      quality:
+        - { model: "claude:claude-sonnet-5-5", name: Sonnet }
+        - { model: "oc:commandcode/moonshotai/Kimi-K3", name: Kimi }
+        - { model: "omp:zai/glm-5.3", name: GLM }
+      security:
+        - { model: "oc:xai/grok-4.7", name: Grok }
+        - { model: "oc:commandcode/Qwen/Qwen3.8-Max", name: Qwen }
+      tests:
+        - { model: "omp:opencode-go/mimo-v2.6-pro", name: MiMo }
+        - { model: "oc:commandcode/deepseek/deepseek-v4-pro", name: DeepSeek }
+      performance:
+        - { model: "commandcode:zai-org/GLM-5.3", name: GLM-cc }
+    moderators:
+      - "claude:claude-opus-5-5"
+      - "codex:gpt-6-astra"
+      - "claude:claude-sonnet-5-5"

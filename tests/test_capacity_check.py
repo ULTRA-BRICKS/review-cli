@@ -39,7 +39,7 @@ import reviewlib.seat_cooldown as sc  # noqa: E402
 import reviewlib.usage_limits as ul  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     BoardConfigError,
-    DEFAULT_PRESET,
+    default_level_name,
     resolve_review_board,
 )
 
@@ -1028,9 +1028,9 @@ def test_report_names_the_evaluated_configuration():
         light = cc.board_capacity_report(config={}, now=NOW)
         heavy = cc.board_capacity_report(config={}, preset="heavy", now=NOW)
         models = _report([OPUS])
-    assert light["configuration"]["source"] == f"preset:{DEFAULT_PRESET}"
-    assert heavy["configuration"]["source"] == "preset:heavy"
-    assert heavy["configuration"]["preset"] == "heavy"
+    assert light["configuration"]["source"] == f"level:{default_level_name()}"
+    assert heavy["configuration"]["source"] == "level:deep"
+    assert heavy["configuration"]["preset"] == "deep"
     assert (
         light["configuration"]["board_fingerprint"]
         != heavy["configuration"]["board_fingerprint"]
@@ -1046,9 +1046,9 @@ def test_resolve_review_board_precedence():
     board, source, _ = resolve_review_board(both)
     assert source == "config.yaml (models:)" and board[0].model == OPUS
     _, source, preset = resolve_review_board(both, preset="heavy")
-    assert (source, preset) == ("preset:heavy", "heavy")
+    assert (source, preset) == ("level:deep", "deep")
     _, source, preset = resolve_review_board({})
-    assert (source, preset) == (f"preset:{DEFAULT_PRESET}", DEFAULT_PRESET)
+    assert (source, preset) == (f"level:{default_level_name()}", default_level_name())
     try:
         resolve_review_board({"board": [{"model": OPUS, "role": "nope"}]})
     except BoardConfigError:
@@ -1144,7 +1144,7 @@ def test_cli_capacity_check_json_prints_the_versioned_report():
     assert rc == 0, out
     payload = json.loads(out)
     assert payload["schema_version"] == cc.SCHEMA_VERSION
-    assert payload["configuration"]["source"] == "preset:heavy"
+    assert payload["configuration"]["source"] == "level:deep"
     assert payload["all_exhausted"] is False
 
 
@@ -1152,7 +1152,7 @@ def test_cli_capacity_check_text():
     with _env(live={"codex"}):
         rc, out = _run_cli(["capacity-check", "--preset", "heavy"])
     assert rc == 0, out
-    assert "preset:heavy" in out and "all_exhausted=false" in out, out
+    assert "level:deep" in out and "all_exhausted=false" in out, out
 
 
 def test_help_capacity_topic_documents_the_contract():

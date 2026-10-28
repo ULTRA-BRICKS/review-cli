@@ -141,6 +141,34 @@ def test_codex_weekly_limit_is_read_in_the_local_zone():
     assert found is not None and found.source == "reset-time" and found.until == until
 
 
+def _codex_reset_with_wall_clock(text, wall_clock):
+    from unittest.mock import patch
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return wall_clock if tz is None else wall_clock.astimezone(tz)
+
+    with patch.object(availability, "datetime", Clock):
+        return availability.parse_reset_time(text, now=wall_clock.timestamp())
+
+
+def test_codex_reset_uses_target_offset_after_autumn_transition():
+    with _local_zone("Europe/Belgrade"):
+        found = _codex_reset_with_wall_clock(
+            CODEX_WEEKLY, datetime(2026, 10, 24, 12)
+        )
+    assert found == datetime(2026, 10, 30, 17, 43, tzinfo=timezone.utc).timestamp()
+
+
+def test_codex_reset_uses_target_offset_after_spring_transition():
+    with _local_zone("Europe/Belgrade"):
+        found = _codex_reset_with_wall_clock(
+            "try again at Mar 30th, 2026 6:43 PM", datetime(2026, 3, 27, 12)
+        )
+    assert found == datetime(2026, 3, 30, 16, 43, tzinfo=timezone.utc).timestamp()
+
+
 def test_codex_reset_ordinals_and_midnight_noon_edges():
     with _local_zone("UTC"):
         for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (11, "th"), (30, "th")):
@@ -164,6 +192,8 @@ def test_codex_reset_in_the_past_or_malformed_is_not_a_window():
             "try again at Foo 30th, 2026 6:43 PM",
             "try again at Oct 32nd, 2026 6:43 PM",
             "try again at Oct 30th, 2026 13:43 PM",
+            "try again at Jan 1st, 0001 1:00 AM",
+            "try again at Dec 31st, 9999 11:00 PM",
         ):
             assert availability.parse_reset_time(bad, now=NOW) is None
             found = availability.classify("", "usage limit; " + bad, 1, now=NOW)

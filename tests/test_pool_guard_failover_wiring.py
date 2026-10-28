@@ -107,7 +107,6 @@ def test_guard_proceeds_when_only_a_failover_alternate_is_live():
         rc = cli._evaluate_pool_or_bail(
             config={},
             config_models=[],
-            config_has_board=False,
             user_seats=(("glm53", "glm53"),),
             explicit_models=["glm53"],
             pool_arg=None,
@@ -127,7 +126,6 @@ def test_guard_still_bails_when_every_provider_in_the_chain_is_down():
         rc = cli._evaluate_pool_or_bail(
             config={},
             config_models=[],
-            config_has_board=False,
             user_seats=(("glm53", "glm53"),),
             explicit_models=["glm53"],
             pool_arg=None,
@@ -153,7 +151,6 @@ def test_guard_synthesizes_a_reason_when_the_head_reason_is_blank():
             rc = cli._evaluate_pool_or_bail(
                 config={},
                 config_models=[],
-                config_has_board=False,
                 user_seats=(("glm53", "glm53"),),
                 explicit_models=["glm53"],
                 pool_arg=None,
@@ -185,7 +182,6 @@ def test_guard_bails_on_one_live_seat_against_the_real_default_board_without_the
         rc = cli._evaluate_pool_or_bail(
             config={},
             config_models=[],
-            config_has_board=True,
             user_seats=board_seats,
             explicit_models=[],
             pool_arg=3,
@@ -203,7 +199,9 @@ def test_guard_proceeds_on_one_live_seat_against_the_real_default_board_with_reu
     from reviewlib.config import DEFAULT_BOARD
 
     board_seats = tuple((r.model, r.display) for r in DEFAULT_BOARD)
-    assert any(r.role for r in DEFAULT_BOARD), "sanity: DEFAULT_BOARD carries role metadata"
+    assert any(r.role for r in DEFAULT_BOARD), (
+        "sanity: DEFAULT_BOARD carries role metadata"
+    )
 
     def _available(model: str) -> bool:
         return model == "codex:gpt-6-luna"
@@ -214,7 +212,6 @@ def test_guard_proceeds_on_one_live_seat_against_the_real_default_board_with_reu
         rc = cli._evaluate_pool_or_bail(
             config={},
             config_models=[],
-            config_has_board=True,
             user_seats=board_seats,
             explicit_models=[],
             pool_arg=3,
@@ -266,7 +263,9 @@ def test_pool_zero_with_one_live_seat_still_bails_end_to_end():
             subprocess.run(
                 ["git", "config", "user.email", "t@t"], cwd=str(repo), check=True
             )
-            subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "t"], cwd=str(repo), check=True
+            )
             (repo / "f.txt").write_text("x\n")
             subprocess.run(["git", "add", "f.txt"], cwd=str(repo), check=True)
             with redirect_stderr(err), redirect_stdout(io.StringIO()):
@@ -329,7 +328,9 @@ def test_unknown_role_board_with_one_live_seat_still_bails_end_to_end():
             subprocess.run(
                 ["git", "config", "user.email", "t@t"], cwd=str(repo), check=True
             )
-            subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "t"], cwd=str(repo), check=True
+            )
             (repo / "f.txt").write_text("x\n")
             subprocess.run(["git", "add", "f.txt"], cwd=str(repo), check=True)
             with redirect_stderr(err), redirect_stdout(io.StringIO()):

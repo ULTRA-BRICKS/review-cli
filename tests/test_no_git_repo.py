@@ -118,7 +118,7 @@ def test_list_defaults_works_outside_repo():
         proc = _run(["--list-defaults"], cwd=d)
         _no_traceback(proc)
         assert proc.returncode == 0, (proc.returncode, proc.stderr)
-        assert "codex" in proc.stdout
+        assert "claude:claude-sonnet-5-5" in proc.stdout
 
 
 def test_show_board_works_outside_repo():
@@ -126,7 +126,7 @@ def test_show_board_works_outside_repo():
         proc = _run(["--show-board"], cwd=d)
         _no_traceback(proc)
         assert proc.returncode == 0, (proc.returncode, proc.stderr)
-        assert "source: preset:light" in proc.stdout
+        assert "source: level:routine" in proc.stdout
 
 
 def test_help_works_outside_repo():

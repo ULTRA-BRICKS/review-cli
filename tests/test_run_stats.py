@@ -1105,9 +1105,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
     from reviewlib import backends as _backends
     from reviewlib.config import (
         DEFAULT_BOARD,
-        DEFAULT_PRESET_BOARD,
-        HEAVY_PRESET_BOARD,
-        LIGHT_PRESET_BOARD,
+        preset_board,
     )
     from reviewlib.modes import review as _review_mode
 
@@ -1141,12 +1139,8 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
 
         def _load_board(_cfg, **kw):
             preset = kw.get("preset")
-            if preset == "default":
-                return list(DEFAULT_PRESET_BOARD)
-            if preset == "heavy":
-                return list(HEAVY_PRESET_BOARD)
-            if preset == "light":
-                return list(LIGHT_PRESET_BOARD)
+            if preset:
+                return preset_board(preset)
             return list(DEFAULT_BOARD)
 
         _cli.load_board = _load_board
@@ -1198,6 +1192,34 @@ def test_cli_default_board_run_records_preset_pool_size():
     assert r["pool_size"] == 3, r  # the sliced, ship-floored board
     assert len(r["models"]) == 3, r
     assert "[review] pool=3 (review)" in r["_stderr"]
+    assert r["level"] == "routine", r  # the level used is recorded (review-cli#697)
+
+
+def test_cli_explicit_level_is_recorded_in_run_stats():
+    """`--level deep` (and its `--preset heavy` spelling) records the canonical level."""
+    for flag, value in (("--level", "deep"), ("--preset", "heavy")):
+        r = _run_board_review_and_get_record([flag, value])
+        assert r["level"] == "deep", (flag, r)
+        assert r["pool_size"] == 4, r
+
+
+def test_record_run_level_field_is_additive_and_omitted_when_unknown():
+    with _TmpStore() as store:
+        assert _stats.record_run(
+            mode="review", models=["m"], duration_seconds=1.0, ok_count=1, fail_count=0
+        )
+        assert _stats.record_run(
+            mode="review",
+            models=["m"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            level="standard",
+        )
+        old, new = store.records()
+    assert "level" not in old, old  # pre-levels records and config-roster runs
+    assert new["level"] == "standard", new
+    assert new["v"] == old["v"], (old, new)  # additive: no STATS_VERSION bump
 
 
 def test_cli_default_board_run_records_roles_review_cli_221():
@@ -1341,9 +1363,7 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
     from reviewlib import backends as _backends
     from reviewlib.config import (
         DEFAULT_BOARD,
-        DEFAULT_PRESET_BOARD,
-        HEAVY_PRESET_BOARD,
-        LIGHT_PRESET_BOARD,
+        preset_board,
     )
     from reviewlib.modes import review as _review_mode
 
@@ -1368,12 +1388,8 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
 
         def _load_board(_cfg, **kw):
             preset = kw.get("preset")
-            if preset == "default":
-                return list(DEFAULT_PRESET_BOARD)
-            if preset == "heavy":
-                return list(HEAVY_PRESET_BOARD)
-            if preset == "light":
-                return list(LIGHT_PRESET_BOARD)
+            if preset:
+                return preset_board(preset)
             return list(DEFAULT_BOARD)
 
         _cli.load_board = _load_board
@@ -1412,27 +1428,23 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
 def test_cli_failover_backfill_records_actual_models_not_planned():
     """When a startup-pool seat FAILS mid-run, the CLI must record the models that
     ACTUALLY produced verdicts (a backfilled reserve under its real id), not the planned
-    pool. review-cli#286: Fable is demoted to last-resort in DEFAULT_BOARD and excluded
-    from HEAVY_PRESET_BOARD entirely, so heavy pool 4 is now [Sol, Opus, GLM-cc, Kimi];
-    the top seat (Sol) fails, Astra (the next reserve seat) backfills, and the record
+    pool. The `deep` level's pool 4 is Opus/Sol/Sonnet/Grok; the `consistency` seat (Sol)
+    fails, Astra (the same-role reserve of the SAME level) backfills, and the record
     excludes Sol while keeping pool_size 4."""
-    from reviewlib.config import ASTRA_SEAT
+    from reviewlib.config import ASTRA_SEAT, GROK_SEAT, SONNET_SEAT
 
-    # Sol (priority #1 in the heavy pool of 4, now that Fable is excluded) fails;
-    # everything else succeeds.
     resolver = _stub_resolve_backend({"codex:gpt-6.1-sol": 1})
     r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
     assert r["_rc"] == 0, r
     assert r["mode"] == "review"
     assert r["pool_size"] == 4, r  # backfilled back up to 4
-    # Full set, not individual `in` checks: Kimi is now a PLANNED pool seat (heavy pool 4
-    # is Sol/Opus/GLM-cc/Kimi post-exclusion), so a regression where Kimi also silently
-    # failed and the NEXT reserve backfilled instead would pass a partial `in`-only check.
+    # Full set, not individual `in` checks: a regression where another seat also silently
+    # failed and a different reserve backfilled instead would pass a partial `in`-only check.
     assert set(r["models"]) == {
         "claude:claude-opus-5-5",
-        "commandcode:zai-org/GLM-5.3",
-        "oc:commandcode/moonshotai/Kimi-K3",
-        ASTRA_SEAT,  # the promoted reserve (#5, post-exclusion), by its real id
+        SONNET_SEAT,
+        GROK_SEAT,
+        ASTRA_SEAT,  # the promoted same-role reserve, by its real id
     }, r
     assert "claude:claude-fable-5-1" not in r["models"], r
     assert "codex:gpt-6.1-sol" not in r["models"], r  # the failed seat, not backfilled
@@ -1446,7 +1458,7 @@ def test_cli_failover_exhausted_reserve_reuses_the_only_healthy_seat():
     run succeeds with a full pool of DISTINCT roles, all from that model."""
     from reviewlib.config import DEFAULT_BOARD
 
-    ok = {"claude:claude-opus-5-5"}
+    ok = {"claude:claude-sonnet-5-5"}  # a seat of the default (routine) level
     resolver = _stub_resolve_backend(
         {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
     )
@@ -6219,6 +6231,45 @@ def test_cli_check_min_roles_governs_gate_when_given_review_cli_221():
             rc2 = _cli.main(["task", TASK, "--check", "--min-models", "3"])
         assert rc2 != 0, out2.getvalue()
         assert "2/3 distinct models" in out2.getvalue()
+
+
+def test_cli_check_reports_three_roles_and_two_models_text_and_json_review_cli_697():
+    """Distinct-role vs distinct-model proof (review-cli#697): one history of 3 roles on
+    2 models passes the role floor and states BOTH counts, in text and in --json; the
+    model floor (--min-models 3) is unchanged and still fails on the same history."""
+    import json
+
+    with _TmpStore():
+        for model, role in (
+            ("codex", "correctness"),
+            ("gemini", "security"),
+            ("codex", "tests"),
+        ):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                roles=[role],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc == 0, out.getvalue()
+        assert "3 distinct role" in out.getvalue(), out.getvalue()
+        assert "models: 2 distinct model" in out.getvalue(), out.getvalue()
+        js = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(js):
+            rc = _cli.main(["task", TASK, "--check", "--json"])
+        payload = json.loads(js.getvalue())
+        assert rc == 0 and payload["passed"] is True, payload
+        assert payload["distinct_roles_passed"] == 3, payload
+        assert payload["distinct_models_passed"] == 2, payload
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            assert _cli.main(["task", TASK, "--check", "--min-models", "3"]) != 0
 
 
 def test_cli_check_min_roles_not_met_shows_model_audit_line_review_cli_221():
