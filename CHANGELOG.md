@@ -3,6 +3,21 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.2 — 2026-10-28
+
+- **Feat(seats): per-seat account, usage, cap, reset and reason**
+  ([review-cli#707](https://git.hyperide.ai/ultrabricks/review-cli/issues/707)).
+  `review seats` prints a SEAT ACCOUNTS section: for every seat its status
+  (`usable` / `refused` / `unusable`), the account it would use (the omp Anthropic account
+  with the lowest 5-hour/7-day usage below the cap, for `omp:anthropic/*` seats and for
+  `claude:*` seats answering through omp), that account's 5h and 7d usage, the cap, the
+  reset time and the reason; `--json` carries the same as `seats[].account`. A refusal
+  names its rule: `ограничение review-cli (config <key>=80): аккаунт X использован на 83%
+  окна 5ч, сброс в HH:MM; другой аккаунт доступен: Y`, `все аккаунты выше порога ...`, or
+  `лимит провайдера (omp block / 429) ... это не ограничение review-cli` for an account the
+  provider rate-limited; unknown, incomplete or stale usage is refused conservatively and
+  says so. Seats on an executor with no usage reading say `usage неизвестен` instead of 0%.
+
 ## 0.66.1 — 2026-10-28
 
 - **Fix(config): an unreadable config.yaml is a loud error, not silent defaults**

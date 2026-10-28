@@ -64,6 +64,14 @@ number of working reviewers even when models drop:
   policy with no account list to apply it to fails it too, and while an exclude list is
   set an account without a known email is skipped. `review seats` shows the seat
   UNUSABLE, the policy and each account's skip reason.
+- **Per-seat account view (review-cli#707)** — `review seats` also prints SEAT ACCOUNTS, one
+  row per seat: status, the account the seat would use (lowest 5-hour/7-day usage below the
+  cap), both usages, the cap, the reset time and the reason. A cap refusal reads
+  `ограничение review-cli (config omp_accounts.max_usage_percent=80): аккаунт X использован
+  на 83% окна 5ч, сброс в HH:MM; другой аккаунт доступен: Y` (or `все аккаунты выше порога`),
+  a provider rate limit reads `лимит провайдера (omp block / 429) ... это не ограничение
+  review-cli`, and usage that is unknown or stale is refused conservatively. Seats whose
+  executor has no usage reading print `usage неизвестен`.
 - **Claude CLI -> omp twin (review-cli#594)** — every `claude:claude-X` seat has
   `omp:anthropic/claude-X` (the same model through omp's own, separately logged-in
   Anthropic accounts) as its next executor, and the reverse. When the Claude CLI fails on

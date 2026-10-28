@@ -198,6 +198,12 @@ def _seat_status_report(_api, /, *, as_json: bool) -> int:
     logins = harness_accounts.discover()
     omp_pool = omp_pool_state()
     seats = [(r, seat_health(r.model, accounts, omp_pool=omp_pool)) for r in board]
+    from . import seat_accounts
+
+    seat_views = {
+        r.model: seat_accounts.seat_view(r.model, h, omp_pool, now=_api.time.time())
+        for r, h in seats
+    }
 
     if as_json:
         import json as _json
@@ -211,6 +217,7 @@ def _seat_status_report(_api, /, *, as_json: bool) -> int:
                     "usable": h.reason is None,
                     "reason": h.reason,
                     "substitute": h.substitute,
+                    "account": seat_views[r.model].as_json(),
                 }
                 for r, h in seats
             ],
@@ -249,6 +256,13 @@ def _seat_status_report(_api, /, *, as_json: bool) -> int:
         )
     lines.extend(_account_login_line(account) for account in accounts)
     lines.extend(_api._omp_pool_lines(omp_pool))
+    lines.append(
+        "\nSEAT ACCOUNTS (per seat: status, account, 5h and 7d usage, cap = review-cli's own "
+        "ceiling, reset time, reason; usage from `omp usage`, \"?\" = unknown)"
+    )
+    lines.extend(
+        seat_accounts.render_line(r.display, seat_views[r.model]) for r, _h in seats
+    )
     lines.extend(harness_accounts.render(logins))
     lines.append("")
     lines.append(_api.admission.render_status(_api.admission.status_snapshot()))

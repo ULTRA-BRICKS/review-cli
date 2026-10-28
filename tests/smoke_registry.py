@@ -331,6 +331,10 @@ _UNIT_FILES = [
     ("test_help_defaults.py", {}),
     # review-cli#705: an unreadable config.yaml is a loud error, never silent defaults.
     ("test_config_loud.py", {}),
+    # review-cli#707: per-seat account, usage, cap, reset and refusal rule in `review seats`.
+    ("test_seat_budget.py", {}),
+    ("test_seat_accounts.py", {}),
+    ("test_seats_account_table.py", {}),
     ("test_install_hook_text.py", {}),
     ("test_install_state.py", {}),
     ("test_topic_help.py", {}),

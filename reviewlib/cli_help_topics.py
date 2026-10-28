@@ -6,6 +6,7 @@ patch seams remain effective. No model, quota or admission policy changes.
 
 from __future__ import annotations
 
+
 def _help_topic_config(_api, /) -> str:
     """The `review help config` deep reference (ROADMAP "Topic-based help across the
     ecosystem"): config file path + cascade, the keys, key/auth env vars, and how the
@@ -74,6 +75,11 @@ CONFIG FILE
                        REVIEW_OMP_ACCOUNTS_EXCLUDE=a@x.com,b@y.com (at least one email)
                        replaces `exclude`, REVIEW_OMP_MAX_USAGE_PERCENT=90 (not empty)
                        `max_usage_percent`.
+                       `review seats` also prints SEAT ACCOUNTS: per seat its status, the
+                       account it would use (lowest usage below the cap), 5h and 7d usage,
+                       the cap, the reset time and the reason; a refusal names the rule
+                       ("ограничение review-cli (config ...)" vs "лимит провайдера");
+                       usage that is unknown or stale is refused conservatively.
     timeout:           int         per-call timeout seconds for `review diff` (replaces the
                        configured/default request timeout; still overrideable
                        per-invocation by --timeout). Review/panel agent CLI backends treat
