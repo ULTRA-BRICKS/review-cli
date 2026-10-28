@@ -26,8 +26,12 @@ SEVEN_RESET_MS = int(
 
 def windows(five, seven, fable=None):
     out = [
-        omp_accounts.UsageWindow("Claude 5 Hour", five / 100, FIVE_RESET_MS),
-        omp_accounts.UsageWindow("Claude 7 Day", seven / 100, SEVEN_RESET_MS),
+        omp_accounts.UsageWindow(
+            "Claude 5 Hour", five / 100, FIVE_RESET_MS, observed_at_ms=NOW_MS
+        ),
+        omp_accounts.UsageWindow(
+            "Claude 7 Day", seven / 100, SEVEN_RESET_MS, observed_at_ms=NOW_MS
+        ),
     ]
     if fable is not None:
         out.append(
@@ -203,14 +207,14 @@ def test_json_is_serialisable_and_has_no_secret_fields():
 
 def test_table_line_shows_all_columns():
     v = view(SONNET, pool([state(2, "b@x", 5, 29)]))
-    line = seat_accounts.render_line("Sonnet-omp", v)
+    line = seat_accounts.render_line("Sonnet-omp", v, tz=timezone.utc)
     for fragment in ("Sonnet-omp", "usable", "b@x", "5h 5%", "7d 29%", "cap 80%"):
         assert fragment in line
 
 
 def test_table_line_for_refusal_shows_reset_and_reason():
     v = view(SONNET, pool([state(1, "a@x", 83, 10)]))
-    line = seat_accounts.render_line("Sonnet-omp", v)
+    line = seat_accounts.render_line("Sonnet-omp", v, tz=timezone.utc)
     assert (
         "refused" in line and "сброс 03:30" in line and "ограничение review-cli" in line
     )

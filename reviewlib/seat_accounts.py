@@ -13,8 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import tzinfo
 
-from . import account_cap, omp_accounts, seat_budget
+from . import account_cap, seat_budget
 from .seat_health import OmpAccountState, OmpPoolState, SeatHealth
+from .usage_evidence import confirmed_time
 
 EXECUTOR_OMP = "omp account pool"
 EXECUTOR_CLAUDE_CLI = "claude CLI login"
@@ -29,7 +30,6 @@ _NO_READING = (
     "usage неизвестен: у этого исполнителя нет читаемого usage, "
     "ограничение review-cli к нему не применимо"
 )
-_LABEL_KEYS = {"5 hour": "5h", "7 day": "7d"}
 _GLOBAL_CAP_KEY = "omp_accounts.max_usage_percent"
 
 
@@ -85,18 +85,7 @@ def _windows(
 ) -> tuple[seat_budget.Window, ...] | None:
     if state.usage is None or not state.account.email:
         return None
-    out = []
-    for w in state.usage:
-        if w.tier and not omp_accounts.tier_applies(w.tier, omp_model):
-            continue
-        base = w.label.removeprefix("Claude ").split("(")[0].strip().lower()
-        key = _LABEL_KEYS.get(base, base)
-        if w.tier:
-            key = f"{key}-{w.tier}"
-        resets = None if w.resets_at_ms is None else w.resets_at_ms / 1000
-        # round away binary float noise (0.29 * 100 = 28.999...) so 29% reads as 29
-        out.append(seat_budget.Window(key, round(w.used_fraction * 100, 6), resets))
-    return tuple(out)
+    return account_cap.omp_windows_to_budget(state.usage, omp_model)
 
 
 def _provider_block(state: OmpAccountState, omp_model: str, now: float):
@@ -117,10 +106,11 @@ def _provider_block(state: OmpAccountState, omp_model: str, now: float):
 def _reading(state: OmpAccountState, pool: OmpPoolState, omp_model: str, now: float):
     cap, key = _cap(pool, state.account.email)
     block_until, block_reason = _provider_block(state, omp_model, now)
+    observed = confirmed_time(state.usage, int(now * 1000))
     return seat_budget.AccountReading(
         name=state.account.label,
-        windows=_windows(state, omp_model),
-        read_at=now,
+        windows=_windows(state, omp_model) if observed is not None else None,
+        read_at=observed,
         provider_block_until=block_until,
         provider_block_reason=block_reason,
         cap_percent=cap,
@@ -237,10 +227,13 @@ def _claude_cli_view(seat, pool, cap, now, tz) -> SeatAccountView:
     windows = ((pool.usage if pool is not None else None) or {}).get(
         (email or "").lower()
     )
+    observed = confirmed_time(windows, int(now * 1000))
     reading = seat_budget.AccountReading(
         name=email or "claude (аккаунт по умолчанию)",
-        windows=account_cap.omp_windows_to_budget(windows, seat.split(":", 1)[-1]),
-        read_at=now,
+        windows=account_cap.omp_windows_to_budget(windows, seat.split(":", 1)[-1])
+        if observed is not None
+        else None,
+        read_at=observed,
     )
     verdict = seat_budget.judge(
         reading,

@@ -182,6 +182,11 @@ def omp_pool_state(*, now: float | None = None) -> OmpPoolState:
     if accounts is None:
         return OmpPoolState(launcher, problem, db, None, policy)
     usage = omp_accounts.usage_by_email(launcher) if launcher and accounts else None
+    # A live provider read may finish after the initial snapshot clock. Do not
+    # classify its real observation timestamp as future; explicit test clocks stay fixed.
+    if now is None:
+        moment = time.time()
+        now_ms = int(moment * 1000)
     states = []
     for account in accounts:
         cooldown = seat_cooldown.active_cooldown(

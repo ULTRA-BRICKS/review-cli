@@ -9,9 +9,10 @@ overrides it, `off` disables it and says so) is enforced before any paid dispatc
     sets one (those stay the more specific word);
   * the direct `claude` CLI seat -- `claude_refusal`, called per registered account before
     the CLI is spawned. The reading is the matching account's: omp's `omp usage` windows by
-    email and the harness card for that account. Either one at or over the cap refuses;
-    with no reading at all the account is refused CONSERVATIVELY and the message says so,
-    because an account whose usage cannot be confirmed is not assumed to be below the cap.
+    email. Admission needs both shared windows from ONE provider observation, at most
+    30 minutes old and not future-dated. Partial reports are never combined. A high harness
+    summary can conservatively refuse, but a low scalar does not prove account identity,
+    both windows or source freshness and therefore cannot authorize a call.
 
 A refusal always says it is review-cli's own rule (`ограничение review-cli (config KEY=N)`)
 with the account, the observed percent and window and, when known, the reset time; it never
@@ -30,6 +31,7 @@ from dataclasses import dataclass
 from datetime import tzinfo
 
 from . import omp_accounts, seat_budget
+from .usage_evidence import MAX_OBSERVATION_AGE_MS, confirmed_time, observation_problem
 
 CONFIG_KEY = "account_usage_cap_percent"
 ENV = "REVIEW_ACCOUNT_USAGE_CAP_PERCENT"
@@ -134,6 +136,8 @@ def omp_windows_to_budget(
         return None
     out = []
     for w in windows:
+        if not w.shared and not w.tier:
+            continue
         if w.tier and not omp_accounts.tier_applies(w.tier, omp_model):
             continue
         base = w.label.removeprefix("Claude ").split("(")[0].strip().lower()
@@ -170,26 +174,28 @@ def claude_refusal(
     if cap_percent is None:
         return None
     name = email or "claude (аккаунт по умолчанию)"
-    confirmed = False
-    budget_windows = omp_windows_to_budget(omp_windows, model.split(":", 1)[-1])
-    if budget_windows is not None:
-        verdict = seat_budget.judge(
-            seat_budget.AccountReading(name=name, windows=budget_windows, read_at=now),
-            cap_percent=cap_percent,
-            cap_key=CONFIG_KEY,
-            now=now,
-            tz=tz,
+    # A high summary is a conservative veto. A low scalar has neither source age
+    # nor a complete same-account window pair and must never authorize spending.
+    if harness_percent is not None and harness_percent >= cap_percent:
+        return (
+            f"ограничение review-cli (config {CONFIG_KEY}="
+            f"{seat_budget.percent_text(cap_percent)}): аккаунт {name} использован на "
+            f"{seat_budget.percent_text(harness_percent)}% (по harness, наибольшего из "
+            "окон 5ч/7д)"
         )
-        if verdict.state == seat_budget.OVER_CAP:
-            return verdict.reason
-        confirmed = verdict.state == seat_budget.OK
-    if harness_percent is not None:
-        if harness_percent >= cap_percent:
-            return (
-                f"ограничение review-cli (config {CONFIG_KEY}="
-                f"{seat_budget.percent_text(cap_percent)}): аккаунт {name} использован на "
-                f"{seat_budget.percent_text(harness_percent)}% (по harness, наибольшего из "
-                "окон 5ч/7д)"
-            )
-        confirmed = True
-    return None if confirmed else _unknown_text(name, cap_percent)
+    problem = observation_problem(omp_windows, int(now * 1000))
+    if problem is not None:
+        return f"{_unknown_text(name, cap_percent)}: {problem}"
+    budget_windows = omp_windows_to_budget(omp_windows, model.split(":", 1)[-1])
+    observed_at = confirmed_time(omp_windows, int(now * 1000))
+    verdict = seat_budget.judge(
+        seat_budget.AccountReading(
+            name=name, windows=budget_windows, read_at=observed_at
+        ),
+        cap_percent=cap_percent,
+        cap_key=CONFIG_KEY,
+        now=now,
+        tz=tz,
+        max_age_seconds=MAX_OBSERVATION_AGE_MS / 1000,
+    )
+    return None if verdict.state == seat_budget.OK else verdict.reason

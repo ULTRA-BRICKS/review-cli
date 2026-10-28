@@ -35,10 +35,13 @@ import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+
+from .usage_evidence import observation_problem
 
 # `omp token --account N` and agent.db's `auth_credentials.provider` spell it this way;
 # omp's rate-limit blocks for the provider live under this `provider_key`.
@@ -101,6 +104,24 @@ def _identity_email(identity_key: object) -> str | None:
     return None
 
 
+def _credential_blocks(conn, now: int) -> dict[int, list[tuple[str, int]]]:
+    blocks: dict[int, list[tuple[str, int]]] = {}
+    try:
+        for cred_id, scope, until in conn.execute(
+            "SELECT credential_id, block_scope, MAX(blocked_until_ms) "
+            "FROM auth_credential_blocks WHERE provider_key = ? AND blocked_until_ms > ? "
+            "GROUP BY credential_id, block_scope",
+            (_BLOCK_PROVIDER_KEY, now),
+        ):
+            until_ms = _finite_int(until)
+            if isinstance(cred_id, int) and until_ms is not None:
+                label = scope if isinstance(scope, str) else ""
+                blocks.setdefault(cred_id, []).append((label, until_ms))
+    except sqlite3.OperationalError:
+        pass  # Older omp schema has no block table.
+    return blocks
+
+
 def anthropic_accounts(
     db: Path, *, now_ms: int | None = None
 ) -> list[OmpAccount] | None:
@@ -131,20 +152,7 @@ def anthropic_accounts(
         except sqlite3.OperationalError:
             # an older agent.db without the identity_key column: ids only
             rows = conn.execute(query.format(identity="NULL"), (PROVIDER,)).fetchall()
-        blocks: dict[int, list[tuple[str, int]]] = {}
-        try:
-            for cred_id, scope, until in conn.execute(
-                "SELECT credential_id, block_scope, MAX(blocked_until_ms) "
-                "FROM auth_credential_blocks WHERE provider_key = ? AND blocked_until_ms > ? "
-                "GROUP BY credential_id, block_scope",
-                (_BLOCK_PROVIDER_KEY, now),
-            ):
-                until_ms = _finite_int(until)
-                if isinstance(cred_id, int) and until_ms is not None:
-                    label = scope if isinstance(scope, str) else ""
-                    blocks.setdefault(cred_id, []).append((label, until_ms))
-        except sqlite3.OperationalError:
-            pass  # no block table in this omp version: nothing is blocked
+        blocks = _credential_blocks(conn, now)
     except sqlite3.Error:
         return None
     finally:
@@ -453,6 +461,73 @@ class UsageWindow:
     used_fraction: float
     resets_at_ms: int | None
     tier: str | None = None
+    # Preserve provider time through caches; reading the cache must not refresh it.
+    observed_at_ms: int | None = field(default=None, compare=False)
+    shared: bool = field(default=True, compare=False)
+
+
+def _report_window(limit, observed: int | None) -> UsageWindow | None:
+    if not isinstance(limit, dict):
+        return None
+    amount, window = limit.get("amount"), limit.get("window")
+    used = amount.get("usedFraction") if isinstance(amount, dict) else None
+    if _finite_int(used) is None or used < 0:
+        return None
+    resets = window.get("resetsAt") if isinstance(window, dict) else None
+    scope = limit.get("scope")
+    tier = scope.get("tier") if isinstance(scope, dict) else None
+    return UsageWindow(
+        label=str(limit.get("label") or limit.get("id") or "?"),
+        used_fraction=float(used),
+        resets_at_ms=_finite_int(resets),
+        tier=tier if isinstance(tier, str) and tier else None,
+        observed_at_ms=observed,
+        shared=not isinstance(scope, dict) or scope.get("shared", True) is True,
+    )
+
+
+def _report_windows(report: dict, observed: int | None) -> list[UsageWindow]:
+    limits = report.get("limits")
+    windows = []
+    for limit in limits if isinstance(limits, list) else []:
+        window = _report_window(limit, observed)
+        if window is not None:
+            windows.append(window)
+    return windows
+
+
+def _select_observation(previous, observed, windows):
+    """Choose one whole report; never union partial reports into invented evidence."""
+    if previous is None:
+        return observed, windows
+    old_stamp, old_windows = previous
+    if observed is None or old_stamp is None:
+        return None, []  # Cannot establish which observation is current.
+    if observed > old_stamp:
+        return observed, windows
+    if observed == old_stamp and [vars(w) for w in windows] != [
+        vars(w) for w in old_windows
+    ]:
+        return observed, []  # Conflicting observations of the same claimed instant.
+    return previous
+
+
+def _read_usage_reports(reports) -> dict[str, list[UsageWindow]]:
+    selected = {}
+    for report in reports if isinstance(reports, list) else []:
+        if not isinstance(report, dict) or report.get("provider") != PROVIDER:
+            continue
+        metadata = report.get("metadata")
+        email = metadata.get("email") if isinstance(metadata, dict) else None
+        if not isinstance(email, str) or not email.strip():
+            continue
+        key = email.strip().lower()
+        observed = _finite_int(report.get("fetchedAt"))
+        if observed is not None and observed <= 0:
+            observed = None
+        windows = _report_windows(report, observed)
+        selected[key] = _select_observation(selected.get(key), observed, windows)
+    return {email: windows for email, (_stamp, windows) in selected.items()}
 
 
 def usage_by_email(launcher: OmpLauncher) -> dict[str, list[UsageWindow]] | None:
@@ -475,38 +550,7 @@ def usage_by_email(launcher: OmpLauncher) -> dict[str, list[UsageWindow]] | None
         return None
     if not isinstance(data, dict):
         return None
-    out: dict[str, list[UsageWindow]] = {}
-    reports = data.get("reports")
-    for report in reports if isinstance(reports, list) else []:
-        if not isinstance(report, dict) or report.get("provider") != PROVIDER:
-            continue
-        metadata = report.get("metadata")
-        email = metadata.get("email") if isinstance(metadata, dict) else None
-        if not isinstance(email, str):
-            continue
-        windows = []
-        limits = report.get("limits")
-        for limit in limits if isinstance(limits, list) else []:
-            if not isinstance(limit, dict):
-                continue
-            amount, window = limit.get("amount"), limit.get("window")
-            used = amount.get("usedFraction") if isinstance(amount, dict) else None
-            if _finite_int(used) is None:
-                continue
-            resets = window.get("resetsAt") if isinstance(window, dict) else None
-            scope = limit.get("scope")
-            tier = scope.get("tier") if isinstance(scope, dict) else None
-            windows.append(
-                UsageWindow(
-                    label=str(limit.get("label") or limit.get("id") or "?"),
-                    used_fraction=float(used),
-                    resets_at_ms=_finite_int(resets),
-                    tier=tier if isinstance(tier, str) and tier else None,
-                )
-            )
-        # a second report for the same email adds its windows instead of replacing them
-        out.setdefault(email.lower(), []).extend(windows)
-    return out
+    return _read_usage_reports(data.get("reports"))
 
 
 def utc_stamp(epoch_ms: float) -> str:
@@ -528,7 +572,7 @@ class AccountPolicy:
     """Which of omp's Anthropic accounts an omp:anthropic seat may take. `exclude` holds
     lower-cased emails that are never taken. An account with a usage window at or above
     its threshold (percent: its `per_account` entry, else `max_usage_percent`) waits for
-    that window's reset; unknown usage never skips. `problems` are invalid settings: while
+    that window's reset; missing or stale evidence refuses while a cap is configured. `problems` are invalid settings: while
     one exists the pool is not used, because the intended exclusions cannot be trusted."""
 
     exclude: tuple[str, ...] = ()
@@ -570,7 +614,8 @@ class AccountPolicy:
         return [
             (w, threshold)
             for w in usage
-            if w.used_fraction >= threshold / 100
+            if (w.shared or w.tier is not None)
+            and w.used_fraction >= threshold / 100
             and (w.resets_at_ms is None or w.resets_at_ms > now_ms)
         ]
 
@@ -595,7 +640,13 @@ class AccountPolicy:
             for w, threshold in self._over_limit(account, usage, now_ms)
             if tier_applies(w.tier, omp_model)
         ]
-        return "OVER LIMIT (" + "; ".join(over) + ")" if over else None
+        if over:
+            return "OVER LIMIT (" + "; ".join(over) + ")"
+        if self.threshold_for(account.email) is not None:
+            problem = observation_problem(usage, now_ms)
+            if problem is not None:
+                return f"USAGE UNKNOWN (review-cli account cap: {problem})"
+        return None
 
     def tier_over_limit(
         self, account: OmpAccount, usage: list[UsageWindow] | None, now_ms: int
@@ -712,55 +763,79 @@ def _config_per_account(accounts: object) -> tuple[dict[str, float], list[str]]:
     return out, problems
 
 
-def account_policy(raw: object, env: Mapping[str, str]) -> AccountPolicy:
-    """The policy from config.yaml's `omp_accounts:` value `raw` (None when absent) and the
-    env overrides: `$REVIEW_OMP_ACCOUNTS_EXCLUDE` (comma-separated emails, at least one)
-    replaces the exclude list and `$REVIEW_OMP_MAX_USAGE_PERCENT` the global threshold;
-    a config value an env override replaces is not validated. Invalid values are collected
-    in `problems`, never silently dropped."""
-    problems: list[str] = []
-    exclude: tuple[str, ...] = ()
-    max_percent: float | None = None
-    per_account: dict[str, float] = {}
-    exclude_source = max_source = ""
+def _policy_mapping(raw: object, problems: list[str]) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        problems.append(f"{_CONFIG_WHERE} must be a mapping, got {raw!r}")
+        return {}
+    unknown = sorted(str(k) for k in raw if k not in _POLICY_KEYS)
+    if unknown:
+        problems.append(
+            f"{_CONFIG_WHERE}: unknown key {', '.join(unknown)} "
+            f"(known: {', '.join(_POLICY_KEYS)})"
+        )
+    return raw
+
+
+def _configured_exclude(
+    raw: dict, overridden: bool, problems: list[str]
+) -> tuple[tuple[str, ...], str]:
+    if raw.get("exclude") is None or overridden:
+        return (), ""
+    exclude, problem = _config_exclude(raw["exclude"])
+    if problem:
+        problems.append(problem)
+        return exclude, ""
+    return exclude, f"{_CONFIG_WHERE}.exclude"
+
+
+def _configured_max(
+    raw: dict, overridden: bool, problems: list[str]
+) -> tuple[float | None, str]:
+    if raw.get("max_usage_percent") is None or overridden:
+        return None, ""
+    percent, problem = _percent(
+        raw["max_usage_percent"], f"{_CONFIG_WHERE}.max_usage_percent"
+    )
+    if problem:
+        problems.append(problem)
+        return percent, ""
+    return percent, f"{_CONFIG_WHERE}.max_usage_percent"
+
+
+def _configured_accounts(raw: dict, problems: list[str]) -> dict[str, float]:
+    if raw.get("accounts") is None:
+        return {}
+    accounts, found = _config_per_account(raw["accounts"])
+    problems.extend(found)
+    return accounts
+
+
+def _environment_exclude(
+    env: Mapping[str, str], problems: list[str]
+) -> tuple[str, ...]:
     env_tokens = [
         e.strip() for e in (env.get(EXCLUDE_ENV) or "").split(",") if e.strip()
     ]
-    env_exclude = tuple(
-        dict.fromkeys(e.lower() for e in env_tokens if _is_email_token(e))
-    )
+    result = tuple(dict.fromkeys(e.lower() for e in env_tokens if _is_email_token(e)))
     problems.extend(
         f"${EXCLUDE_ENV}: {e!r} is not an email"
         for e in env_tokens
         if not _is_email_token(e)
     )
+    return result
+
+
+def account_policy(raw: object, env: Mapping[str, str]) -> AccountPolicy:
+    """Resolve settings and explicit env overrides without dropping validation errors."""
+    problems: list[str] = []
+    env_exclude = _environment_exclude(env, problems)
     env_max = (env.get(MAX_USAGE_ENV) or "").strip()
-    if raw is not None and not isinstance(raw, dict):
-        problems.append(f"{_CONFIG_WHERE} must be a mapping, got {raw!r}")
-    elif isinstance(raw, dict):
-        unknown = sorted(str(k) for k in raw if k not in _POLICY_KEYS)
-        if unknown:
-            problems.append(
-                f"{_CONFIG_WHERE}: unknown key {', '.join(unknown)} "
-                f"(known: {', '.join(_POLICY_KEYS)})"
-            )
-        if raw.get("exclude") is not None and not env_exclude:
-            exclude, problem = _config_exclude(raw["exclude"])
-            if problem:
-                problems.append(problem)
-            else:
-                exclude_source = f"{_CONFIG_WHERE}.exclude"
-        if raw.get("max_usage_percent") is not None and not env_max:
-            max_percent, problem = _percent(
-                raw["max_usage_percent"], f"{_CONFIG_WHERE}.max_usage_percent"
-            )
-            if problem:
-                problems.append(problem)
-            else:
-                max_source = f"{_CONFIG_WHERE}.max_usage_percent"
-        if raw.get("accounts") is not None:
-            per_account, account_problems = _config_per_account(raw["accounts"])
-            problems.extend(account_problems)
+    mapping = _policy_mapping(raw, problems)
+    exclude, exclude_source = _configured_exclude(mapping, bool(env_exclude), problems)
+    max_percent, max_source = _configured_max(mapping, bool(env_max), problems)
+    per_account = _configured_accounts(mapping, problems)
     if env_exclude:
         exclude, exclude_source = env_exclude, f"${EXCLUDE_ENV}"
     if env_max:

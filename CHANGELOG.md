@@ -3,6 +3,18 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.6 — 2026-10-28
+
+- Require a fresh, complete same-account five-hour and weekly observation before
+  either the direct Claude route or the OMP pool can spend below its configured cap.
+  Preserve the provider timestamp through caches; refuse missing, future, stale,
+  conflicting and mixed partial reports. Low harness summaries no longer manufacture
+  permission, and account displays use the same observation evidence. Related:
+  [review-cli#720](https://git.hyperide.ai/ultrabricks/review-cli/issues/720).
+- Preserve deliberate cap overrides, tier-specific limits and the exact 80% boundary.
+  Fix the live snapshot clock so a completed usage read is not compared with a time
+  captured before it started. No auth, rate-limit or provider cooldown is cleared.
+
 ## 0.66.5 — 2026-10-28
 
 - **Fix(budget): an account-cap hold starts no seat cooldown**

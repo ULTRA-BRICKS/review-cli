@@ -482,7 +482,7 @@ def _fake_real_omp(path: Path) -> Path:
         f"#!{sys.executable}\n"
         + textwrap.dedent(
             f"""\
-            import json, os, sys
+            import json, os, sys, time
             from pathlib import Path
             args = sys.argv[1:]
             def record(**kw):
@@ -500,13 +500,14 @@ def _fake_real_omp(path: Path) -> Path:
                 print(os.environ["FAKE_OMP_USAGE"])
                 sys.exit(0)
             if args[:1] == ["usage"]:
+                now = int(time.time() * 1000)
                 print(json.dumps({{"reports": [
-                    {{"provider": "anthropic", "metadata": {{"email": "a@example.com"}},
-                      "limits": [{{"label": "Claude 7 Day", "amount": {{"usedFraction": 1.0}},
-                                  "window": {{"resetsAt": 1792292399734}}}}]}},
-                    {{"provider": "anthropic", "metadata": {{"email": "b@example.com"}},
-                      "limits": [{{"label": "Claude 5 Hour", "amount": {{"usedFraction": 0.1}},
-                                  "window": {{}}}}]}}]}}))
+                    {{"provider": "anthropic", "metadata": {{"email": email}}, "fetchedAt": now,
+                      "limits": [{{"label": label, "amount": {{"usedFraction": value}},
+                                  "scope": {{"shared": True}}, "window": {{"resetsAt": now + 86400000}}}}
+                                 for label, value in [("Claude 5 Hour", five), ("Claude 7 Day", seven)]]}}
+                    for email, five, seven in [("a@example.com", 0.1, 1.0), ("b@example.com", 0.1, 0.2)]
+                ]}}))
                 sys.exit(0)
             if "-p" in args:
                 token = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
@@ -822,9 +823,18 @@ def _omp_accounts_config(raw):
         backends.configure_omp_accounts(saved)
 
 
+_WINDOW_OBSERVED_MS = int(time.time() * 1000)
+
+
 def _window(label: str, used: float, *, in_ms: int | None = 3_600_000, tier=None):
     resets = None if in_ms is None else int(time.time() * 1000) + in_ms
-    return omp_accounts.UsageWindow(label, used, resets, tier)
+    return omp_accounts.UsageWindow(
+        label, used, resets, tier, observed_at_ms=_WINDOW_OBSERVED_MS
+    )
+
+
+def _pair(five: float, seven: float = 0.0):
+    return [_window("Claude 5 Hour", five), _window("Claude 7 Day", seven)]
 
 
 def _usage(per_email: dict):
@@ -933,33 +943,20 @@ def test_skip_reason_threshold_reset_tier_and_unknown_usage():
     assert over is not None and over.startswith(
         "OVER LIMIT (5 Hour 90% >= 90%, resets "
     )
-    assert (
-        policy.skip_reason(a, [_window("Claude 5 Hour", 0.89)], _SELECTOR, now_ms)
-        is None
-    )
+    assert policy.skip_reason(a, _pair(0.89), _SELECTOR, now_ms) is None
     # compared unrounded: just under the threshold is under it
-    assert (
-        policy.skip_reason(
-            a, [_window("Claude 5 Hour", 0.899999999)], _SELECTOR, now_ms
-        )
-        is None
-    )
+    assert policy.skip_reason(a, _pair(0.899999999), _SELECTOR, now_ms) is None
     at_29 = omp_accounts.account_policy({"max_usage_percent": 29}, {})
     assert at_29.skip_reason(a, [_window("Claude 5 Hour", 0.29)], None, now_ms)
     reset = [_window("Claude 7 Day", 1.0, in_ms=-1000)]
-    assert policy.skip_reason(a, reset, _SELECTOR, now_ms) is None, (
-        "window already reset"
-    )
+    assert "USAGE UNKNOWN" in policy.skip_reason(a, reset, _SELECTOR, now_ms)
     unknown_reset = policy.skip_reason(
         a, [_window("Claude 7 Day", 0.95, in_ms=None)], None, now_ms
     )
     assert unknown_reset is not None and "reset time unknown" in unknown_reset
-    assert policy.skip_reason(a, None, _SELECTOR, now_ms) is None, "unknown usage"
-    assert (
-        policy.skip_reason(b, [_window("Claude 5 Hour", 0.92)], _SELECTOR, now_ms)
-        is None
-    )
-    fable = [_window("Claude 7 Day (Fable)", 0.97, tier="fable")]
+    assert "USAGE UNKNOWN" in policy.skip_reason(a, None, _SELECTOR, now_ms)
+    assert policy.skip_reason(b, _pair(0.92), _SELECTOR, now_ms) is None
+    fable = [_window("Claude 7 Day (Fable)", 0.97, tier="fable"), *_pair(0.1)]
     assert policy.skip_reason(a, fable, _SELECTOR, now_ms) is None
     assert policy.skip_reason(a, fable, "anthropic/claude-fable-5", now_ms) is not None
     assert policy.tier_over_limit(a, fable, now_ms) == (
@@ -1030,7 +1027,7 @@ def test_policy_fails_closed_without_emails_or_without_accounts():
     assert excluding.skip_reason(nameless, None, _SELECTOR, now_ms) == (
         "EMAIL UNKNOWN (cannot be checked against config.yaml omp_accounts.exclude)"
     )
-    assert capping.skip_reason(nameless, None, _SELECTOR, now_ms) is None
+    assert "USAGE UNKNOWN" in capping.skip_reason(nameless, None, _SELECTOR, now_ms)
     db = Path("/x/agent.db")
     refusal, eligible, _ = omp_accounts.pool_refusal(
         excluding, [], db, None, _SELECTOR, now_ms
@@ -1061,7 +1058,7 @@ def test_policy_emails_with_control_characters_are_refused():
     assert env.exclude == ("a@example.com",)
 
 
-def test_duplicate_usage_reports_for_one_email_keep_every_window():
+def test_duplicate_partial_usage_reports_do_not_merge_windows():
     report = {
         "reports": [
             {
@@ -1086,10 +1083,9 @@ def test_duplicate_usage_reports_for_one_email_keep_every_window():
             argv0=str(fake), real_bin=None, source="PATH"
         )
         usage = omp_accounts.usage_by_email(launcher)
-    assert [w.label for w in usage["a@example.com"]] == [
-        "Claude 5 Hour",
-        "Claude 7 Day",
-    ]
+    assert usage["a@example.com"] == [], (
+        "separate partial reports are not a full reading"
+    )
 
 
 def test_pool_never_fetches_a_token_for_an_excluded_account():
@@ -1118,7 +1114,7 @@ def test_pool_skips_an_account_over_its_threshold_reading_usage_once():
     usage = _usage(
         {
             "a@example.com": [_window("Claude 5 Hour", 0.95)],
-            "b@example.com": [_window("Claude 5 Hour", 0.1)],
+            "b@example.com": _pair(0.1),
         }
     )
     with (
@@ -1142,8 +1138,8 @@ def test_pool_per_account_threshold_wins_and_env_beats_config():
     calls: list = []
     usage = _usage(
         {
-            "a@example.com": [_window("Claude 7 Day", 0.92)],
-            "b@example.com": [_window("Claude 7 Day", 0.5)],
+            "a@example.com": _pair(0.1, 0.92),
+            "b@example.com": _pair(0.1, 0.5),
         }
     )
     config = {
@@ -1174,7 +1170,7 @@ def test_pool_per_account_threshold_wins_and_env_beats_config():
     assert "b@example.com: OVER LIMIT (7 Day 50% >= 40%" in second.stderr
 
 
-def test_pool_with_a_threshold_and_unknown_usage_skips_nothing():
+def test_pool_with_a_threshold_and_unknown_usage_never_dispatches():
     calls: list = []
     usage = _usage(None)
     with (
@@ -1184,8 +1180,8 @@ def test_pool_with_a_threshold_and_unknown_usage_skips_nothing():
         _patched(omp_accounts, access_token=_fake_token([]), usage_by_email=usage),
     ):
         result = backends.review_omp(_MODEL, "prompt", "diff", Path("."), 60)
-    assert usage.reads == [1] and calls == [(2, "tok-2")], (usage.reads, calls)
-    assert result.account == "a@example.com (omp anthropic account 1 of 2)"
+    assert usage.reads == [1] and calls == [], (usage.reads, calls)
+    assert result.returncode != 0 and "USAGE UNKNOWN" in result.stderr
 
 
 def test_status_pool_refusal_counts_a_tier_window_only_for_that_tier():
@@ -1197,7 +1193,12 @@ def test_status_pool_refusal_counts_a_tier_window_only_for_that_tier():
     policy = omp_accounts.account_policy(
         {"max_usage_percent": 90, "exclude": ["b@example.com"]}, {}
     )
-    usage = {"a@example.com": [_window("Claude 7 Day (Fable)", 0.95, tier="fable")]}
+    usage = {
+        "a@example.com": [
+            _window("Claude 7 Day (Fable)", 0.95, tier="fable"),
+            *_pair(0.1),
+        ]
+    }
     states = [
         seat_health.OmpAccountState(x, None, None, omp_accounts.usage_of(usage, x))
         for x in (a, b)
@@ -1265,12 +1266,15 @@ def _usage_report(**used: float) -> str:
                 {
                     "provider": "anthropic",
                     "metadata": {"email": f"{name}@example.com"},
+                    "fetchedAt": _WINDOW_OBSERVED_MS,
                     "limits": [
                         {
-                            "label": "Claude 5 Hour",
+                            "label": label,
                             "amount": {"usedFraction": fraction},
                             "window": {"resetsAt": resets},
+                            "scope": {"shared": True},
                         }
+                        for label in ("Claude 5 Hour", "Claude 7 Day")
                     ],
                 }
                 for name, fraction in used.items()

@@ -28,9 +28,14 @@ def windows(five, seven, *, live=False):
     run through backends, which reads time.time())."""
     five_reset = int((time.time() + 3600) * 1000) if live else int(FIVE_RESET * 1000)
     seven_reset = int((time.time() + 86400) * 1000) if live else int(SEVEN_RESET * 1000)
+    observed = int((time.time() if live else NOW) * 1000)
     return (
-        omp_accounts.UsageWindow("Claude 5 Hour", five / 100, five_reset),
-        omp_accounts.UsageWindow("Claude 7 Day", seven / 100, seven_reset),
+        omp_accounts.UsageWindow(
+            "Claude 5 Hour", five / 100, five_reset, observed_at_ms=observed
+        ),
+        omp_accounts.UsageWindow(
+            "Claude 7 Day", seven / 100, seven_reset, observed_at_ms=observed
+        ),
     )
 
 
@@ -149,11 +154,11 @@ def test_a_reset_window_is_not_a_reading():
     assert "usage неизвестен" in refusal(80, omp=stale)
 
 
-def test_harness_reading_covers_for_an_incomplete_omp_pair():
+def test_harness_scalar_cannot_cover_for_an_incomplete_omp_pair():
     only_five = (
         omp_accounts.UsageWindow("Claude 5 Hour", 0.1, int(FIVE_RESET * 1000)),
     )
-    assert refusal(80, omp=only_five, harness=30.0) is None
+    assert "usage неизвестен" in refusal(80, omp=only_five, harness=30.0)
 
 
 def test_no_cap_means_no_refusal_even_without_a_reading():

@@ -129,6 +129,7 @@ def _usage_json(**pairs):
                 {
                     "provider": "anthropic",
                     "metadata": {"email": f"{name}@example.com"},
+                    "fetchedAt": int(time.time() * 1000),
                     "limits": [
                         {
                             "label": label,
@@ -147,7 +148,7 @@ def _usage_json(**pairs):
     )
 
 
-def _first_token(world, usage):
+def _first_token(world, usage, **extra_env):
     ask = world.review(
         "just-ask",
         "Say hi",
@@ -158,6 +159,7 @@ def _first_token(world, usage):
         "--timeout",
         "60",
         FAKE_OMP_USAGE=usage,
+        **extra_env,
     )
     assert ask.returncode == 0, ask.stdout + ask.stderr
     runs = [c for c in world.calls() if c["kind"] == "run"]
@@ -174,9 +176,12 @@ def test_dispatch_rotates_to_the_other_account_when_readings_flip():
         assert _first_token(world, _usage_json(a=(0.1, 0.2), b=(0.6, 0.5))) == "tok-1"
 
 
-def test_dispatch_without_a_usage_answer_keeps_omps_order():
+def test_explicit_disabled_cap_without_usage_keeps_omps_order():
     with _world() as world:
-        assert _first_token(world, "not json") == "tok-1"
+        assert (
+            _first_token(world, "not json", REVIEW_ACCOUNT_USAGE_CAP_PERCENT="off")
+            == "tok-1"
+        )
 
 
 if __name__ == "__main__":
