@@ -74,6 +74,7 @@ from pathlib import Path as Path
 from typing import TYPE_CHECKING as TYPE_CHECKING, Callable as Callable, Literal as Literal, TextIO as TextIO
 
 from . import admission as admission
+from . import account_budget as account_budget
 from . import backends as backends
 from . import jobs as jobs
 from . import portable as portable

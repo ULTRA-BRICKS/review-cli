@@ -287,6 +287,7 @@ def _resume_session_cli(_api, /, ns: argparse.Namespace) -> int:
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
     backends.configure_omp_bin(config.get("omp_bin"))
     backends.configure_omp_accounts(config.get("omp_accounts"))
+    _api.account_budget.configure(config.get("account_budget"))
 
     try:
         sess = _sessions.find_session(ns.resume)

@@ -547,6 +547,9 @@ class _World:
         wrapper.chmod(0o755)
         self.db = _make_agent_db(root / "agent" / "agent.db")
         self.log = root / "omp-calls.jsonl"
+        # the account budget (review-cli#696) is shipped ON; these #637/#641 worlds test the
+        # pool and the policy without it. A budget test opts in with its own `account_budget:`.
+        _write_config(self, "")
 
     def env(self, **extra: str) -> dict[str, str]:
         state = self.root / "state"
@@ -821,7 +824,9 @@ def _omp_accounts_config(raw):
 
 def _window(label: str, used: float, *, in_ms: int | None = 3_600_000, tier=None):
     resets = None if in_ms is None else int(time.time() * 1000) + in_ms
-    return omp_accounts.UsageWindow(label, used, resets, tier)
+    return omp_accounts.UsageWindow(
+        label, used, resets, tier, observed_at_ms=int(time.time() * 1000) - 1000
+    )
 
 
 def _usage(per_email: dict):
@@ -1004,8 +1009,8 @@ def test_usage_reads_tiers_and_matches_emails_case_insensitively():
         usage = omp_accounts.usage_by_email(launcher)
     assert usage == {
         "user@example.com": [
-            omp_accounts.UsageWindow("Claude 7 Day (Fable)", 0.2, resets, "fable"),
-            omp_accounts.UsageWindow("Claude 5 Hour", 0.95, resets, None),
+            omp_accounts.UsageWindow("Claude 7 Day (Fable)", 0.2, resets, "fable", observation_key="0"),
+            omp_accounts.UsageWindow("Claude 5 Hour", 0.95, resets, None, observation_key="0"),
         ]
     }, usage
     account = omp_accounts.OmpAccount(2, 1, "USER@example.COM")
@@ -1276,9 +1281,15 @@ def _usage_report(**used: float) -> str:
     )
 
 
+_NO_BUDGET_CONFIG = "account_budget:\n  enabled: false\n"
+
+
 def _write_config(world, text: str) -> None:
+    """config.yaml in the world's HOME; the account budget is off unless `text` sets one."""
     path = world.home / ".config" / "review-cli" / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if "account_budget:" not in text:
+        text = _NO_BUDGET_CONFIG + text
     path.write_text(text, encoding="utf-8")
 
 
@@ -1375,6 +1386,259 @@ def test_e2e_every_account_skipped_fails_the_seat_and_seats_shows_over_limit():
         "INVALID SETTING: $REVIEW_OMP_MAX_USAGE_PERCENT must be a number above 0 and at "
         "most 100, got '150'" in invalid.stdout
     ), invalid.stdout
+
+
+# ---- the configured account budget on omp's Anthropic pool (review-cli#696) ---------------
+
+from reviewlib import account_budget  # noqa: E402
+
+_BLOCKED = "Blocked by review-cli configured 80% budget ceiling"
+_NOW_MS = int(time.time() * 1000)
+_A = omp_accounts.OmpAccount(2, 1, "invntrm@example.com")
+_B = omp_accounts.OmpAccount(3, 2, "b@example.com")
+_STRICT_CONFIG = "account_budget:\n  max_usage_percent: 80\n"
+
+
+def _budget_policy(raw=None, omp_raw=None, env=None):
+    """The account policy with the shipped budget (+ `raw` overrides) folded in."""
+    return omp_accounts.account_policy(omp_raw, env or {}, account_budget.resolve(raw))
+
+
+def _pair(five: float, seven: float, **kw):
+    return [_window("Claude 5 Hour", five, **kw), _window("Claude 7 Day", seven, **kw)]
+
+
+def test_budget_79_99_is_allowed_80_and_100_are_blocked_in_either_window():
+    policy = _budget_policy()
+    assert policy.skip_reason(_A, _pair(0.7999, 0.7999), _SELECTOR, _NOW_MS) is None
+    for five, seven, name in (
+        (0.80, 0.1, "5 Hour 80%"),
+        (0.1, 0.80, "7 Day 80%"),
+        (1.0, 1.0, "100%"),
+    ):
+        held = policy.skip_reason(_A, _pair(five, seven), _SELECTOR, _NOW_MS)
+        assert held is not None and held.startswith(_BLOCKED), (name, held)
+    held = policy.skip_reason(_A, _pair(0.1, 0.85), _SELECTOR, _NOW_MS)
+    assert "7-day window at 85%" in held and "resets 20" in held, held
+    assert "OVER LIMIT" not in held and "invntrm" not in held, held
+
+
+def test_budget_missing_partial_or_stale_usage_fails_closed():
+    policy = _budget_policy()
+    cases = {
+        "omp did not answer": None,
+        "no windows": [],
+        "only 5 hour": [_window("Claude 5 Hour", 0.1)],
+        "only 7 day": [_window("Claude 7 Day", 0.1)],
+        "window already reset": _pair(0.1, 0.1, in_ms=-1000),
+        "unknown label": [_window("Claude Opus 30 Day", 0.1)],
+    }
+    for name, usage in cases.items():
+        held = policy.skip_reason(_A, usage, _SELECTOR, _NOW_MS + 60_000)
+        assert held is not None and held.startswith(_BLOCKED), (name, held)
+        assert "failing closed" in held and "cannot confirm" in held, (name, held)
+    unread = policy.skip_reason(_A, None, _SELECTOR, _NOW_MS)
+    assert "omp usage lists no windows" in unread, unread
+    nameless = omp_accounts.OmpAccount(9, 4, None)
+    held = policy.skip_reason(nameless, _pair(0.1, 0.1), _SELECTOR, _NOW_MS)
+    assert "email is unknown" in held, held
+    lenient = _budget_policy({"strict": False})
+    for usage in (None, [], [_window("Claude 5 Hour", 0.1)]):
+        assert lenient.skip_reason(_A, usage, _SELECTOR, _NOW_MS) is None
+    assert _BLOCKED in lenient.skip_reason(_A, _pair(0.9, 0.1), _SELECTOR, _NOW_MS)
+
+
+def test_budget_never_mixes_another_accounts_usage():
+    policy = _budget_policy()
+    usage = {"b@example.com": _pair(0.1, 0.1)}  # only b is listed
+    refusal, eligible, skipped = omp_accounts.pool_refusal(
+        policy, [_A, _B], Path("/x"), usage, _SELECTOR, _NOW_MS
+    )
+    assert refusal is None and eligible == [_B], (refusal, eligible)
+    assert len(skipped) == 1 and skipped[0].startswith("i***@example.com: " + _BLOCKED)
+    a_busy = {"b@example.com": _pair(0.1, 0.1), "invntrm@example.com": _pair(0.95, 0.1)}
+    _r, eligible, _s = omp_accounts.pool_refusal(
+        policy, [_A, _B], Path("/x"), a_busy, _SELECTOR, _NOW_MS
+    )
+    assert eligible == [_B]
+
+
+def test_budget_tier_window_counts_for_its_tier_and_never_completes_the_pair():
+    policy = _budget_policy()
+    fable = _window("Claude 7 Day (Fable)", 0.97, tier="fable")
+    shared_5h = _window("Claude 5 Hour", 0.1)
+    held = policy.skip_reason(_A, [shared_5h, fable], _SELECTOR, _NOW_MS)
+    assert held is not None and "cannot confirm" in held and "7-day" in held, held
+    full = [*_pair(0.1, 0.1), fable]
+    assert policy.skip_reason(_A, full, _SELECTOR, _NOW_MS) is None, (
+        "Fable is not Sonnet"
+    )
+    fable_seat = policy.skip_reason(_A, full, "anthropic/claude-fable-5", _NOW_MS)
+    assert fable_seat is not None and "(model tier) at 97%" in fable_seat, fable_seat
+
+
+def test_budget_is_the_stricter_of_it_and_the_omp_accounts_threshold():
+    # a looser omp_accounts threshold cannot lift the budget ceiling
+    loose = _budget_policy(omp_raw={"max_usage_percent": 95})
+    assert loose.threshold_for("invntrm@example.com") == 80
+    assert _BLOCKED in loose.skip_reason(_A, _pair(0.85, 0.1), _SELECTOR, _NOW_MS)
+    # a stricter one keeps its own, legacy wording
+    strict = _budget_policy(omp_raw={"max_usage_percent": 50})
+    assert strict.threshold_for("invntrm@example.com") == 50
+    held = strict.skip_reason(_A, _pair(0.6, 0.1), _SELECTOR, _NOW_MS)
+    assert held.startswith("OVER LIMIT (5 Hour 60% >= 50%"), held
+    # a per-account entry above the ceiling is capped too
+    per_account = {"accounts": {"invntrm@example.com": {"max_usage_percent": 99}}}
+    assert (
+        _budget_policy(omp_raw=per_account).threshold_for("invntrm@example.com") == 80
+    )
+    # a configured ceiling replaces the default, per provider too
+    ninety = _budget_policy({"max_usage_percent": 90})
+    assert ninety.skip_reason(_A, _pair(0.85, 0.85), _SELECTOR, _NOW_MS) is None
+    fifty = _budget_policy({"max_usage_percent": 90, "providers": {"anthropic": 50}})
+    held = fifty.skip_reason(_A, _pair(0.6, 0.1), _SELECTOR, _NOW_MS)
+    assert "50% budget ceiling" in held, held
+    assert "budget ceiling 80%, strict (shipped default)" in _budget_policy().summary()
+
+
+def test_budget_disabled_and_excluded_accounts_keep_their_own_reason():
+    policy = _budget_policy(omp_raw={"exclude": ["invntrm@example.com"]})
+    assert policy.skip_reason(_A, _pair(0.95, 0.95), _SELECTOR, _NOW_MS) == (
+        "EXCLUDED (config.yaml omp_accounts.exclude)"
+    )
+    # a disabled credential (id 4 in the fake db) is not in the pool, so no budget applies
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_agent_db(Path(tmp) / "agent.db")
+        emails = [a.email for a in omp_accounts.anthropic_accounts(db) or []]
+    assert emails == ["a@example.com", "b@example.com"], emails
+    assert account_budget.resolve({"enabled": False}).enabled is False
+
+
+def test_budget_pool_swap_and_redacted_refusal():
+    policy = _budget_policy()
+    usage = {
+        "invntrm@example.com": _pair(0.85, 0.1),
+        "b@example.com": _pair(0.7999, 0.2),
+    }
+    refusal, eligible, skipped = omp_accounts.pool_refusal(
+        policy, [_A, _B], Path("/x"), usage, _SELECTOR, _NOW_MS
+    )
+    assert refusal is None and eligible == [_B]
+    assert "invntrm" not in " ".join(skipped), skipped
+    all_over = {k: _pair(0.9, 0.9) for k in ("invntrm@example.com", "b@example.com")}
+    refusal, eligible, skipped = omp_accounts.pool_refusal(
+        policy, [_A, _B], Path("/x"), all_over, _SELECTOR, _NOW_MS
+    )
+    assert eligible == []
+    assert refusal.startswith("no omp anthropic account may be used (2): "), refusal
+    assert "i***@example.com: " + _BLOCKED in refusal, refusal
+    assert "b***@example.com: " in refusal, refusal
+    assert "invntrm" not in refusal and "b@example.com" not in refusal, refusal
+
+
+def test_budget_refuses_profiles_whose_account_is_unknown_unless_lenient():
+    strict = omp_accounts.profiles_reason(_budget_policy())
+    assert strict is not None and strict.startswith(_BLOCKED), strict
+    assert "REVIEW_OMP_CLAUDE_PROFILES" in strict
+    assert omp_accounts.profiles_reason(_budget_policy({"strict": False})) is None
+    invalid = omp_accounts.profiles_reason(_budget_policy({"strict": "no"}))
+    assert "invalid account_budget settings" in invalid, invalid
+
+
+def _full_usage(**used: tuple[float, float]) -> str:
+    resets = int(time.time() * 1000) + 3_600_000
+    return json.dumps(
+        {
+            "reports": [
+                {
+                    "provider": "anthropic",
+                    "fetchedAt": int(time.time() * 1000) - 1000,
+                    "metadata": {"email": f"{name}@example.com"},
+                    "limits": [
+                        {
+                            "label": label,
+                            "amount": {"usedFraction": fraction},
+                            "window": {"resetsAt": resets},
+                        }
+                        for label, fraction in (
+                            ("Claude 5 Hour", five),
+                            ("Claude 7 Day", seven),
+                        )
+                    ],
+                }
+                for name, (five, seven) in used.items()
+            ]
+        }
+    )
+
+
+def _ask(world, **env):
+    return world.review(
+        "just-ask", "Say hi", "--task", "696", "-m", _MODEL, "--timeout", "60", **env
+    )
+
+
+def test_e2e_budget_hold_spawns_nothing_and_redacts_the_accounts():
+    with _world() as world:
+        _write_config(world, _STRICT_CONFIG)
+        ask = _ask(world, FAKE_OMP_USAGE=_full_usage(a=(0.85, 0.1), b=(0.1, 0.95)))
+        calls = world.calls()
+    out = ask.stdout + ask.stderr
+    assert ask.returncode != 0, out
+    assert _BLOCKED in out, out
+    assert "5-hour window at 85%" in out and "7-day window at 95%" in out, out
+    assert "a@example.com" not in out and "b@example.com" not in out, out
+    assert "a***@example.com" in out and "b***@example.com" in out, out
+    assert "review-cli policy hold" in out and "quota exhausted" not in out.lower(), out
+    assert [c for c in calls if c["kind"] in ("token", "run")] == [], (
+        "a held pool must not fetch a token or start omp"
+    )
+
+
+def test_e2e_budget_pool_swap_uses_only_the_account_under_the_ceiling():
+    with _world() as world:
+        _write_config(world, _STRICT_CONFIG)
+        ask = _ask(world, FAKE_OMP_USAGE=_full_usage(a=(0.85, 0.1), b=(0.7999, 0.7999)))
+        calls = world.calls()
+    out = ask.stdout + ask.stderr
+    assert ask.returncode == 0, out
+    assert "ANSWER served with tok-2" in ask.stdout, out
+    assert [c["account"] for c in calls if c["kind"] == "token"] == ["2"], calls
+    assert [c["token"] for c in calls if c["kind"] == "run"] == ["tok-2"], calls
+
+
+def test_e2e_budget_unreadable_usage_fails_closed_before_any_token():
+    with _world() as world:
+        _write_config(world, _STRICT_CONFIG)
+        ask = _ask(world, FAKE_OMP_USAGE="omp usage is down")
+        calls = world.calls()
+        _write_config(world, "account_budget:\n  strict: false\n")
+        lenient = _ask(world, FAKE_OMP_USAGE="omp usage is down")
+    out = ask.stdout + ask.stderr
+    assert ask.returncode != 0 and _BLOCKED in out, out
+    assert "omp usage lists no windows for this account (or did not answer)" in out, out
+    assert [c for c in calls if c["kind"] in ("token", "run")] == []
+    assert lenient.returncode == 0, lenient.stdout + lenient.stderr
+
+
+def test_e2e_budget_config_overrides_the_default_ceiling():
+    with _world() as world:
+        _write_config(world, "account_budget:\n  max_usage_percent: 90\n")
+        ask = _ask(world, FAKE_OMP_USAGE=_full_usage(a=(0.85, 0.85), b=(0.95, 0.1)))
+        calls = world.calls()
+    assert ask.returncode == 0, ask.stdout + ask.stderr
+    assert [c["account"] for c in calls if c["kind"] == "token"] == ["1"], calls
+
+
+def test_e2e_budget_off_is_announced_and_enforces_nothing():
+    with _world() as world:
+        _write_config(world, _NO_BUDGET_CONFIG)
+        ask = _ask(world, FAKE_OMP_USAGE=_full_usage(a=(0.99, 0.99), b=(0.99, 0.99)))
+    assert ask.returncode == 0, ask.stdout + ask.stderr
+    assert (
+        "account budget ceiling is OFF (config.yaml account_budget.enabled: false)"
+        in ask.stderr
+    )
 
 
 if __name__ == "__main__":

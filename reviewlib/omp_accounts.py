@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from . import account_budget
+
 # `omp token --account N` and agent.db's `auth_credentials.provider` spell it this way;
 # omp's rate-limit blocks for the provider live under this `provider_key`.
 PROVIDER = "anthropic"
@@ -131,20 +133,7 @@ def anthropic_accounts(
         except sqlite3.OperationalError:
             # an older agent.db without the identity_key column: ids only
             rows = conn.execute(query.format(identity="NULL"), (PROVIDER,)).fetchall()
-        blocks: dict[int, list[tuple[str, int]]] = {}
-        try:
-            for cred_id, scope, until in conn.execute(
-                "SELECT credential_id, block_scope, MAX(blocked_until_ms) "
-                "FROM auth_credential_blocks WHERE provider_key = ? AND blocked_until_ms > ? "
-                "GROUP BY credential_id, block_scope",
-                (_BLOCK_PROVIDER_KEY, now),
-            ):
-                until_ms = _finite_int(until)
-                if isinstance(cred_id, int) and until_ms is not None:
-                    label = scope if isinstance(scope, str) else ""
-                    blocks.setdefault(cred_id, []).append((label, until_ms))
-        except sqlite3.OperationalError:
-            pass  # no block table in this omp version: nothing is blocked
+        blocks = _active_credential_blocks(conn, now)
     except sqlite3.Error:
         return None
     finally:
@@ -427,6 +416,23 @@ class UsageWindow:
     used_fraction: float
     resets_at_ms: int | None
     tier: str | None = None
+    observed_at_ms: int | None = None
+    observation_key: str | None = None
+
+
+_USAGE_WINDOW_LABELS = (
+    (re.compile(r"\b5\s*hours?\b", re.IGNORECASE), account_budget.WINDOW_5H),
+    (re.compile(r"\b7\s*days?\b", re.IGNORECASE), account_budget.WINDOW_7D),
+)
+
+
+def usage_window_name(label: str) -> str | None:
+    """`account_budget.WINDOW_5H` / `WINDOW_7D` for an `omp usage` limit labelled like
+    `Claude 5 Hour` / `Claude 7 Day (Fable)`, None for any other window."""
+    for pattern, name in _USAGE_WINDOW_LABELS:
+        if pattern.search(label):
+            return name
+    return None
 
 
 def usage_by_email(launcher: OmpLauncher) -> dict[str, list[UsageWindow]] | None:
@@ -451,33 +457,14 @@ def usage_by_email(launcher: OmpLauncher) -> dict[str, list[UsageWindow]] | None
         return None
     out: dict[str, list[UsageWindow]] = {}
     reports = data.get("reports")
-    for report in reports if isinstance(reports, list) else []:
+    for report_index, report in enumerate(reports if isinstance(reports, list) else []):
         if not isinstance(report, dict) or report.get("provider") != PROVIDER:
             continue
         metadata = report.get("metadata")
         email = metadata.get("email") if isinstance(metadata, dict) else None
         if not isinstance(email, str):
             continue
-        windows = []
-        limits = report.get("limits")
-        for limit in limits if isinstance(limits, list) else []:
-            if not isinstance(limit, dict):
-                continue
-            amount, window = limit.get("amount"), limit.get("window")
-            used = amount.get("usedFraction") if isinstance(amount, dict) else None
-            if _finite_int(used) is None:
-                continue
-            resets = window.get("resetsAt") if isinstance(window, dict) else None
-            scope = limit.get("scope")
-            tier = scope.get("tier") if isinstance(scope, dict) else None
-            windows.append(
-                UsageWindow(
-                    label=str(limit.get("label") or limit.get("id") or "?"),
-                    used_fraction=float(used),
-                    resets_at_ms=_finite_int(resets),
-                    tier=tier if isinstance(tier, str) and tier else None,
-                )
-            )
+        windows = _report_usage_windows(report, str(report_index))
         # a second report for the same email adds its windows instead of replacing them
         out.setdefault(email.lower(), []).extend(windows)
     return out
@@ -511,23 +498,43 @@ class AccountPolicy:
     problems: tuple[str, ...] = ()
     exclude_source: str = ""
     max_usage_source: str = ""
+    budget: account_budget.AccountBudget | None = None
 
     @property
     def needs_usage(self) -> bool:
-        return self.max_usage_percent is not None or bool(self.per_account)
+        return (
+            self.max_usage_percent is not None
+            or bool(self.per_account)
+            or self.budget is not None
+        )
 
     @property
     def restricts(self) -> bool:
         """True when the policy can refuse an account (or is invalid): omp must then not
-        pick an account on its own."""
-        return bool(self.exclude) or self.needs_usage or bool(self.problems)
+        pick an account on its own. A strict budget refuses an account whose usage cannot
+        be confirmed; a lenient one only refuses an account it can see over the ceiling."""
+        return (
+            bool(self.exclude)
+            or self.max_usage_percent is not None
+            or bool(self.per_account)
+            or bool(self.problems)
+            or (self.budget is not None and self.budget.strict)
+        )
 
     def threshold_for(self, email: str | None) -> float | None:
+        """The percent at which `email`'s account waits: its `per_account` entry, else the
+        global `max_usage_percent`, lowered to the account budget's ceiling when one is
+        configured (the stricter of the two wins); None when neither sets one."""
         key = (email or "").lower()
+        configured = self.max_usage_percent
         for name, percent in self.per_account:
             if name == key:
-                return percent
-        return self.max_usage_percent
+                configured = percent
+                break
+        if self.budget is None:
+            return configured
+        ceiling = self.budget.ceiling_for(PROVIDER)
+        return ceiling if configured is None else min(configured, ceiling)
 
     def is_excluded(self, account: OmpAccount) -> bool:
         return bool(account.email) and account.email.lower() in self.exclude
@@ -548,6 +555,48 @@ class AccountPolicy:
             and (w.resets_at_ms is None or w.resets_at_ms > now_ms)
         ]
 
+    def _budget_hold(
+        self,
+        account: OmpAccount,
+        usage: list[UsageWindow] | None,
+        omp_model: str | None,
+        now_ms: int,
+    ) -> str | None:
+        """The account budget's hold (review-cli#696) for a seat on `omp_model` taking
+        `account`, else None. The text leaves the account out: the caller names it,
+        redacted. Only this account's own windows are read (`usage_of` matches by email);
+        a tier window counts for that tier's models and never completes the 5-hour/7-day
+        pair."""
+        if self.budget is None:
+            return None
+        readings = [
+            account_budget.Reading(
+                window=name,
+                percent=w.used_fraction * 100,
+                resets_at=None if w.resets_at_ms is None else w.resets_at_ms / 1000,
+                shared=w.tier is None,
+            )
+            for w in usage or []
+            if (name := usage_window_name(w.label)) and tier_applies(w.tier, omp_model)
+        ]
+        gap = None
+        if not account.email:
+            gap = "the account's email is unknown, so omp usage cannot be matched to it"
+        elif not usage:
+            gap = "omp usage lists no windows for this account (or did not answer)"
+        else:
+            gap = _budget_observation_gap(self.budget, usage, omp_model, now_ms)
+            if gap is not None:
+                readings = []  # Cached/ambiguous data is not a current quota observation.
+        return account_budget.hold(
+            self.budget,
+            PROVIDER,
+            readings,
+            now=now_ms / 1000,
+            name_account=False,
+            gap=gap,
+        )
+
     def skip_reason(
         self,
         account: OmpAccount,
@@ -564,6 +613,9 @@ class AccountPolicy:
             return f"EMAIL UNKNOWN (cannot be checked against {self.exclude_source})"
         if self.is_excluded(account):
             return f"EXCLUDED ({self.exclude_source})"
+        held = self._budget_hold(account, usage, omp_model, now_ms)
+        if held is not None:
+            return held
         over = [
             _window_text(w, threshold)
             for w, threshold in self._over_limit(account, usage, now_ms)
@@ -596,6 +648,8 @@ class AccountPolicy:
             if self.max_usage_percent is not None
             else "max usage none (accounts are used up to their limit)"
         )
+        if self.budget is not None:
+            parts.append(self.budget.summary())
         if self.per_account:
             parts.append(
                 "per account "
@@ -686,53 +740,17 @@ def _config_per_account(accounts: object) -> tuple[dict[str, float], list[str]]:
     return out, problems
 
 
-def account_policy(raw: object, env: Mapping[str, str]) -> AccountPolicy:
-    """The policy from config.yaml's `omp_accounts:` value `raw` (None when absent) and the
-    env overrides: `$REVIEW_OMP_ACCOUNTS_EXCLUDE` (comma-separated emails, at least one)
-    replaces the exclude list and `$REVIEW_OMP_MAX_USAGE_PERCENT` the global threshold;
-    a config value an env override replaces is not validated. Invalid values are collected
-    in `problems`, never silently dropped."""
+def account_policy(
+    raw: object,
+    env: Mapping[str, str],
+    budget: account_budget.AccountBudget | None = None,
+) -> AccountPolicy:
+    """Resolve configuration and environment overrides without validating replaced fields."""
     problems: list[str] = []
-    exclude: tuple[str, ...] = ()
-    max_percent: float | None = None
-    per_account: dict[str, float] = {}
-    exclude_source = max_source = ""
-    env_tokens = [e.strip() for e in (env.get(EXCLUDE_ENV) or "").split(",") if e.strip()]
-    env_exclude = tuple(
-        dict.fromkeys(e.lower() for e in env_tokens if _is_email_token(e))
+    env_exclude, env_max = _policy_environment(env, problems)
+    exclude, max_percent, per_account, exclude_source, max_source = (
+        _policy_config_values(raw, env_exclude, env_max, problems)
     )
-    problems.extend(
-        f"${EXCLUDE_ENV}: {e!r} is not an email"
-        for e in env_tokens
-        if not _is_email_token(e)
-    )
-    env_max = (env.get(MAX_USAGE_ENV) or "").strip()
-    if raw is not None and not isinstance(raw, dict):
-        problems.append(f"{_CONFIG_WHERE} must be a mapping, got {raw!r}")
-    elif isinstance(raw, dict):
-        unknown = sorted(str(k) for k in raw if k not in _POLICY_KEYS)
-        if unknown:
-            problems.append(
-                f"{_CONFIG_WHERE}: unknown key {', '.join(unknown)} "
-                f"(known: {', '.join(_POLICY_KEYS)})"
-            )
-        if raw.get("exclude") is not None and not env_exclude:
-            exclude, problem = _config_exclude(raw["exclude"])
-            if problem:
-                problems.append(problem)
-            else:
-                exclude_source = f"{_CONFIG_WHERE}.exclude"
-        if raw.get("max_usage_percent") is not None and not env_max:
-            max_percent, problem = _percent(
-                raw["max_usage_percent"], f"{_CONFIG_WHERE}.max_usage_percent"
-            )
-            if problem:
-                problems.append(problem)
-            else:
-                max_source = f"{_CONFIG_WHERE}.max_usage_percent"
-        if raw.get("accounts") is not None:
-            per_account, account_problems = _config_per_account(raw["accounts"])
-            problems.extend(account_problems)
     if env_exclude:
         exclude, exclude_source = env_exclude, f"${EXCLUDE_ENV}"
     if env_max:
@@ -748,6 +766,7 @@ def account_policy(raw: object, env: Mapping[str, str]) -> AccountPolicy:
         problems=tuple(problems),
         exclude_source=exclude_source,
         max_usage_source=max_source,
+        budget=budget,
     )
 
 
@@ -795,8 +814,14 @@ def pool_refusal(
         why = policy.skip_reason(account, usage_of(usage, account), omp_model, now_ms)
         if why is None:
             eligible.append(account)
-        else:
-            skipped.append(f"{account.label}: {why}")
+            continue
+        # a budget hold is printed into review output and logs: the account is redacted
+        label = (
+            account_budget.redact_account(account.email)
+            if account.email and account_budget.is_budget_hold(why)
+            else account.label
+        )
+        skipped.append(f"{label}: {why}")
     if not eligible:
         reason = (
             f"no omp {PROVIDER} account may be used ({len(accounts)}): "
@@ -818,6 +843,18 @@ def profiles_reason(policy: AccountPolicy) -> str | None:
     under `policy` (a profile's account is not known), None when the policy is empty."""
     if policy.problems:
         return _invalid_reason(policy)
+    if policy.budget is not None and policy.budget.strict:
+        return account_budget.hold(
+            policy.budget,
+            PROVIDER,
+            [],
+            now=0.0,
+            name_account=False,
+            gap=(
+                "the account behind a $REVIEW_OMP_CLAUDE_PROFILES profile is not known, "
+                "so its usage cannot be checked; unset the profiles"
+            ),
+        )
     if not policy.restricts:
         return None
     return (
@@ -825,3 +862,152 @@ def profiles_reason(policy: AccountPolicy) -> str | None:
         "$REVIEW_OMP_CLAUDE_PROFILES profiles (their accounts are not known); unset one "
         "of them"
     )
+
+
+def _active_credential_blocks(conn, now):
+    blocks: dict[int, list[tuple[str, int]]] = {}
+    try:
+        rows = conn.execute(
+            "SELECT credential_id, block_scope, MAX(blocked_until_ms) "
+            "FROM auth_credential_blocks WHERE provider_key = ? AND blocked_until_ms > ? "
+            "GROUP BY credential_id, block_scope",
+            (_BLOCK_PROVIDER_KEY, now),
+        )
+        for credential, scope, until in rows:
+            until_ms = _finite_int(until)
+            if isinstance(credential, int) and until_ms is not None:
+                label = scope if isinstance(scope, str) else ""
+                blocks.setdefault(credential, []).append((label, until_ms))
+    except sqlite3.OperationalError:
+        pass  # Older schemas have no block table.
+    return blocks
+
+
+def _report_usage_windows(report, observation_key):
+    windows = []
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        window = _usage_window(
+            limit, _finite_int(report.get("fetchedAt")), observation_key
+        )
+        if window is not None:
+            windows.append(window)
+    return windows
+
+
+def _usage_window(limit, observed_at_ms, observation_key):
+    if not isinstance(limit, dict):
+        return None
+    amount, window = limit.get("amount"), limit.get("window")
+    used = amount.get("usedFraction") if isinstance(amount, dict) else None
+    if _finite_int(used) is None:
+        return None
+    resets = window.get("resetsAt") if isinstance(window, dict) else None
+    scope = limit.get("scope")
+    tier = scope.get("tier") if isinstance(scope, dict) else None
+    return UsageWindow(
+        label=str(limit.get("label") or limit.get("id") or "?"),
+        used_fraction=float(used),
+        resets_at_ms=_finite_int(resets),
+        tier=tier if isinstance(tier, str) and tier else None,
+        observed_at_ms=observed_at_ms,
+        observation_key=observation_key,
+    )
+
+
+def _policy_environment(env, problems):
+    tokens = [
+        value.strip()
+        for value in (env.get(EXCLUDE_ENV) or "").split(",")
+        if value.strip()
+    ]
+    exclude = tuple(
+        dict.fromkeys(value.lower() for value in tokens if _is_email_token(value))
+    )
+    problems.extend(
+        f"${EXCLUDE_ENV}: {value!r} is not an email"
+        for value in tokens
+        if not _is_email_token(value)
+    )
+    return exclude, (env.get(MAX_USAGE_ENV) or "").strip()
+
+
+def _policy_config_values(raw, env_exclude, env_max, problems):
+    if not isinstance(raw, dict):
+        if raw is not None:
+            problems.append(f"{_CONFIG_WHERE} must be a mapping, got {raw!r}")
+        return (), None, {}, "", ""
+    unknown = sorted(str(key) for key in raw if key not in _POLICY_KEYS)
+    if unknown:
+        problems.append(
+            f"{_CONFIG_WHERE}: unknown key {', '.join(unknown)} (known: {', '.join(_POLICY_KEYS)})"
+        )
+    exclude, exclude_source = _policy_exclude_value(
+        raw.get("exclude"), env_exclude, problems
+    )
+    maximum, max_source = _policy_max_value(
+        raw.get("max_usage_percent"), env_max, problems
+    )
+    per_account = {}
+    if raw.get("accounts") is not None:
+        per_account, account_problems = _config_per_account(raw["accounts"])
+        problems.extend(account_problems)
+    return exclude, maximum, per_account, exclude_source, max_source
+
+
+def _policy_exclude_value(raw, overridden, problems):
+    if raw is None or overridden:
+        return (), ""
+    exclude, problem = _config_exclude(raw)
+    if problem:
+        problems.append(problem)
+        return exclude, ""
+    return exclude, f"{_CONFIG_WHERE}.exclude"
+
+
+def _policy_max_value(raw, overridden, problems):
+    if raw is None or overridden:
+        return None, ""
+    maximum, problem = _percent(raw, f"{_CONFIG_WHERE}.max_usage_percent")
+    if problem:
+        problems.append(problem)
+        return maximum, ""
+    return maximum, f"{_CONFIG_WHERE}.max_usage_percent"
+
+
+def _budget_observation_gap(budget, windows, model, now_ms):
+    """Validate original provider timestamps and complete pairs within one report.
+
+    Reading the cached `omp usage` response does not refresh its `fetchedAt`.
+    Five seconds of clock skew tolerates sampling and rendering in one operation.
+    Distinct partial reports never manufacture a complete shared-window pair.
+    """
+    groups = {}
+    for window in windows:
+        if not tier_applies(window.tier, model):
+            continue
+        observed = window.observed_at_ms
+        if observed is None or observed <= 0:
+            return "provider observation time is unknown"
+        age = now_ms - observed
+        if age < -5000:
+            return "provider observation time is in the future"
+        if age > budget.max_age_seconds * 1000:
+            return f"provider observation is stale ({int(age / 1000)}s old)"
+        groups.setdefault(window.observation_key, []).append(window)
+    for group in groups.values():
+        if not _observation_has_shared_pair(group, now_ms):
+            return (
+                "one provider observation does not contain both current shared windows"
+            )
+    return None
+
+
+def _observation_has_shared_pair(windows, now_ms):
+    names = {
+        usage_window_name(window.label)
+        for window in windows
+        if window.tier is None
+        and (window.resets_at_ms is None or window.resets_at_ms > now_ms)
+    }
+    return {account_budget.WINDOW_5H, account_budget.WINDOW_7D} <= names

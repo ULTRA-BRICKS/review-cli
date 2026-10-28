@@ -146,6 +146,8 @@ _UNIT_FILES = [
     ("test_review_stamp_delta_tolerance.py", {}),
     ("test_failover_pool.py", {}),
     ("test_levels.py", {}),
+    ("test_backend_forwarding.py", {}),
+    ("test_omp_budget_freshness.py", {}),
     ("test_panel_levels.py", {}),
     # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
     # switchover (provider A fails on the call, the model completes via B, board not degraded).

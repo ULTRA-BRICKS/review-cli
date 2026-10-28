@@ -50,6 +50,7 @@ Evidence, per candidate, in this order (first decisive answer wins):
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -121,27 +122,6 @@ def _iso(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_time(value: object) -> float | None:
-    """UNIX seconds from an epoch number (seconds or milliseconds) or an ISO-8601
-    string; None for anything else."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        ts = float(value)
-        if not math.isfinite(ts):
-            return None
-        return ts / 1000.0 if ts > 1e12 else ts
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-    return None
-
-
 def _verdict(
     reason: str,
     *,
@@ -173,26 +153,7 @@ def _card_verdict(card: dict, observed_at: float, now: float) -> dict:
             detail=f"{who}: card status {card.get('status')!r}",
             observed_at=observed_at,
         )
-    exhausted: list[str] = []
-    reset_since: list[str] = []
-    below: list[float] = []
-    windows = card.get("windows")
-    for window in windows if isinstance(windows, list) else []:
-        if not isinstance(window, dict):
-            continue
-        kind = usage_limits._window_kind(window.get("window_seconds"))
-        pct = usage_limits._finite_percent(window.get("used_percent"))
-        if kind is None or pct is None:
-            continue
-        if pct < 100.0:
-            below.append(pct)
-            continue
-        resets_at = _parse_time(window.get("resets_at"))
-        if resets_at is not None and resets_at <= now:
-            reset_since.append(f"{kind} (reset at {_iso(resets_at)})")
-        else:
-            until = f", resets {_iso(resets_at)}" if resets_at is not None else ""
-            exhausted.append(f"{kind} {pct:g}%{until}")
+    exhausted, reset_since, below = _card_window_summary(card.get("windows"), now)
     if exhausted:
         return _verdict(
             "quota_window_exhausted",
@@ -289,15 +250,18 @@ def _omp_pool(
     Anthropic seat with no enabled account and no policy (omp picks its own credential).
     `omp usage` is not read: an account a usage threshold would skip still counts, which
     only widens the candidate set the report needs exhausted evidence for (conservative:
-    it can keep `all_exhausted` false, never make it true)."""
+    it can keep `all_exhausted` false, never make it true). The account budget
+    (review-cli#696) is not part of this policy: it is a review-cli hold, not provider
+    quota evidence, and it never makes a route count as exhausted."""
     omp_model = route.split(":", 1)[1] if ":" in route else None
     if not backends._omp_selector_is_anthropic(omp_model):
         return [], None
+    policy = dataclasses.replace(backends._omp_account_policy(), budget=None)
     if backends._review_omp_claude_profiles() != [None]:
-        return [], backends._omp_profiles_policy_reason(omp_model)
+        return [], omp_accounts.profiles_reason(policy)
     db = backends._omp_auth_db()
     refusal, eligible, _skipped = omp_accounts.pool_refusal(
-        backends._omp_account_policy(),
+        policy,
         omp_accounts.anthropic_accounts(db),
         db,
         None,
@@ -329,79 +293,14 @@ def _route_candidates(route: str, cards: list[dict], now: float) -> list[dict]:
         "checks_cli_login": False,
     }
     if backend is backends.review_claude and method == "cli":
-        accounts = backends._claude_account_candidates()
-        multi = len(accounts) > 1
-        out = []
-        for config_dir, email in accounts:
-            name = email or (Path(config_dir).name if config_dir else None)
-            out.append(
-                {
-                    **base,
-                    "account": name,
-                    "account_dir": config_dir,
-                    "account_email": email,
-                    "quota_identity": f"claude-cli:{name or 'default'}",
-                    "quota_identity_basis": "account",
-                    "harness_family": "claude",
-                    "route_accounts": len(accounts),
-                    "multi_account": multi,
-                    "checks_cli_login": True,
-                }
-            )
-        return out
+        return _claude_route_candidates(base)
     pool, refusal = (
         _omp_pool(route, now) if backend is backends.review_omp else ([], None)
     )
     if pool:
-        # `_review_omp_with_anthropic_pool` records each limit under the account's own
-        # cooldown key (a chronic one also under the route key), so that key's evidence
-        # is attributable to the account alone. With ONE account the route key is its
-        # evidence too; with several it names none of them and is not read.
-        out = []
-        for account in pool:
-            label = account.label
-            keys = [backends._omp_account_cooldown_key(account)]
-            if len(pool) == 1 and key is not None:
-                keys.append(key)
-            out.append(
-                {
-                    **base,
-                    "cooldown_keys": keys,
-                    "window_quota_unattributable": len(pool) > 1,
-                    "route_cooldown_keys": (
-                        [key] if len(pool) > 1 and key is not None else []
-                    ),
-                    "account": label,
-                    "account_dir": None,
-                    "account_email": account.email,
-                    "quota_identity": f"omp-anthropic:{label}",
-                    "quota_identity_basis": "account",
-                    # harness-cli's Claude Code card of the same login (by email)
-                    "harness_family": "claude" if account.email else None,
-                    "route_accounts": len(pool),
-                    # False: the account's own cooldown key IS attributable; the card
-                    # filter keys on `account_email` (see `_candidate_verdict`)
-                    "multi_account": False,
-                }
-            )
-        return out
+        return _omp_route_candidates(base, pool, key)
     if backend is backends.review_codex:
-        codex_cards = _family_cards(cards, "codex")
-        named = sorted({str(c["account"]) for c in codex_cards if c.get("account")})
-        account = named[0] if len(named) == 1 else None
-        return [
-            {
-                **base,
-                "account": account,
-                "account_dir": None,
-                "account_email": None,
-                "quota_identity": f"codex:{account or 'default'}",
-                "quota_identity_basis": "account",
-                "harness_family": "codex",
-                "route_accounts": 1,
-                "multi_account": False,
-            }
-        ]
+        return _codex_route_candidates(base, cards)
     return [
         {
             **base,
@@ -460,60 +359,12 @@ def _candidate_verdict(
             source="omp-account-policy",
             detail=cand["refusal"],
         )
-    if cand["checks_cli_login"]:
-        account_dir = Path(cand["account_dir"]) if cand["account_dir"] else None
-        failure = claude_accounts.login_failure(account_dir)
-        if failure is not None:
-            return _verdict(
-                "login_failed",
-                source="claude-accounts",
-                detail=failure["reason"],
-                observed_at=failure["recorded_at"],
-                cause=seat_cooldown.CAUSE_AUTH,
-            )
-    # A candidate can have two keys (an omp pool's only account: its own, then the
-    # route's). A typed non-quota cooldown on either outranks quota evidence, so a
-    # login/stall record is never masked by an older quota one.
-    # The seat's availability WINDOW (review-cli#663: an exclusion until the time the
-    # failure itself named) is stored under the transport-independent `window` method with
-    # the same typed cause, keyed by the seat's route (and `provider:<name>` for a
-    # provider-wide failure). It is read like a timer cooldown: a quota window is quota
-    # evidence under the same freshness and account-identity rules, any other cause (auth,
-    # unavailable, rate_limit, stall) is non-quota evidence. A route that rotates through
-    # several accounts records its window on the route, so only its non-quota windows
-    # (which block every account) count there; a quota window names no single account.
-    found = [
-        (cand["access_method"], entry)
-        for key in cand["cooldown_keys"]
-        if (
-            entry := seat_cooldown.active_cooldown(
-                key, access_method=cand["access_method"], now=now
-            )
-        )
-        is not None
-    ]
-    for key in cand["route_cooldown_keys"]:
-        entry = seat_cooldown.active_cooldown(
-            key, access_method=cand["access_method"], now=now
-        )
-        if entry is not None and entry["cause"] not in (
-            None,
-            seat_cooldown.CAUSE_QUOTA,
-        ):
-            found.append((cand["access_method"], entry))
-    for key in cand["window_keys"]:
-        entry = seat_cooldown.active_cooldown(
-            key, access_method=seat_cooldown.WINDOW_ACCESS_METHOD, now=now
-        )
-        if entry is None:
-            continue
-        if cand["window_quota_unattributable"] and entry["cause"] in (
-            None,
-            seat_cooldown.CAUSE_QUOTA,
-        ):
-            continue
-        found.append((seat_cooldown.WINDOW_ACCESS_METHOD, entry))
-    method, cooldown = _pick_cooldown(found, cand["access_method"])
+    login = _candidate_login_verdict(cand)
+    if login is not None:
+        return login
+    method, cooldown = _pick_cooldown(
+        _candidate_cooldowns(cand, now), cand["access_method"]
+    )
     source = f"seat-cooldown:{method}"
     if cooldown is not None and cooldown["cause"] not in (
         None,
@@ -526,74 +377,19 @@ def _candidate_verdict(
             observed_at=cooldown["recorded_at"],
             cause=cooldown["cause"],
         )
-
-    harness_verdict = None
-    if cand["harness_family"] is not None and harness["status"] == "ok":
-        cards = _family_cards(harness["cards"], cand["harness_family"])
-        if cand["multi_account"] or cand["account_email"]:
-            email = (cand["account_email"] or "").strip().lower()
-            cards = [
-                c for c in cards if email and usage_limits._card_account(c) == email
-            ]
-        harness_verdict = _cards_verdict(cards, harness["observed_at"], now, max_age)
-        if harness_verdict is not None and harness_verdict["status"] in (
-            STATUS_EXHAUSTED,
-            STATUS_USABLE,
-        ):
-            return harness_verdict
-
-    if cooldown is not None and cooldown["cause"] == seat_cooldown.CAUSE_QUOTA:
-        recorded_at = cooldown["recorded_at"]
-        if cand["multi_account"]:
-            return _verdict(
-                "cooldown_not_account_scoped",
-                source=source,
-                detail=(
-                    f"{cooldown['reason']} — recorded for the route, which rotates "
-                    f"through {cand['route_accounts']} accounts; not attributable to "
-                    "this one"
-                ),
-                observed_at=recorded_at,
-                cause=seat_cooldown.CAUSE_QUOTA,
-            )
-        if recorded_at is None or now - recorded_at > max_age:
-            age = (
-                "unknown age"
-                if recorded_at is None
-                else f"{int(now - recorded_at)}s old"
-            )
-            return _verdict(
-                "stale_observation",
-                source=source,
-                detail=f"{cooldown['reason']} ({age}, > {max_age:g}s)",
-                observed_at=recorded_at,
-                cause=seat_cooldown.CAUSE_QUOTA,
-            )
-        return _verdict(
-            "quota_cooldown",
-            source=source,
-            detail=cooldown["reason"],
-            observed_at=recorded_at,
-            cause=seat_cooldown.CAUSE_QUOTA,
-        )
+    harness_verdict = _candidate_harness_verdict(cand, harness, now, max_age)
+    if harness_verdict is not None and harness_verdict["status"] in (
+        STATUS_EXHAUSTED,
+        STATUS_USABLE,
+    ):
+        return harness_verdict
     if cooldown is not None:
-        return _verdict(
-            "cooldown_unclassified",
-            source=source,
-            detail=f"{cooldown['reason']} (recorded without a typed cause)",
-            observed_at=cooldown["recorded_at"],
-        )
+        return _candidate_cooldown_verdict(cand, cooldown, source, now, max_age)
     if harness_verdict is not None:
         return harness_verdict
-    if cand["harness_family"] is None:
-        detail = "no quota source covers this route"
-    elif harness["status"] != "ok":
-        detail = f"harness limits source {harness['status']}"
-        if harness.get("detail"):
-            detail += f": {harness['detail']}"
-    else:
-        detail = f"no harness limit card for {cand['quota_identity']}"
-    return _verdict("no_observation", source="none", detail=detail)
+    return _verdict(
+        "no_observation", source="none", detail=_candidate_missing_detail(cand, harness)
+    )
 
 
 # --- report ---------------------------------------------------------------------------
@@ -670,39 +466,7 @@ def board_capacity_report(
         return unavailable[route]
 
     models = list(dict.fromkeys(r.model for r in board))
-    candidates: list[dict] = []
-    for model in models:
-        routes = provider_chain(
-            model,
-            available=lambda c: _unavailable(c) is None,
-            unpaid=backends.runtime_provider_marked_unpaid,
-        )
-        for route in routes:
-            for cand in _route_candidates(route, harness["cards"], now):
-                verdict = _candidate_verdict(
-                    cand,
-                    unavailable_reason=_unavailable(route),
-                    harness=harness,
-                    now=now,
-                    max_age=max_age,
-                )
-                observed_at = verdict.pop("observed_at")
-                candidates.append(
-                    {
-                        "seat_model": model,
-                        "route": cand["route"],
-                        "backend": cand["backend"],
-                        "access_method": cand["access_method"],
-                        "account": cand["account"],
-                        "quota_identity": cand["quota_identity"],
-                        "quota_identity_basis": cand["quota_identity_basis"],
-                        **verdict,
-                        "observed_at": _iso(observed_at),
-                        "age_seconds": (
-                            None if observed_at is None else round(now - observed_at, 1)
-                        ),
-                    }
-                )
+    candidates = _board_candidate_rows(models, harness, now, max_age, _unavailable)
 
     counts = {status: 0 for status in STATUSES}
     for cand in candidates:
@@ -742,19 +506,7 @@ def board_capacity_report(
         # Schema v1 fields, kept for consumers that read only these (agent-tools ship.sh
         # reads `all_exhausted` and `exhausted[].model/.evidence/.source`).
         "models": models,
-        "exhausted": [
-            {
-                "model": c["seat_model"],
-                "source": c["source"],
-                "evidence": (
-                    f"{c['route']}"
-                    + (f" [{c['account']}]" if c["account"] else "")
-                    + f": {c['detail']}"
-                ),
-            }
-            for c in candidates
-            if c["status"] == STATUS_EXHAUSTED
-        ],
+        "exhausted": _exhausted_report_rows(candidates),
         "all_exhausted": all_exhausted,
         "error": None,
     }
@@ -776,16 +528,298 @@ def render_text(report: dict) -> str:
             if "status" in info
         ),
     ]
-    for status in STATUSES:
-        rows = [c for c in report["candidates"] if c["status"] == status]
-        if not rows:
-            continue
-        lines.append(f"{status}:")
-        for c in rows:
-            account = f" [{c['account']}]" if c["account"] else ""
-            seen = f", observed {c['observed_at']}" if c["observed_at"] else ""
-            lines.append(
-                f"  - {c['route']}{account} ({c['reason']}{seen}): {c['detail']}"
-            )
+    lines.extend(_candidate_text_lines(report["candidates"]))
     lines.append(f"all_exhausted={'true' if report['all_exhausted'] else 'false'}")
     return "\n".join(lines) + "\n"
+
+
+def _card_window_summary(windows, now):
+    exhausted, reset_since, below = [], [], []
+    for window in windows if isinstance(windows, list) else []:
+        value = _reported_window_percent(window)
+        if value is None:
+            continue
+        kind, percent = value
+        if percent < 100.0:
+            below.append(percent)
+            continue
+        resets = usage_limits.parse_time(window.get("resets_at"))
+        if resets is not None and resets <= now:
+            reset_since.append(f"{kind} (reset at {_iso(resets)})")
+        else:
+            until = f", resets {_iso(resets)}" if resets is not None else ""
+            exhausted.append(f"{kind} {percent:g}%{until}")
+    return exhausted, reset_since, below
+
+
+def _reported_window_percent(window):
+    if not isinstance(window, dict):
+        return None
+    kind = usage_limits._window_kind(window.get("window_seconds"))
+    percent = usage_limits._finite_percent(window.get("used_percent"))
+    return None if kind is None or percent is None else (kind, percent)
+
+
+def _claude_route_candidates(base):
+    accounts = backends._claude_account_candidates()
+    out = []
+    for directory, email in accounts:
+        name = email or (Path(directory).name if directory else None)
+        out.append(
+            {
+                **base,
+                "account": name,
+                "account_dir": directory,
+                "account_email": email,
+                "quota_identity": f"claude-cli:{name or 'default'}",
+                "quota_identity_basis": "account",
+                "harness_family": "claude",
+                "route_accounts": len(accounts),
+                "multi_account": len(accounts) > 1,
+                "checks_cli_login": True,
+            }
+        )
+    return out
+
+
+def _omp_route_candidates(base, pool, key):
+    out = []
+    for account in pool:
+        keys = [backends._omp_account_cooldown_key(account)]
+        if len(pool) == 1 and key is not None:
+            keys.append(key)
+        out.append(
+            {
+                **base,
+                "cooldown_keys": keys,
+                "window_quota_unattributable": len(pool) > 1,
+                "route_cooldown_keys": [key]
+                if len(pool) > 1 and key is not None
+                else [],
+                "account": account.label,
+                "account_dir": None,
+                "account_email": account.email,
+                "quota_identity": f"omp-anthropic:{account.label}",
+                "quota_identity_basis": "account",
+                "harness_family": "claude" if account.email else None,
+                "route_accounts": len(pool),
+                "multi_account": False,
+            }
+        )
+    return out
+
+
+def _codex_route_candidates(base, cards):
+    names = sorted(
+        {
+            str(card["account"])
+            for card in _family_cards(cards, "codex")
+            if card.get("account")
+        }
+    )
+    account = names[0] if len(names) == 1 else None
+    return [
+        {
+            **base,
+            "account": account,
+            "account_dir": None,
+            "account_email": None,
+            "quota_identity": f"codex:{account or 'default'}",
+            "quota_identity_basis": "account",
+            "harness_family": "codex",
+            "route_accounts": 1,
+            "multi_account": False,
+        }
+    ]
+
+
+def _candidate_login_verdict(candidate):
+    if not candidate["checks_cli_login"]:
+        return None
+    directory = Path(candidate["account_dir"]) if candidate["account_dir"] else None
+    failure = claude_accounts.login_failure(directory)
+    if failure is None:
+        return None
+    return _verdict(
+        "login_failed",
+        source="claude-accounts",
+        detail=failure["reason"],
+        observed_at=failure["recorded_at"],
+        cause=seat_cooldown.CAUSE_AUTH,
+    )
+
+
+def _candidate_cooldowns(candidate, now):
+    method = candidate["access_method"]
+    found = [
+        (method, entry)
+        for key in candidate["cooldown_keys"]
+        if (entry := seat_cooldown.active_cooldown(key, access_method=method, now=now))
+        is not None
+    ]
+    found.extend(_route_nonquota_cooldowns(candidate, now))
+    found.extend(_candidate_window_cooldowns(candidate, now))
+    return found
+
+
+def _route_nonquota_cooldowns(candidate, now):
+    found = []
+    method = candidate["access_method"]
+    for key in candidate["route_cooldown_keys"]:
+        entry = seat_cooldown.active_cooldown(key, access_method=method, now=now)
+        if entry is not None and entry["cause"] not in (
+            None,
+            seat_cooldown.CAUSE_QUOTA,
+        ):
+            found.append((method, entry))
+    return found
+
+
+def _candidate_window_cooldowns(candidate, now):
+    found = []
+    method = seat_cooldown.WINDOW_ACCESS_METHOD
+    for key in candidate["window_keys"]:
+        entry = seat_cooldown.active_cooldown(key, access_method=method, now=now)
+        if entry is None:
+            continue
+        if candidate["window_quota_unattributable"] and entry["cause"] in (
+            None,
+            seat_cooldown.CAUSE_QUOTA,
+        ):
+            continue
+        found.append((method, entry))
+    return found
+
+
+def _candidate_harness_verdict(candidate, harness, now, max_age):
+    if candidate["harness_family"] is None or harness["status"] != "ok":
+        return None
+    cards = _family_cards(harness["cards"], candidate["harness_family"])
+    if candidate["multi_account"] or candidate["account_email"]:
+        email = (candidate["account_email"] or "").strip().lower()
+        cards = [
+            card
+            for card in cards
+            if email and usage_limits._card_account(card) == email
+        ]
+    return _cards_verdict(cards, harness["observed_at"], now, max_age)
+
+
+def _candidate_cooldown_verdict(candidate, cooldown, source, now, max_age):
+    recorded = cooldown["recorded_at"]
+    if cooldown["cause"] != seat_cooldown.CAUSE_QUOTA:
+        return _verdict(
+            "cooldown_unclassified",
+            source=source,
+            detail=f"{cooldown['reason']} (recorded without a typed cause)",
+            observed_at=recorded,
+        )
+    if candidate["multi_account"]:
+        return _verdict(
+            "cooldown_not_account_scoped",
+            source=source,
+            detail=f"{cooldown['reason']} — recorded for the route, which rotates through {candidate['route_accounts']} accounts; not attributable to this one",
+            observed_at=recorded,
+            cause=seat_cooldown.CAUSE_QUOTA,
+        )
+    if recorded is None or now - recorded > max_age:
+        age = "unknown age" if recorded is None else f"{int(now - recorded)}s old"
+        return _verdict(
+            "stale_observation",
+            source=source,
+            detail=f"{cooldown['reason']} ({age}, > {max_age:g}s)",
+            observed_at=recorded,
+            cause=seat_cooldown.CAUSE_QUOTA,
+        )
+    return _verdict(
+        "quota_cooldown",
+        source=source,
+        detail=cooldown["reason"],
+        observed_at=recorded,
+        cause=seat_cooldown.CAUSE_QUOTA,
+    )
+
+
+def _candidate_missing_detail(candidate, harness):
+    if candidate["harness_family"] is None:
+        return "no quota source covers this route"
+    if harness["status"] != "ok":
+        detail = f"harness limits source {harness['status']}"
+        return detail + f": {harness['detail']}" if harness.get("detail") else detail
+    return f"no harness limit card for {candidate['quota_identity']}"
+
+
+def _board_candidate_rows(models, harness, now, max_age, unavailable):
+    rows = []
+    for model in models:
+        routes = provider_chain(
+            model,
+            available=lambda candidate: unavailable(candidate) is None,
+            unpaid=backends.runtime_provider_marked_unpaid,
+        )
+        for route in routes:
+            rows.extend(
+                _capacity_route_rows(model, route, harness, now, max_age, unavailable)
+            )
+    return rows
+
+
+def _capacity_route_rows(model, route, harness, now, max_age, unavailable):
+    rows = []
+    for candidate in _route_candidates(route, harness["cards"], now):
+        verdict = _candidate_verdict(
+            candidate,
+            unavailable_reason=unavailable(route),
+            harness=harness,
+            now=now,
+            max_age=max_age,
+        )
+        observed = verdict.pop("observed_at")
+        rows.append(
+            {
+                "seat_model": model,
+                "route": candidate["route"],
+                "backend": candidate["backend"],
+                "access_method": candidate["access_method"],
+                "account": candidate["account"],
+                "quota_identity": candidate["quota_identity"],
+                "quota_identity_basis": candidate["quota_identity_basis"],
+                **verdict,
+                "observed_at": _iso(observed),
+                "age_seconds": None if observed is None else round(now - observed, 1),
+            }
+        )
+    return rows
+
+
+def _exhausted_report_rows(candidates):
+    return [
+        {
+            "model": candidate["seat_model"],
+            "source": candidate["source"],
+            "evidence": _candidate_evidence(candidate),
+        }
+        for candidate in candidates
+        if candidate["status"] == STATUS_EXHAUSTED
+    ]
+
+
+def _candidate_evidence(candidate):
+    account = f" [{candidate['account']}]" if candidate["account"] else ""
+    return f"{candidate['route']}{account}: {candidate['detail']}"
+
+
+def _candidate_text_lines(candidates):
+    lines = []
+    for status in STATUSES:
+        rows = [candidate for candidate in candidates if candidate["status"] == status]
+        if rows:
+            lines.append(f"{status}:")
+            lines.extend(_candidate_text_row(candidate) for candidate in rows)
+    return lines
+
+
+def _candidate_text_row(candidate):
+    account = f" [{candidate['account']}]" if candidate["account"] else ""
+    seen = f", observed {candidate['observed_at']}" if candidate["observed_at"] else ""
+    return f"  - {candidate['route']}{account} ({candidate['reason']}{seen}): {candidate['detail']}"

@@ -163,7 +163,7 @@ def test_cli_fallback_rotates_past_chronic_account_to_next():
     with (
         _patched_backends(
             _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
-            allow_spawn_for_model=lambda model, account=None: True,
+            spawn_refuse_reason=lambda model, account=None: None,
             review_claude_cli=fake_cli,
         ),
         _isolated_env(**_hermetic_env()),
@@ -187,7 +187,7 @@ def _run_cli_fallback_with_first_account_returning(first_result):
     with (
         _patched_backends(
             _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
-            allow_spawn_for_model=lambda model, account=None: True,
+            spawn_refuse_reason=lambda model, account=None: None,
             review_claude_cli=fake_cli,
         ),
         _isolated_env(**_hermetic_env()),
@@ -233,13 +233,15 @@ def test_cli_fallback_skips_exhausted_account_without_dispatching_it():
         calls.append(config_dir)
         return _usable(model)
 
-    def fake_allow(model, account=None):
-        return account != "one@example.com"
+    def fake_refuse(model, account=None):
+        if account == "one@example.com":
+            return "harness 5-hour window exhausted (100%)"
+        return None
 
     with (
         _patched_backends(
             _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
-            allow_spawn_for_model=fake_allow,
+            spawn_refuse_reason=fake_refuse,
             review_claude_cli=fake_cli,
         ),
         _isolated_env(**_hermetic_env()),
@@ -263,7 +265,6 @@ def test_cli_fallback_all_accounts_exhausted_returns_skip_naming_every_account()
     with (
         _patched_backends(
             _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
-            allow_spawn_for_model=lambda model, account=None: False,
             spawn_refuse_reason=lambda model, account=None: (
                 "harness 5-hour window exhausted (100%)"
             ),
@@ -278,7 +279,41 @@ def test_cli_fallback_all_accounts_exhausted_returns_skip_naming_every_account()
     assert result.returncode == 0
     assert "usage-limit skip" in result.command
     assert "all 2 configured accounts" in result.stdout, result.stdout
-    assert "one@example.com" in result.stdout and "two@example.com" in result.stdout
+    # accounts are named redacted: the first character and the domain
+    assert "o***@example.com" in result.stdout and "t***@example.com" in result.stdout
+    assert "one@example.com" not in result.stdout, result.stdout
+
+
+def test_cli_fallback_budget_hold_on_any_account_marks_the_skip_and_is_not_a_cooldown():
+    held = (
+        "Blocked by review-cli configured 80% budget ceiling: 5-hour window at 90% "
+        "(reset time unknown); account o***@example.com. review-cli policy hold, "
+        "not a provider error"
+    )
+
+    def refuse(model, account=None):
+        if account == "one@example.com":
+            return "harness 5-hour window exhausted (100%)"
+        return held
+
+    spawned = []
+    with (
+        _patched_backends(
+            _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
+            spawn_refuse_reason=refuse,
+            review_claude_cli=lambda *a, **k: spawned.append(1),
+        ),
+        _isolated_env(**_hermetic_env()),
+    ):
+        result = backends._review_claude_cli_with_account_fallback(
+            _MODEL, "prompt", "diff", Path("."), 60, 1, effort=None
+        )
+    assert spawned == []
+    assert result.command.endswith(backends._BUDGET_SKIP_SUFFIX), result.command
+    assert held in result.stdout and "all 2 configured accounts" in result.stdout
+    # review_claude records a cooldown for a chronic-looking skip: this one must not be
+    assert backends._chronic_unavailable_reason(result) is not None
+    assert result.command.endswith(": account budget hold")
 
 
 def test_cli_fallback_every_account_chronic_returns_the_last_result():
@@ -293,7 +328,7 @@ def test_cli_fallback_every_account_chronic_returns_the_last_result():
     with (
         _patched_backends(
             _claude_account_candidates=lambda: list(_TWO_CANDIDATES),
-            allow_spawn_for_model=lambda model, account=None: True,
+            spawn_refuse_reason=lambda model, account=None: None,
             review_claude_cli=fake_cli,
         ),
         _isolated_env(**_hermetic_env()),
@@ -317,7 +352,7 @@ def test_cli_fallback_single_implicit_account_dispatches_once_with_none_config_d
     with (
         _patched_backends(
             _claude_account_candidates=lambda: [(None, None)],
-            allow_spawn_for_model=lambda model, account=None: True,
+            spawn_refuse_reason=lambda model, account=None: None,
             review_claude_cli=fake_cli,
         ),
         _isolated_env(**_hermetic_env()),
@@ -444,8 +479,8 @@ def test_review_claude_skips_every_seat_shape_only_when_all_accounts_exhausted()
     assert calls == [], "an exhausted account was still dispatched"
     assert result.returncode == 0
     assert "usage-limit skip" in result.command
-    assert "account-1@example.com" in result.stdout
-    assert "account-2@example.com" in result.stdout
+    assert result.stdout.count("a***@example.com") == 2, result.stdout
+    assert "account-1@example.com" not in result.stdout, result.stdout
 
 
 # --- the omp-hosted Claude profile-rotation loop -----------------------------

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 
+import reviewlib.account_budget as _account_budget
 import reviewlib.backends as _backends
 import reviewlib.provider_failover as _pf
 from _brainstorm_env_isolation import _ISOLATED_ENV_KEYS
@@ -109,8 +110,10 @@ def _isolate_omp_accounts(tmp_path, monkeypatch):
         monkeypatch.delenv(key, raising=False)
     saved = _backends._CONFIG_OMP_BIN, _backends._CONFIG_OMP_ACCOUNTS
     _backends.configure_omp_accounts(None)
+    _account_budget.unconfigure()
     yield
     _backends._CONFIG_OMP_BIN, _backends._CONFIG_OMP_ACCOUNTS = saved
+    _account_budget.unconfigure()
 
 
 @pytest.fixture(autouse=True)

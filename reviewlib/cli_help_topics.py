@@ -74,6 +74,18 @@ CONFIG FILE
                        REVIEW_OMP_ACCOUNTS_EXCLUDE=a@x.com,b@y.com (at least one email)
                        replaces `exclude`, REVIEW_OMP_MAX_USAGE_PERCENT=90 (not empty)
                        `max_usage_percent`.
+    account_budget:    mapping     review-cli's subscription account spending policy:
+                         max_usage_percent: 80        hold at or above this percentage
+                         strict: true                 unknown/incomplete usage holds
+                         max_age_seconds: 1800        maximum source observation age
+                         providers: {{anthropic: 80}}   per-provider override
+                         enabled: true                explicit false is announced
+                       The same-account five-hour and seven-day windows must both be
+                       current. Direct Claude text/images and OMP account promotion
+                       use the same ceiling; the stricter OMP account policy wins.
+                       A policy hold spawns nothing and does not create a cooldown.
+                       Paid API quota is separate from a CLI subscription; unsupported
+                       providers keep their existing admission rules.
     timeout:           int         per-call timeout seconds for `review diff` (replaces the
                        configured/default request timeout; still overrideable
                        per-invocation by --timeout). Review/panel agent CLI backends treat

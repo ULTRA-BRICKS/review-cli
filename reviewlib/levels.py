@@ -95,6 +95,12 @@ def _shipped_raw() -> dict:
     return data
 
 
+def shipped_section(name: str) -> object:
+    """A deep copy of top-level key `name` of the shipped file (None when absent): the
+    version-controlled defaults of settings that are not levels, e.g. `account_budget`."""
+    return copy.deepcopy(_shipped_raw().get(name))
+
+
 def _merge(base: object, override: object) -> object:
     if not isinstance(base, dict) or not isinstance(override, dict):
         return copy.deepcopy(override)
@@ -162,6 +168,44 @@ def _string_list(value: object, where: str) -> tuple[str, ...]:
 
 def _build_level(name: str, raw: object) -> Level:
     where = f"levels.{name}"
+    _validate_level_fields(raw, where)
+    pool = raw["pool"]
+    if isinstance(pool, bool) or not isinstance(pool, int) or pool < 1:
+        raise LevelError(f"{where}.pool: must be an integer >= 1, got {pool!r}")
+    escalation = _level_escalation(raw.get("escalate_to"), where)
+    roles = _level_roles(raw["roles"], where)
+    aliases = _level_aliases(raw.get("aliases", []), where)
+    return Level(
+        name=name,
+        aliases=aliases,
+        pool=pool,
+        effort=_effort(raw["effort"], f"{where}.effort"),
+        escalate_to=escalation,
+        roles=roles,
+        moderators=_string_list(raw["moderators"], f"{where}.moderators"),
+    )
+
+
+def resolve_levels(config: dict | None = None) -> LevelSet:
+    """Apply user overrides to shipped data, preserving validation and precedence."""
+    shipped = _shipped_raw()
+    raw_levels = _merged_level_data(shipped, config)
+    levels = {
+        str(name): _build_level(str(name), raw) for name, raw in raw_levels.items()
+    }
+    _validate_level_links(levels)
+    default = (config or {}).get("default_level", shipped.get("default_level"))
+    level_set = LevelSet(levels=levels, default="")
+    try:
+        default_name = level_set.get(default).name if isinstance(default, str) else None
+    except LevelError as exc:
+        raise LevelError(f"default_level: {exc}") from exc
+    if default_name is None:
+        raise LevelError(f"default_level: must be a level name, got {default!r}")
+    return LevelSet(levels=levels, default=default_name)
+
+
+def _validate_level_fields(raw, where):
     if not isinstance(raw, dict):
         raise LevelError(f"{where}: must be a mapping, got {raw!r}")
     unknown = sorted(set(raw) - _LEVEL_KEYS)
@@ -174,82 +218,65 @@ def _build_level(name: str, raw: object) -> Level:
             raise LevelError(
                 f"{where}.{required}: required (a new level must be complete)"
             )
-    pool = raw["pool"]
-    if isinstance(pool, bool) or not isinstance(pool, int) or pool < 1:
-        raise LevelError(f"{where}.pool: must be an integer >= 1, got {pool!r}")
-    escalate_to = raw.get("escalate_to")
-    if escalate_to is not None and not (
-        isinstance(escalate_to, str) and escalate_to.strip()
-    ):
+
+
+def _level_escalation(value, where):
+    if value is not None and not (isinstance(value, str) and value.strip()):
         raise LevelError(
-            f"{where}.escalate_to: must be a level name or null, got {escalate_to!r}"
+            f"{where}.escalate_to: must be a level name or null, got {value!r}"
         )
-    roles_raw = raw["roles"]
-    if not isinstance(roles_raw, dict) or not roles_raw:
+    return value.strip() if value else None
+
+
+def _level_roles(raw, where):
+    if not isinstance(raw, dict) or not raw:
         raise LevelError(f"{where}.roles: must be a non-empty mapping of role -> seats")
-    roles: dict[str, tuple[LevelSeat, ...]] = {}
-    for role, seats in roles_raw.items():
+    roles = {}
+    for role, seats in raw.items():
         if not isinstance(seats, list) or not seats:
             raise LevelError(f"{where}.roles.{role}: must be a non-empty list of seats")
         roles[str(role)] = tuple(
-            _seat(s, f"{where}.roles.{role}[{i}]") for i, s in enumerate(seats)
+            _seat(seat, f"{where}.roles.{role}[{index}]")
+            for index, seat in enumerate(seats)
         )
-    aliases = raw.get("aliases", [])
-    if not isinstance(aliases, list) or not all(
-        isinstance(a, str) and a.strip() for a in aliases
+    return roles
+
+
+def _level_aliases(raw, where):
+    if not isinstance(raw, list) or not all(
+        isinstance(alias, str) and alias.strip() for alias in raw
     ):
-        raise LevelError(f"{where}.aliases: must be a list of names, got {aliases!r}")
-    return Level(
-        name=name,
-        aliases=tuple(a.strip().lower() for a in aliases),
-        pool=pool,
-        effort=_effort(raw["effort"], f"{where}.effort"),
-        escalate_to=escalate_to.strip() if escalate_to else None,
-        roles=roles,
-        moderators=_string_list(raw["moderators"], f"{where}.moderators"),
-    )
+        raise LevelError(f"{where}.aliases: must be a list of names, got {raw!r}")
+    return tuple(alias.strip().lower() for alias in raw)
 
 
-def resolve_levels(config: dict | None = None) -> LevelSet:
-    """The shipped levels with `config`'s `levels:` / `default_level:` merged over them.
-    `config=None` (or no such keys) is exactly the shipped defaults. Raises `LevelError`
-    naming the offending key."""
-    shipped = _shipped_raw()
+def _merged_level_data(shipped, config):
     raw_levels = copy.deepcopy(shipped["levels"])
     user = (config or {}).get("levels")
-    if user is not None:
-        if not isinstance(user, dict):
-            raise LevelError(
-                f"levels: must be a mapping of level name -> overrides, got {user!r}"
-            )
-        for name, override in user.items():
-            if not isinstance(override, dict):
-                raise LevelError(f"levels.{name}: must be a mapping, got {override!r}")
-            raw_levels[name] = _merge(raw_levels.get(name, {}), override)
-    levels = {
-        str(name): _build_level(str(name), raw) for name, raw in raw_levels.items()
-    }
+    if user is None:
+        return raw_levels
+    if not isinstance(user, dict):
+        raise LevelError(
+            f"levels: must be a mapping of level name -> overrides, got {user!r}"
+        )
+    for name, override in user.items():
+        if not isinstance(override, dict):
+            raise LevelError(f"levels.{name}: must be a mapping, got {override!r}")
+        raw_levels[name] = _merge(raw_levels.get(name, {}), override)
+    return raw_levels
+
+
+def _validate_level_links(levels):
     seen: dict[str, str] = {}
     for level in levels.values():
         for label in (level.name, *level.aliases):
             if label in seen and seen[label] != level.name:
                 raise LevelError(
-                    f"levels.{level.name}: name/alias {label!r} is already used by level "
-                    f"{seen[label]!r}"
+                    f"levels.{level.name}: name/alias {label!r} is already used by level {seen[label]!r}"
                 )
             seen[label] = level.name
     for level in levels.values():
         if level.escalate_to is not None and level.escalate_to not in levels:
             raise LevelError(
-                f"levels.{level.name}.escalate_to: unknown level {level.escalate_to!r}; "
-                f"known levels: {', '.join(levels)}"
+                f"levels.{level.name}.escalate_to: unknown level {level.escalate_to!r}; known levels: {', '.join(levels)}"
             )
-    default = (config or {}).get("default_level", shipped.get("default_level"))
-    level_set = LevelSet(levels=levels, default="")
-    try:
-        default_name = level_set.get(default).name if isinstance(default, str) else None
-    except LevelError as exc:
-        raise LevelError(f"default_level: {exc}") from exc
-    if default_name is None:
-        raise LevelError(f"default_level: must be a level name, got {default!r}")
-    return LevelSet(levels=levels, default=default_name)

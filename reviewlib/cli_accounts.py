@@ -25,6 +25,7 @@ def _apply_runtime_config(_api, /, config: dict) -> None:
     _api.backends.configure_unpaid_providers(config.get("unpaid_providers"))
     _api.backends.configure_omp_bin(config.get("omp_bin"))
     _api.backends.configure_omp_accounts(config.get("omp_accounts"))
+    _api.account_budget.configure(config.get("account_budget"))
     from .provider_failover import configure_provider_chains
 
     configure_provider_chains(config.get("provider_chains"))

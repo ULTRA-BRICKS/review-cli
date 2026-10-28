@@ -3,6 +3,18 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.67.0 — 2026-10-28
+
+- Enforce the configurable account budget on direct Claude text and images, OMP
+  account selection and promoted review seats. The shipped ceiling is 80%; strict
+  mode requires fresh shared five-hour and seven-day evidence for the same account.
+  Policy holds spawn no call and create no provider cooldown. Refs #696.
+- Load `account_budget:` defaults from packaged configuration with machine overrides
+  on normal CLI dispatch, resumed sessions and availability checks. Preserve explicit
+  overrides, paid-provider restrictions and provider-quota reporting distinctions.
+- Organize backend implementation into focused modules while retaining the public
+  call signatures, state, introspection and dependency-patching contracts.
+
 ## 0.66.0 — 2026-10-27
 
 - Apply capability levels consistently to `diff`, `just-ask`, `quorum` and

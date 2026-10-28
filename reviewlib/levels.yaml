@@ -27,6 +27,26 @@
 # commandcode route at xhigh. Fable (a 97-100% dispatch failure rate on the owner's account,
 # review-cli#fable-seat-reliability) is in NO level: reach it with `-m fable` or by adding it to
 # a level in your own config.
+#
+# Account budget (`account_budget:`): the ceiling review-cli never spends a subscription-backed
+# Claude account beyond, whichever route dispatches (the claude CLI, omp's Anthropic account
+# pool, a promoted reserve seat). It is NOT part of a level: every level obeys it. A user's
+# config.yaml `account_budget:` overrides single keys (see reviewlib/account_budget.py and
+# `review help config`):
+#   max_usage_percent  ceiling for every budgeted provider: a 5-hour or 7-day window at or
+#                      above it (compared unrounded, 79.99 is under 80) holds the dispatch
+#   providers          per-provider ceilings that replace max_usage_percent (`anthropic`)
+#   strict             true: usage that cannot be confirmed (no harness card / omp usage for
+#                      the SAME account, stale, or missing its 5-hour or 7-day window) also
+#                      holds the dispatch (fail closed); false: unknown usage is let through
+#   max_age_seconds    how old a harness usage read may be before it no longer counts
+#   enabled            false: the owner's deliberate override, no ceiling is enforced (said on
+#                      stderr once per run)
+account_budget:
+  max_usage_percent: 80
+  providers: {}
+  strict: true
+  max_age_seconds: 1800
 
 default_level: routine
 

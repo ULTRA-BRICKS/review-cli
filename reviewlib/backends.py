@@ -30,24 +30,25 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from .backend_facade import forwarding as _forwarding
+from . import backend_api as _backend_api
+from . import backend_claude as _backend_claude
+from . import backend_cooldown as _backend_cooldown
+from . import backend_dispatch as _backend_dispatch
+from . import backend_omp as _backend_omp
+from . import backend_omp_registry as _backend_omp_registry
+from . import backend_opencode as _backend_opencode
+from . import backend_provider as _backend_provider
+from . import backend_rest as _backend_rest
 from typing import Callable, Iterator
 
-from .config import _agentic
+from .config import _agentic as _agentic
 from . import availability
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
-from . import admission, omp_accounts
+from . import account_budget, admission, omp_accounts
 from .portable import lock_file, unlock_file
-from .process import (
-    TIMEOUT_KIND_STALL,
-    _run,
-    _run_streamed,
-    _safe_log_header,
-    git_repo_env,
-    run_deadline_remaining,
-    strip_control_sequences,
-    write_sidecar_log,
-)
+from .process import TIMEOUT_KIND_STALL, _run as _run, _run_streamed as _run_streamed, _safe_log_header as _safe_log_header, git_repo_env, run_deadline_remaining, strip_control_sequences, write_sidecar_log
 from .seat_cooldown import (
     CAUSE_AUTH,
     CAUSE_QUOTA,
@@ -59,7 +60,6 @@ from .seat_cooldown import (
     record_cooldown,
 )
 from .usage_limits import (
-    allow_spawn_for_model,
     spawn_refuse_reason,
     usage_percent_for_model,
 )
@@ -104,21 +104,6 @@ class ReviewResult:
     account: str = ""
 
 
-def _which(name: str) -> str:
-    path = _which_optional(name)
-    if not path:
-        raise RuntimeError(f"{name} not found on PATH")
-    return path
-
-
-def _which_optional(name: str) -> str | None:
-    """`shutil.which`, but as a backends-local indirection. The claude CLI resolution
-    (review-cli#76) needs the present-or-absent form (None on miss, not a raise); routing
-    it through this module symbol lets tests patch `backends._which_optional` to simulate
-    a host's CLI inventory WITHOUT monkeypatching the stdlib `shutil.which` globally."""
-    return shutil.which(name)
-
-
 # A backend that passes the prompt as argv caps out near ARG_MAX (~1 MB): opencode
 # passes the message as argv. Feeding via stdin (claude/codex) removes that ceiling
 # for them, but opencode has no stdin path — so warn well before it, loudly not
@@ -126,400 +111,10 @@ def _which_optional(name: str) -> str | None:
 _PAYLOAD_WARN_BYTES = 600_000
 
 
-def _payload(prompt: str, diff: str = "") -> str:
-    out = prompt if not diff.strip() else f"{prompt}\n\n```diff\n{diff}\n```"
-    if len(out.encode("utf-8")) > _PAYLOAD_WARN_BYTES:
-        print(
-            f"[review-cli] WARNING: payload is {len(out)} bytes — nearing the ~1 MB "
-            "ARG_MAX ceiling; opencode (argv-only) may fail. "
-            "Use fewer --max-rounds or a smaller diff.",
-            file=sys.stderr,
-            flush=True,
-        )
-    return out
-
-
-def _claude_api_model(model: str) -> str:
-    return (
-        model.split(":", 1)[1]
-        if ":" in model
-        else os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")
-    )
-
-
-def _claude_api_command(model: str) -> str:
-    return f"Anthropic API {_claude_api_model(model)}"
-
-
-def _prompt_with_effort(prompt: str, effort: str | None) -> str:
-    if not effort:
-        return prompt
-    effort_label = "highest" if effort in {"xhigh", "max"} else effort
-    hint = f"Use {effort_label} reasoning effort."
-    if hint in prompt:
-        return prompt
-    return f"{prompt}\n\n{hint}"
-
-
-def _codex_reasoning_effort(effort: str | None) -> str | None:
-    if not effort:
-        return None
-    if effort == "minimal":
-        return "low"
-    if effort == "max":
-        return "xhigh"
-    return effort
-
-
-def _claude_reasoning_effort(effort: str | None) -> str | None:
-    if not effort:
-        return None
-    if effort == "minimal":
-        return "low"
-    return effort
-
-
-def _opencode_variant(effort: str | None) -> str | None:
-    """The opencode `--variant` value for a review effort level, or None.
-
-    opencode's `--variant` is "provider-specific reasoning effort" (its help lists
-    `high`, `max`, `minimal`) forwarded to whatever provider the seat routes to. review's
-    effort vocabulary is a strict superset of those examples, so the level passes straight
-    through; opencode + the provider decide how to honour it."""
-    if not effort:
-        return None
-    return effort
-
-
-def _http_error_text(exc: urllib.error.HTTPError) -> str:
-    """An HTTP error's body, plus its `Retry-After` header as a trailing line: the header
-    is where a provider says how long to wait, and `availability` reads it from the text."""
-    body = exc.read().decode("utf-8", "replace")
-    headers = getattr(exc, "headers", None)
-    retry_after = headers.get("Retry-After") if headers is not None else None
-    return f"{body}\nRetry-After: {retry_after}" if retry_after else body
-
-
-def call_backend(
-    backend: Callable[..., ReviewResult],
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    *,
-    effort: str | None = None,
-) -> ReviewResult:
-    """Run one seat call while holding a slot of its provider's host-wide budget
-    (reviewlib.admission, review-cli#614); a 429/overload reply feeds back into that
-    budget. The per-call `timeout` starts only once the slot is held, and is capped to
-    the time left of an explicit `--timeout N`: an HTTP backend has no process for the
-    command deadline to kill, so queue time plus its call must not outrun N.
-
-    A seat that is excluded (`availability`: its quota/credits/login window has not
-    ended) is answered with the cached-skip sentinel BEFORE it takes a provider slot,
-    and what a failed call says about when the seat answers again is recorded."""
-    excluded = availability_exclusion(model)
-    if excluded is not None:
-        return _availability_skip_result(model, round_no, excluded)
-    with admission.seat_slot(model) as denied:
-        if denied is not None:
-            return _admission_skip_result(model, round_no, denied)
-        remaining = run_deadline_remaining()
-        if remaining is not None:
-            timeout = max(1, min(timeout, math.ceil(remaining)))
-        result = _call_backend_now(
-            backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
-        )
-    admission.note_result(model, result)
-    note_availability(model, result)
-    return result
-
-
-def _availability_methods(model: str) -> tuple[str, ...]:
-    """The cooldown-store transports `model` can actually run on, whose older escalating-
-    timer entries therefore exclude it: claude's resolved transport, opencode's and omp's
-    own bucket, else the CLI/API buckets (the `window` bucket is always checked)."""
-    backend = resolve_backend(model)
-    if backend is review_claude:
-        return (claude_access_method(),)
-    if backend is review_opencode:
-        return (_OPENCODE_ACCESS_METHOD,)
-    if backend is review_omp:
-        return (_OMP_ACCESS_METHOD,)
-    return ("cli", "api")
-
-
-def availability_exclusion(model: str) -> availability.Exclusion | None:
-    """Why `model` must not be dispatched right now — a quota/credits/login/rate-limit
-    window recorded from an earlier failure (own seat or whole provider) — or None.
-    Disabled under the test fake backend and by `$REVIEW_SEAT_COOLDOWN_SECONDS<=0`."""
-    if _fake_backend_enabled():
-        return None
-    try:
-        return availability.exclusion(
-            model,
-            methods=_availability_methods(model),
-            legacy_check=lambda m, access_method: _cooldown_after_recovery_probe(
-                m, access_method=access_method
-            ),
-        )
-    except Exception:  # noqa: BLE001 — a bookkeeping failure must not block a seat
-        return None
-
-
-def note_availability(model: str, result: ReviewResult) -> None:
-    """Feed a finished seat call to `availability.observe`. Never raises."""
-    if _fake_backend_enabled():
-        return
-    try:
-        from .panel import result_is_usable
-
-        availability.observe(model, result, usable=result_is_usable(result))
-    except Exception:  # noqa: BLE001 — see availability.observe
-        pass
-
-
-def _availability_skip_result(
-    model: str, round_no: int, excluded: availability.Exclusion
-) -> ReviewResult:
-    """The cached-skip sentinel for an excluded seat: same shape as a cooldown skip, so
-    failover and the dashboard treat it as unavailable without any call being made."""
-    return _cooldown_skip_result(
-        model,
-        round_no,
-        {
-            "reason": excluded.describe(),
-            "remaining_seconds": excluded.remaining_seconds,
-        },
-        backend=provider_route_name(model),
-    )
-
-
-def _admission_skip_result(model: str, round_no: int, reason: str) -> ReviewResult:
-    """Synthetic rc=0 "unavailable" sentinel for a seat whose provider stayed saturated
-    past `admission.provider_wait_seconds`, so board/provider failover moves on to the
-    next provider or a reserve seat (same shape as `_usage_limit_skip_result`)."""
-    marker = _UNAVAILABLE_MARKERS[0]
-    stdout = f"{model} {marker} ({reason}).\n"
-    if len(stdout) > _UNAVAILABLE_MAX_LEN:
-        stdout = f"{marker} ({reason}).\n"[:_UNAVAILABLE_MAX_LEN]
-    command = "admission skip (provider saturated)"
-    _emit_rest_log(
-        provider_route_name(model),
-        command,
-        round_no=round_no,
-        returncode=0,
-        stdout=stdout,
-        stderr="",
-    )
-    return ReviewResult(
-        model=model, command=command, returncode=0, stdout=stdout, stderr=""
-    )
-
-
-def _call_backend_now(
-    backend: Callable[..., ReviewResult],
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    *,
-    effort: str | None = None,
-) -> ReviewResult:
-    if effort is None:
-        return backend(model, prompt, diff, cwd, timeout, round_no)
-    try:
-        sig = inspect.signature(backend)
-    except (TypeError, ValueError):
-        accepts_effort = False
-    else:
-        effort_param = sig.parameters.get("effort")
-        accepts_effort = (
-            effort_param is not None
-            and effort_param.kind != inspect.Parameter.POSITIONAL_ONLY
-        ) or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-    prompt = _prompt_with_effort(prompt, effort)
-    if accepts_effort:
-        return backend(model, prompt, diff, cwd, timeout, round_no, effort=effort)
-    return backend(model, prompt, diff, cwd, timeout, round_no)
-
-
-def review_with_images(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    images: tuple[Path, ...] = (),
-    effort: str | None = None,
-) -> ReviewResult:
-    """Run a backend with raw image attachments when that backend safely supports them.
-
-    Unsupported text backends still receive the grounded visual note in the prompt; the
-    raw image path is an additive transport for capable backends, not a new hard
-    dependency for every panel seat.
-    """
-    backend = resolve_backend(model)
-    if images and backend is review_claude:
-        unpaid = unpaid_provider_result(
-            model,
-            backend="claude",
-            command=_claude_api_command(model),
-            round_no=round_no,
-            provider=_claude_gateway_provider_from_env(),
-        )
-        if unpaid is not None:
-            return unpaid
-        # Mirrors review_claude()'s own cooldown check/record (this branch bypasses
-        # review_claude entirely to reach the images-capable CLI transport, so it must
-        # opt back into the SAME contract explicitly — kimi review finding: --visual
-        # was the one dispatch path that never consulted or recorded seat_cooldown).
-        # Always the CLI transport (review_claude_cli_with_images), so it shares the
-        # "cli" cooldown bucket with review_claude()'s own CLI branch (review-cli#187) —
-        # both really are the same underlying CLI/quota.
-        cooldown = _cooldown_after_recovery_probe(model, access_method="cli")
-        if cooldown is not None:
-            return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
-        if not allow_spawn_for_model(model):
-            reason = (
-                spawn_refuse_reason(model) or "harness 5-hour window exhausted (100%)"
-            )
-            return _usage_limit_skip_result(model, round_no, reason, backend="claude")
-        with admission.seat_slot(model) as denied:
-            if denied is not None:
-                return _admission_skip_result(model, round_no, denied)
-            result = review_claude_cli_with_images(
-                model, prompt, diff, cwd, timeout, round_no, images, effort=effort
-            )
-        admission.note_result(model, result)
-        reason = _chronic_unavailable_reason(result)
-        if reason is not None:
-            record_cooldown(
-                model, reason, access_method="cli", cause=_chronic_cause(reason)
-            )
-        elif _clears_cooldown_history(result):
-            clear_cooldown(model, access_method="cli")
-        return result
-    return call_backend(
-        backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
-    )
-
-
 # Guards `_ensure_codex_recursion_guard` so the (cheap but non-zero: stat + maybe
 # write) install check runs at most ONCE per process, not once per codex seat/round.
 _codex_recursion_guard_ensured = False
 _codex_recursion_guard_lock = threading.Lock()
-
-
-def _ensure_codex_recursion_guard() -> None:
-    """Best-effort, once-per-process install of the review-cli#180 execpolicy guard
-    (see `install.install_codex_recursion_guard` for the rationale and its
-    limitations). Never raises — a failed write must not block a review run; the
-    REVIEW_CLI_ACTIVE reentrancy guard (`reviewlib.cli._reject_if_reentrant`) is the
-    mechanism that still holds either way. Prints a one-line stderr notice ONLY when
-    the file is actually created/rewritten (never on the common no-op "already up to
-    date" path) — this writes into the user's `$CODEX_HOME` as a side effect of an
-    ordinary review run, so it must not be silent (review-cli#180 review finding,
-    glm-5.2)."""
-    global _codex_recursion_guard_ensured
-    if _codex_recursion_guard_ensured:
-        return
-    with _codex_recursion_guard_lock:
-        if _codex_recursion_guard_ensured:
-            return
-        try:
-            if install_codex_recursion_guard():
-                print(
-                    "[review-cli] installed/updated the codex execpolicy recursion "
-                    "guard at $CODEX_HOME/rules/ (review-cli#180) — forbids codex "
-                    "from shelling out to review/codex/claude/opencode/omp.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        except Exception:  # noqa: BLE001 — must never break a review call
-            pass
-        _codex_recursion_guard_ensured = True
-
-
-def _cwd_is_git_repo(cwd: Path) -> bool:
-    """True when `cwd` is inside a git work tree. codex's `-s read-only -C <cwd>`
-    refuses to run ("Not inside a trusted directory and --skip-git-repo-check was
-    not specified") for a non-repo cwd (review-cli#168's reported `codex:gpt-5.6-terra`
-    failure) -- e.g. review-cli's own omp-cage sandbox dirs, or a plain scratch dir a
-    caller points `review visual`/`--diff` at. Any subprocess failure (git missing,
-    timeout) is treated as "not a repo", the conservative default that still lets
-    codex make its own trust decision rather than review-cli asserting a repo exists."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
-
-
-def review_codex(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    codex_model = model.split(":", 1)[1] if ":" in model else None
-    unpaid = unpaid_provider_result(
-        model, backend="codex", command="codex", round_no=round_no
-    )
-    if unpaid is not None:
-        return unpaid
-    codex_path = _which("codex")
-    # Only after the unpaid short-circuit and the PATH check: installing the execpolicy
-    # guard writes into $HOME (review-cli#180 review finding, Opus) — a board that lists
-    # a codex seat the user has no binary for, or has disabled as unpaid, must not touch
-    # their home directory or print a guard-installed notice for a backend that never runs.
-    _ensure_codex_recursion_guard()
-    argv = [codex_path, "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
-    if not _cwd_is_git_repo(cwd):
-        # review-cli#168: codex refuses a non-repo `-C` dir outright otherwise.
-        argv.append("--skip-git-repo-check")
-    if codex_model:
-        argv += ["-m", codex_model]
-    codex_effort = _codex_reasoning_effort(effort)
-    if codex_effort:
-        argv += ["-c", f'model_reasoning_effort="{codex_effort}"']
-    argv.append("-")
-    command = " ".join(argv[:-1]) + " -"
-    proc = _run_streamed(
-        argv,
-        cwd=cwd,
-        input_text=_payload(prompt, diff),
-        timeout=timeout,
-        backend="codex",
-        round_no=round_no,
-        announce=_ANNOUNCE_LOGS,
-        true_silence_timeout=true_silence_timeout_seconds(model),
-        header_argv0=f"codex -m {_safe_log_header(codex_model)}"
-        if codex_model
-        else None,
-    )
-    return ReviewResult(
-        model=model,
-        command=command,
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
 
 
 # Every capability the read-only reviewer agent MUST deny. This is the security boundary
@@ -583,159 +178,6 @@ def _build_readonly_agent_markdown() -> str:
 _READONLY_AGENT_MARKDOWN = _build_readonly_agent_markdown()
 
 
-def _frontmatter_yaml(text: str) -> str | None:
-    """The YAML between the opening ``---`` and the next CLOSING ``---``, each on its OWN
-    line (the markdown frontmatter convention), or ``None`` if there is no such block.
-
-    Splitting on a LINE-anchored delimiter (not a bare ``---`` substring) avoids tearing
-    the YAML on a ``---`` that appears INSIDE a value (e.g. ``description: a---b``), which a
-    naive ``str.split('---')`` would mis-cut — turning a legit file into "unparseable" and
-    forcing a needless rewrite."""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            return "\n".join(lines[1:i])
-    return None  # opening --- but no closing --- => not a frontmatter block
-
-
-def _agent_frontmatter(text: str) -> dict | None:
-    """Parse the YAML frontmatter of an opencode agent markdown file into a dict.
-
-    Returns ``None`` when there is no line-delimited ``---`` frontmatter block or it does
-    not parse to a mapping — the caller treats that as "not a trusted read-only definition"
-    and rewrites the canonical one. PyYAML is a hard dependency (it parses config.yaml),
-    but the import stays lazy/guarded so a broken install degrades to "rewrite" rather
-    than a traceback on the hot review path."""
-    block = _frontmatter_yaml(text)
-    if block is None:
-        return None
-    try:
-        import yaml
-
-        data = yaml.safe_load(block)
-    except Exception:  # noqa: BLE001 — any parse/import failure => not trusted
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _permission_value_is_fully_denied(value: object) -> bool:
-    """True if a single permission VALUE grants nothing.
-
-    opencode accepts both the scalar form (``bash: deny``) and a granular per-pattern map
-    (``bash: {"*": deny, "git diff": deny}``). A value denies everything iff it is:
-      * the string ``deny``; OR
-      * a granular map that has an explicit catch-all ``"*": deny`` AND every other leaf is
-        also fully denied.
-    The catch-all requirement is the SECURITY-CRITICAL bit (verified against opencode's
-    permission docs, review-cli#40): opencode's defaults are PERMISSIVE and rules match by
-    "last matching wins", so a granular map WITHOUT a ``"*"`` catch-all leaves every
-    UNLISTED command at the default ``allow``. A map like ``bash: {"git status": deny}``
-    would otherwise look "all-deny" to a naive scan yet permit arbitrary other shell — the
-    exact tampered-agent hole this hardening must close. An empty map, a missing/non-deny
-    ``"*"``, a string other than ``deny`` (``allow``/``ask``), or any other type is a GRANT."""
-    if isinstance(value, str):
-        return value == "deny"
-    if isinstance(value, dict):
-        if not value:
-            return False
-        # A granular map must explicitly deny the catch-all (unlisted patterns default to
-        # allow otherwise) AND deny every other listed pattern.
-        if value.get("*") != "deny":
-            return False
-        return all(_permission_value_is_fully_denied(v) for v in value.values())
-    return False
-
-
-def _agent_is_strictly_readonly(text: str) -> bool:
-    """True only if the agent definition's permission block is at-least-as-strict as the
-    canonical deny-all set — i.e. it grants NO write/exec capability.
-
-    Strict on purpose (a stale/tampered global agent is the threat in review-cli#40):
-      * the frontmatter must parse to a mapping with a ``permission`` mapping;
-      * EVERY key we require (``_READONLY_AGENT_DENIED_PERMISSIONS``) must be present and
-        fully denied — a missing key defaults to opencode's permissive behaviour, so a
-        partial block is treated as permissive;
-      * EVERY key actually present (including extra capabilities we don't enumerate, e.g.
-        a future ``network``) must ALSO be fully denied. A single grant on ANY key — known
-        or unknown, scalar or nested — means we reject it and rewrite the canonical def.
-    "Fully denied" accepts BOTH the scalar ``deny`` and a granular per-action map whose
-    every leaf is ``deny`` (so a legitimately hardened granular config is NOT clobbered).
-    Extra keys that are themselves fully denied are ACCEPTED (a user who hardened the agent
-    with more denies is at least as safe as canonical — we must not downgrade them by
-    rewriting). Anything with a grant, a missing required key, or an unparseable frontmatter
-    is rejected so the caller rewrites the canonical safe definition.
-
-    NOTE: this enforces "no capability is granted", NOT "exactly the canonical key set".
-    The known-safe set is the FLOOR (all must be denied); extra denies only raise it."""
-    front = _agent_frontmatter(text)
-    if front is None:
-        return False
-    perms = front.get("permission")
-    if not isinstance(perms, dict):
-        return False
-    # Floor: every capability we know must be present and fully denied (a missing one
-    # falls back to opencode's permissive default, so a partial block is permissive).
-    if any(name not in perms for name in _READONLY_AGENT_DENIED_PERMISSIONS):
-        return False
-    # And nothing present (extras included) may grant anything: every value must be denied.
-    return all(_permission_value_is_fully_denied(value) for value in perms.values())
-
-
-def _ensure_opencode_readonly_agent(_project: Path, _oc_model: str) -> None:
-    """Guarantee the GLOBAL read-only-reviewer opencode agent is the safe deny-all def.
-
-    SECURITY (review-cli#40): a pre-existing global agent file is NOT trusted blindly. A
-    stale or tampered ``read-only-reviewer.md`` that ALLOWS bash/edit/write/etc would
-    silently give the "read-only" reviewer write/exec capability on the user's repo,
-    defeating the guarantee the whole agentic-opencode path leans on. So we VALIDATE an
-    existing file and REWRITE the canonical safe definition (loudly) if it is not strictly
-    read-only — never run agentically against a permissive agent. Idempotent: a file that
-    already matches the canonical deny-all set is left untouched (no spurious writes)."""
-    agent = Path.home() / ".config" / "opencode" / "agents" / "read-only-reviewer.md"
-    if agent.is_file():
-        try:
-            existing = agent.read_text(encoding="utf-8")
-        except OSError:
-            existing = ""
-        if _agent_is_strictly_readonly(existing):
-            return  # already the trusted deny-all definition
-        print(
-            f"[review-cli] opencode: the global read-only-reviewer agent at {agent} is "
-            "not strictly read-only (its permissions grant or omit a deny for a write/exec "
-            "capability); rewriting it to the canonical deny-all definition for safety.",
-            file=sys.stderr,
-            flush=True,
-        )
-    agent.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(agent, _READONLY_AGENT_MARKDOWN)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write `text` to `path` ATOMICALLY: a concurrent reader sees either the old file or
-    the complete new one, never a truncated mid-write file.
-
-    The default board runs SEVERAL agentic opencode seats in parallel, each calling
-    `_ensure_opencode_readonly_agent`. A plain `write_text` (truncate-then-write) lets one
-    seat's opencode read this agent while another seat is rewriting it — the reader could
-    get an empty/partial markdown, lose the frontmatter, and fall back to opencode's
-    PERMISSIVE defaults (bash/edit/write). Writing to a temp file in the SAME directory and
-    `os.replace`-ing it in is atomic on POSIX, so the read-only guarantee holds under
-    concurrency. The temp file is cleaned up on any write failure."""
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".read-only-reviewer.", suffix=".tmp", dir=str(path.parent)
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)  # atomic on POSIX: reader never sees a partial file
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
 # Project-local opencode config paths that opencode merges when run with `--dir <cwd>`.
 # A reviewed repo that ships ANY of these can REDEFINE the `read-only-reviewer` agent
 # (or the global permission rules) and FLIP its deny→allow — verified: a repo-local
@@ -746,58 +188,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
 # We refuse to run agentically in such a repo and fall back to the isolated temp-dir
 # (diff-only) posture instead — the safe default for a potentially adversarial repo.
 _OPENCODE_PROJECT_CONFIG_NAMES = (".opencode", "opencode.json", "opencode.jsonc")
-
-
-def _opencode_has_project_config(cwd: Path) -> bool:
-    """True if `cwd` ships its OWN opencode config that could redefine the read-only
-    agent / weaken its permissions (see _OPENCODE_PROJECT_CONFIG_NAMES). When True we do
-    NOT run opencode agentically there — the sandbox can't be trusted."""
-    return any((cwd / name).exists() for name in _OPENCODE_PROJECT_CONFIG_NAMES)
-
-
-def _opencode_runs_in_repo(cwd: Path) -> bool:
-    """True iff `cwd` is a git repo we can let opencode read AGENTICALLY AND SAFELY.
-
-    Mirrors review's own cwd resolution: the panel/agentic backends (codex/claude)
-    run in the REAL repo read-only and read the whole tree; opencode now does the
-    same so the api-only seats routed through it (deepseek/kimi/qwen/glm via `oc:`)
-    are AGENTIC too — they can open any project file, not just the diff in the prompt.
-
-    Two gates, both required:
-      * it must be a git work tree (a non-repo `cwd` — e.g. `--just-ask` from /tmp —
-        has nothing to read, so we fall back rather than roam a scratch dir);
-      * it must NOT ship its own opencode project config (.opencode/ or opencode.json
-        /jsonc), which could OVERRIDE our read-only agent and re-enable write/bash —
-        a real privilege-escalation path on an untrusted repo. Such a repo falls back
-        to the isolated temp-dir posture (read-only is enforced by the global agent in
-        a clean dir, where no project config can touch it)."""
-    if not cwd.is_dir():
-        return False
-    # This is reached by `--show-board` (a meta flag that must work anywhere) and the
-    # opencode-seat scope label, so a missing git binary (OSError -> FileNotFoundError) or a
-    # wedged `git rev-parse` (TimeoutExpired) must degrade to "not a repo" (False), never a
-    # raw traceback — same defensive catch as cli._is_git_repo.
-    try:
-        proc = _run(
-            ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
-            cwd=cwd,
-            env=git_repo_env(cwd),
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if not (proc.returncode == 0 and proc.stdout.strip() == "true"):
-        return False
-    if _opencode_has_project_config(cwd):
-        print(
-            f"[review-cli] opencode: {cwd} ships its own opencode config "
-            "(.opencode/ or opencode.json) which could override the read-only agent; "
-            "running diff-only in an isolated dir for safety.",
-            file=sys.stderr,
-            flush=True,
-        )
-        return False
-    return True
 
 
 # opencode's agentic seats (esp. `oc:zai/glm-5.2`) can STALL — hang at ~0% CPU
@@ -834,408 +224,6 @@ _OPENCODE_STALL_MODELS_ENV = "REVIEW_OPENCODE_STALL_MODELS"
 # round 2: a blanket liveness bound risks misclassifying another seat's legitimately
 # slow start as a stall, retrying it 3x, and wrongly cooling it down).
 _OPENCODE_DEFAULT_STALL_MODEL_SUBSTRINGS = ("zai/glm",)
-
-
-def _opencode_model_needs_stall_watchdog(model: str) -> bool:
-    """True iff `model` matches a route known to hang at 0% CPU with zero output on
-    quota exhaustion (review-cli#153/#159/#179 — confirmed so far only for zai/glm-5.2
-    via opencode). Overridable via $REVIEW_OPENCODE_STALL_MODELS (comma-separated
-    case-insensitive substrings) if a future model needs the same treatment."""
-    raw = os.environ.get(_OPENCODE_STALL_MODELS_ENV)
-    substrings = (
-        tuple(s.strip() for s in raw.split(",") if s.strip())
-        if raw is not None and raw.strip()
-        else _OPENCODE_DEFAULT_STALL_MODEL_SUBSTRINGS
-    )
-    model_lower = model.lower()
-    return any(s.lower() in model_lower for s in substrings)
-
-
-def _opencode_stall_seconds() -> int | None:
-    """Seconds of TOTAL silence (zero output since spawn) before an opencode seat is
-    declared stalled, distinct from (and much shorter than) the generic idle timeout.
-    None disables the check. Overridable via $REVIEW_OPENCODE_STALL_SECONDS for
-    tests/tuning; a value <= 0 disables it, mirroring $REVIEW_IDLE_TIMEOUT_SECONDS's own
-    convention."""
-    raw = os.environ.get(_OPENCODE_STALL_SECONDS_ENV)
-    if raw is not None and raw.strip():
-        try:
-            value = int(raw)
-        except ValueError:
-            value = None
-        if value is not None:
-            return value if value > 0 else None
-    return _OPENCODE_DEFAULT_STALL_SECONDS
-
-
-def _opencode_call_stalled(proc: subprocess.CompletedProcess[str]) -> bool:
-    """True iff `proc` is a `_run_streamed` result that timed out via the STALL
-    (liveness) path specifically — not a normal idle timeout, not a real error.
-
-    Reads the `timeout_kind` attribute `_run_streamed` stamps on its result (process.py)
-    rather than text-scraping `stdout` for a marker substring (codex review finding: a
-    substring search is both forgeable — a reviewed model could itself emit matching
-    prose — and, after `_run_streamed`'s own idle/liveness clamping, the marker's exact
-    embedded seconds value may not match what this caller requested anyway).
-
-    A stall whose bound was CLAMPED below the requested window (`stall_bound_clamped`,
-    stamped by `_run_streamed` when the board-deadline / idle clamp shortened it) is
-    NOT a stall in this sense (round-2 review finding, Fable): under deadline pressure
-    a merely slow-to-first-byte seat would otherwise rack up three sub-minute "stalls"
-    and be benched for the next invocation on a signal that says nothing about quota.
-    Such a result is returned as an honest bounded failure — no retry, no cooldown."""
-    return (
-        proc.returncode == 124
-        and getattr(proc, "timeout_kind", None) == TIMEOUT_KIND_STALL
-        and not getattr(proc, "stall_bound_clamped", False)
-    )
-
-
-def _run_opencode_with_stall_retry(
-    argv: list[str],
-    *,
-    cwd: Path,
-    timeout: int,
-    round_no: int,
-    header_argv0: str,
-    model: str,
-    true_silence_timeout: int | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run an opencode agentic seat, retrying up to `_OPENCODE_MAX_STALL_RETRIES` times
-    if it stalls (see the module-level comment above for the full rationale). After the
-    final attempt is ALSO a stall, records a cooldown for `(model, "opencode")` so the
-    NEXT `review` invocation skips the real dispatch entirely, and returns the last
-    (stalled) result to the caller — this run's pool still gets a bounded, honest
-    failure instead of hanging.
-
-    Composition with the outer in-seat retry (`reviewlib.retry`, capped at
-    `_MAX_TIMEOUT_RETRIES=1` for an rc=124 result): if every attempt here stalls, the
-    cooldown is already recorded by the time this returns, so the outer layer's ONE
-    permitted retry re-enters `review_opencode`, hits the fresh cooldown at the top of
-    that function, and short-circuits to the (fast, rc=0) cooldown-skip sentinel instead
-    of spending another `_OPENCODE_MAX_STALL_RETRIES` attempts — the same self-limiting
-    composition `review_claude`'s existing cooldown cache already relies on.
-
-    Only applies the stall bound to `model`s matching
-    `_opencode_model_needs_stall_watchdog` — every OTHER opencode seat dispatches
-    exactly as before this feature (no liveness bound, no retry, no cooldown).
-
-    For a WATCHED model the liveness watchdog is the SOLE owner of the "zero output
-    since spawn" signal: `true_silence_timeout` is NOT forwarded to `_run_streamed`
-    for it (round-1 review finding, Opus + Fable: both detectors fire on the same
-    signal but with opposite policies — liveness retries up to 3x then cools down,
-    true-silence cools down on the FIRST trip with no retry — and the registry's
-    true-silence value for zai/glm equals the 300s stall default, so which policy
-    applied was decided by poll-loop check order, not by design; a user raising
-    $REVIEW_OPENCODE_STALL_SECONDS above the registry value would silently have
-    flipped the seat to "cooldown on first silence"). Unwatched models keep the
-    true-silence wiring exactly as before."""
-    stall_seconds = (
-        _opencode_stall_seconds()
-        if _opencode_model_needs_stall_watchdog(model)
-        else None
-    )
-    effective_true_silence = None if stall_seconds is not None else true_silence_timeout
-    proc = None
-    for attempt in range(1, _OPENCODE_MAX_STALL_RETRIES + 1):
-        proc = _run_streamed(
-            argv,
-            cwd=cwd,
-            timeout=timeout,
-            backend="opencode",
-            round_no=round_no,
-            announce=_ANNOUNCE_LOGS,
-            header_argv0=header_argv0,
-            liveness_timeout=stall_seconds,
-            true_silence_timeout=effective_true_silence,
-        )
-        if not _opencode_call_stalled(proc):
-            return proc
-        if attempt >= _OPENCODE_MAX_STALL_RETRIES:
-            record_cooldown(
-                model,
-                f"opencode stalled with no output after {attempt} attempts",
-                access_method=_OPENCODE_ACCESS_METHOD,
-                cause=CAUSE_STALL,
-            )
-    assert proc is not None  # loop runs >= 1 time (_OPENCODE_MAX_STALL_RETRIES >= 1)
-    return proc
-
-
-def _record_true_silence_if_needed(model: str, proc, *, access_method: str) -> None:
-    """After a `_run_streamed` call (codex review finding, round 13: originally only
-    opencode called this — review-cli#235 now also wires `review_omp` through the
-    same path; the remaining backends #235 still tracks are not done yet): if it was
-    reaped for producing ZERO output (`proc.true_silenced` — see
-    process._run_streamed's
-    true_silence_timeout), record a cooldown so the NEXT invocation skips this seat
-    for a while instead of paying for another multi-minute stuck dispatch (Alex's
-    request 2026-08-19/20). A no-op for every other outcome (ordinary success,
-    ordinary idle-timeout, or a real error) — those are unrelated to true-silence and
-    already handled by their own existing paths. `access_method` (required, no
-    default — every caller must name its own cooldown namespace explicitly) keys the
-    cooldown-store entry, mirroring `_cooldown_skip_result`'s own no-default
-    reasoning: opencode and omp are independent failure domains and must never share
-    one cooldown bucket.
-
-    Branches on the explicit `.true_silenced` attribute, NOT `proc.returncode == 125`
-    (round-2 review finding, codex + Fable): 125 is a real exit code some CLIs/
-    wrappers legitimately use on their own (`timeout(1)`'s "the wrapper itself
-    failed", docker run, git-bisect skip) — a child that happens to genuinely exit
-    125 by itself, even after producing full real output, must never be misdiagnosed
-    as a true-silence reap and wrongly benched. `getattr(..., False)` tolerates a
-    plain mock/fake CompletedProcess in tests that doesn't set the attribute at all.
-
-    Deliberately does NOT pass an explicit `ttl_seconds` to `record_cooldown` (codex
-    review finding, round 1): an explicit TTL makes `record_cooldown` treat every
-    occurrence as `fail_count = 1` (see its docstring), which would silently DISABLE
-    the escalating cooldown schedule this repo already ships (review-cli#230) for a
-    model that keeps going true-silent repeatedly. Letting the reason string alone
-    drive an un-parameterized `record_cooldown` call means it escalates exactly like
-    every other cooldown-worthy failure.
-
-    codex review finding, round 3: a genuine success ALSO clears any true-silence
-    cooldown history, mirroring `clear_cooldown`'s own documented contract (it names
-    this as one of backends.py's two intended call sites) and review_claude's sibling
-    pattern above. Without this, a seat that recovers after one true-silence reap,
-    then goes true-silent again later (still within the 24h escalation-reset window),
-    would wrongly resume at `fail_count=2` (30 minutes) instead of resetting to
-    `fail_count=1` (10 minutes) — the same "never actually recovers" shape #221 fixed
-    for the ordinary chronic-failure path.
-
-    codex review finding, round 12 (P1): a bare `returncode == 0 and stdout.strip()`
-    treated ANY non-empty rc=0 body as recovery — including a chronic-unavailable-
-    shaped sentinel body (the same 4 marker phrases `review_claude`'s sibling clear
-    already guards against via `_chronic_unavailable_reason`). `_chronic_unavailable_
-    reason` is NOT actually claude-specific in implementation — it only inspects the
-    generic `ReviewResult`-shaped `.stdout`/`.returncode`/`.stderr`, it is simply not
-    wired into any non-claude call site yet — so reusing it here, mirroring
-    `review_claude_with_images`'s exact pattern above, closes the false-clear for any
-    body matching that SHARED marker vocabulary, using zero new detection logic. This
-    narrows, but does not fully close, review-cli#226 (codex review finding, round 17:
-    an earlier version of this docstring wrongly claimed the unrecognised case is a
-    no-op — it is NOT): an opencode-specific quota wording that matches NONE of the 4
-    shared marker phrases falls through past `reason is None` to the `elif` below,
-    which DOES clear the cooldown (any non-empty rc=0 body is treated as recovery
-    unless it matches a known chronic sentinel) — the exact same behavior
-    `review_claude`'s identical sibling pattern has always had for an unrecognised
-    claude quota wording, not a new gap this diff introduces. Building genuine
-    opencode-specific quota-body detection (so an unrecognised wording is correctly
-    classified as chronic rather than defaulting to "success") remains #226's job.
-
-    Opus review finding, round 14 (doc accuracy): `_chronic_unavailable_reason` runs
-    on EVERY non-true-silenced outcome, not just the rc=0 sentinel case — a non-zero
-    exit whose stderr/short-stdout matches `_CHRONIC_QUOTA_MARKERS` ("session limit" /
-    "usage-credits" / "usage credits") ALSO records a cooldown here, mirroring
-    `review_claude`'s identical handling of that same signal. The narrower framing
-    above ("closes the false-clear ... rc=0 body") describes the round-12 FIX's
-    motivating scenario, not the full scope of what this call now covers."""
-    if getattr(proc, "true_silenced", False):
-        record_cooldown(
-            model,
-            "true-silence timeout",
-            access_method=access_method,
-            cause=CAUSE_STALL,
-        )
-        return
-    reason = _chronic_unavailable_reason(proc)
-    if reason is not None:
-        record_cooldown(
-            model, reason, access_method=access_method, cause=_chronic_cause(reason)
-        )
-    elif proc.returncode == 0 and proc.stdout.strip():
-        clear_cooldown(model, access_method=access_method)
-
-
-def review_opencode(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    oc_model = model.split(":", 1)[1] if ":" in model else model
-    # codex review finding, review-cli#243 round 22: `resolve_backend` routes BOTH the
-    # `oc:` and `opencode:` prefixes here (config.py's own `_agentic` docstring calls
-    # this pair "both spellings" deliberately), but the cooldown store and
-    # model_behavior registry are keyed by the raw, un-normalized `model` string —
-    # `oc:zai/glm-5.3` and `opencode:zai/glm-5.3` would build SEPARATE cooldown/
-    # behavior histories for what the board/dashboard treat as the SAME canonical
-    # seat. `_agentic` is idempotent+canonical for an already-agentic id (returns
-    # `oc:...` unchanged, rewrites `opencode:...` to it) — reused here rather than
-    # duplicating that normalization, so a true-silence trip via either spelling
-    # protects the next dispatch regardless of which spelling it uses.
-    #
-    # codex review finding, round 26 (P1 — supersedes the round-23/24 notes this
-    # replaced): `canonical_model` must NEVER leak into a RETURNED `ReviewResult.model`
-    # — only into internal cooldown-store / model_behavior-registry KEYS. Rounds 23-24
-    # made the returned `.model` canonical on every exit path (dispatch, skip, unpaid,
-    # preflight) to fix an inconsistency BETWEEN those paths — but that broke a
-    # load-bearing invariant a caller several layers up already depends on:
-    # `reviewlib/modes/review.py`'s flat-diff path builds `by_model = {result.model:
-    # result for result in results}` and then looks up `by_model[model]` for each
-    # ORIGINAL requested model string. `review diff -m opencode:zai/glm-5.3` would
-    # dispatch with `models = ["opencode:zai/glm-5.3"]`, get back a result whose
-    # `.model` was rewritten to `"oc:zai/glm-5.3"`, and KeyError on the lookup —
-    # crashing a basic, real CLI invocation. The correct fix keeps EVERY returned
-    # `ReviewResult.model` as the caller's own `model` string, unchanged — `canonical_
-    # model` is scoped to internal lookups only (`active_cooldown`, `record_cooldown`/
-    # `clear_cooldown` via `_record_true_silence_if_needed`, `true_silence_timeout_
-    # seconds`), which never leak their key back into anything a caller inspects.
-    #
-    # codex review finding, round 25 (deferred, tracked #259): `_agentic` and
-    # `oc_model` above parse a catch-all colon-form id (no `oc:`/`opencode:` prefix
-    # — `resolve_backend`'s documented back-compat fallback for an unrecognized
-    # model) DIFFERENTLY -- `oc_model` drops everything before the first colon
-    # (silently discarding the provider segment), `_agentic` keeps it as a provider/
-    # model pair. This is a real, narrow edge case (not the standard `oc:`/
-    # `opencode:` path this fix covers), and fixing it means deciding the correct
-    # provider-parsing contract for that pre-existing catch-all derivation — a
-    # product/design question, not a mechanical one — so it's tracked, not fixed here.
-    canonical_model = _agentic(model)
-    unpaid = unpaid_provider_result(
-        model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
-    )
-    if unpaid is not None:
-        return unpaid
-    # review-cli#153/#159/#179 fold-in of #187's cooldown design: checked BEFORE
-    # `_which`/preflight (codex review finding — a cached-unavailable seat must skip
-    # ALL real work, including the preflight network probe, not just the final
-    # dispatch) so a cooling-down seat costs nothing beyond this cheap store read.
-    # codex review finding (round 1): recording a true-silence cooldown is useless if
-    # nothing ever CHECKS it before the next dispatch — mirrors review_claude's own
-    # cooldown-consult pattern, so a seat that just went true-silent is actually
-    # skipped (a synthetic sentinel, same shape failover already knows how to handle)
-    # instead of paying for another multi-minute stuck attempt on every invocation.
-    # `canonical_model` (not `model`) for the lookup — see the module comment above
-    # about internal-lookup-only uses of `canonical_model`.
-    cooldown = _cooldown_after_recovery_probe(
-        canonical_model, access_method=_OPENCODE_ACCESS_METHOD
-    )
-    if cooldown is not None:
-        # `backend="opencode"` (codex review finding, round 2): without this the skip
-        # was hard-coded to "claude" in the sidecar log/dashboard, mislabeling every
-        # opencode cooldown skip as a Claude/Fable event and hiding the real `oc:*`
-        # seat's health. `model` (not `canonical_model`) here too — round 26.
-        return _cooldown_skip_result(model, round_no, cooldown, backend="opencode")
-    _which("opencode")
-    preflight = provider_preflight_result(
-        model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
-    )
-    if preflight is not None:
-        return preflight
-    _ensure_opencode_readonly_agent(cwd, oc_model)
-
-    if _opencode_runs_in_repo(cwd):
-        command = f"opencode run --agent read-only-reviewer --dir {cwd} -m {oc_model} <prompt-with-diff>"
-        # AGENTIC, read-only: run opencode in the REAL repo (like review_codex's
-        # `codex exec -s read-only -C <cwd>`), so it can READ any project file — not
-        # just the diff embedded in the prompt. SAFETY is enforced by the
-        # read-only-reviewer agent: it DENIES bash/edit/write/webfetch/etc, so opencode
-        # may open files but can NEVER mutate the user's repo, run a command, or hit the
-        # network. The diff is still handed in the message as the review FOCUS; the repo
-        # is the surrounding context the model can pull in on demand.
-        message = (
-            f"{prompt}\n\nYou are reviewing a real git repository in READ-ONLY mode: "
-            "read any project file you need with your read tools, but do not edit, "
-            "write, or run commands. "
-            + (
-                f"Focus on this diff:\n\n```diff\n{diff}\n```"
-                if diff.strip()
-                else "Answer based on the repository and the prompt."
-            )
-        )
-        argv = [
-            _which("opencode"),
-            "run",
-            "--agent",
-            "read-only-reviewer",
-            "--dir",
-            str(cwd),
-            "-m",
-            oc_model,
-        ]
-        variant = _opencode_variant(effort)
-        if variant:
-            argv += ["--variant", variant]
-        argv.append(message)
-        proc = _run_opencode_with_stall_retry(
-            argv,
-            cwd=cwd,
-            timeout=timeout,
-            round_no=round_no,
-            header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
-            model=canonical_model,
-            true_silence_timeout=true_silence_timeout_seconds(canonical_model),
-        )
-        _record_true_silence_if_needed(
-            canonical_model, proc, access_method=_OPENCODE_ACCESS_METHOD
-        )
-        return ReviewResult(
-            model=model,
-            command=command,
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-        )
-
-    # FALLBACK: cwd is not a git repo (e.g. a panel `--just-ask` run from a scratch
-    # dir) — there is nothing to read, so keep the old isolated empty-temp-dir posture
-    # and review the diff/prompt alone.
-    command = (
-        f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
-    )
-    with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
-        tmp = Path(tmp_raw)
-        # Strip the repo-pinning git env: a leaked GIT_DIR/GIT_WORK_TREE would make `git init`
-        # operate on the LEAKED repo instead of this isolated temp dir, defeating the read-only
-        # sandbox (review-cli#71). `tmp` is a fresh empty dir (not yet a repo), so git_repo_env
-        # resolves no target git dir and drops every set var — exactly the isolation wanted.
-        _run(["git", "init", "-q"], cwd=tmp, env=git_repo_env(tmp), timeout=30)
-        if diff.strip():
-            message = (
-                f"{prompt}\n\nYou are running outside the source repo; do not edit files. "
-                f"Review this diff:\n\n```diff\n{diff}\n```"
-            )
-        else:
-            message = (
-                f"{prompt}\n\nYou are running outside any source repo; do not edit files "
-                "or run shell commands. Answer based on the prompt alone."
-            )
-        argv = [
-            _which("opencode"),
-            "run",
-            "--agent",
-            "read-only-reviewer",
-            "-m",
-            oc_model,
-        ]
-        variant = _opencode_variant(effort)
-        if variant:
-            argv += ["--variant", variant]
-        argv.append(message)
-        proc = _run_opencode_with_stall_retry(
-            argv,
-            cwd=tmp,
-            timeout=timeout,
-            round_no=round_no,
-            header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
-            model=canonical_model,
-            true_silence_timeout=true_silence_timeout_seconds(canonical_model),
-        )
-    _record_true_silence_if_needed(
-        canonical_model, proc, access_method=_OPENCODE_ACCESS_METHOD
-    )
-    return ReviewResult(
-        model=model,
-        command=command,
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
 
 
 # Oh My Pi (omp) — agentic read-only seat (review-cli#174).
@@ -1299,370 +287,6 @@ OMP_SUPPORTED_MODES = ("cli",)  # CLI-only — no omp REST transport exists.
 _OMP_ACCESS_METHOD = "omp"
 
 
-def _omp_model_hosts_claude(omp_model: str | None) -> bool:
-    """True when the `omp:<selector>` model string names an Anthropic/Claude model
-    (review-cli#168's omp-engine account axis) -- e.g. `anthropic/claude-sonnet-5-5` or
-    any selector containing "claude"."""
-    if not omp_model:
-        return False
-    lowered = omp_model.lower()
-    return "claude" in lowered or lowered.startswith("anthropic/")
-
-
-def _review_omp_claude_profiles() -> list[str | None]:
-    """Ordered omp `--profile` names to try when the hosted model is Claude/Anthropic
-    (review-cli#168's omp-engine account axis). `$REVIEW_OMP_CLAUDE_PROFILES` is a
-    comma-separated list of already-logged-in omp profile names (each populated by a
-    one-time interactive `omp --profile <name>` OAuth login -- review-cli cannot perform
-    that itself). Unset/empty -> `[None]`, today's single-default-profile behaviour,
-    unchanged."""
-    raw = os.environ.get("REVIEW_OMP_CLAUDE_PROFILES", "").strip()
-    if not raw:
-        return [None]
-    names = [n.strip() for n in raw.split(",") if n.strip()]
-    return names or [None]
-
-
-def _omp_model_hosts_openai_codex(omp_model: str | None) -> bool:
-    """True when the `omp:<selector>` model string names an openai-codex model
-    (review-cli#168 omp-engine account axis) -- e.g. `openai-codex/gpt-6-luna`."""
-    if not omp_model:
-        return False
-    return omp_model.lower().startswith("openai-codex/")
-
-
-def _review_omp_openai_codex_credentials() -> list[int | None]:
-    """Ordered openai-codex credential ids from omp's auth db for this process.
-
-    Reads `auth_credentials` rows for provider `openai-codex` with no
-    `disabled_cause`, ordered by `id` (same ordering `omp token --list` uses).
-    Probe failure or zero rows -> `[None]` (single implicit dispatch, unchanged).
-    """
-    db = _omp_auth_db()
-    try:
-        import sqlite3  # noqa: PLC0415
-        from urllib.parse import quote  # noqa: PLC0415
-
-        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=ro", uri=True, timeout=0.5)
-        try:
-            rows = conn.execute(
-                "SELECT id FROM auth_credentials "
-                "WHERE provider = 'openai-codex' AND disabled_cause IS NULL "
-                "ORDER BY id"
-            ).fetchall()
-        finally:
-            conn.close()
-    except Exception:  # noqa: BLE001 — unreadable db => implicit single identity
-        return [None]
-    ids = [
-        row[0]
-        for row in rows
-        if isinstance(row[0], int) and not isinstance(row[0], bool)
-    ]
-    return ids if ids else [None]
-
-
-def _review_omp_with_codex_credential_fallback(
-    model, omp_model, prompt, diff, cwd, timeout, round_no, effort
-) -> ReviewResult:
-    """Try each openai-codex credential in order until one produces a non-chronic
-    result, or return the last (worst) result when every credential is exhausted.
-
-    Pins each attempt via `OMP_CREDENTIAL_ID` in the seat env when omp supports
-    it (forward-compatible); a single stored credential keeps today's behaviour
-    (no pin env, one dispatch)."""
-    candidates = _review_omp_openai_codex_credentials()
-    if len(candidates) <= 1:
-        # Single (or zero) stored credential: identical to pre-fallback dispatch —
-        # do not pin via OMP_CREDENTIAL_ID so omp's native selector stays unchanged.
-        return _review_omp_once(
-            model,
-            omp_model,
-            prompt,
-            diff,
-            cwd,
-            timeout,
-            round_no,
-            effort,
-            profile=None,
-        )
-    last_result = None
-    for credential_id in candidates:
-        if not isinstance(credential_id, int):
-            continue
-        result = _review_omp_once(
-            model,
-            omp_model,
-            prompt,
-            diff,
-            cwd,
-            timeout,
-            round_no,
-            effort,
-            profile=None,
-            credential_id=credential_id,
-        )
-        if _chronic_unavailable_reason(result) is None:
-            return result
-        last_result = result
-    return last_result
-
-
-def _review_omp_with_account_fallback(
-    model, omp_model, prompt, diff, cwd, timeout, round_no, effort
-) -> ReviewResult:
-    """Try each configured omp Claude profile in order until one produces a
-    non-chronic result, or return the last (worst) result when every profile is
-    exhausted -- the omp-hosted mirror of `_review_claude_cli_with_account_fallback`."""
-    candidates = _review_omp_claude_profiles()
-    last_result = None
-    for profile in candidates:
-        result = _review_omp_once(
-            model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile
-        )
-        if not _account_should_advance(result):
-            return result
-        last_result = result
-    return last_result
-
-
-def _omp_selector_is_anthropic(omp_model: str | None) -> bool:
-    """True when omp would serve `omp_model` from its `anthropic` provider: an
-    `anthropic/<model>` selector, or an unqualified Claude selector. A Claude model under
-    another provider (`some-proxy/claude-x`) is not served by the Anthropic accounts."""
-    if not omp_model or not _omp_model_hosts_claude(omp_model):
-        return False
-    head, sep, _rest = omp_model.partition("/")
-    return not sep or head.lower() == omp_accounts.PROVIDER
-
-
-def _omp_account_cooldown_key(account: omp_accounts.OmpAccount) -> str:
-    """The cooldown-store key a limited omp Anthropic account is recorded under."""
-    return f"omp-account:{omp_accounts.PROVIDER}:{account.credential_id}"
-
-
-def _omp_accounts_limited_until(
-    accounts: list[omp_accounts.OmpAccount],
-) -> dict[int, float]:
-    """credential id -> epoch seconds until which an earlier call saw that account
-    limited (the cooldown store, so it holds across review-cli processes)."""
-    out: dict[int, float] = {}
-    for account in accounts:
-        entry = active_cooldown(
-            _omp_account_cooldown_key(account), access_method=_OMP_ACCESS_METHOD
-        )
-        if entry is not None:
-            out[account.credential_id] = float(entry["until"])
-    return out
-
-
-def _omp_account_failure(result: ReviewResult) -> tuple[str, str | None] | None:
-    """Why `result` means the account that ran it cannot answer now, as (the failure
-    line, its typed cooldown cause), else None -- the next account is then tried. A
-    rate/usage limit or a chronic quota notice is `quota`, an administrative
-    "unavailable" sentinel is `unavailable`, a failed login is `auth`."""
-    limit = omp_accounts.limit_failure(result.returncode, result.stdout, result.stderr)
-    if limit is not None:
-        return limit, CAUSE_QUOTA
-    if _account_should_advance(result):
-        chronic = _chronic_unavailable_reason(result)
-        if chronic is not None:
-            return chronic, _chronic_cause(chronic)
-        login = _login_failure_line(result)
-        if login is not None:
-            return login, CAUSE_AUTH
-    return None
-
-
-def _omp_pool_refusal(model: str, round_no: int, reason: str) -> ReviewResult:
-    """The seat's result when the account policy leaves no omp Anthropic account it may
-    take: no model is called, and the reason names every account and why."""
-    command = f"omp {omp_accounts.PROVIDER} account pool"
-    stderr = f"[review-cli] {reason}"
-    _emit_rest_log(
-        "omp", command, round_no=round_no, returncode=1, stdout="", stderr=stderr
-    )
-    return ReviewResult(
-        model=model,
-        command=command,
-        returncode=1,
-        stdout="",
-        stderr=stderr,
-        account=f"none answered -- {reason}",
-    )
-
-
-def _review_omp_with_anthropic_pool(
-    model, omp_model, prompt, diff, cwd, timeout, round_no, effort
-) -> ReviewResult:
-    """Run an Anthropic-hosted omp seat on omp's own Anthropic accounts, one account per
-    attempt (review-cli#637, see reviewlib.omp_accounts): accounts omp has not blocked and
-    review-cli has not seen limited go first; a limit, quota or login failure moves on to
-    the next account. The account policy (review-cli#641, config.yaml `omp_accounts:`)
-    removes excluded accounts and accounts at or over their usage threshold before any
-    token is fetched. The result's `account` names the account that answered, any that
-    failed before it and any the policy skipped. No account in agent.db -> one unpinned
-    run, omp picks."""
-    policy = _omp_account_policy()
-    db = _omp_auth_db()
-    accounts = None if policy.problems else omp_accounts.anthropic_accounts(db)
-    # usage is read once per dispatch, and only when a non-excluded account could be
-    # over a threshold
-    usage = None
-    if (
-        accounts
-        and policy.needs_usage
-        and any(not policy.is_excluded(a) for a in accounts)
-    ):
-        usage = omp_accounts.usage_by_email(_omp_launcher())
-    refusal, eligible, skipped = omp_accounts.pool_refusal(
-        policy, accounts, db, usage, omp_model, int(time.time() * 1000)
-    )
-    if refusal is not None:
-        return _omp_pool_refusal(model, round_no, refusal)
-    if not accounts:
-        return _review_omp_once(
-            model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile=None
-        )
-    launcher = _omp_launcher()
-    total = len(accounts)
-    ordered = omp_accounts.dispatch_order(
-        eligible, omp_model, _omp_accounts_limited_until(eligible)
-    )
-    skipped_note = f"; skipped: {'; '.join(skipped)}" if skipped else ""
-    failed: list[str] = []
-    last_result: ReviewResult | None = None
-    for account in ordered:
-        served = (
-            f"{account.label} (omp {omp_accounts.PROVIDER} account "
-            f"{account.position} of {total})"
-        )
-        token, error = omp_accounts.access_token(launcher, account)
-        if token is None:
-            failed.append(f"{account.label}: {error}")
-            last_result = ReviewResult(
-                model=model,
-                command=f"omp token {omp_accounts.PROVIDER} --account {account.position}",
-                returncode=1,
-                stdout="",
-                stderr=f"[review-cli] omp account {served}: {error}",
-            )
-            continue
-        result = _review_omp_once(
-            model,
-            omp_model,
-            prompt,
-            diff,
-            cwd,
-            timeout,
-            round_no,
-            effort,
-            profile=None,
-            anthropic_account=account,
-            oauth_token=token,
-            launcher=launcher,
-        )
-        outcome = _omp_account_failure(result)
-        key = _omp_account_cooldown_key(account)
-        if outcome is None:
-            if result.returncode == 0:
-                clear_cooldown(key, access_method=_OMP_ACCESS_METHOD)
-            note = served + (
-                f"; failed before it: {'; '.join(failed)}" if failed else ""
-            )
-            return dataclasses.replace(result, account=note + skipped_note)
-        failure, cause = outcome
-        record_cooldown(
-            key,
-            failure,
-            access_method=_OMP_ACCESS_METHOD,
-            ttl_seconds=omp_accounts.retry_after_seconds(result.stdout, result.stderr),
-            cause=cause,
-        )
-        failed.append(f"{account.label}: {failure}")
-        last_result = result
-    assert (
-        last_result is not None
-    )  # `ordered` is every eligible account, and there is at least one
-    # counts the accounts tried; the ones the policy skipped are listed after them
-    summary = (
-        f"every omp {omp_accounts.PROVIDER} account failed ({len(ordered)}): "
-        f"{'; '.join(failed)}{skipped_note}"
-    )
-    return dataclasses.replace(
-        last_result,
-        stderr=f"{last_result.stderr.rstrip()}\n[review-cli] {summary}".lstrip(),
-        account=f"none answered -- {summary}",
-    )
-
-
-def review_omp(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    omp_model = model.split(":", 1)[1] if ":" in model else None
-    command = (
-        f"omp -p --no-session --tools {_OMP_READONLY_TOOLS}"
-        + (f" --model {omp_model}" if omp_model else "")
-        + " @<payloadfile>"
-    )
-    unpaid = unpaid_provider_result(
-        model, backend="omp", command=command, round_no=round_no
-    )
-    if unpaid is not None:
-        return unpaid
-    # review-cli#235: mirrors review_opencode's own cooldown-consult pattern (checked
-    # BEFORE resolve_backend_mode/_which/preflight) so a cooling-down omp seat skips ALL
-    # real work, not just the final dispatch. omp model ids (e.g. "omp:kimi-code/k3")
-    # are already the canonical cooldown-store key -- no alias-normalization step is
-    # needed here the way review_opencode's oc:/opencode: spelling pair requires.
-    cooldown = _cooldown_after_recovery_probe(model, access_method=_OMP_ACCESS_METHOD)
-    if cooldown is not None:
-        return _cooldown_skip_result(model, round_no, cooldown, backend="omp")
-    # CLI-only: a forced REVIEW_OMP_MODE=api is a config error — surface it as a
-    # dead-backend result (mirrors review_zai's forced-mode path), never silently run.
-    try:
-        resolve_backend_mode("omp", OMP_SUPPORTED_MODES, "cli")
-    except RuntimeError as exc:
-        _emit_rest_log(
-            "omp", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc)
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
-        )
-    # review-cli#637: an omp seat on omp's `anthropic` provider runs on omp's Anthropic
-    # accounts one at a time (`_review_omp_with_anthropic_pool`). review-cli#168's
-    # explicit `$REVIEW_OMP_CLAUDE_PROFILES` (separately logged-in omp profiles) still
-    # wins when set, unless an account policy (review-cli#641) is set: a profile's
-    # account is unknown, so it could be an excluded one. Every other omp-hosted model
-    # (Kimi, MiMo, ...) dispatches once.
-    if _omp_model_hosts_claude(omp_model):
-        refusal = _omp_profiles_policy_reason(omp_model)
-        if refusal is not None:
-            return _omp_pool_refusal(model, round_no, refusal)
-        if _review_omp_claude_profiles() == [None] and _omp_selector_is_anthropic(
-            omp_model
-        ):
-            return _review_omp_with_anthropic_pool(
-                model, omp_model, prompt, diff, cwd, timeout, round_no, effort
-            )
-        return _review_omp_with_account_fallback(
-            model, omp_model, prompt, diff, cwd, timeout, round_no, effort
-        )
-    if _omp_model_hosts_openai_codex(omp_model):
-        return _review_omp_with_codex_credential_fallback(
-            model, omp_model, prompt, diff, cwd, timeout, round_no, effort
-        )
-    return _review_omp_once(
-        model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile=None
-    )
-
-
 # review-cli#598: removing a seat's sandbox must never cost the seat's answer. omp's
 # process lifeline (oh-my-pi f7f04f2) starts a supervisor in its OWN session — outside
 # the seat's process group, so the group kill never reaches it — that inherits the seat
@@ -1677,29 +301,6 @@ _SANDBOX_REMOVE_ATTEMPTS = 3
 _SANDBOX_REMOVE_RETRY_SECONDS = 0.2
 
 
-def _remove_sandbox_best_effort(path: Path) -> None:
-    """Delete `path`, retrying while a process outside the seat still writes into it;
-    warn on stderr (never raise) when it cannot be fully removed."""
-    reason = ""
-    for attempt in range(_SANDBOX_REMOVE_ATTEMPTS):
-        if attempt:
-            time.sleep(_SANDBOX_REMOVE_RETRY_SECONDS)
-        try:
-            shutil.rmtree(path)
-        except OSError as exc:
-            reason = str(exc)
-        else:
-            reason = "recreated after removal"
-        if not os.path.lexists(path):
-            return
-    print(
-        f"[review-cli] warning: could not remove seat sandbox {path} ({reason}); left "
-        "for the OS temp cleaner, the seat's answer is kept",
-        file=sys.stderr,
-        flush=True,
-    )
-
-
 @contextlib.contextmanager
 def _seat_sandbox(prefix: str) -> Iterator[Path]:
     """A fresh private temp dir, removed best-effort on exit (see
@@ -1712,454 +313,11 @@ def _seat_sandbox(prefix: str) -> Iterator[Path]:
         _remove_sandbox_best_effort(path)
 
 
-def _review_omp_once(
-    model: str,
-    omp_model: str | None,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int,
-    effort: str | None,
-    profile: str | None,
-    credential_id: int | None = None,
-    anthropic_account: omp_accounts.OmpAccount | None = None,
-    oauth_token: str | None = None,
-    launcher: omp_accounts.OmpLauncher | None = None,
-) -> ReviewResult:
-    """The actual omp dispatch (sandbox/cage/argv/env), extracted verbatim from
-    `review_omp` (review-cli#168) so the outer function can pick which omp `--profile`
-    or openai-codex credential to use before calling in — see `_omp_agent_dir`'s
-    `profile` parameter and `_OMP_CREDENTIAL_ID_ENV`. With `oauth_token` (and the
-    `anthropic_account` it belongs to, review-cli#637) the run is pinned to that one
-    Anthropic account: its agent dir is an empty dir inside the sandbox, so omp has no
-    stored credential to pick and uses `ANTHROPIC_OAUTH_TOKEN` (see
-    reviewlib.omp_accounts)."""
-    launcher = launcher or _omp_launcher()
-    command = (
-        f"omp -p --no-session --tools {_OMP_READONLY_TOOLS}"
-        + (f" --model {omp_model}" if omp_model else "")
-        + " @<payloadfile>"
-    )
-    # AGENTIC, read-only: omp can READ any project file (mounted via `--add-dir`) — not
-    # just the diff embedded in the prompt — while the three-layer cage (see the module
-    # comment above) makes mutation, exec, and egress impossible.
-    message = (
-        f"{prompt}\n\nYou are reviewing a real git repository mounted at `{cwd}` in "
-        "READ-ONLY mode: read any project file under that directory with your read "
-        "tools, but do not edit, write, run commands, or access the network. "
-        + (
-            f"Focus on this diff:\n\n```diff\n{diff}\n```"
-            # `not diff.isspace()` tests emptiness WITHOUT the full-size copy
-            # `.strip()` would allocate just for truthiness.
-            if diff and not diff.isspace()
-            else "Answer based on the repository and the prompt."
-        )
-    )
-    argv = [
-        launcher.argv0,
-        "-p",
-        "--no-session",
-        "--no-extensions",
-        "--no-skills",
-        "--tools",
-        _OMP_READONLY_TOOLS,
-        "--add-dir",
-        str(cwd),
-    ]
-    if omp_model:
-        argv += ["--model", omp_model]
-    if effort:
-        # review's effort vocabulary (minimal/low/medium/high/xhigh/max) is a strict
-        # subset of omp's `--thinking` levels (those plus off/auto) — pass through.
-        argv += ["--thinking", effort]
-    # The sandbox dir is the NEUTRAL launch cwd AND the seat's HOME (cage layer 2): a
-    # fresh empty temp dir with no repo root above it, so omp's project discovery
-    # (`.mcp.json`, `.omp/tools`, `.claude/tools`) finds nothing, and its user-scope MCP
-    # discovery (~/.claude.json etc.) sees an empty home. PI_CODING_AGENT_DIR pins the
-    # REAL agent dir so provider auth still resolves; OMP_PROFILE is dropped so nothing
-    # re-derives profile paths from the fake HOME (its profile-scoped settings are user
-    # workflow, not reviewer context, and the auth db is pinned explicitly). NOTE: this
-    # layer assumes omp resolves `~` via the HOME env var (not getpwuid) — verified
-    # live: with HOME redirected, the seat has no user-scope MCP tools
-    # (tests/test_omp_cage_live.py). The dir also holds payload + overlay.
-    with _seat_sandbox("review-cli-omp-") as box:
-        home = box / "home"
-        home.mkdir()
-        payload = box / "payload.md"
-        payload.write_text(message, encoding="utf-8")
-        cage = box / "cage.yml"
-        cage.write_text(_OMP_CAGE_OVERLAY, encoding="utf-8")
-        argv += ["--config", str(cage), f"@{payload}"]
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k
-            not in (
-                "HOME",
-                "XDG_CONFIG_HOME",
-                "PI_CODING_AGENT_DIR",
-                "OMP_PROFILE",
-                "ANTHROPIC_OAUTH_TOKEN",
-                _OMP_CREDENTIAL_ID_ENV,
-            )
-        }
-        # Sanitized XDG_CONFIG_HOME too — user-scope discovery that keys off XDG
-        # instead of HOME must not escape the cage either (review of #174).
-        env["HOME"] = str(home)
-        env["XDG_CONFIG_HOME"] = str(home / ".config")
-        # review-cli#636: a wrapper launcher finds its real binary through this, not
-        # through the sandbox HOME.
-        env.update(launcher.seat_env())
-        if oauth_token is not None:
-            agent_dir = box / "agent"
-            agent_dir.mkdir()
-            env["PI_CODING_AGENT_DIR"] = str(agent_dir)
-            env["ANTHROPIC_OAUTH_TOKEN"] = oauth_token
-        else:
-            env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir(profile=profile))
-        if credential_id is not None:
-            env[_OMP_CREDENTIAL_ID_ENV] = str(credential_id)
-        # review-cli#646: an env-key provider (z.ai) with no credential stored in the
-        # agent dir this seat runs on gets the key the availability probe resolved
-        # (process env first, then review-cli's .env; a blank primary var loses to a set
-        # alias). A stored credential is left to omp.
-        provider = _omp_provider_from_model(model)
-        if oauth_token is not None:
-            stored = False  # the seat's agent dir is the empty sandbox one
-        elif profile is not None:
-            live = _omp_auth_probe(_omp_agent_dir(profile=profile) / "agent.db")
-            stored = provider in (live or ())
-        else:
-            stored = _omp_stored_auth(provider)
-        env_key = None if stored else omp_env_key(provider)
-        if env_key is not None:
-            env[env_key[0]] = env_key[1]
-        header = f"omp -m {_safe_log_header(omp_model)}" if omp_model else None
-        if header and anthropic_account is not None:
-            # the account this call ran on, in the per-call log (review-cli#465/#637)
-            header += f" account={_safe_log_header(anthropic_account.label)}"
-        proc = _run_streamed(
-            argv,
-            cwd=box,
-            env=env,
-            timeout=timeout,
-            backend="omp",
-            round_no=round_no,
-            announce=_ANNOUNCE_LOGS,
-            header_argv0=header,
-            true_silence_timeout=true_silence_timeout_seconds(model),
-        )
-    _record_true_silence_if_needed(model, proc, access_method=_OMP_ACCESS_METHOD)
-    return ReviewResult(
-        model=model,
-        command=command,
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
-
-
-def _read_env_key(env_file: Path, var: str = "GEMINI_API_KEY") -> str | None:
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith(f"{var}="):
-                value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                return value or None
-    except (OSError, ValueError):  # unreadable, or not UTF-8 (UnicodeDecodeError)
-        return None
-    return None
-
-
-def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
-    """Resolve a provider API key from the environment, then the same fallback files
-    review already reads (GEMINI_ENV_FILE override, else GEMINI_ENV_FALLBACKS — the
-    shared `~/.config/review-cli/.env` and the personal env). Returns None if unset.
-    See `resolve_key_source` for the precedence."""
-    found = resolve_key_source(env_names, fallback_var)
-    return found[1] if found is not None else None
-
-
-def _env_key_files() -> tuple[Path, ...]:
-    env_file = os.environ.get("GEMINI_ENV_FILE")
-    return (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
-
-
-def resolve_key_source(
-    env_names: tuple, fallback_var: str
-) -> tuple[str, str, str] | None:
-    """(variable name, key, where: "env" or the .env path) for the key `_resolve_key`
-    returns, or None if unset.
-
-    Precedence is KEY-NAME-FIRST, not path-first: env var beats every file, and among
-    the files the canonical/primary key name wins over an alias REGARDLESS of which
-    .env file each lives in. So `COMMANDCODE_API_KEY` in a later fallback file beats
-    `DEEPSEEK_API_KEY` in an earlier one — the precedence a caller reading the env-var
-    order would expect. (A path-first loop would let an earlier file's alias shadow a
-    later file's primary key, a surprising and non-deterministic ordering.)
-
-    REUSE (§6.4 / CTO D9): vision providers piggyback on the SAME config surface review
-    already uses for Gemini — no new per-provider egress config is invented."""
-    # env var wins over any file, in declared order (primary name first).
-    for name in env_names:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return (name, value, "env")
-    paths = _env_key_files()
-    # File lookup is name-priority-first: fallback_var (the canonical/primary name),
-    # then the remaining accepted aliases, each checked across ALL .env files before
-    # moving to the next name. This keeps key-name precedence deterministic and
-    # independent of file ordering, mirroring the env-var lookup above.
-    file_vars = (fallback_var, *(n for n in env_names if n != fallback_var))
-    for var in file_vars:
-        for path in paths:
-            key = _read_env_key(path, var)
-            if key:
-                return (var, key, str(path))
-    return None
-
-
-def _gemini_key() -> str:
-    key = _resolve_key(("GEMINI_API_KEY", "GOOGLE_API_KEY"), "GEMINI_API_KEY")
-    if key:
-        return key
-    raise RuntimeError(
-        "GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
-    )
-
-
 # NOTE: `_anthropic_key` / `_openai_key` were added in 30163c5 ONLY for the REST vision
 # path. That path is gone (vision now invokes the agent CLIs — claude/codex — which carry
 # their own auth, exactly like review's TEXT backends). Gemini stays the one key-based
 # vision exception via `_gemini_key`. The two orphaned helpers are removed with the REST
 # adapters; `_resolve_key` stays — `_gemini_key` still uses it.
-
-
-def review_gemini(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    gemini_model = (
-        model.split(":", 1)[1]
-        if ":" in model
-        else os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-    )
-    command = f"Gemini API {gemini_model}"
-    # Gemini is a REST backend — it never goes through `_run_streamed`, so it must emit
-    # its own per-call sidecar log or the dashboard parser (which reads ONLY `.log`
-    # files) would not see it at all: models undercounted, Gemini-only runs invisible
-    # (HYP-742 finding 2). The sidecar carries the explicit EXIT status (finding 4) and
-    # is stamped with the call's START time (captured now), so a slow call's duration
-    # and session clustering stay correct (codex P2).
-    #
-    # KEY RESOLUTION IS INSIDE the try: a missing GEMINI_API_KEY is the COMMON failure
-    # (gemini is in DEFAULT_MODELS), and `_gemini_key()` raising before the logged path
-    # would leave that auth failure invisible — `run_panel` would turn it into an
-    # internal 127 with no `.log` (codex P2). Now the auth failure emits a sidecar too.
-    started = datetime.now(timezone.utc)
-    unpaid = unpaid_provider_result(
-        model, backend="gemini", command=command, round_no=round_no, started=started
-    )
-    if unpaid is not None:
-        return unpaid
-    try:
-        key = _gemini_key()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
-        body = {
-            "contents": [{"parts": [{"text": _payload(prompt, diff)}]}],
-            "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
-        }
-        data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        # Shape-guarded walk: `{"candidates": []}` (a filtered/blocked response) used to
-        # raise IndexError here and surface as a generic failure with the spent tokens
-        # lost; it is now the same fail-closed empty-content result as any other
-        # candidate-less 2xx, with usage still parsed below.
-        candidates = payload.get("candidates") if isinstance(payload, dict) else None
-        first = candidates[0] if isinstance(candidates, list) and candidates else {}
-        content = first.get("content") if isinstance(first, dict) else None
-        parts = content.get("parts") if isinstance(content, dict) else None
-        parts = parts if isinstance(parts, list) else []
-        # Only real string parts count as content: a `"text": null`/object/array part
-        # must not be stringified into a fake verdict ("None") that passes
-        # `result_is_usable()`.
-        text = "".join(
-            part["text"]
-            for part in parts
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        )
-        usage = _usage_dict(payload, "usageMetadata")
-        # Empty success is a failure, exactly as on the OpenAI-compatible and Anthropic
-        # paths: a 2xx with no candidate text has nothing to review with, and a bare
-        # `prompt_tokens=...` footer would otherwise pass `result_is_usable()` as
-        # review content and consume a seat instead of failing over. The tokens the
-        # call SPENT still ride on the failed result for the per-attempt tally.
-        rc = 0 if text.strip() else 1
-        prompt_tokens, output_tokens = _validated_usage_pair(
-            usage.get("promptTokenCount"),
-            usage.get("candidatesTokenCount"),
-            completed=rc == 0,
-        )
-        if rc == 0:
-            stdout = (
-                text.strip()
-                + f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
-            )
-            stderr = ""
-        else:
-            stdout = ""
-            stderr = (
-                f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
-            )
-        _emit_rest_log(
-            "gemini",
-            command,
-            round_no=round_no,
-            returncode=rc,
-            stdout=stdout,
-            stderr=stderr,
-            started=started,
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-        return ReviewResult(
-            model=model,
-            command=command,
-            returncode=rc,
-            stdout=stdout,
-            stderr=stderr,
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-    except urllib.error.HTTPError as exc:
-        body_text = _http_error_text(exc)
-        rc = exc.code or 1
-        _emit_rest_log(
-            "gemini",
-            command,
-            round_no=round_no,
-            returncode=rc,
-            stdout="",
-            stderr=body_text,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=rc, stdout="", stderr=body_text
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Anything other than an HTTPError: a missing API key (RuntimeError from
-        # `_gemini_key()`), a network/DNS/socket-timeout error (URLError), or a malformed
-        # JSON response (ValueError). Without this the call would raise out of run_panel
-        # as an "internal" 127 with NO `.log`, so a failed Gemini run would stay invisible
-        # to the dashboard (codex P2). Emit a failure sidecar and return a normal non-zero
-        # ReviewResult instead of raising.
-        err = f"{type(exc).__name__}: {exc}"
-        # A urlopen timeout (socket timeout, or a URLError wrapping one) must be recorded
-        # as a TIMEOUT, not a generic error, so the dashboard's timeout metric stays
-        # consistent with the subprocess backends (codex P2). rc 124 = the timeout code.
-        if _is_timeout_error(exc):
-            _emit_rest_log(
-                "gemini",
-                command,
-                round_no=round_no,
-                returncode=124,
-                stdout="",
-                stderr=err,
-                started=started,
-                timed_out=True,
-                timeout_secs=timeout,
-            )
-            return ReviewResult(
-                model=model, command=command, returncode=124, stdout="", stderr=err
-            )
-        _emit_rest_log(
-            "gemini",
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=err,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=err
-        )
-
-
-def _is_timeout_error(exc: BaseException) -> bool:
-    """True if ``exc`` is (or wraps) a socket/network timeout.
-
-    `urlopen(..., timeout=N)` surfaces a timeout as `socket.timeout` (== `TimeoutError`
-    on 3.10+) directly, or as a `urllib.error.URLError` whose `.reason` is that timeout."""
-    if isinstance(exc, (socket.timeout, TimeoutError)):
-        return True
-    reason = getattr(exc, "reason", None)
-    return isinstance(reason, (socket.timeout, TimeoutError))
-
-
-def _emit_rest_log(
-    backend: str,
-    argv0: str,
-    *,
-    round_no: int,
-    returncode: int,
-    stdout: str,
-    stderr: str,
-    started: datetime | None = None,
-    timed_out: bool = False,
-    timeout_secs: int | None = None,
-    prompt_tokens: int = 0,
-    output_tokens: int = 0,
-) -> None:
-    """Best-effort sidecar log for a NON-subprocess (REST) backend run.
-
-    Mirrors what `_run_streamed` writes for subprocess backends so the dashboard parser
-    counts the run. ``backend`` is the canonical backend name (gemini, z.ai, commandcode)
-    — it becomes the `{stamp}-{backend}-r{n}.log` filename segment the parser reads, so
-    EACH REST backend is attributed to itself in the dashboard, not lumped under a single
-    hardcoded name (HYP-742: z.ai/commandcode runs were invisible because this hardcoded
-    "gemini"). Logging must never take down a review: a read-only log dir or write error
-    is swallowed (the backend already produced its result). ``started`` is the call's
-    START time so the dashboard reports an honest duration (codex P2); ``timed_out``
-    records a TIMEOUT marker so a REST timeout counts as a timeout, not a generic error.
-    ``prompt_tokens``/``output_tokens`` MUST be the same usage reading the returned
-    `ReviewResult` carries, on every path that has one -- the dashboard Metrics tab reads
-    usage only from this log (review-cli#369: a billed no-text failure used to log none)."""
-    try:
-        write_sidecar_log(
-            backend,
-            round_no=round_no,
-            argv0=argv0,
-            returncode=returncode,
-            stdout=stdout,
-            stderr=stderr,
-            started=started,
-            timed_out=timed_out,
-            timeout_secs=timeout_secs,
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-    except Exception:  # noqa: BLE001 - logging is best-effort; it must NEVER change the
-        # review outcome. Beyond OSError (read-only / full log dir), a provider can return
-        # text with an unpaired surrogate that makes write_sidecar_log raise
-        # UnicodeEncodeError (a ValueError) — and since this is called on the SUCCESS path
-        # of the REST backends, an unswallowed error would flip a successful ReviewResult
-        # into a failure (codex P3). Swallow everything; a missing sidecar only loses a log.
-        pass
 
 
 # --- Backend transport mode (api | cli) ----------------------------------------
@@ -2176,33 +334,6 @@ def _emit_rest_log(
 # transport (e.g. forcing `cli` on commandcode must fail loudly, not POST anyway).
 
 
-def _mode_env_var(name: str) -> str:
-    """The env var that forces a backend's transport mode, e.g. commandcode ->
-    REVIEW_COMMANDCODE_MODE. Mirrors PR #8's REVIEW_CLAUDE_MODE naming so the
-    whole family is discoverable from one rule."""
-    sanitized = "".join(ch if ch.isalnum() else "_" for ch in name.upper())
-    return f"REVIEW_{sanitized}_MODE"
-
-
-def resolve_backend_mode(name: str, supported: tuple[str, ...], default: str) -> str:
-    """Resolve a backend's transport mode from REVIEW_<NAME>_MODE, validated against
-    `supported`. Returns the forced mode if set and supported, else `default`.
-
-    Raises RuntimeError on an explicitly-forced mode the backend does not support —
-    that is a user configuration error (e.g. REVIEW_COMMANDCODE_MODE=cli when no
-    commandcode CLI exists) and must surface loudly, not silently run the api path.
-    An empty/unset value selects `default` (the backend's own auto-pick)."""
-    forced = os.environ.get(_mode_env_var(name), "").strip().lower()
-    if not forced:
-        return default
-    if forced not in supported:
-        raise RuntimeError(
-            f"{_mode_env_var(name)}={forced!r} is not a supported mode for the "
-            f"'{name}' backend (supported: {', '.join(supported)})"
-        )
-    return forced
-
-
 # --- OpenAI-compatible keyed HTTP backends (z.ai / commandcode) -----------------
 # Both z.ai (Zhipu / GLM) and commandcode expose an OpenAI-compatible
 # /chat/completions API. Unlike review_gemini's bespoke `contents`/`parts` shape,
@@ -2212,310 +343,6 @@ def resolve_backend_mode(name: str, supported: tuple[str, ...], default: str) ->
 #
 # Both are API-ONLY: no z.ai or commandcode CLI exists on PATH, so a forced
 # `cli` mode is rejected by resolve_backend_mode rather than silently POSTing.
-
-
-def _parse_openai_choice(payload: object) -> str:
-    """Pull assistant text out of an OpenAI-compatible response, tolerating any shape.
-
-    A provider can return a 2xx body that is valid JSON but NOT the expected object
-    (e.g. `[]`, `{"choices":[null]}`, `{"choices":[{"message":[]}]}`). Each access is
-    type-guarded so a wrong shape yields "" instead of raising AttributeError/
-    TypeError/IndexError out of the backend (those would crash the whole run).
-
-    REASONING MODELS (e.g. z.ai glm-5.3) return `message.content` (the final answer)
-    PLUS `message.reasoning_content` (the chain of thought). We read `content` for the
-    review text. When `content` is empty/missing but `reasoning_content` is present —
-    a reasoning model with a low output-token budget can spend it all on reasoning and
-    emit no final answer — we fall back to the reasoning text (prefixed so the reader
-    knows what they're getting) rather than fail-closed as "empty output". A non-string
-    reasoning field is ignored (type-guarded), never a crash."""
-    if not isinstance(payload, dict):
-        return ""
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    first = choices[0]
-    if not isinstance(first, dict):
-        return ""
-    message = first.get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content
-    reasoning = message.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning.strip():
-        return "[reasoning_content — no final answer returned]\n\n" + reasoning
-    return content if isinstance(content, str) else ""
-
-
-def _valid_token_count(count: object) -> bool:
-    """A real token count: a non-negative int (and not a bool, which is an int subclass)."""
-    return isinstance(count, int) and not isinstance(count, bool) and count >= 0
-
-
-def _usage_dict(payload: object, key: str) -> dict:
-    """The provider's usage object under `key` in a JSON response, or `{}` when the
-    response or the usage entry is not a dict -- so every REST path reads usage through
-    one shape guard instead of re-deriving it."""
-    usage = payload.get(key) if isinstance(payload, dict) else None
-    return usage if isinstance(usage, dict) else {}
-
-
-def _validated_usage_pair(
-    prompt: object, output: object, *, completed: bool
-) -> tuple[int, int]:
-    """The ONE validity rule for a provider usage reading, shared by every REST path
-    (OpenAI-compatible, Anthropic, Gemini) so `run-stats.jsonl` and `review stat`'s
-    log-derived `tokenstats` can never disagree on what counts as a measurement.
-
-    All-or-nothing: a `usage` object with only one valid field is a partial reading,
-    and defaulting the missing field to 0 independently would persist `(prompt, 0)` as
-    a real total. 0/0 is the one value every reader already treats as "usage unknown",
-    so anything short of a complete pair collapses to it.
-
-    `completed` = the response carried real assistant content. A completed call can
-    never genuinely have zero prompt OR zero output tokens, so either field being 0 is
-    the same "absent/defaulted" signal `tokenstats.extract_usage_tokens` already
-    rejects, and collapses to 0/0 too. A NON-completed call (a 2xx with no content,
-    which fails closed) legitimately has output 0 while still having SPENT its prompt
-    tokens, so that pair is kept as parsed -- provider failover tallies every dispatch
-    attempt, and dropping it would lose real spend from the run record.
-    """
-    if not completed and output is None:
-        # A provider that produced no content commonly OMITS the output field rather
-        # than writing an explicit 0 (Gemini blocked responses, some OpenAI-compatible
-        # gateways). That is the same "nothing generated" reading, so coalesce it --
-        # otherwise the prompt tokens the call spent are lost on exactly the shape
-        # this branch exists for.
-        output = 0
-    if not (isinstance(prompt, int) and isinstance(output, int)):
-        return 0, 0
-    if not (_valid_token_count(prompt) and _valid_token_count(output)):
-        return 0, 0
-    if completed and (prompt == 0 or output == 0):
-        return 0, 0
-    return prompt, output
-
-
-def _parse_openai_usage(payload: object, *, completed: bool = True) -> tuple[int, int]:
-    """Return (prompt_tokens, output_tokens) from an OpenAI-shape response via
-    `_validated_usage_pair`'s rule; 0/0 ("unknown") on any wrong or partial shape."""
-    usage = _usage_dict(payload, "usage")
-    return _validated_usage_pair(
-        usage.get("prompt_tokens"), usage.get("completion_tokens"), completed=completed
-    )
-
-
-def _openai_compatible_request(
-    *,
-    model: str,
-    api_model: str,
-    label: str,
-    base_url: str,
-    key: str,
-    prompt: str,
-    diff: str,
-    timeout: int,
-    backend: str,
-    round_no: int = 0,
-    extra_body: dict | None = None,
-    extra_headers: dict | None = None,
-) -> ReviewResult:
-    """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
-
-    `model` is the REQUESTED backend string (e.g. `zai`, `commandcode:deepseek/deepseek-v4-flash`)
-    and is preserved in ReviewResult.model — mode_review keys results by the requested
-    string, so substituting the resolved provider id here would KeyError. `api_model`
-    is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek/deepseek-v4-flash).
-
-    `backend` is the canonical sidecar name (e.g. `z.ai`, `commandcode`) used for the
-    dashboard `.log` file, and `round_no` is threaded from the panel. Like review_gemini,
-    these REST backends never go through `_run_streamed`, so they MUST emit their own
-    sidecar log on EVERY return path or the dashboard parser (which reads only `.log`
-    files) never sees the run — z.ai/commandcode runs were invisible and models were
-    undercounted (HYP-742). The sidecar is stamped with the call START time so a slow
-    call's duration and session clustering stay correct (codex P2); a socket timeout is
-    recorded as a TIMEOUT, not a generic error, keeping the timeout metric consistent.
-
-    `extra_body` merges provider-specific request fields into the body while keeping the
-    shared OpenAI wire shape generic. z.ai/commandcode/openrouter all pass None today; the
-    hook stays for any future provider that needs a non-standard field.
-
-    `extra_headers` merges provider-specific HTTP headers onto the shared
-    Content-Type/Authorization pair (used by OpenRouter for its OPTIONAL leaderboard
-    attribution headers HTTP-Referer / X-Title). It can never override the credential:
-    any case-insensitive `authorization`/`content-type` key in `extra_headers` is dropped
-    BEFORE the canonical pair is written, so a stray (even lower-cased) Authorization can't
-    shadow the real bearer key — the defense is explicit, not a reliance on urllib's header
-    capitalization. (Note: urllib normalizes header NAMES on the wire, e.g. `HTTP-Referer`
-    → `Http-referer`; HTTP header names are case-insensitive so this is cosmetic.)
-    This helper does NOT sanitize `extra_headers` VALUES — a value with a CR/LF or a
-    non-latin-1 char would make http.client.putheader raise mid-send (caught here as a
-    malformed-request ValueError, but a wasted call). The caller is responsible for passing
-    safe values; OpenRouter's wrapper validates via `_header_value_is_safe` and drops bad ones.
-
-    `base_url` is the endpoint root (e.g. https://api.z.ai/api/paas/v4); the
-    /chat/completions suffix is appended here so callers pass the same value users
-    would set in any OpenAI-compatible client. EVERY failure mode maps to a non-zero
-    returncode with the error on stderr — HTTP status errors, connection refused /
-    DNS / socket timeouts (URLError, OSError, TimeoutError), malformed JSON
-    (JSONDecodeError), and valid-but-wrong-shape JSON (type-guarded parse) — so the
-    panel treats a failed call as a dead backend rather than crashing the whole run."""
-    url = base_url.rstrip("/") + "/chat/completions"
-    command = f"{label} API {api_model}"
-    started = datetime.now(timezone.utc)
-    body = {
-        "model": api_model,
-        "messages": [{"role": "user", "content": _payload(prompt, diff)}],
-        "stream": False,
-    }
-    if extra_body:
-        body.update(extra_body)
-    data = json.dumps(body).encode("utf-8")
-    # Drop any caller-supplied credential/content-type header (case-insensitively) BEFORE
-    # writing the canonical pair, so a stray `extra_headers` entry — even a lower-cased
-    # `authorization` that would be a DISTINCT dict key — can never shadow the real bearer
-    # key or content type. The canonical pair is then the only authority for those names.
-    _reserved = {"authorization", "content-type"}
-    headers = {
-        str(k): str(v)
-        for k, v in (extra_headers or {}).items()
-        if str(k).lower() not in _reserved
-    }
-    headers["Content-Type"] = "application/json"
-    headers["Authorization"] = f"Bearer {key}"
-    headers.setdefault("Accept", "application/json")
-    headers.setdefault("User-Agent", "review-cli/0.1")
-    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-        payload = json.loads(raw)
-        text = _parse_openai_choice(payload)
-        # Usage is parsed BEFORE the empty-content check: a 2xx with a valid `usage`
-        # but no assistant content still SPENT its prompt tokens, and provider
-        # failover tallies every dispatch attempt -- the failed result must carry
-        # them or they vanish from `run-stats.jsonl` (see `_validated_usage_pair`).
-        prompt_tokens, output_tokens = _parse_openai_usage(
-            payload, completed=bool(text.strip())
-        )
-        if not text.strip():
-            # A 2xx whose body carries NO assistant content (`[]`, `{"choices":[null]}`,
-            # `{"error":...}` with HTTP 200, an empty completion) is NOT a successful
-            # review — it has nothing to review with. Returning rc=0 here would let
-            # mode_review write a "reviewed" stamp and satisfy the commit gate with an
-            # empty result. Fail-closed: map it to a non-zero dead-backend result.
-            stderr = f"{label} API returned no assistant content: {raw[:500]}"
-            _emit_rest_log(
-                backend,
-                command,
-                round_no=round_no,
-                returncode=1,
-                stdout="",
-                stderr=stderr,
-                started=started,
-                prompt_tokens=prompt_tokens,
-                output_tokens=output_tokens,
-            )
-            return ReviewResult(
-                model=model,
-                command=command,
-                returncode=1,
-                stdout="",
-                stderr=stderr,
-                prompt_tokens=prompt_tokens,
-                output_tokens=output_tokens,
-            )
-        stdout = text.strip() + (
-            f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
-        )
-        _emit_rest_log(
-            backend,
-            command,
-            round_no=round_no,
-            returncode=0,
-            stdout=stdout,
-            stderr="",
-            started=started,
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-        return ReviewResult(
-            model=model,
-            command=command,
-            returncode=0,
-            stdout=stdout,
-            stderr="",
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-    except urllib.error.HTTPError as exc:
-        body_text = _http_error_text(exc)
-        rc = exc.code or 1
-        if _is_payment_preflight_denial(rc, body_text):
-            _cache_payment_preflight_denial(model, rc, body_text)
-        _emit_rest_log(
-            backend,
-            command,
-            round_no=round_no,
-            returncode=rc,
-            stdout="",
-            stderr=body_text,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=rc, stdout="", stderr=body_text
-        )
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        # Connection refused / DNS failure / socket timeout — no HTTP status. URLError
-        # and TimeoutError are both OSError subclasses; the wide catch normalises any
-        # transport-level failure to a dead-backend result instead of crashing. A socket
-        # timeout is logged as a TIMEOUT (rc 124) to match the subprocess + gemini metric.
-        err = f"{label} API request failed: {exc}"
-        if _is_timeout_error(exc):
-            _emit_rest_log(
-                backend,
-                command,
-                round_no=round_no,
-                returncode=124,
-                stdout="",
-                stderr=err,
-                started=started,
-                timed_out=True,
-                timeout_secs=timeout,
-            )
-            return ReviewResult(
-                model=model, command=command, returncode=124, stdout="", stderr=err
-            )
-        _emit_rest_log(
-            backend,
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=err,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=err
-        )
-    except (json.JSONDecodeError, ValueError) as exc:
-        # 2xx with a non-JSON / truncated body — the provider returned garbage. Treat
-        # it as a failed call rather than letting the decode error escape.
-        err = f"{label} API returned a malformed response: {exc}"
-        _emit_rest_log(
-            backend,
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=err,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=err
-        )
 
 
 # z.ai (Zhipu / GLM) — OpenAI-compatible /chat/completions, Bearer-keyed.
@@ -2532,71 +359,7 @@ ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 ZAI_DEFAULT_MODEL = "glm-5.3"
 
 
-def _zai_key() -> str:
-    key = _resolve_key(("ZAI_API_KEY", "ZHIPU_API_KEY"), "ZAI_API_KEY")
-    if key:
-        return key
-    raise RuntimeError(
-        "ZAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
-    )
-
-
 ZAI_SUPPORTED_MODES = ("api",)  # z.ai is REST-only; no z.ai CLI exists.
-
-
-def review_zai(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    # api-only: a forced REVIEW_ZAI_MODE=cli is a config error, surfaced as a
-    # dead-backend result instead of silently running the api path.
-    # `round_no` is accepted (and forwarded) so the panel's uniform 6-arg dispatch
-    # (panel.py: backend(model, prompt, diff, cwd, timeout, round_no)) does not raise
-    # for these post-HYP-741 REST backends and the dashboard attributes the run to the
-    # right brainstorm round.
-    # A forced-mode config error or a missing key both produce a NON-zero result AND a
-    # sidecar log — like review_gemini, these are real (failed) run attempts and must be
-    # visible in the dashboard, never raise out of run_panel as an invisible internal 127.
-    zai_model = (
-        model.split(":", 1)[1]
-        if ":" in model
-        else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
-    )
-    command = f"z.ai API {zai_model}"
-    unpaid = unpaid_provider_result(
-        model, backend="z.ai", command=command, round_no=round_no
-    )
-    if unpaid is not None:
-        return unpaid
-    try:
-        resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
-        key = _zai_key()
-    except RuntimeError as exc:
-        _emit_rest_log(
-            "z.ai", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc)
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
-        )
-    base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
-    return _openai_compatible_request(
-        model=model,
-        api_model=zai_model,
-        label="z.ai",
-        base_url=base_url,
-        key=key,
-        prompt=prompt,
-        diff=diff,
-        timeout=timeout,
-        backend="z.ai",
-        round_no=round_no,
-    )
 
 
 # commandcode — Command Code's OpenAI-compatible Provider API (API-only).
@@ -2630,85 +393,6 @@ COMMANDCODE_SUPPORTED_MODES = ("api",)  # API-only — no commandcode CLI exists
 # `extra_body` hook stays available for any future provider that needs it.
 
 
-def _commandcode_key() -> str:
-    # ONLY COMMANDCODE_API_KEY. The key is a Command Code `user_...` token, NOT a
-    # DeepSeek key — accepting DEEPSEEK_API_KEY here would silently POST a DeepSeek
-    # credential to api.commandcode.ai (a different host), which both fails to auth
-    # AND leaks the key cross-provider. So no alias key names: the canonical name is
-    # the only one that resolves. (Codex P1, HYP-741.)
-    key = _resolve_key(("COMMANDCODE_API_KEY",), "COMMANDCODE_API_KEY")
-    if key:
-        return key
-    raise RuntimeError(
-        "COMMANDCODE_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
-    )
-
-
-def review_commandcode(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    # API-only: a forced REVIEW_COMMANDCODE_MODE=cli is a config error (there is no
-    # commandcode CLI), surfaced as a dead-backend result, never a silent api POST.
-    # `round_no` is accepted so the panel's uniform 6-arg dispatch does not raise for
-    # this post-HYP-741 REST backend (see review_zai for the rationale).
-    # A forced-mode config error or a missing key both produce a NON-zero result AND a
-    # sidecar log (see review_zai) — a failed run must be visible in the dashboard, never
-    # an invisible internal 127 raised out of run_panel.
-    has_suffix = ":" in model
-    env_model = os.environ.get("COMMANDCODE_MODEL")
-    cc_model = (
-        model.split(":", 1)[1]
-        if has_suffix
-        else (env_model or COMMANDCODE_DEFAULT_MODEL)
-    )
-    command = f"commandcode API {cc_model}"
-    unpaid = unpaid_provider_result(
-        model, backend="commandcode", command=command, round_no=round_no
-    )
-    if unpaid is not None:
-        return unpaid
-    try:
-        resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
-        key = _commandcode_key()
-    except RuntimeError as exc:
-        _emit_rest_log(
-            "commandcode",
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=str(exc),
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
-        )
-    preflight = provider_preflight_result(
-        model, backend="commandcode", command=command, round_no=round_no
-    )
-    if preflight is not None:
-        return preflight
-    base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
-    return _openai_compatible_request(
-        model=model,
-        api_model=cc_model,
-        label="commandcode",
-        base_url=base_url,
-        key=key,
-        prompt=prompt,
-        diff=diff,
-        timeout=timeout,
-        backend="commandcode",
-        round_no=round_no,
-    )
-
-
 # OpenRouter — an OpenAI-compatible API AGGREGATOR (https://openrouter.ai) that fronts 400+
 # models across providers (anthropic/openai/google/meta/...) behind ONE key and ONE
 # OpenAI-shaped /chat/completions endpoint. So it is a keyed-HTTP backend exactly like z.ai
@@ -2727,127 +411,6 @@ OPENROUTER_DEFAULT_MODEL = "openrouter/auto"
 OPENROUTER_SUPPORTED_MODES = ("api",)  # API-only — no OpenRouter CLI exists.
 
 
-def _openrouter_key() -> str:
-    # ONLY OPENROUTER_API_KEY. Like commandcode's `user_...` token, an OpenRouter key is a
-    # provider-specific `sk-or-v1-...` credential; accepting a foreign alias (e.g. a raw
-    # OpenAI/Anthropic key) would silently POST that credential to openrouter.ai — a wrong
-    # host and a cross-provider key leak. So the canonical name is the only one that resolves.
-    key = _resolve_key(("OPENROUTER_API_KEY",), "OPENROUTER_API_KEY")
-    if key:
-        return key
-    raise RuntimeError(
-        "OPENROUTER_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
-    )
-
-
-def _openrouter_extra_headers() -> dict:
-    """OpenRouter's OPTIONAL leaderboard-attribution headers, built from env. Empty when
-    unset, so the backend works with nothing configured (the headers only affect how the
-    app appears on openrouter.ai rankings — never the review result). HTTP-Referer / X-Title
-    are the documented header names; the env vars mirror them for discoverability.
-
-    A value containing a control character (CR/LF/etc.) is DROPPED, not sent: http.client's
-    putheader would raise a ValueError on a newline mid-send, turning a stray env value into
-    a crash AND it would be a header-injection vector. Dropping the bad value keeps the
-    backend on its "any failure is a graceful dead-backend, never a raw exception" contract
-    and refuses to smuggle attacker/typo CRLF into the request."""
-    headers: dict[str, str] = {}
-    referer = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
-    if referer and _header_value_is_safe(referer):
-        headers["HTTP-Referer"] = referer
-    title = os.environ.get("OPENROUTER_X_TITLE", "").strip()
-    if title and _header_value_is_safe(title):
-        headers["X-Title"] = title
-    return headers
-
-
-def _header_value_is_safe(value: str) -> bool:
-    """True iff `value` is safe to send as an HTTP header value, on two counts:
-
-    * it is encodable as **latin-1** — http.client encodes header values as latin-1, so a
-      non-encodable char (emoji, CJK, …) would raise UnicodeEncodeError mid-send; and
-    * it carries **no control character** — C0 (0x00-0x1F, except tab), DEL (0x7F), or C1
-      (0x80-0x9F) — which could break HTTP header framing (CR/LF injection) or be mangled.
-
-    A value failing either is DROPPED by the caller, keeping an optional attribution header
-    from ever crashing or corrupting the request. Printable ASCII + printable latin-1
-    (e.g. accented letters, 0xA0-0xFF) + tab are allowed."""
-    try:
-        value.encode("latin-1")
-    except UnicodeEncodeError:
-        return False
-    return not any(
-        (ord(ch) < 0x20 and ch != "\t") or 0x7F <= ord(ch) <= 0x9F for ch in value
-    )
-
-
-def review_openrouter(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    # API-only: a forced REVIEW_OPENROUTER_MODE=cli is a config error (no OpenRouter CLI),
-    # surfaced as a dead-backend result, never a silent api POST. `round_no` is accepted so
-    # the panel's uniform 6-arg dispatch does not raise (see review_zai for the rationale).
-    # A forced-mode config error or a missing key both produce a NON-zero result AND a
-    # sidecar log so a failed run is visible in the dashboard, not an invisible internal 127.
-    # `split(":", 1)[1]` strips ONLY the `openrouter:` prefix, preserving both the slug's
-    # `/` AND any trailing `:variant` colon (e.g. openrouter:anthropic/claude-3.5-sonnet:beta
-    # → anthropic/claude-3.5-sonnet:beta). The suffix is `.strip()`ed and used ONLY when
-    # non-empty: a bare `openrouter`, an EMPTY suffix (`openrouter:` / `openrouter: `) all fall
-    # back to OPENROUTER_MODEL, then the auto-router default — never POST `"model": ""` (a
-    # guaranteed 400) just because a stray colon was present.
-    # Both env overrides are `.strip()`ed and used only when non-empty, symmetric with the
-    # suffix discipline above: a whitespace-only OPENROUTER_MODEL / OPENROUTER_BASE_URL must
-    # NOT win (it would POST `"model": "   "` / build a broken URL — the same 400 the empty
-    # suffix guards against), so it falls through to the next source / the default.
-    suffix = model.split(":", 1)[1].strip() if ":" in model else ""
-    env_model = os.environ.get("OPENROUTER_MODEL", "").strip()
-    or_model = suffix or env_model or OPENROUTER_DEFAULT_MODEL
-    command = f"openrouter API {or_model}"
-    unpaid = unpaid_provider_result(
-        model, backend="openrouter", command=command, round_no=round_no
-    )
-    if unpaid is not None:
-        return unpaid
-    try:
-        resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
-        key = _openrouter_key()
-    except RuntimeError as exc:
-        _emit_rest_log(
-            "openrouter",
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=str(exc),
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=str(exc)
-        )
-    base_url = (
-        os.environ.get("OPENROUTER_BASE_URL", "").strip() or OPENROUTER_DEFAULT_BASE_URL
-    )
-    return _openai_compatible_request(
-        model=model,
-        api_model=or_model,
-        label="openrouter",
-        base_url=base_url,
-        key=key,
-        prompt=prompt,
-        diff=diff,
-        timeout=timeout,
-        backend="openrouter",
-        round_no=round_no,
-        extra_headers=_openrouter_extra_headers(),
-    )
-
-
 # A non-default User-Agent: some Anthropic-compatible gateways (e.g. CommandCode,
 # behind Cloudflare) 403 the bare urllib UA with "error code: 1010".
 _ANTHROPIC_UA = "review-cli (anthropic-compatible client)"
@@ -2864,270 +427,6 @@ _CLAUDE_IMAGE_REVIEW_SYSTEM = (
 )
 
 
-def _anthropic_api_config() -> dict | None:
-    """Resolve Anthropic-compatible API config (auth header + base url), or None.
-
-    Mirrors the Anthropic SDK / claude CLI env surface so the SAME vars drive
-    both review's API backend and any local claude CLI: ANTHROPIC_API_KEY (sent
-    as ``x-api-key``) or ANTHROPIC_AUTH_TOKEN (sent as ``Authorization: Bearer``,
-    for gateways / OAuth), plus ANTHROPIC_BASE_URL (default api.anthropic.com,
-    point it at e.g. CommandCode). Keys also fall back to review's shared env
-    files via _resolve_key. Returns None when no key is set, so the dispatcher
-    can fall back to the CLI backend."""
-    apikey = _resolve_key(("ANTHROPIC_API_KEY",), "ANTHROPIC_API_KEY")
-    if apikey:
-        auth = ("x-api-key", apikey)
-    else:
-        token = _resolve_key(("ANTHROPIC_AUTH_TOKEN",), "ANTHROPIC_AUTH_TOKEN")
-        if not token:
-            return None
-        auth = ("Authorization", f"Bearer {token}")
-    base = _anthropic_base_url_from_env() or "https://api.anthropic.com"
-    return {"base": base, "auth": auth}
-
-
-def _anthropic_base_url_from_env() -> str | None:
-    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
-    return base or None
-
-
-def _base_url_hostname(base_url: str) -> str:
-    parsed = urllib.parse.urlparse(base_url)
-    if parsed.hostname:
-        return parsed.hostname.lower()
-    parsed = urllib.parse.urlparse(f"//{base_url}")
-    return (parsed.hostname or "").lower()
-
-
-def _anthropic_gateway_provider(base_url: str) -> str | None:
-    host = _base_url_hostname(base_url)
-    if host == "api.commandcode.ai":
-        return "commandcode"
-    return None
-
-
-def review_claude_api(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    """Anthropic Messages API backend — works WITHOUT the claude CLI (needs only a
-    key). POSTs to ``{ANTHROPIC_BASE_URL}/v1/messages``; the default base is
-    Anthropic, but any Anthropic-compatible gateway works (e.g. CommandCode via
-    ANTHROPIC_BASE_URL). ``cwd`` is unused — the API has no workspace, which is
-    exactly why this variant runs where the CLI cannot.
-
-    Like the other REST backends, this never goes through `_run_streamed`, so it emits
-    its own dashboard sidecar log (under the canonical ``claude`` backend name, same as
-    the CLI variant) on EVERY return path with ``round_no`` threaded — else a claude
-    API-mode run would be invisible to the dashboard and missing from stats / brainstorm
-    round attribution (codex P2)."""
-    prompt = _prompt_with_effort(prompt, effort)
-    claude_model = _claude_api_model(model)
-    cfg = _anthropic_api_config()
-    command = f"Anthropic API {claude_model}"
-    started = datetime.now(timezone.utc)
-    gateway_provider = (
-        _anthropic_gateway_provider(cfg["base"]) if cfg is not None else None
-    )
-    unpaid = unpaid_provider_result(
-        model,
-        backend="claude",
-        command=command,
-        round_no=round_no,
-        started=started,
-        provider=gateway_provider,
-    )
-    if unpaid is not None:
-        return unpaid
-    if cfg is None:
-        stderr = (
-            "claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured"
-        )
-        _emit_rest_log(
-            "claude",
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=stderr,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=stderr
-        )
-    try:
-        max_tokens = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
-    except ValueError:
-        max_tokens = 16000
-    body = {
-        "model": claude_model,
-        "max_tokens": max_tokens,
-        "system": _CLAUDE_REVIEW_SYSTEM,
-        "messages": [{"role": "user", "content": _payload(prompt, diff)}],
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "User-Agent": _ANTHROPIC_UA,
-        cfg["auth"][0]: cfg["auth"][1],
-    }
-    data = json.dumps(body).encode("utf-8")
-    url = cfg["base"] + "/v1/messages"
-    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
-    command = f"Anthropic API {claude_model} @ {cfg['base']}"
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        parts = payload.get("content", []) if isinstance(payload, dict) else []
-        text = "".join(
-            p.get("text", "")
-            for p in parts
-            if isinstance(p, dict) and p.get("type") == "text"
-        )
-        usage = _usage_dict(payload, "usage")
-        # Empty success is a failure for the panel/moderator fallback path.
-        rc = 0 if text.strip() else 1
-        prompt_tokens, output_tokens = _validated_usage_pair(
-            usage.get("input_tokens"), usage.get("output_tokens"), completed=rc == 0
-        )
-        # A footer-only stdout on the empty-content failure would read as review
-        # content to `result_is_usable()`; keep the failed result's stdout empty
-        # like the other REST paths (tokens still ride on the result fields).
-        stdout = (
-            text.strip()
-            + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
-            if rc == 0
-            else ""
-        )
-        _emit_rest_log(
-            "claude",
-            command,
-            round_no=round_no,
-            returncode=rc,
-            stdout=stdout,
-            stderr="",
-            started=started,
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-        return ReviewResult(
-            model=model,
-            command=command,
-            returncode=rc,
-            stdout=stdout,
-            stderr="",
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-        )
-    except urllib.error.HTTPError as exc:
-        body_text = _http_error_text(exc)
-        rc = exc.code or 1
-        _emit_rest_log(
-            "claude",
-            command,
-            round_no=round_no,
-            returncode=rc,
-            stdout="",
-            stderr=body_text,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=rc, stdout="", stderr=body_text
-        )
-    except urllib.error.URLError as exc:
-        err = str(exc)
-        if _is_timeout_error(exc):
-            _emit_rest_log(
-                "claude",
-                command,
-                round_no=round_no,
-                returncode=124,
-                stdout="",
-                stderr=err,
-                started=started,
-                timed_out=True,
-                timeout_secs=timeout,
-            )
-            return ReviewResult(
-                model=model, command=command, returncode=124, stdout="", stderr=err
-            )
-        _emit_rest_log(
-            "claude",
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=err,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=err
-        )
-    except (ValueError, OSError) as exc:
-        # malformed / non-JSON 2xx body, or a read/decode/timeout failure — surface
-        # as a normal backend result, not an uncaught exception. (URLError, a
-        # subclass of OSError, is handled above; this catches the rest.)
-        if _is_timeout_error(exc):
-            err = str(exc)
-            _emit_rest_log(
-                "claude",
-                command,
-                round_no=round_no,
-                returncode=124,
-                stdout="",
-                stderr=err,
-                started=started,
-                timed_out=True,
-                timeout_secs=timeout,
-            )
-            return ReviewResult(
-                model=model, command=command, returncode=124, stdout="", stderr=err
-            )
-        err = f"claude API: malformed or unreadable response: {exc}"
-        _emit_rest_log(
-            "claude",
-            command,
-            round_no=round_no,
-            returncode=1,
-            stdout="",
-            stderr=err,
-            started=started,
-        )
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="", stderr=err
-        )
-
-
-def _have_claude_cli() -> bool:
-    # A host with the `claude` binary has a working CLI seat, so the dispatcher must not
-    # route it to the paid API.
-    return bool(_which_optional("claude"))
-
-
-def _claude_api_available_for_model(model: str) -> bool:
-    cfg = _anthropic_api_config()
-    if cfg is None:
-        return False
-    provider = _anthropic_gateway_provider(cfg["base"])
-    return _matched_unpaid_provider(model, provider) is None
-
-
-def _claude_gateway_provider_from_env() -> str | None:
-    base = _anthropic_base_url_from_env()
-    return _anthropic_gateway_provider(base) if base is not None else None
-
-
-def _claude_runtime_gateway_provider() -> str | None:
-    # The Claude CLI child intentionally inherits ANTHROPIC_* vars, so an
-    # Anthropic-compatible gateway can be the runtime provider for both API and CLI paths.
-    return _claude_gateway_provider_from_env()
-
-
 # review-cli#588: a Claude login that is gone (logged out, OAuth expired/revoked) on ONE
 # registered account. The account loops below move on to the next account for this, the
 # same as for a chronic quota result — on 2026-09-29 the `current` account (account-2) was
@@ -3139,225 +438,6 @@ _ACCOUNT_AUTH_FAILURE = re.compile(
     r"|please run /login|invalid api key|authentication_error|log in again",
     re.IGNORECASE,
 )
-
-
-def _login_failure_line(result: ReviewResult) -> str | None:
-    """The output line saying this account's login failed (`_ACCOUNT_AUTH_FAILURE` on a
-    non-zero exit that is not a chronic quota result), else None."""
-    if result.returncode == 0 or _chronic_unavailable_reason(result) is not None:
-        return None
-    for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines():
-        if _ACCOUNT_AUTH_FAILURE.search(line):
-            return line.strip()
-    return None
-
-
-def _account_should_advance(result: ReviewResult) -> bool:
-    """True when the next registered account should be tried after `result`: a chronic
-    quota/unavailable result (`_chronic_unavailable_reason`) or a failed login on this
-    account (`_login_failure_line`)."""
-    if _chronic_unavailable_reason(result) is not None:
-        return True
-    return _login_failure_line(result) is not None
-
-
-def _claude_account_dir(config_dir: str | None) -> Path | None:
-    """The account a candidate's CLAUDE_CONFIG_DIR names (None = the single implicit
-    account): the key its recorded login failure lives under."""
-    return Path(config_dir) if config_dir else None
-
-
-def _remember_claude_login(config_dir: str | None, result: ReviewResult) -> None:
-    """After a real call on account `config_dir`, record its failed login or clear a
-    recorded one once the account answers (review-cli#596)."""
-    from . import claude_accounts as _accts
-
-    account = _claude_account_dir(config_dir)
-    failure = _login_failure_line(result)
-    if failure is not None:
-        _accts.record_login_failure(account, failure)
-    elif _clears_cooldown_history(result):
-        _accts.clear_login_failure(account)
-
-
-def _claude_cli_login_reason() -> str | None:
-    """Why the Claude CLI transport cannot run right now: every account it rotates
-    through has a standing recorded login failure (review-cli#596), with the command
-    that logs each back in; None while any account has none. Reads the cooldown store
-    and, for a recorded failure, when that account's login was last stored (a
-    `security` Keychain attribute read on macOS, cached briefly) -- no `claude`
-    process, no model call. Side effect: a failure whose account was logged back in is
-    dropped (`claude_accounts.login_failure`). `review status` shows a wider verdict
-    (`seat_health._claude_cli_reason` also counts accounts `claude auth status` reports
-    logged out), which this probe cannot afford on every availability check."""
-    from . import claude_accounts as _accts
-
-    accounts: list[Path | None] = [*_accts.rotation_order()] or [None]
-    names_by_reason: dict[str, list[str]] = {}
-    for account in accounts:
-        failure = _accts.login_failure(account)
-        if failure is None:
-            return None
-        name = account.name if account is not None else "the default account"
-        names_by_reason.setdefault(failure["reason"], []).append(name)
-    what = "; ".join(
-        f"{', '.join(names)}: {reason}" for reason, names in names_by_reason.items()
-    )
-    commands = ", ".join(_accts.login_command(a) for a in accounts)
-    return (
-        f"Claude CLI login failed on every account ({what}) -- log back in: {commands}"
-    )
-
-
-def _claude_account_candidates() -> list[tuple[str | None, str | None]]:
-    """Ordered (CLAUDE_CONFIG_DIR, email) pairs review_claude's CLI transport tries,
-    current account first (reviewlib.claude_accounts.rotation_order). A single
-    `(None, None)` when no `~/.claude-accounts` registry exists -- the single implicit
-    account, IDENTICAL to review-cli's pre-#168 behaviour."""
-    from . import claude_accounts as _accts
-
-    order = _accts.rotation_order()
-    if not order:
-        return [(None, None)]
-    return [(str(d), _accts.account_email(d)) for d in order]
-
-
-def _review_claude_cli_with_account_fallback(
-    model, prompt, diff, cwd, timeout, round_no, *, effort
-) -> ReviewResult:
-    """Try each registered Claude account (CLAUDE_CONFIG_DIR) in rotation order, current
-    first, until one produces a result that is neither chronic nor a failed login
-    (`_account_should_advance`) or every account is exhausted
-    (review-cli#168/#170: the OLD gate blocked every claude:* seat when ANY ONE
-    configured account reported 100% usage, even when the account actually in use was
-    fine). A host with no `~/.claude-accounts` registry gets exactly one (None, None)
-    candidate and behaves byte-identically to before this function existed."""
-    from . import claude_accounts as _accts
-
-    candidates = _claude_account_candidates()
-    # review-cli#596: an account whose login already failed is not paid for again while
-    # another account may still answer. When every account's login has failed they are
-    # all tried: nothing else can answer this call (with a reachable omp twin the seat
-    # never gets here -- `backend_unavailable_reason` already handed it over), and a
-    # success is what clears the record.
-    fresh: list[tuple[str | None, str | None]] = []
-    login_failed: list[tuple[str | None, str | None]] = []
-    for candidate in candidates:
-        failure = _accts.login_failure(_claude_account_dir(candidate[0]))
-        (fresh if failure is None else login_failed).append(candidate)
-    if not fresh:
-        fresh, login_failed = login_failed, []
-    last_result = None
-    skipped = [
-        f"{email or config_dir or 'default'} (login failed)"
-        for config_dir, email in login_failed
-    ]
-    for config_dir, email in fresh:
-        if not allow_spawn_for_model(model, account=email):
-            skipped.append(email or config_dir or "default")
-            continue
-        result = review_claude_cli(
-            model,
-            prompt,
-            diff,
-            cwd,
-            timeout,
-            round_no,
-            effort=effort,
-            config_dir=config_dir,
-        )
-        _remember_claude_login(config_dir, result)
-        if not _account_should_advance(result):
-            return result
-        last_result = result
-        skipped.append(email or config_dir or "default")
-    if last_result is not None:
-        return last_result
-    reason = (
-        spawn_refuse_reason(model, account=candidates[0][1])
-        or "harness 5-hour window exhausted (100%)"
-    )
-    if len(candidates) > 1:
-        reason = f"{reason} on all {len(candidates)} configured accounts ({', '.join(skipped)})"
-    return _usage_limit_skip_result(model, round_no, reason, backend="claude")
-
-
-def claude_access_method() -> str:
-    """Which transport `review_claude` dispatches through right now: "api" or "cli".
-
-    REVIEW_CLAUDE_MODE forces it; otherwise the CLI when the claude binary is present, and
-    the API only when there is no binary but a key IS configured (see `review_claude`)."""
-    mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
-    use_api = mode == "api" or (
-        mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None
-    )
-    return "api" if use_api else "cli"
-
-
-def review_claude(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    """Dispatch the claude/opus backend between the API and CLI variants.
-
-    REVIEW_CLAUDE_MODE forces it: ``api`` (HTTP, no claude binary needed) or ``cli``
-    (``claude --print``). With no override the choice is automatic and conservative:
-    prefer the CLI when the claude binary is present (subscription, no API cost,
-    and reliable now that workspace trust is deterministic), and fall back to the
-    API only when there is no claude binary but a key IS configured — i.e. don't
-    silently switch a working CLI host to the paid API just because a key happens
-    to be in the environment. Set REVIEW_CLAUDE_MODE=api to force the API.
-
-    ``round_no`` is threaded from the panel into BOTH variants so the per-call sidecar
-    log lands in the right brainstorm round (the dashboard parser keys on it) — the CLI
-    variant via _run_streamed, the API variant via its own _emit_rest_log sidecar.
-
-    Before dispatching, checks ``reviewlib.seat_cooldown`` for a CACHED chronic-
-    unavailable verdict from an earlier process (Fable's session-limit/paywall pattern —
-    see that module's docstring) and, if cooling down, returns a synthetic sentinel
-    WITHOUT spawning the real CLI/API call. After a genuine dispatch, a result matching
-    that same chronic shape records a fresh cooldown for the NEXT invocation."""
-    unpaid = unpaid_provider_result(
-        model,
-        backend="claude",
-        command=_claude_api_command(model),
-        round_no=round_no,
-        provider=_claude_runtime_gateway_provider(),
-    )
-    if unpaid is not None:
-        return unpaid
-    # Resolve the transport BEFORE checking the cooldown (review-cli#187): a cooldown
-    # recorded from one transport must not shadow the other, independently-healthy one
-    # for the same model, so the store is keyed by (model, access_method) and the
-    # access_method must be known before the lookup, not after.
-    access_method = claude_access_method()
-    use_api = access_method == "api"
-    cooldown = _cooldown_after_recovery_probe(model, access_method=access_method)
-    if cooldown is not None:
-        return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
-    # Claude Code 5h/7d cards measure the CLI subscription, not the paid API
-    # account. Gating the API transport on that card would suppress a valid
-    # Anthropic-compatible call when local Claude Code is exhausted.
-    result = (
-        review_claude_api(model, prompt, diff, cwd, timeout, round_no, effort=effort)
-        if use_api
-        else _review_claude_cli_with_account_fallback(
-            model, prompt, diff, cwd, timeout, round_no, effort=effort
-        )
-    )
-    reason = _chronic_unavailable_reason(result)
-    if reason is not None:
-        record_cooldown(
-            model, reason, access_method=access_method, cause=_chronic_cause(reason)
-        )
-    elif _clears_cooldown_history(result):
-        clear_cooldown(model, access_method=access_method)
-    return result
 
 
 # The rc=0 administrative sentinel shapes ("Claude Fable 5 is currently unavailable.
@@ -3399,16 +479,15 @@ _CHRONIC_REASON_CAUSE = {
 }
 
 
-def _chronic_cause(reason: str) -> str | None:
-    """The typed cooldown cause for a `_chronic_unavailable_reason` result."""
-    return _CHRONIC_REASON_CAUSE.get(reason)
-
-
 # The administrative sentinel is only trustworthy when the WHOLE body is short (a
 # one-liner notice) — a real, long review that happens to mention availability must
 # never be cached as a chronic failure. Shared by panel.result_is_usable and
 # retry._is_rc0_sentinel too (both import this name), so all three agree on the bound.
 _UNAVAILABLE_MAX_LEN = 400
+# Marks the command of a skip caused by the configured account budget (review-cli#696): it is
+# a policy decision re-made from fresh usage on every dispatch, so it must never be recorded
+# as a seat cooldown (`review_claude`).
+_BUDGET_SKIP_SUFFIX = ": account budget hold"
 
 
 # seat_cooldown's TTL is a blind timer -- once a quota-exhaustion failure escalates to
@@ -3418,69 +497,12 @@ _UNAVAILABLE_MAX_LEN = 400
 # `$REVIEW_SEAT_COOLDOWN_SECONDS<=0` hatch -- a human has to notice and manually export
 # it (in practice: re-running `review` after manually clearing/waiting). `usage_limits`
 # already collects the live signal that answers "has it actually recovered" (the same
-# harness-card/tg-ctl snapshot `allow_spawn_for_model` reads for a seat with NO
+# harness-card/tg-ctl snapshot `spawn_refuse_reason` reads for a seat with NO
 # cooldown) -- `_cooldown_after_recovery_probe` below consults it BEFORE honoring a
 # cooldown, so a seat that recovered early is silently re-included on the very next
 # dispatch instead of waiting out the clock. No daemon, no background polling: a plain
 # check-before-use, run once per dispatch decision, at the exact point `active_cooldown`
 # was already being read.
-def _cooldown_after_recovery_probe(model: str, *, access_method: str) -> dict | None:
-    """`active_cooldown(model, access_method=access_method)`, but first gives a
-    quota-cooled-down seat a chance to prove it has ALREADY recovered instead of
-    blindly waiting out the full (possibly hours-long, escalated) cooldown window.
-
-    Narrow on purpose: only a cooldown recorded for a QUOTA reason
-    (`_CHRONIC_QUOTA_MARKERS` -- session/usage-credit limits and the weekly/monthly
-    "limit exhausted. your limit will reset" notice)
-    is probed. A true-silence timeout, a bare "unavailable sentinel", or any other
-    chronic reason is NOT modeled by the usage-limit percent at all -- a healthy quota
-    reading says nothing about whether an unrelated hang/notice has actually cleared,
-    so probing those would be a false recovery, not a real one. Those reasons keep
-    relying purely on the existing TTL.
-
-    The probe (`usage_percent_for_model`) must return a CONCRETE percent below 100 to
-    count as recovered -- `None` ("no data": no harness-cli installed, no tg-ctl
-    sample, an unmapped provider) is explicitly NOT treated as recovered. Fail-open
-    there would silently defeat the whole cooldown feature for every user without
-    harness-cli installed (their very first re-check would always read "recovered"
-    despite having no evidence at all) -- "unknown" must stay unknown; only a real
-    reading proves recovery. A recovered seat's cooldown is cleared via
-    `clear_cooldown` (not merely ignored for this one call) so the NEXT probe/report
-    also sees it as healthy, matching `clear_cooldown`'s existing genuine-success
-    contract elsewhere in this module.
-
-    Also narrow on the ACCESS METHOD: `access_method="api"` is never probed either.
-    `usage_percent_for_model` measures the Claude Code CLI subscription window, not
-    the separate paid Anthropic API account -- a healthy CLI reading is no evidence
-    the API transport's own problem (a bad key, a billing issue) has cleared.
-
-    KNOWN ACCEPTED TRADE-OFF (review finding, tracked in review-cli#530 for a future
-    pass, not fixed here to keep this change minimal): a `clear_cooldown` recovery
-    also wipes the seat's escalation `fail_count` history (same as any other
-    genuine-success clear in this module), and a tg-ctl fallback reading from
-    `usage_percent_for_model` may be up to `usage_limits.DEFAULT_MAX_AGE_SECONDS`
-    (24h) stale -- a stale-but-still-"fresh" sample could clear a chronic seat's
-    escalation history early. This inherits the SAME trust window
-    `allow_spawn_for_model` already uses to gate real dispatch for a seat with no
-    cooldown at all; it is not a new risk this probe introduces, just an existing
-    one now also reachable through the escalation path."""
-    cooldown = active_cooldown(model, access_method=access_method)
-    if cooldown is None:
-        return None
-    if not any(
-        marker in cooldown["reason"].lower() for marker in _CHRONIC_QUOTA_MARKERS
-    ):
-        return cooldown
-    # access_method="api" is never probed -- see the docstring above ("Also narrow
-    # on the ACCESS METHOD") for why. Keeps the existing TTL-only behavior, same
-    # as any other reason this probe doesn't model.
-    if access_method == "api":
-        return cooldown
-    pct = usage_percent_for_model(model)
-    if pct is not None and pct < 100.0:
-        clear_cooldown(model, access_method=access_method)
-        return None
-    return cooldown
 
 
 # Byte-exact match for the numeric codes retry.py's `_TRANSIENT_PATTERNS` regex
@@ -3506,681 +528,12 @@ _TRANSIENT_HTTP_STATUSES = frozenset(
 _SEAT_FATAL_HTTP_STATUSES = frozenset({401, 403, 501})
 
 
-def _looks_transient(haystack: str, returncode: int) -> bool:
-    """True when `haystack` (the error channel — GLM review finding, round 3: this is
-    now ALSO called from the rc=0 branch, stderr-only there, not just rc!=0) ALSO
-    carries retry.py's own TRANSIENT signal (a process timeout, a 429/5xx status, or
-    a rate-limit/overload/service-unavailable
-    phrase) — used to keep `_chronic_unavailable_reason`'s rc!=0 `_UNAVAILABLE_MARKERS`
-    check (review-cli#fable-seat-reliability) from mis-caching a genuinely transient
-    blip as a chronic, hours-long cooldown (see that function's docstring for the
-    concrete 503/529 scenario this guards against).
-
-    Codex review finding: a process TIMEOUT (`returncode == 124`, `retry._TIMEOUT_
-    EXIT_CODE`) is retry.py's own FIRST, UNCONDITIONAL transient check — `classify_
-    failure` returns RETRYABLE for rc=124 before it ever looks at the body text
-    (retry.py:264). Without checking it here too, a timeout whose PARTIAL captured
-    output happens to contain "is currently unavailable" (plausible: a killed
-    subprocess's last buffered line) would be cached as chronic instead — retry.py
-    would still want to retry it, but the cooldown would short-circuit that retry on
-    every subsequent call. Checked directly, unconditionally, matching retry.py's own
-    precedence (before the numeric-status/text checks below).
-
-    `returncode` is ALSO checked directly for HTTP statuses (not just scanned as
-    text): `review_claude_api` sets it to the literal HTTP status on an `HTTPError`
-    (`rc = exc.code or 1`), so a real 503/529 reaches here as `returncode=503`/`529`,
-    not a generic `1` — a plain numeric check is a more precise signal than hoping the
-    status also appears in the body text. `haystack` (the SAME string the caller
-    already built from stderr + a short stdout) covers the CLI-transport case, where
-    the status is conveyed only in prose.
-
-    k3 review finding: `retry.classify_failure` checks `_SEAT_FATAL_PATTERNS` BEFORE
-    `_TRANSIENT_PATTERNS` — "a SEAT-FATAL channel wins over an incidental transient-
-    looking substring" (retry.py's own docstring). Without mirroring that precedence
-    here, a channel like `"401 Unauthorized: this account is temporarily unavailable"`
-    would have `_looks_transient` return True (the transient wording matches) even
-    though retry.py itself calls this SEAT_FATAL (401 wins there) — the worst outcome
-    of both: no in-seat retry (retry.py's own call) AND no cooldown cache (this
-    guard's call), so the seat pays a full doomed dispatch on literally every
-    subsequent invocation. Checking `_SEAT_FATAL_PATTERNS` first, and returning False
-    (never transient) on a match, restores the fatal-wins precedence: a seat-fatal
-    channel HAS a chronic-worthy cooldown decision to make (deferred to the caller's
-    own marker checks), never gets misrouted into "looks transient, withhold."
-
-    Lazy import: `reviewlib.retry` imports `ReviewResult` from THIS module and
-    `result_is_usable` from `panel` at its own module top level, so an eager
-    module-level import here would be a circular import — mirrors `panel.py`'s
-    existing lazy import of `reviewlib.retry` for the identical reason. Reusing
-    retry.py's own pattern tuples (rather than second, hand-copied lists) means the
-    two modules can never independently drift on what counts as transient/fatal."""
-    from .retry import (
-        _TIMEOUT_EXIT_CODE,
-        _TRANSIENT_PATTERNS,
-    )  # lazy: breaks the backends<->retry cycle
-
-    if returncode == _TIMEOUT_EXIT_CODE:
-        return True
-    if _is_seat_fatal(haystack, returncode):
-        return False
-    if returncode in _TRANSIENT_HTTP_STATUSES:
-        return True
-    return any(p.search(haystack) for p in _TRANSIENT_PATTERNS)
-
-
-def _is_seat_fatal(haystack: str, returncode: int) -> bool:
-    """True when `haystack` (the error channel — GLM review finding, round 3: this
-    is now ALSO called from the rc=0 branch, stderr-only there, not just rc!=0)
-    matches retry.py's own SEAT_FATAL vocabulary (auth failures, 401, refusals,
-    ...). Shared by `_looks_transient` (a seat-fatal
-    match wins over an incidental transient-looking substring, mirroring retry.py's
-    own precedence) AND by `_chronic_unavailable_reason`'s marker checks directly.
-
-    Codex review finding (review-cli#286): before this helper existed, a seat-fatal
-    channel that also happened to contain the administrative-unavailable wording
-    (concrete repro: `returncode=1, stderr="401 Unauthorized: model is currently
-    unavailable to this account"`) fell through `_looks_transient`'s False return
-    (correctly: an auth failure is not transient) straight into the unavailable-
-    marker check below, and got cached as an hours-long chronic cooldown. That
-    directly contradicts seat_cooldown.py's own documented contract that auth and
-    other seat-fatal failures must never be cached — an auth failure resolves the
-    moment credentials are fixed, not after a timer; caching it either strands the
-    seat for the full escalation window after the fix, or (if never fixed) wastes a
-    dispatch on the SAME account-level issue every window regardless. A seat-fatal
-    channel is deferred entirely to retry.py's own no-retry verdict; it is never a
-    cooldown-worthy CHRONIC reason from this module's cache.
-
-    k3 review finding (round 8): `returncode` is ALSO checked directly against
-    `_SEAT_FATAL_HTTP_STATUSES` (401/403/501) — not just scanned as text — mirroring
-    `_looks_transient`'s identical numeric-vs-text split for the transient side. A
-    gateway that conveys the status ONLY via the exit code (no digits anywhere in the
-    body) would otherwise never match any text pattern and be misread as "not
-    seat-fatal", reaching the marker check and getting wrongly cached."""
-    if returncode in _SEAT_FATAL_HTTP_STATUSES:
-        return True
-    from .retry import _SEAT_FATAL_PATTERNS  # lazy: breaks the backends<->retry cycle
-
-    return any(p.search(haystack) for p in _SEAT_FATAL_PATTERNS)
-
-
-def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
-    """A short reason string if ``result`` looks like a CHRONIC (cooldown-worthy)
-    unavailability review-cli already knows how to recognise elsewhere, else ``None``.
-
-    Deliberately narrow — see seat_cooldown.py's docstring for why only these two
-    shapes (not every seat-fatal failure) start a cooldown. BOTH branches require a
-    NON-usable result (rc=0 short sentinel, or rc!=0), mirroring retry.py's
-    `_error_channel` error-channel discipline: a long, genuinely SUCCESSFUL review
-    (rc=0, real content) is NEVER scanned for the quota markers, even though its prose
-    could legitimately mention "session limit" (this repo's own README/code does) —
-    codex/kimi review finding: the quota check originally scanned ANY body regardless
-    of exit code, so a real review of review-cli itself could self-starve the seat.
-
-    review-cli#fable-seat-reliability: `_UNAVAILABLE_MARKERS` is now checked on BOTH
-    branches, not just rc=0. A real production log (2026-06-26) confirmed Fable's CLI
-    wrapper sometimes relays the identical "is currently unavailable" administrative
-    notice with a NON-ZERO exit code (`exit=1`) — before this fix, the rc!=0 branch
-    checked only `_CHRONIC_QUOTA_MARKERS`, so that confirmed-live shape was silently
-    never cached and the seat kept paying for a real dispatch on every invocation. This
-    is the same defect class as the already-fixed "only 1 of `_UNAVAILABLE_MARKERS`'s 4
-    wordings recognised" bug (see that tuple's own comment) — this time the gap was the
-    exit code, not the wording. The rc=0 branch's OWN quota-marker exclusion is
-    unchanged and deliberate (see `test_review_claude_does_not_cache_a_short_rc0_body_
-    mentioning_session_limit`): a short rc=0 body can genuinely, harmlessly mention
-    "session limit" in prose, so that marker set stays rc!=0-only.
-
-    GLM review finding (review-cli#fable-seat-reliability): the rc!=0 branch's
-    `_UNAVAILABLE_MARKERS` check above is NOT safe unconditionally.
-    GLM review finding (review-cli#286, round 5 — CORRECTING the paragraph above):
-    only ONE of the four wordings, "is temporarily unavailable", is directly
-    retry.py's own TRANSIENT TEXT vocabulary (`_TRANSIENT_PATTERNS`'s `temporarily
-    (?:limiting|unavailable)`). "is currently unavailable" does NOT itself match any
-    `_TRANSIENT_PATTERNS` text — it collides only INDIRECTLY, via the NUMERIC
-    503/529 status (see below) or the SEPARATE `service unavailable` text pattern
-    when that different phrase happens to also be present. The API transport
-    (`review_claude_api`) sets `returncode = exc.code` on an `HTTPError` — a REAL
-    503/529 blip therefore reaches this function with `returncode` literally equal to
-    the HTTP status, not a generic `1`. Caching that as an 8-hour-escalating CHRONIC
-    cooldown (seat_cooldown.py's `_ESCALATION_SCHEDULE`) directly contradicts this
-    module's own "a false-cache costs at most one cooldown window" contract (this
-    module's paragraph above) — it would cost up to 8 hours for a blip that clears
-    itself in seconds. `_looks_transient` below gates the rc!=0 unavailable-marker
-    check on retry.py's OWN transient classification (a lazy import — mirrors
-    panel.py's existing lazy import of retry.py for the identical backends<->retry
-    import-cycle reason).
-
-    GLM review finding (round 5): the guarantee is ONE-DIRECTIONAL, not mutual — say
-    so precisely rather than the stronger "can never disagree" this paragraph used to
-    claim. `_looks_transient` also checks `returncode in _TRANSIENT_HTTP_STATUSES`,
-    which `retry.classify_failure` has no equivalent of (its only numeric check is the
-    timeout code); a channel like `returncode=503` with body text that names neither
-    "503" nor any transient phrase would have `_looks_transient` return True (numeric
-    match) while `retry.classify_failure` would call it SEAT_FATAL by default (no
-    pattern matches either way). The asymmetry only ever WITHHOLDS a cooldown it
-    otherwise would have recorded — never the reverse — so the safety property that
-    actually matters still holds exactly ON THE rc!=0 BRANCH: a failure retry.py would
-    retry is never cached as chronic there.
-
-    GLM review finding (review-cli#286, round 6 — CORRECTING the paragraph that used
-    to sit here): an earlier revision of this function's rc=0 branch never consulted
-    `_looks_transient` at all, so the guarantee above was scoped to the rc!=0 branch
-    only. That gap is now CLOSED (round 2/3 findings, Codex): the rc=0 branch below
-    also calls `_looks_transient(stderr, ...) or _is_seat_fatal(stderr, ...)` before
-    caching its sentinel, on the SAME stderr-only channel `retry.classify_failure`
-    consults for an rc=0 result. The concrete repro this paragraph used to cite as an
-    uncaught counterexample — `ReviewResult(returncode=0, stdout=<the sentinel>,
-    stderr="upstream 503 while proxying")` — is now pinned as WITHHELD (not cached)
-    by `test_review_claude_does_not_cache_an_rc0_sentinel_with_transient_stderr`. The
-    guarantee now holds on both branches, not just rc!=0."""
-    body = (result.stdout or "").strip()
-    if result.returncode == 0:
-        if not body or len(body) > _UNAVAILABLE_MAX_LEN:
-            return None  # empty, or a long genuine review — never scanned
-        if any(marker in body.lower() for marker in _UNAVAILABLE_MARKERS):
-            # Codex review finding (review-cli#286, round 2): retry.py's rc=0 error
-            # channel is stderr-only, so a stderr that independently looks transient
-            # (concrete repro: `returncode=0, stdout=<the short unavailable
-            # sentinel>, stderr="upstream HTTP 503 while proxying"`) means
-            # retry.classify_failure would call this RETRYABLE even though rc=0's
-            # stdout alone reads as the administrative sentinel. Caching it here as
-            # an 8-hour chronic cooldown would short-circuit that retry — the same
-            # transient-vs-chronic collision `_looks_transient` already guards
-            # against on the rc!=0 branch below, now mirrored for rc=0.
-            #
-            # Codex review finding (review-cli#286, round 3): `_looks_transient`
-            # returns False for a seat-fatal stderr (it correctly treats seat-fatal
-            # as "not transient"), so the transient check ALONE let a seat-fatal
-            # channel (401/403/...) fall through and still get cached here —
-            # contradicting the same seat-fatal-is-never-cooldown-worthy contract
-            # already enforced on the rc!=0 branch below via its own separate
-            # `_is_seat_fatal` check. Concrete repro: `returncode=0`, sentinel
-            # stdout, `stderr="401 Unauthorized: model is currently unavailable"`
-            # — retry.classify_failure calls this SEAT_FATAL, so caching it here
-            # would hide a credential rotation behind an hours-long cooldown.
-            stderr = (result.stderr or "").strip()
-            if stderr and (
-                _looks_transient(stderr.lower(), result.returncode)
-                or _is_seat_fatal(stderr.lower(), result.returncode)
-            ):
-                return None
-            return _SENTINEL_COOLDOWN_REASON
-        return None  # a short rc=0 body that is NOT the sentinel is a real (if terse) answer
-    # From here: a non-zero exit.
-    stderr = (result.stderr or "").strip()
-    # k3 review finding (review-cli#286, round 3): a process TIMEOUT (`returncode ==
-    # 124`) is retry.py's own FIRST, UNCONDITIONAL transient check — `classify_
-    # failure` returns RETRYABLE for it before ever looking at the body text
-    # (mirrors `_looks_transient`'s identical unconditional check below). The quota
-    # check right after this is DELIBERATELY unguarded by `_looks_transient`
-    # (round-8/9 findings, see its own comment) — but that means, without this
-    # separate check, a killed subprocess whose partial output happens to contain
-    # "session limit" (plausible in a long partial transcript) would still get
-    # cached as an 8-hour chronic cooldown, short-circuiting the exact retry
-    # `test_review_claude_does_not_cache_a_process_timeout_with_incidental_
-    # unavailable_text` already pins for the sibling `_UNAVAILABLE_MARKERS` check.
-    from .retry import _TIMEOUT_EXIT_CODE  # lazy: breaks the backends<->retry cycle
-
-    if result.returncode == _TIMEOUT_EXIT_CODE:
-        return None
-    # GLM review finding (review-cli#286, round 4, HIGH): the quota-marker check and
-    # the transient/seat-fatal guard below used to each build their OWN
-    # byte-identical haystack (`quota_haystack`/`transient_haystack`, 30 lines
-    # apart, under different names) — this exact function has already been churned
-    # across 9 review rounds, so a future edit touching one copy and not the other
-    # is a real drift risk, not a hypothetical one. One shared `error_channel`,
-    # computed once, removes that risk structurally. Mirrors retry.py's own
-    # `_error_channel` EXACTLY (stderr always, unbounded — deliberately, see the
-    # round-8/9 comment below — plus a SHORT stdout, since a failed CLI often
-    # writes its error to stdout, not stderr) — Opus review finding (review-cli#286,
-    # round 3): `body` (stdout) is LENGTH-GATED before joining even here, mirroring
-    # the rc=0 branch's own reasoning ("a short rc=0 body can genuinely, harmlessly
-    # mention 'session limit' in prose, so a real review of review-cli itself could
-    # self-starve the seat"). Concrete failure this closes: an agentic seat
-    # reviewing review-cli itself streams a long, genuine review to STDOUT that
-    # happens to quote "session limit" / "usage credits" verbatim (this repo's own
-    # code/docs do), then exits rc!=0 for an unrelated reason (or rc=124 timeout,
-    # already excluded above) — an EARLIER version of this haystack joined the
-    # full, unbounded body too, which would have cached that healthy seat as
-    # chronically doomed. Every round-8/9 repro (below) uses a long STDERR, never a
-    # long body, so bounding body alone costs none of them.
-    error_channel = stderr.lower()
-    if body and len(body) <= _UNAVAILABLE_MAX_LEN:
-        error_channel += "\n" + body.lower()
-
-    # k3 review finding (rounds 8-9, three separate concrete repros converging on the
-    # same point): `_CHRONIC_QUOTA_MARKERS` (session/usage-credit limits and the
-    # weekly/monthly limit-reset notice) is checked FIRST, UNCONDITIONALLY — no
-    # transient guard, no seat-fatal guard, no STDERR length bound — deliberately
-    # UNLIKE `_UNAVAILABLE_MARKERS`
-    # below. Three rounds of this repo's own review gate converged on why the two
-    # marker sets need different treatment: (1) a genuinely chronic quota-exhaustion
-    # failure can arrive via `returncode=429` on the API transport (Anthropic's own
-    # status for BOTH a brief rate-limit spike and real usage exhaustion), which the
-    # transient guard would otherwise withhold forever; (2) `reviewlib/dashboard/
-    # parser.py`'s own comment on `_body_has_real_content` documents a VERIFIED real
-    # shape — a CLI call streaming a long partial transcript to STDERR before hitting
-    # the session-limit sentinel at the very end, past any reasonable byte cap —
-    # which a length bound would silently drop; (3) quota text can co-occur with
-    # fatal-looking wording in the same message, which the seat-fatal guard would
-    # otherwise treat as "defer entirely, never cache" even though quota exhaustion
-    # is exactly the chronic condition this whole cache exists to catch.
-    # `_UNAVAILABLE_MARKERS`' four wordings ("is currently unavailable" etc.) are
-    # comparatively GENERIC — plausible in an unrelated 503 gateway blip or a long
-    # stack trace by coincidence — which is why those three guards stay load-bearing
-    # for that check specifically. `_CHRONIC_QUOTA_MARKERS`'s phrasing is narrow and
-    # Fable-specific enough that no unrelated transient/fatal STDERR channel is
-    # realistically going to contain it by accident; this was ALSO the pre-existing,
-    # pre-review-cli#fable-seat-reliability behavior for this exact check (an earlier
-    # revision of this function briefly applied the same guards uniformly to both
-    # marker sets — reverted here after the round-8/9 findings). The BODY side of
-    # this haystack stays length-gated even here (round-3 finding above) — only
-    # stderr is unconditionally unbounded.
-    if any(marker in error_channel for marker in _CHRONIC_QUOTA_MARKERS):
-        return _QUOTA_COOLDOWN_REASON
-
-    # The broader, more generic _UNAVAILABLE_MARKERS check below reuses the SAME
-    # `error_channel` for its transient/seat-fatal guard — so `_looks_transient`
-    # can never disagree with `retry.classify_failure` about what the error channel
-    # even is, and can never independently drift from the quota check's own channel
-    # above.
-    # Codex review finding (review-cli#fable-seat-reliability): a REAL 503/529/
-    # timeout blip whose message ALSO happens to say "is currently unavailable"
-    # (concrete repro: `returncode=503, stderr="Service is currently unavailable,
-    # please retry"`) must not be cached as an 8-hour-escalating chronic cooldown —
-    # retry.py would retry it, so this cache must not short-circuit that retry with
-    # a chronic verdict.
-    #
-    # Codex review finding (review-cli#286): a seat-fatal channel (401, refusal,
-    # ...) is separately never cooldown-worthy either — `_looks_transient` already
-    # calls `_is_seat_fatal` internally and correctly returns False for it (a
-    # seat-fatal channel is NOT transient), but WITHOUT this second, independent
-    # check, that False would let the SAME channel fall through to the
-    # unavailable-marker check below and still get cached if it also contains the
-    # administrative-unavailable wording (concrete repro: `returncode=1,
-    # stderr="401 Unauthorized: model is currently unavailable to this
-    # account"`), caching an auth problem as an hours-long chronic cooldown. See
-    # `_is_seat_fatal`'s own docstring for why that contradicts seat_cooldown.py's
-    # documented contract.
-    #
-    # GLM review finding (review-cli#286, round 4): the two checks used to run as
-    # separate `if` blocks, each re-deriving the fatal-wins precedence in its own
-    # comment — `_looks_transient` already runs `_is_seat_fatal` on the identical
-    # haystack internally, so calling it again here is a redundant second scan, not
-    # a second code path. Combined into one guard.
-    if _looks_transient(error_channel, result.returncode) or _is_seat_fatal(
-        error_channel, result.returncode
-    ):
-        return None
-    # k3 review finding: an administrative notice is a one-liner by construction (the
-    # rc=0 branch already enforces exactly this for stdout), so a long, multi-line
-    # stderr dump (a wrapped upstream error during a rolling deploy, a stack trace)
-    # must never be scanned for these generic-sounding phrases just because it happens
-    # to be long — unlike the quota check above, this bound is intentional here.
-    #
-    # Codex review finding (review-cli#286, round 2): bounding the CONCATENATED
-    # stderr+body length (rather than each channel independently) drops a genuine
-    # short sentinel when it's paired with an unrelated but moderately-sized stderr.
-    # Concrete repro: a 62-char sentinel stdout plus a 380-char non-transient wrapper
-    # diagnostic stderr — neither exceeds the bound alone, but their concatenation
-    # (with the joining newline) does, so the sentinel was silently never cached.
-    # Each channel is now scrutinized on its OWN length: an individually-long
-    # component (the actual case this bound exists for — a real stack trace) is
-    # dropped from the scan, but two individually-short components are both kept
-    # even when their sum would have exceeded the old combined bound.
-    bounded_haystack = "\n".join(
-        p for p in (stderr, body) if p and len(p) <= _UNAVAILABLE_MAX_LEN
-    ).lower()
-    if any(marker in bounded_haystack for marker in _UNAVAILABLE_MARKERS):
-        return _SENTINEL_COOLDOWN_REASON
-    return None
-
-
-def _clears_cooldown_history(result: ReviewResult) -> bool:
-    """True when `result` is genuine RECOVERY evidence — safe grounds to wipe any
-    escalated cooldown history via `clear_cooldown` (see its own docstring). Shared
-    by both `record_cooldown`/`clear_cooldown` call sites (the main `review_claude`
-    dispatch and the `--visual` images path) so the two can never independently
-    drift on what counts as "genuine success".
-
-    review-cli#221: `reason is None` (from `_chronic_unavailable_reason`) alone
-    isn't enough here, since it also covers a non-chronic FAILURE (returncode != 0)
-    that must NOT be treated as recovery evidence. Round-4 review finding (k3):
-    `returncode == 0` alone isn't "genuine success" either — panel.py's own
-    `result_is_usable` treats rc=0 with an EMPTY body as a failure shape too ("a
-    silently-disabled model often returns rc=0 with nothing"). Without this check,
-    a seat oscillating between chronic-quota failures (escalates) and empty-rc0
-    responses (clears) would never actually escalate — pinned at the 10-minute
-    window forever, the exact chronically-broken shape this feature exists to push
-    out of the pool.
-
-    Codex review finding (review-cli#286, round 3): a bare `returncode == 0 and
-    stdout.strip()` ALSO wrongly clears history for the rc=0 transient-stderr
-    exception `_chronic_unavailable_reason` now recognises — a result whose stdout
-    IS the unavailable sentinel, but whose stderr independently looks transient
-    (so the cache guard withholds a chronic verdict for it this particular call).
-    That is NOT genuine recovery evidence; it is the SAME "still unavailable"
-    sentinel, just not cached this time. `result_is_usable` (panel.py) already
-    excludes exactly this shape (rc=0 + a short body matching `_UNAVAILABLE_
-    MARKERS` returns False), so reusing it here instead of a second, ad hoc
-    truthiness check closes the gap without duplicating sentinel-detection logic a
-    third time."""
-    from .panel import result_is_usable  # lazy: panel imports FROM backends at its
-    # own module top level, so an eager import here would be a circular import.
-
-    return result_is_usable(result)
-
-
-def _bounded_cooldown_skip_body(model: str, reason: str, remaining: int) -> str:
-    """Build the cooldown-skip stdout, guaranteed <= `_UNAVAILABLE_MAX_LEN` chars so
-    `panel.result_is_usable`'s length-gated marker scan (and `retry._is_rc0_sentinel`'s
-    identical bound) always recognises it as the sentinel it deliberately mirrors.
-
-    glm review finding: the previous, unbounded f-string could exceed the bound — the
-    `reason` seat_cooldown persists can be up to `_REASON_MAX_LEN=200` chars, and
-    `model` is the raw, unvalidated seat string from `-m`/a board config entry, with no
-    length limit of its own. Past the bound, `result_is_usable` stops scanning for
-    markers at all and returns `True` — silently demoting a cached skip (that never ran
-    a real review) to a "successful" rc=0 verdict that satisfies the flat path's `ok`
-    and the `--commit`/`--staged` gate, exactly the certification failure this whole
-    sentinel-mirroring design exists to prevent.
-
-    `reason` (diagnostic only) is truncated first; `model` (the seat identifier a human
-    actually needs to read in run-stats) only as a last resort. The marker phrase itself
-    (`_UNAVAILABLE_MARKERS[0]`) is NEVER truncated — it's the one substring every
-    downstream consumer actually keys on, so truncating it would defeat recognition
-    entirely rather than just look slightly odd.
-
-    Opus review finding, round 4: `remaining` used to be embedded as-is, treated as
-    part of the FIXED template overhead the `model`/`reason` budgets are computed
-    against — but it is not actually bounded anywhere. `_ttl_seconds()` rejects a
-    non-finite `$REVIEW_SEAT_COOLDOWN_SECONDS` (NaN/inf), but a pathologically large yet
-    still-FINITE value (e.g. approaching float64's ~1.8e308 ceiling) survives that guard
-    and renders as a many-hundred-digit `remaining`, which alone can exceed
-    `_UNAVAILABLE_MAX_LEN` — at which point even truncating `model` to nothing (the
-    function's own last resort) cannot bring the body back under the bound, silently
-    breaking the "guaranteed <= max_len" promise this docstring makes and letting
-    `result_is_usable` treat the skip as a real result. Clamping `remaining` to a sane
-    ceiling up front (a cooldown lasting >31 years is meaningless to display precisely
-    anyway) keeps it a true fixed-width part of the overhead, restoring the guarantee
-    unconditionally rather than only for realistic TTLs."""
-    marker = _UNAVAILABLE_MARKERS[0]
-    # 999,999,999s (~31.7 years) — always <= 9 digits, comfortably below any TTL a real
-    # operator would configure; a display value beyond this is meaningless precision,
-    # not information worth spending the length budget on.
-    remaining = min(remaining, 999_999_999)
-
-    def _build(m: str, r: str) -> str:
-        return (
-            f"{m} {marker} (cached: {r}; skip expires in {remaining}s — "
-            "reviewlib.seat_cooldown).\n"
-        )
-
-    body = _build(model, reason)
-    if len(body) <= _UNAVAILABLE_MAX_LEN:
-        return body
-    overhead = len(_build(model, ""))
-    reason_budget = max(0, _UNAVAILABLE_MAX_LEN - overhead)
-    body = _build(model, reason[:reason_budget])
-    if len(body) <= _UNAVAILABLE_MAX_LEN:
-        return body
-    overhead_no_model = len(_build("", ""))
-    model_budget = max(0, _UNAVAILABLE_MAX_LEN - overhead_no_model)
-    return _build(model[:model_budget], "")
-
-
-def _usage_limit_skip_result(
-    model: str, round_no: int, reason: str, *, backend: str
-) -> ReviewResult:
-    """Synthetic skip when a family's 5-hour or 7-day window is exhausted.
-
-    Mirrors `_cooldown_skip_result`'s sentinel shape (rc=0 + unavailable
-    marker) so failover/dashboard treat it as unusable, without Popen."""
-    marker = _UNAVAILABLE_MARKERS[0]
-    stdout = f"{model} {marker} ({reason}).\n"
-    if len(stdout) > _UNAVAILABLE_MAX_LEN:
-        stdout = f"{marker} ({reason}).\n"[:_UNAVAILABLE_MAX_LEN]
-    command = f"usage-limit skip ({backend})"
-    _emit_rest_log(
-        backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr=""
-    )
-    return ReviewResult(
-        model=model, command=command, returncode=0, stdout=stdout, stderr=""
-    )
-
-
-def _cooldown_skip_result(
-    model: str, round_no: int, cooldown: dict, *, backend: str
-) -> ReviewResult:
-    """Build the synthetic ReviewResult for a cached-cooldown skip, and log it via the
-    same REST sidecar path REST backends use — so the dashboard still sees the call (as
-    a skipped/paywall-shaped one) instead of the seat silently vanishing from a session.
-
-    ``backend`` attributes the skip to the ACTUAL seat that cooled down (codex review
-    finding, round 2: an earlier version of this function hard-coded "claude" for every
-    caller, so an opencode true-silence cooldown skip was logged/dashboarded as a
-    Claude/Fable event — corrupting attribution and hiding the real `oc:*` seat).
-    Required (no default) as of round 3 (Fable review finding): a default of "claude"
-    would silently reintroduce the exact same misattribution class for the NEXT
-    backend that grows a cooldown gate (review-cli#235 plans five more) if its author
-    simply forgets the keyword — every call site must now name its own backend
-    explicitly, enforced at call time, not by convention.
-
-    The command label deliberately does NOT say "Anthropic API" (kimi review finding:
-    that string is `_claude_api_command`'s REST-transport label and would mislabel a
-    CLI-mode seat's skip as an API call in the sidecar log/dashboard, misleading a
-    post-mortem) — the skip never chose a transport at all, it short-circuited before
-    either.
-
-    codex review finding, round 4: attributing to the BACKEND alone isn't enough for
-    opencode -- `model_id_for_call` (reviewlib/dashboard/parser.py) only resolves an
-    opencode call to its real board seat (`oc:<provider/model>`) via an `-m <model>`
-    token in argv0, same shape `review_opencode`'s own real dispatch already writes
-    (`header_argv0=f"opencode -m {oc_model}"`). Without it, a true-silence cooldown
-    skip fell through to the generic `opencode` bucket -- present in the log, but
-    invisible on the specific seat's health/error row, defeating the round-2 fix's
-    whole point. `-m <model>` must be followed by whitespace (the parser's regex is
-    greedy non-whitespace-run), so the parenthetical note goes AFTER the model token,
-    not glued to it. If a future backend growing its own cooldown gate (review-cli#235) resolves
-    the same way (omp does, per parser.py's comment), extend this the same way."""
-    if backend == "opencode":
-        # Opus review finding, round 5: matches the real dispatch's own header
-        # construction exactly (`header_argv0=f"opencode -m {_safe_log_header(oc_model)}"`
-        # in review_opencode) — cosmetic today for a normal `provider/model` selector, but
-        # keeps the skip's parser-facing header byte-for-byte consistent with the real
-        # call in case a model selector ever needs sanitizing.
-        oc_model = model.split(":", 1)[1] if ":" in model else model
-        command = f"opencode -m {_safe_log_header(oc_model)} (seat-cooldown skip)"
-    else:
-        command = f"seat-cooldown skip ({backend})"
-    remaining = int(cooldown["remaining_seconds"])
-    stdout = _bounded_cooldown_skip_body(model, cooldown["reason"], remaining)
-    _emit_rest_log(
-        backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr=""
-    )
-    return ReviewResult(
-        model=model, command=command, returncode=0, stdout=stdout, stderr=""
-    )
-
-
-def _claude_project_key(cwd: Path) -> str:
-    """The ``~/.claude.json`` ``projects`` key claude uses for ``cwd``: the RESOLVED real
-    path (claude canonicalises cwd — e.g. /tmp -> /private/tmp, symlinked worktrees). On
-    Windows claude writes it with forward slashes (``C:/Users/...``), so a native
-    backslash path would never match its entry."""
-    key = os.path.realpath(str(cwd))
-    if os.name == "nt":
-        key = key.replace("\\", "/")
-    return key
-
-
-def _open_trust_lock(cfg: Path):
-    """Open + exclusively lock the sidecar ``.claude.json.review-trust.lock`` that
-    serialises review's own read-modify-writes of ``~/.claude.json`` (the data file itself
-    is swapped by ``os.replace``, so a lock held on it wouldn't survive the swap). Returns
-    the locked file object, or None when the lock is unavailable → the caller proceeds
-    unsynchronised, best-effort."""
-    lock = None
-    try:
-        lock = open(cfg.with_name(".claude.json.review-trust.lock"), "w")
-        lock_file(lock.fileno())
-    except OSError:
-        if lock is not None:
-            lock.close()
-        return None
-    return lock
-
-
-def _release_trust_lock(lock) -> None:
-    if lock is None:
-        return
-    try:
-        unlock_file(lock.fileno())
-    except OSError:
-        pass
-    finally:
-        lock.close()
-
-
-def _ensure_workspace_trusted(cwd: Path) -> None:
-    """Pre-accept Claude Code's workspace trust for ``cwd`` in ~/.claude.json.
-
-    The headless seat must never stop on Claude Code's "Quick safety check / Do you
-    trust this folder?" gate in an untrusted directory (a fresh git worktree, a
-    not-yet-opened repo). `claude --print` skips that dialog on its own (per
-    `claude --help`); seeding the trust flag directly keeps the directory trusted
-    regardless of that print-mode behaviour, so the deterministic ``dontAsk`` path
-    just works.
-
-    This is a DELIBERATE, persistent edit to the user's global config (review is
-    configured to auto-trust the directory it reviews): a later interactive
-    claude session in the same dir inherits the trust. It is scoped to the trust
-    flag (+ onboarding) only — no permissions or tools are granted.
-
-    Best-effort and conservative: skips the write when already trusted (the
-    common case → no write at all), only touches the one project entry, writes
-    via a same-dir temp + atomic ``os.replace`` (a concurrent reader never sees a
-    half-write), and serialises review's own writers with an flock. Any error
-    (missing / locked / non-JSON config) silently degrades to the old behaviour.
-    """
-    cfg = Path.home() / ".claude.json"
-    if not cfg.exists():
-        return  # best-effort: never fabricate a config the user didn't have
-    # claude keys workspace trust by the RESOLVED real path (it canonicalises
-    # cwd — e.g. /tmp -> /private/tmp, symlinked worktrees), so a raw-path key
-    # would silently miss and the prompt would still fire.
-    key = _claude_project_key(cwd)
-    # Serialise the read-modify-write against other review processes with an
-    # advisory flock on a sidecar lock file (the data file itself is swapped by
-    # os.replace, so a lock held on it wouldn't survive the swap). This can't
-    # synchronise against `claude` — it doesn't lock — but the skip-when-already-
-    # trusted guard means we only ever write on the FIRST review in a fresh dir,
-    # keeping that residual window tiny.
-    lock = _open_trust_lock(cfg)
-    try:
-        data = json.loads(cfg.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return
-        projects = data.get("projects")
-        if not isinstance(projects, dict):
-            projects = {}
-            data["projects"] = projects
-        entry = projects.get(key)
-        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
-            return  # already trusted — leave the shared config untouched
-        entry = entry if isinstance(entry, dict) else {}
-        entry["hasTrustDialogAccepted"] = True
-        # Force (not setdefault): a prior blocked/headless attempt can leave a
-        # partial entry with hasCompletedProjectOnboarding=false, which would
-        # still let claude block on the onboarding gate. Seed both to true.
-        entry["hasCompletedProjectOnboarding"] = True
-        projects[key] = entry
-        tmp = None
-        try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(cfg.parent), prefix=".claude.", suffix=".tmp"
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, cfg)  # atomic: a concurrent reader never sees a half-write
-        except Exception:
-            if tmp is not None:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-    except Exception:
-        return  # malformed / unreadable config → degrade to the old behaviour
-    finally:
-        _release_trust_lock(lock)
-
-
 # The exact flag set `_ensure_workspace_trusted` seeds. An entry holding ONLY these (a subset is
 # fine) is one review created and nothing else enriched — safe to reap. Any EXTRA key means a
 # real claude session touched it, so we leave it.
 _REVIEW_SEEDED_TRUST_KEYS = frozenset(
     {"hasTrustDialogAccepted", "hasCompletedProjectOnboarding"}
 )
-
-
-def _is_review_seeded_trust_entry(entry: object) -> bool:
-    """True iff ``entry`` looks like an entry review SEEDED and nothing else enriched: a dict
-    whose keys are a subset of the trust/onboarding flags review writes. A larger entry (extra
-    keys from a real interactive session) returns False so we never delete a user's real data."""
-    return isinstance(entry, dict) and set(entry).issubset(_REVIEW_SEEDED_TRUST_KEYS)
-
-
-def _remove_workspace_trust(cwd: Path) -> None:
-    """Remove a previously-seeded workspace-trust entry for ``cwd`` from ~/.claude.json.
-
-    The inverse of ``_ensure_workspace_trusted``: qa seeds a trust entry for each EPHEMERAL
-    throwaway worktree it spawns the claude tester in (a fresh worktree is untrusted and the
-    headless gate blocks on it). The worktree is deleted on exit, but its persisted
-    ``projects[<realpath>]`` trust entry is NOT — so over many default qa runs ~/.claude.json
-    accumulates trusted ``/tmp/review-qa-wt-*`` paths that no longer exist (review-cli#60). Call
-    this after the run to drop the one entry, keyed by the SAME realpath the seed used.
-
-    Best-effort and conservative (mirrors the seed): only ever removes the ONE project key, uses
-    the same flock + atomic os.replace, and silently degrades on any error. It removes the entry
-    ONLY when it still holds just the flags review seeds — if a later real interactive claude
-    session enriched it, the entry is LEFT intact so we reap only what we created."""
-    cfg = Path.home() / ".claude.json"
-    if not cfg.exists():
-        return
-    key = _claude_project_key(cwd)
-    lock = _open_trust_lock(cfg)
-    try:
-        data = json.loads(cfg.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return
-        projects = data.get("projects")
-        if not isinstance(projects, dict) or key not in projects:
-            return  # nothing seeded for this path — nothing to reap
-        if not _is_review_seeded_trust_entry(projects.get(key)):
-            return  # the entry grew beyond what review seeds — leave it untouched
-        del projects[key]
-        tmp = None
-        try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(cfg.parent), prefix=".claude.", suffix=".tmp"
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, cfg)
-        except Exception:
-            if tmp is not None:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-    except Exception:
-        return
-    finally:
-        _release_trust_lock(lock)
-
-
-def _claude_cli_binary() -> str:
-    """Resolve the `claude` CLI binary (driven via `claude --print`, see
-    `_claude_cli_argv`). Raises a clear "claude not found on PATH" error when absent."""
-    return _which("claude")
 
 
 @lru_cache(maxsize=8)
@@ -4198,219 +551,6 @@ def _claude_cli_supports_effort(binary: str) -> bool:
     return "--effort" in help_text
 
 
-def _claude_cli_argv(
-    binary: str,
-    model: str | None,
-    *,
-    image_dir: Path | None = None,
-    effort: str | None = None,
-) -> list[str]:
-    """Build the `claude --print` argv.
-
-    It runs headless and reads the prompt from STDIN (never `-p <payload>` argv: a
-    brainstorm round embeds the whole prior transcript and a diff can be huge, which as
-    a command-line argument blows past ARG_MAX → execve E2BIG). Read-only is enforced by
-    an EMPTY tool allowlist (`--tools ""` = all built-in tools off) unless a visual
-    panel job needs scoped image reads, in which case it gets `--tools Read` plus
-    `--add-dir <staged-image-dir>`. That keeps normal text review locked down while
-    allowing the explicit screenshot attachment path to read only its temp image files.
-
-    cwd is the Popen cwd (claude has no --cwd); there is no --timeout-sec (review-cli's
-    own _run_streamed timeout governs the call)."""
-    tools = "Read" if image_dir is not None else ""
-    system_prompt = (
-        _CLAUDE_IMAGE_REVIEW_SYSTEM if image_dir is not None else _CLAUDE_REVIEW_SYSTEM
-    )
-    argv = [
-        binary,
-        "--print",
-        "--output-format",
-        "text",
-        "--permission-mode",
-        "dontAsk",
-        "--tools",
-        tools,
-        "--strict-mcp-config",
-        "--disable-slash-commands",
-        "--safe-mode",
-        "--append-system-prompt",
-        system_prompt,
-    ]
-    if image_dir is not None:
-        argv += ["--add-dir", str(image_dir)]
-    claude_effort = _claude_reasoning_effort(effort)
-    if claude_effort and _claude_cli_supports_effort(binary):
-        argv += ["--effort", claude_effort]
-    if model:
-        argv += ["--model", model]
-    return argv
-
-
-def _stage_panel_images(images: tuple[Path, ...], tmp: Path) -> list[Path]:
-    paths: list[Path] = []
-    for idx, image in enumerate(images):
-        src = Path(image)
-        if not src.is_file():
-            continue
-        suffix = src.suffix if src.suffix else ".png"
-        dst = tmp / f"{idx}-panel-image{suffix}"
-        try:
-            dst.write_bytes(src.read_bytes())
-        except OSError:
-            continue
-        paths.append(dst)
-    return paths
-
-
-def _prompt_with_panel_images(prompt: str, images: list[Path]) -> str:
-    if not images:
-        return prompt
-    refs = "\n".join(f"- @{path}" for path in images)
-    return (
-        f"{prompt}\n\n"
-        "=== RAW VISUAL ATTACHMENT ===\n"
-        "Inspect these screenshot image files directly before answering; do not rely only "
-        "on any textual visual summary already in the prompt.\n"
-        f"{refs}"
-    )
-
-
-def _claude_cli_env() -> dict[str, str]:
-    """Child env that keeps the claude CLI from emitting decorative terminal control
-    sequences into the captured pipe. `TERM=dumb` + `NO_COLOR=1` disable colour/cursor
-    rendering; `CI=1` nudges any progress UI off. Inherits the rest of the environment
-    (auth, PATH, ANTHROPIC_* gateway vars) so the subscription / gateway path is intact."""
-    env = dict(os.environ)
-    env["TERM"] = "dumb"
-    env["NO_COLOR"] = "1"
-    env["CI"] = "1"
-    return env
-
-
-def _claude_cli_log_header(claude_model: str | None) -> str | None:
-    """`claude --model <id>` for the call log, so the dashboard attributes the call to the
-    model that ran (review-cli#645: `-m opus48` and the default Opus share the binary)."""
-    return f"claude --model {_safe_log_header(claude_model)}" if claude_model else None
-
-
-def review_claude_cli(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-    config_dir: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    claude_model = model.split(":", 1)[1] if ":" in model else None
-    # Resolve the binary BEFORE touching trust so a missing CLI raises here, not after
-    # _ensure_workspace_trusted has already mutated ~/.claude.json.
-    binary = _claude_cli_binary()
-    # Pre-accept workspace trust for cwd: the headless run cannot answer the
-    # interactive "Do you trust this folder?" gate (see _ensure_workspace_trusted).
-    _ensure_workspace_trusted(cwd)
-    argv = _claude_cli_argv(binary, claude_model, effort=effort)
-    # A fresh per-call dict (`_claude_cli_env()` already returns `dict(os.environ)`, a
-    # new object every call) -- account rotation (review-cli#168) selects a registered
-    # `~/.claude-accounts/account-N` dir via CLAUDE_CONFIG_DIR here. NEVER mutate global
-    # `os.environ`: seats dispatch concurrently across threads (reviewlib/process.py's
-    # ThreadPoolExecutor), so a global mutation here would be a real, hard-to-reproduce
-    # cross-seat race.
-    env = _claude_cli_env()
-    if config_dir:
-        env["CLAUDE_CONFIG_DIR"] = config_dir
-    proc = _run_streamed(
-        argv,
-        cwd=cwd,
-        input_text=_payload(prompt, diff),
-        env=env,
-        timeout=timeout,
-        backend="claude",
-        round_no=round_no,
-        announce=_ANNOUNCE_LOGS,
-        true_silence_timeout=true_silence_timeout_seconds(model),
-        header_argv0=_claude_cli_log_header(claude_model),
-    )
-    # Belt-and-suspenders: strip any terminal control noise the CLI still leaked into the
-    # pipe (a stray escape sequence) so it can never corrupt the parsed
-    # `## <model> [ok]/[needs-changes]` verdict (review-cli#76).
-    stdout = strip_control_sequences(proc.stdout)
-    stderr = strip_control_sequences(proc.stderr)
-    # A redacted, human-readable command line for the result header (no prompt/diff).
-    command = (
-        "claude --print --output-format text --permission-mode dontAsk --tools '' "
-        "--strict-mcp-config --disable-slash-commands --safe-mode "
-        "--append-system-prompt <read-only-review>  (prompt via stdin)"
-    )
-    return ReviewResult(
-        model=model,
-        command=command,
-        returncode=proc.returncode,
-        stdout=stdout,
-        stderr=stderr,
-    )
-
-
-def review_claude_cli_with_images(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    images: tuple[Path, ...] = (),
-    effort: str | None = None,
-) -> ReviewResult:
-    prompt = _prompt_with_effort(prompt, effort)
-    claude_model = model.split(":", 1)[1] if ":" in model else None
-    if os.environ.get(_mode_env_var("claude"), "").strip().lower() == "api":
-        return review_claude(model, prompt, diff, cwd, timeout, round_no, effort=effort)
-    binary = _which_optional("claude")
-    if not binary:
-        return review_claude(model, prompt, diff, cwd, timeout, round_no, effort=effort)
-    with tempfile.TemporaryDirectory(prefix="review-cli-claude-images-") as tmp_raw:
-        tmp = Path(tmp_raw)
-        staged = _stage_panel_images(images, tmp)
-        if not staged:
-            return review_claude_cli(
-                model, prompt, diff, cwd, timeout, round_no, effort=effort
-            )
-        _ensure_workspace_trusted(tmp)
-        argv = _claude_cli_argv(binary, claude_model, image_dir=tmp, effort=effort)
-        proc = _run_streamed(
-            argv,
-            cwd=tmp,
-            input_text=_payload(_prompt_with_panel_images(prompt, staged), diff),
-            env=_claude_cli_env(),
-            timeout=timeout,
-            backend="claude",
-            round_no=round_no,
-            announce=_ANNOUNCE_LOGS,
-            true_silence_timeout=true_silence_timeout_seconds(model),
-            header_argv0=_claude_cli_log_header(claude_model),
-        )
-    # The TemporaryDirectory context deleted tmp; remove the trust entry that
-    # _ensure_workspace_trusted seeded so dead /tmp/review-cli-claude-images-* paths
-    # don't accumulate in ~/.claude.json. (P2 fix — review-cli#98 thread.)
-    _remove_workspace_trust(tmp)
-    stdout = strip_control_sequences(proc.stdout)
-    stderr = strip_control_sequences(proc.stderr)
-    command = (
-        "claude --print --output-format text --permission-mode dontAsk --tools Read "
-        "--strict-mcp-config --disable-slash-commands --safe-mode --add-dir <image-dir> "
-        "--append-system-prompt <read-only-review>  (prompt via stdin, image @refs)"
-    )
-    return ReviewResult(
-        model=model,
-        command=command,
-        returncode=proc.returncode,
-        stdout=stdout,
-        stderr=stderr,
-    )
-
-
 # --- Fake backend (TEST-ONLY, env-gated) -------------------------------------------
 # `REVIEW_FAKE_BACKEND=1` replaces EVERY real backend with a deterministic in-process
 # responder — NO network, NO CLI subprocess, NO API key. It exists so the e2e tests
@@ -4424,166 +564,6 @@ def review_claude_cli_with_images(
 # call funnels through), so the fake is the ONLY fake in the whole stack — argument
 # parsing, mode dispatch, the round loop, the discussion-log writer, the parser, and the
 # resume seeding all run for real.
-def _fake_backend_enabled() -> bool:
-    # Normalize case so `False`/`FALSE`/`No` are treated as OFF (not just lowercase forms) —
-    # otherwise a case-variant false value would silently route every backend to the fake.
-    return os.environ.get("REVIEW_FAKE_BACKEND", "").strip().lower() not in (
-        "",
-        "0",
-        "false",
-        "no",
-    )
-
-
-def review_fake(
-    model: str,
-    prompt: str,
-    diff: str,
-    cwd: Path,
-    timeout: int,
-    round_no: int = 0,
-    effort: str | None = None,
-) -> ReviewResult:
-    """Deterministic, network-free stand-in for a real backend (TEST-ONLY).
-
-    Distinguishes the brainstorm prompt shapes by their fixed lead-in text (imported from the
-    prompt SOURCE — `modes.brainstorm` — so a reword can never silently misroute the fake):
-      * the final SYNTHESIS prompt (SYNTHESIS_PROMPT_MARKER) -> a synthesis body;
-      * a MODERATOR round prompt (MODERATOR_PROMPT_LEADIN) -> a summary ending in
-        `DECISION: CONTINUE` (so the loop runs to its max cap, then synthesizes — a
-        deterministic, always-terminating run with a guaranteed final synthesis);
-      * anything else (a persona prompt) -> a short per-round idea.
-    The text embeds `model`/`round_no` so each round's content is distinct and a resumed
-    run's new rounds are visibly different from the pre-kill ones. `REVIEW_FAKE_DELAY`
-    (float seconds, default 0) sleeps per call so an e2e can make a run slow enough to
-    reliably SIGTERM it mid-round; the delay still honours `timeout` as an upper bound.
-    `REVIEW_FAKE_RECORD_DIR` (a directory) makes every call write one `<ns>-<pid>-<tid>.json`
-    file holding the `model`, `prompt` and `diff` it received, so an e2e can assert exactly
-    what each seat was sent (e.g. that a chunked diff's passes cover every file)."""
-    prompt = _prompt_with_effort(prompt, effort)
-    record_dir = os.environ.get("REVIEW_FAKE_RECORD_DIR", "").strip()
-    if record_dir:
-        target = Path(record_dir)
-        target.mkdir(parents=True, exist_ok=True)
-        (
-            target / f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}.json"
-        ).write_text(
-            json.dumps({"model": model, "prompt": prompt, "diff": diff}),
-            encoding="utf-8",
-        )
-
-    # Lazy import (not at module top) so this lower backends layer never imports the higher
-    # modes layer at import time — only when the env-gated fake is actually exercised.
-    from .modes.brainstorm import MODERATOR_PROMPT_LEADIN, SYNTHESIS_PROMPT_MARKER
-
-    delay = 0.0
-    try:
-        delay = float(os.environ.get("REVIEW_FAKE_DELAY", "0") or "0")
-    except ValueError:
-        delay = 0.0
-    if delay > 0:
-        time.sleep(min(delay, max(timeout - 0.1, 0.0)))
-
-    if SYNTHESIS_PROMPT_MARKER in prompt:
-        body = (
-            f"FINAL SYNTHESIS (fake/{model}). BEST IDEAS (ranked): 1) idea-A 2) idea-B. "
-            "TRADEOFFS: A is simpler, B scales better. RECOMMENDATION: ship idea-A first."
-        )
-    elif MODERATOR_PROMPT_LEADIN in prompt:
-        body = (
-            f"Moderator summary (fake/{model}, round {round_no}): the panel converged on a "
-            "couple of concrete directions.\nDECISION: CONTINUE"
-        )
-    else:
-        body = (
-            f"Idea from {model} in round {round_no}: a concrete, deterministic suggestion "
-            f"(#{round_no}) the fake backend emits without any network or CLI."
-        )
-    # Mirror a real REST backend's sidecar live-log so `tail -f` / the dashboard parser behave
-    # the same under the fake. A log-dir hiccup must not break the call, but it shouldn't fail
-    # SILENTLY either — narrow to OSError (the only thing write_sidecar_log raises on disk) and
-    # note it on stderr so a broken log dir is diagnosable.
-    try:
-        write_sidecar_log(
-            backend="fake",
-            round_no=round_no,
-            argv0=f"fake:{model}",
-            returncode=0,
-            stdout=body,
-            stderr="",
-        )
-    except OSError as exc:
-        print(
-            f"[review-cli] fake sidecar log skipped: {exc}", file=sys.stderr, flush=True
-        )
-    return ReviewResult(
-        model=model, command=f"fake:{model}", returncode=0, stdout=body, stderr=""
-    )
-
-
-def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
-    """Match a model string to an EXPLICITLY-recognized backend, or None when nothing
-    matches. `lowered` is the already-lowercased model id.
-
-    This is the set of providers the CLI knows by name — every branch here is a deliberate,
-    documented route. `resolve_backend` adds a catch-all opencode fallthrough on top (so an
-    unknown id still runs *something*). Splitting the match out keeps one source of truth for
-    the named routes and keeps `resolve_backend` a one-liner over it."""
-    if lowered == "codex" or lowered.startswith("codex:"):
-        return review_codex
-    if lowered in ("gemini", "gemini-api") or lowered.startswith("gemini:"):
-        return review_gemini
-    # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP. `zai`/`glm` plus `zai:<model>`
-    # (e.g. zai:glm-5.3). `glm:` prefix also routes here.
-    if lowered in ("zai", "z.ai", "zhipu", "glm") or lowered.startswith(
-        ("zai:", "z.ai:", "glm:", "zhipu:")
-    ):
-        return review_zai
-    # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
-    # The legacy `common-code`/`common_code` spellings still route here as aliases so
-    # any pre-rename config keeps working.
-    if lowered in (
-        "commandcode",
-        "command-code",
-        "command_code",
-        "common-code",
-        "commoncode",
-        "common_code",
-    ) or lowered.startswith(
-        (
-            "commandcode:",
-            "command-code:",
-            "command_code:",
-            "common-code:",
-            "commoncode:",
-            "common_code:",
-        )
-    ):
-        return review_commandcode
-    # OpenRouter — OpenAI-compatible API aggregator (keyed HTTP). `openrouter` plus
-    # `openrouter:<provider>/<model>` (e.g. openrouter:anthropic/claude-3.5-sonnet). Does NOT
-    # collide with opencode's `oc:`/`opencode:` prefixes — `openrouter:` shares no prefix with
-    # either, so the order relative to the opencode catch-all below is irrelevant.
-    if lowered == "openrouter" or lowered.startswith("openrouter:"):
-        return review_openrouter
-    # Oh My Pi (omp) — agentic read-only CLI seat (review-cli#174). `omp` plus
-    # `omp:<provider>/<model>` (e.g. omp:kimi-code/k3); the selector after `omp:` goes
-    # to omp's `--model` fuzzy matcher verbatim. `omp:` shares no prefix with `oc:`/
-    # `opencode:`, but an explicit branch keeps the seat off the catch-all fallthrough.
-    if lowered == "omp" or lowered.startswith("omp:"):
-        return review_omp
-    # fable runs on the claude CLI. Route any fable form to review_claude defensively, so
-    # an unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
-    # default (which would hit fireworks — the wrong provider entirely).
-    if (
-        lowered in ("claude", "claude-fable-5", "claude-fable-5-1")
-        or lowered.startswith("claude:")
-        or lowered.startswith("fable")
-    ):
-        return review_claude
-    if lowered.startswith(("oc:", "opencode:")):
-        return review_opencode
-    return None
 
 
 # Providers known to be DEAD — a default model id must never route through one. Right now
@@ -4607,60 +587,6 @@ _AGENTIC_ONLY_PROVIDERS = frozenset({"xai"})
 
 
 _OC_TRANSPORT_PREFIXES = ("oc:", "opencode:")
-
-
-def _peel_oc_transport(lowered: str) -> str | None:
-    """The opencode `provider/model` selector under an `oc:`/`opencode:` transport prefix
-    of an already-lower-cased id, or None when the id carries no transport prefix. The ONE
-    place the prefix list lives — `effective_provider` and `default_routes_live` both peel
-    through it, so the two can never disagree on what counts as the agentic transport."""
-    for prefix in _OC_TRANSPORT_PREFIXES:
-        if lowered.startswith(prefix):
-            return lowered[len(prefix) :]
-    return None
-
-
-def _oc_selector_is_well_formed(selector: str, provider: str) -> bool:
-    """True iff an opencode selector (the part after `oc:`) is the exact `provider/model`
-    shape opencode's `-m` wants: a slash, the segment before the FIRST slash canonicalising
-    to the effective `provider` (so a colon-contaminated `xai:grok/model` — whose provider
-    peels as `xai` on the colon — or `zai:/glm` fails, while `gemini-api/...` still matches
-    its canonical `gemini`), no whitespace anywhere, and no empty `/`-separated segment
-    (rejects `zai//glm-5.3`, an interior `deepseek//v4` and a trailing `grok-4.5/` alike).
-
-    Whitespace is REJECTED, never canonicalised away (review round 2, GH-165, Codex): the
-    selector is forwarded to `opencode -m` verbatim by `review_opencode`, so a
-    `oc: xai/grok-4.5` or `oc:xai /grok-4.5` default that this guard stripped into shape
-    would pass the anti-rot CI check and then fail at dispatch."""
-    if "/" not in selector or any(ch.isspace() for ch in selector):
-        return False
-    segments = selector.split("/")
-    if not all(segments):
-        return False
-    return _canonical_provider(segments[0]) == provider
-
-
-def effective_provider(model: str) -> str:
-    """The EFFECTIVE underlying provider of a model id, peeling the `oc:`/`opencode:`
-    AGENTIC-transport prefix so the real provider — not "opencode" — is what's checked.
-
-    `oc:commandcode/moonshotai/Kimi-K3` -> `commandcode`; `oc:fireworks/x` ->
-    `fireworks`; `zai:glm-5.3` -> `zai`; a bare `codex` -> `codex`. Lower-cased. The #25
-    guard needs this because an `oc:` seat is just a transport: the dead-provider check must
-    look THROUGH the `oc:` prefix at the provider underneath — otherwise a dead
-    `oc:fireworks/...` default reads as the opencode transport and the rot slips past."""
-    lowered = model.lower()
-    peeled = _peel_oc_transport(lowered)
-    if peeled is not None:
-        lowered = peeled
-    if lowered.startswith("fable"):
-        return "claude"
-    # The provider is the first segment before either a `:` (keyed-HTTP `provider:model`)
-    # or a `/` (opencode `provider/model`), whichever comes first.
-    for sep in (":", "/"):
-        if sep in lowered:
-            lowered = lowered.split(sep, 1)[0]
-    return _canonical_provider(lowered)
 
 
 # ---------------------------------------------------------------------------
@@ -4716,119 +642,6 @@ _PROVIDER_ALIASES = {
 }
 
 
-def _canonical_provider(provider: str) -> str:
-    return _PROVIDER_ALIASES.get(provider.strip().lower(), provider.strip().lower())
-
-
-def _parse_provider_names(raw: object) -> frozenset[str]:
-    """Normalize config/env provider lists (`["commandcode"]` or "a,b")."""
-    if raw is None:
-        return frozenset()
-    parts: list[str] = []
-    if isinstance(raw, str):
-        parts = raw.split(",")
-    elif isinstance(raw, (list, tuple, set, frozenset)):
-        for item in raw:
-            if isinstance(item, str):
-                parts.extend(item.split(","))
-    return frozenset(_canonical_provider(part) for part in parts if part.strip())
-
-
-def configure_unpaid_providers(raw: object) -> None:
-    """Set per-process providers whose billing/entitlement is currently unavailable.
-
-    `reviewlib.backends` intentionally does not import the YAML config loader. The CLI calls
-    this after `load_config()`; tests and non-CLI callers can use REVIEW_UNPAID_PROVIDERS.
-    """
-    global _CONFIG_UNPAID_PROVIDERS
-    _CONFIG_UNPAID_PROVIDERS = _parse_provider_names(raw)
-
-
-def unpaid_providers() -> frozenset[str]:
-    """Providers skipped before dispatch because their subscription/billing is unavailable."""
-    return _CONFIG_UNPAID_PROVIDERS | _parse_provider_names(
-        os.environ.get(_UNPAID_PROVIDERS_ENV)
-    )
-
-
-def provider_marked_unpaid(model: str) -> bool:
-    """True when `model` routes through a provider disabled by the payment/entitlement list."""
-    return effective_provider(model) in unpaid_providers()
-
-
-def _runtime_unpaid_provider(model: str) -> str | None:
-    provider = (
-        _claude_runtime_gateway_provider()
-        if resolve_backend(model) is review_claude
-        else None
-    )
-    return _matched_unpaid_provider(model, provider)
-
-
-def runtime_provider_marked_unpaid(model: str) -> bool:
-    """True when a backend invocation for `model` would use a disabled provider."""
-    return _runtime_unpaid_provider(model) is not None
-
-
-def runtime_unpaid_provider_error(model: str) -> str:
-    return unpaid_provider_error(model, _runtime_unpaid_provider(model))
-
-
-def _matched_unpaid_provider(model: str, provider: str | None = None) -> str | None:
-    providers = []
-    if provider:
-        providers.append(_canonical_provider(provider))
-    providers.append(effective_provider(model))
-    disabled = unpaid_providers()
-    for candidate in providers:
-        if candidate in disabled:
-            return candidate
-    return None
-
-
-def unpaid_provider_error(model: str, provider: str | None = None) -> str:
-    provider = _matched_unpaid_provider(model, provider) or effective_provider(model)
-    return (
-        f"provider '{provider}' is marked unpaid/disabled "
-        f"({_UNPAID_PROVIDERS_ENV} or config.yaml unpaid_providers); skipping {model}"
-    )
-
-
-def unpaid_provider_result(
-    model: str,
-    *,
-    backend: str,
-    command: str,
-    round_no: int = 0,
-    started: datetime | None = None,
-    provider: str | None = None,
-) -> ReviewResult | None:
-    """Return a skipped result for an unpaid provider, emitting the usual live-log sidecar."""
-    provider = _matched_unpaid_provider(model, provider)
-    if provider is None:
-        return None
-    stderr = unpaid_provider_error(model, provider)
-    try:
-        _emit_rest_log(
-            backend,
-            command,
-            stdout="",
-            stderr=stderr,
-            returncode=1,
-            round_no=round_no,
-            started=started,
-        )
-    except OSError as exc:
-        print(
-            f"[review-cli] unpaid-provider sidecar log skipped: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-    return ReviewResult(
-        model=model, command=command, returncode=1, stdout="", stderr=stderr
-    )
-
-
 _PAYMENT_PREFLIGHT_PROVIDERS = frozenset({"commandcode", "fireworks"})
 _PAYMENT_PREFLIGHT_MARKER_CODES = frozenset({400, 401, 403})
 _PAYMENT_PREFLIGHT_MARKERS = (
@@ -4857,284 +670,6 @@ _PAYMENT_PREFLIGHT_CACHE: dict[tuple[str, str, str, str], tuple[bool, int | None
 _PAYMENT_PREFLIGHT_CACHE_LOCK = threading.Lock()
 
 
-def _provider_preflight_url(provider: str) -> str | None:
-    if provider == "commandcode":
-        base = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
-    elif provider == "fireworks":
-        base = os.environ.get("FIREWORKS_BASE_URL") or _FIREWORKS_DEFAULT_BASE_URL
-    else:
-        return None
-    return base.rstrip("/") + "/models"
-
-
-def _oc_auth_provider_key(provider: str) -> str | None:
-    try:
-        data = json.loads(_oc_auth_file().read_text())
-        value = data.get(provider, {}).get("key", "")
-        return value if isinstance(value, str) and value.strip() else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _oc_config_provider_key(provider: str) -> str | None:
-    key, _base = _oc_config_provider_credentials(provider)
-    return key
-
-
-def _oc_config_provider_credentials(provider: str) -> tuple[str | None, str | None]:
-    try:
-        data = json.loads(_oc_config_file().read_text())
-        opts = data.get("provider", {}).get(provider, {}).get("options", {})
-        value = opts.get("apiKey", "")
-        key = value if isinstance(value, str) and value.strip() else None
-        base_value = (
-            opts.get("baseURL") or opts.get("baseUrl") or opts.get("base_url") or ""
-        )
-        base = base_value.strip() if isinstance(base_value, str) else ""
-        return key, (base or None)
-    except Exception:  # noqa: BLE001
-        return None, None
-
-
-def _oc_env_provider_key(provider: str) -> str | None:
-    for var in _OC_PROVIDER_ENV_VARS.get(provider, ()):
-        value = os.environ.get(var, "").strip()
-        if value:
-            return value
-    return None
-
-
-def _oc_provider_key(provider: str) -> str | None:
-    return (
-        _oc_auth_provider_key(provider)
-        or _oc_config_provider_key(provider)
-        or _oc_env_provider_key(provider)
-    )
-
-
-def _models_url_from_base(base_url: str | None, provider: str) -> str | None:
-    if not base_url:
-        return _provider_preflight_url(provider)
-    return base_url.rstrip("/") + "/models"
-
-
-def _payment_preflight_credentials(
-    model: str, provider: str
-) -> tuple[str | None, str | None]:
-    if provider == "commandcode":
-        if model.lower().startswith(("oc:", "opencode:")):
-            config_key, config_base = _oc_config_provider_credentials(provider)
-            auth_key = _oc_auth_provider_key(provider)
-            if auth_key:
-                return auth_key, _models_url_from_base(config_base, provider)
-            if config_key:
-                return config_key, _models_url_from_base(config_base, provider)
-            env_key = _oc_env_provider_key(provider)
-            return env_key, _models_url_from_base(config_base, provider)
-        try:
-            return _commandcode_key(), _provider_preflight_url(provider)
-        except RuntimeError:
-            return None, None
-    if provider == "fireworks":
-        config_key, config_base = _oc_config_provider_credentials(provider)
-        auth_key = _oc_auth_provider_key(provider)
-        if auth_key:
-            return auth_key, _models_url_from_base(config_base, provider)
-        if config_key:
-            return config_key, _models_url_from_base(config_base, provider)
-        env_key = _oc_env_provider_key(provider)
-        return env_key, _models_url_from_base(config_base, provider)
-    return None, None
-
-
-def _payment_preflight_cache_key(
-    provider: str,
-    url: str,
-    key: str,
-    scope: str = _PAYMENT_PREFLIGHT_PROVIDER_SCOPE,
-) -> tuple[str, str, str, str]:
-    # Keep the cache key credential-sensitive without storing the credential itself.
-    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return (provider, url, key_hash, scope)
-
-
-def _is_payment_preflight_denial(code: int | None, body: str) -> bool:
-    if code == 402:
-        return True
-    lowered = body.lower()
-    return code in _PAYMENT_PREFLIGHT_MARKER_CODES and any(
-        marker in lowered for marker in _PAYMENT_PREFLIGHT_MARKERS
-    )
-
-
-def _payment_denial_cache_scope(model: str, code: int | None, body: str) -> str:
-    if code == 402:
-        return _PAYMENT_PREFLIGHT_PROVIDER_SCOPE
-    lowered = body.lower()
-    if any(marker in lowered for marker in _PAYMENT_PREFLIGHT_PROVIDER_WIDE_MARKERS):
-        return _PAYMENT_PREFLIGHT_PROVIDER_SCOPE
-    return model
-
-
-def _payment_preflight_reason(provider: str, model: str, code: int | None) -> str:
-    suffix = f"HTTP {code}" if code is not None else "payment/availability denial"
-    return f"provider '{provider}' failed payment/availability preflight ({suffix}); skipping {model}"
-
-
-def _cache_payment_preflight_denial(
-    model: str, code: int | None, body: str = ""
-) -> None:
-    provider = effective_provider(model)
-    if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
-        return
-    key, url = _payment_preflight_credentials(model, provider)
-    if not key or not url:
-        return
-    cache_key = _payment_preflight_cache_key(
-        provider, url, key, _payment_denial_cache_scope(model, code, body)
-    )
-    with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-        _PAYMENT_PREFLIGHT_CACHE[cache_key] = (True, code)
-
-
-def _cached_payment_preflight_result(
-    provider: str,
-    model: str,
-    url: str,
-    key: str,
-) -> tuple[bool, int | None] | None:
-    with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-        return _PAYMENT_PREFLIGHT_CACHE.get(
-            _payment_preflight_cache_key(provider, url, key, model)
-        ) or _PAYMENT_PREFLIGHT_CACHE.get(
-            _payment_preflight_cache_key(provider, url, key)
-        )
-
-
-def cached_payment_preflight_unavailable_reason(model: str) -> str | None:
-    """Return a cached payment/entitlement denial without performing network I/O."""
-    provider = effective_provider(model)
-    if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
-        return None
-    key, url = _payment_preflight_credentials(model, provider)
-    if not key or not url:
-        return None
-    cached = _cached_payment_preflight_result(provider, model, url, key)
-    if cached is None:
-        return None
-    denied, code = cached
-    return _payment_preflight_reason(provider, model, code) if denied else None
-
-
-def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
-    """Return a skip reason when a provider key exists but payment/entitlement is unavailable.
-
-    This is deliberately narrow: only providers with known cheap `/models` entitlement probes
-    are checked. Network/DNS/transient failures are conservative-allow so an offline probe
-    does not make a working provider disappear; explicit payment/auth/disabled responses are
-    conservative-deny so they do not launch chat/opencode calls.
-    """
-    provider = effective_provider(model)
-    if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
-        return None
-    key, url = _payment_preflight_credentials(model, provider)
-    if not key or not url:
-        return None
-    cached = _cached_payment_preflight_result(provider, model, url, key)
-    if cached is not None:
-        denied, code = cached
-        return _payment_preflight_reason(provider, model, code) if denied else None
-    req = urllib.request.Request(
-        url,
-        method="GET",
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {key}",
-            "User-Agent": "review-cli/0.1",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_PROVIDER_PREFLIGHT_TIMEOUT_SECONDS):
-            with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-                provider_cache_key = _payment_preflight_cache_key(provider, url, key)
-                cached = _PAYMENT_PREFLIGHT_CACHE.get(
-                    _payment_preflight_cache_key(provider, url, key, model)
-                ) or _PAYMENT_PREFLIGHT_CACHE.get(provider_cache_key)
-                if cached is not None and cached[0] is True:
-                    return _payment_preflight_reason(provider, model, cached[1])
-                if cached is None or cached[0] is False:
-                    _PAYMENT_PREFLIGHT_CACHE[provider_cache_key] = (False, None)
-            return None
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        if _is_payment_preflight_denial(exc.code, body):
-            with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-                _PAYMENT_PREFLIGHT_CACHE[
-                    _payment_preflight_cache_key(provider, url, key)
-                ] = (True, exc.code)
-            return _payment_preflight_reason(provider, model, exc.code)
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return None
-    except Exception:  # noqa: BLE001
-        # Test fakes and unusual urllib failures that are not explicit entitlement
-        # denials should not make a provider disappear. Only the HTTP payment/auth
-        # shapes above are authoritative enough to skip a seat.
-        return None
-
-
-def provider_preflight_result(
-    model: str,
-    *,
-    backend: str,
-    command: str,
-    round_no: int = 0,
-    started: datetime | None = None,
-) -> ReviewResult | None:
-    reason = _provider_payment_preflight_unavailable_reason(model)
-    if reason is None:
-        return None
-    try:
-        _emit_rest_log(
-            backend,
-            command,
-            stdout="",
-            stderr=reason,
-            returncode=1,
-            round_no=round_no,
-            started=started,
-        )
-    except OSError as exc:
-        print(
-            f"[review-cli] provider-preflight sidecar log skipped: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-    return ReviewResult(
-        model=model, command=command, returncode=1, stdout="", stderr=reason
-    )
-
-
-def _oc_auth_file() -> Path:
-    """Path to opencode's auth.json.  Injectable via OC_AUTH_FILE for tests."""
-    env = os.environ.get(_OC_AUTH_FILE_ENV, "").strip()
-    if env:
-        return Path(env)
-    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
-    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-    return base / "opencode" / "auth.json"
-
-
-def _oc_config_file() -> Path:
-    """Path to opencode's opencode.json.  Injectable via OC_CONFIG_FILE for tests."""
-    env = os.environ.get(_OC_CONFIG_FILE_ENV, "").strip()
-    if env:
-        return Path(env)
-    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
-    base = Path(xdg) if xdg else Path.home() / ".config"
-    return base / "opencode" / "opencode.json"
-
-
 # opencode auth.json fields that are descriptive metadata, never credential material.
 # Excluded from `_oc_auth_has_provider`'s unknown-auth-type fallback so a future entry
 # with only a label/account and no token is not read as a credential. The two KNOWN shapes
@@ -5145,82 +680,6 @@ _OC_AUTH_METADATA_FIELDS = frozenset(
 )
 
 
-def _oc_auth_has_provider(provider: str) -> bool:
-    """True iff opencode's auth.json carries a usable credential for *provider*.
-
-    Recognised shapes (`opencode providers login`): keyed API auth `{"type": "api",
-    "key": ...}` (deepseek/commandcode/zai) and OAuth `{"type": "oauth", "access": ...,
-    "refresh": ..., "expires": ...}` (xai — `opencode providers list` shows "xAI | oauth").
-    Discriminates by `type`: `key` for "api"; `access` OR `refresh` for "oauth" (opencode
-    auto-refreshes an expired `access` from `refresh`). A whitespace-only value is not a
-    credential. An unrecognised `type` falls back to "any non-blank string field that is
-    not in `_OC_AUTH_METADATA_FIELDS`", so a genuinely new auth shape still counts rather
-    than silently dropping the seat; drift INSIDE a known type (opencode renaming `key`)
-    hits the strict branch and is NOT covered by the fallback. Never proves the token is
-    unexpired — opencode's own auth layer owns expiry/refresh at call time."""
-
-    def _nonblank(value: object) -> bool:
-        return isinstance(value, str) and value.strip() != ""
-
-    # Everything that assumes a dict shape stays INSIDE this try: a corrupted auth.json
-    # can carry a truthy NON-dict value for a provider (`{"xai": "raw-token"}`, a list, a
-    # number) — `.get()`/`.items()` on that raises AttributeError, which must read as "no
-    # credential", not abort board selection.
-    try:
-        entry = json.loads(_oc_auth_file().read_text()).get(provider) or {}
-        if not isinstance(entry, dict) or not entry:
-            return False
-        auth_type = entry.get("type")
-        if auth_type == "api":
-            return _nonblank(entry.get("key"))
-        if auth_type == "oauth":
-            return _nonblank(entry.get("access")) or _nonblank(entry.get("refresh"))
-        return any(
-            _nonblank(v) for k, v in entry.items() if k not in _OC_AUTH_METADATA_FIELDS
-        )
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _oc_config_has_provider_key(provider: str) -> bool:
-    """True iff opencode.json carries an inline options.apiKey for *provider*."""
-    try:
-        data = json.loads(_oc_config_file().read_text())
-        opts = data.get("provider", {}).get(provider, {}).get("options", {})
-        return bool(opts.get("apiKey", ""))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _oc_env_has_provider_key(provider: str) -> bool:
-    """True iff a known env var for *provider* is set and non-empty."""
-    return any(
-        os.environ.get(var, "").strip()
-        for var in _OC_PROVIDER_ENV_VARS.get(provider, ())
-    )
-
-
-def _oc_provider_auth_available(provider: str) -> bool:
-    """True iff opencode has credentials for *provider* from any source.
-
-    Checked in order: local (no-key) → auth.json → opencode.json → env vars.
-    For unknown providers (not in _OC_PROVIDER_ENV_VARS and not local) we fall
-    back to True — opencode may carry them through its own mechanism and we have
-    no signal to reject them.
-    """
-    if provider in _OC_LOCAL_PROVIDERS:
-        return True
-    if _oc_auth_has_provider(provider):
-        return True
-    if _oc_config_has_provider_key(provider):
-        return True
-    if _oc_env_has_provider_key(provider):
-        return True
-    # For a KNOWN provider where every credential source came up empty → unavailable.
-    # For an UNKNOWN provider → conservative True (no false negatives).
-    return provider not in _OC_PROVIDER_ENV_VARS
-
-
 # review-cli#636: the omp an omp seat runs, when not the `omp` on PATH: $REVIEW_OMP_BIN,
 # else config.yaml `omp_bin:` (set once by the CLI after load_config, like
 # `configure_unpaid_providers`).
@@ -5228,55 +687,10 @@ _OMP_BIN_ENV = "REVIEW_OMP_BIN"
 _CONFIG_OMP_BIN: str | None = None
 
 
-def configure_omp_bin(raw: object) -> None:
-    """Set the per-process config.yaml `omp_bin:` value (a path; anything else unsets it)."""
-    global _CONFIG_OMP_BIN
-    _CONFIG_OMP_BIN = raw.strip() if isinstance(raw, str) and raw.strip() else None
-
-
 # review-cli#641: config.yaml `omp_accounts:` (exclude list + usage thresholds for omp's
 # Anthropic accounts), set once by the CLI after load_config like `omp_bin:`; the env
 # overrides are read on every use (omp_accounts.account_policy).
 _CONFIG_OMP_ACCOUNTS: object = None
-
-
-def configure_omp_accounts(raw: object) -> None:
-    """Set the per-process config.yaml `omp_accounts:` value (validated on use)."""
-    global _CONFIG_OMP_ACCOUNTS
-    _CONFIG_OMP_ACCOUNTS = raw
-
-
-def _omp_account_policy() -> omp_accounts.AccountPolicy:
-    return omp_accounts.account_policy(_CONFIG_OMP_ACCOUNTS, os.environ)
-
-
-def _omp_profiles_policy_reason(omp_model: str | None) -> str | None:
-    """Why an `omp_model` seat on omp's Anthropic accounts must not run through
-    `$REVIEW_OMP_CLAUDE_PROFILES`: an account policy is set, and a profile's account is
-    not known. None when profiles are not set or no policy applies."""
-    if _review_omp_claude_profiles() == [None] or not _omp_selector_is_anthropic(
-        omp_model
-    ):
-        return None
-    return omp_accounts.profiles_reason(_omp_account_policy())
-
-
-def _omp_launcher() -> omp_accounts.OmpLauncher:
-    """The omp launcher an omp seat runs, resolved from the REAL environment before the
-    seat's sandbox exists (reviewlib.omp_accounts). Raises RuntimeError when there is no
-    omp or it cannot start under the sandbox HOME, so the seat is reported unusable."""
-    explicit, source = os.environ.get(_OMP_BIN_ENV, "").strip(), f"${_OMP_BIN_ENV}"
-    if not explicit and _CONFIG_OMP_BIN:
-        explicit, source = _CONFIG_OMP_BIN, "config.yaml omp_bin"
-    if explicit:
-        argv0 = os.path.abspath(os.path.expanduser(explicit))
-    else:
-        argv0, source = _which("omp"), "PATH"
-    launcher = omp_accounts.launcher_for(argv0, source=source)
-    problem = omp_accounts.launcher_problem(launcher)
-    if problem is not None:
-        raise RuntimeError(problem)
-    return launcher
 
 
 # Env var that overrides the omp auth db path in tests (mirrors OC_AUTH_FILE for the
@@ -5288,56 +702,6 @@ _OMP_AUTH_DB_ENV = "OMP_AUTH_DB"
 _OMP_CREDENTIAL_ID_ENV = "OMP_CREDENTIAL_ID"
 
 
-def _omp_agent_dir(profile: str | None = None) -> Path:
-    """omp's agent storage dir for THIS process (verified against omp v17):
-    `PI_CODING_AGENT_DIR` replaces it outright; else `OMP_PROFILE` (= `--profile`)
-    isolates state under ~/.omp/profiles/<name>/agent; else the default ~/.omp/agent.
-    Shared by the auth probe and the seat launch — the seat runs with a SANITIZED HOME
-    and pins this explicitly so auth still resolves there.
-
-    `profile`, when given explicitly, takes priority over BOTH env vars -- the caller
-    is requesting a NAMED omp profile's agent dir directly (review-cli#168's
-    omp-Claude-account rotation: `_review_omp_claude_profiles`/
-    `$REVIEW_OMP_CLAUDE_PROFILES`), skipping the env-var precedence entirely. Every
-    existing call site passes nothing, so `profile is None` stays byte-identical to
-    before this parameter existed."""
-    if profile is not None:
-        return Path.home() / ".omp" / "profiles" / profile / "agent"
-    agent_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
-    if agent_dir:
-        # Absolutize (after expanding any `~`): a RELATIVE override would resolve
-        # against a different cwd in the seat's sandbox than in the probe's process
-        # (review of #174).
-        return Path(os.path.abspath(os.path.expanduser(agent_dir)))
-    env_profile = os.environ.get("OMP_PROFILE", "").strip()
-    if env_profile:
-        return Path.home() / ".omp" / "profiles" / env_profile / "agent"
-    return Path.home() / ".omp" / "agent"
-
-
-def _omp_auth_db() -> Path:
-    """The auth db omp ITSELF would use for this process (`_omp_agent_dir` + agent.db;
-    codex review of #174 — probing any OTHER db would misreport a runnable
-    authenticated CLI as unauthenticated). The OMP_AUTH_DB test override wins first."""
-    override = os.environ.get(_OMP_AUTH_DB_ENV, "").strip()
-    if override:
-        return Path(override)
-    return _omp_agent_dir() / "agent.db"
-
-
-def _omp_provider_from_model(model: str) -> str | None:
-    """Extract the provider an `omp:` seat authenticates against.
-
-    Returns None for a bare 'omp' (binary check + any usable credential is enough).
-    'omp:kimi-code/k3' → 'kimi-code'; 'omp:openai/gpt-5.5' → 'openai'.
-    """
-    lowered = model.lower()
-    if not lowered.startswith("omp:"):
-        return None
-    selector = lowered[len("omp:") :]
-    return selector.split("/", 1)[0] or None
-
-
 # In-process memo for the omp auth probe (glm review of #174): `--show-board` and the
 # pool guard probe EVERY omp seat, and a naive probe re-opens the same sqlite db per
 # seat. The memo is keyed on the db's (main, -wal) mtimes — WAL writes (a mid-process
@@ -5347,46 +711,6 @@ def _omp_provider_from_model(model: str) -> str | None:
 # (locked/corrupt db) is NOT cached — the next probe retries instead of serving a stale
 # "unauthenticated" until the db file happens to change.
 _OMP_AUTH_CACHE: dict[str, tuple[tuple[int, int], frozenset[str]]] = {}
-
-
-def _omp_db_stamp(db: Path) -> tuple[int, int] | None:
-    """The (main, -wal) mtime pair for the auth db, or None when the db does not exist."""
-    try:
-        main = db.stat().st_mtime_ns
-    except OSError:
-        return None
-    try:
-        wal = db.with_name(db.name + "-wal").stat().st_mtime_ns
-    except OSError:
-        wal = 0
-    return (main, wal)
-
-
-def _omp_auth_probe(db: Path) -> frozenset[str] | None:
-    """One OFFLINE read of omp's auth db: the set of providers with a NON-disabled
-    credential row (`auth_credentials.disabled_cause` marks dead ones), or None when the
-    probe itself failed (missing/corrupt db, schema drift, a locked file, a python build
-    without sqlite3) — callers treat None as 'unauthenticated' but must NOT cache it.
-    omp keeps OAuth/API credentials in `auth_credentials` keyed by `provider`. The db is
-    opened READ-ONLY via a file: URI so the probe can never create or mutate it. The
-    imports stay inside the try (lazy AND failure-proof; repeat imports are a
-    sys.modules lookup, so this costs nothing per probe)."""
-    try:
-        import sqlite3  # noqa: PLC0415
-        from urllib.parse import quote  # noqa: PLC0415
-
-        # Read-only offline probe: a long lock wait is pointless here, and a short one
-        # bounds the worst case to N seats x 0.5s on a contended db (glm review of #174).
-        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=ro", uri=True, timeout=0.5)
-        try:
-            rows = conn.execute(
-                "SELECT DISTINCT provider FROM auth_credentials WHERE disabled_cause IS NULL"
-            ).fetchall()
-        finally:
-            conn.close()
-    except Exception:  # noqa: BLE001 — any sqlite/schema failure reads as unauthenticated
-        return None
-    return frozenset(row[0] for row in rows if isinstance(row[0], str))
 
 
 # review-cli#646: omp also authenticates these providers from an API key in its env
@@ -5405,293 +729,994 @@ _OMP_ENV_KEY_PROVIDERS: dict[str, tuple[str, tuple[str, ...]]] = {
 _OMP_ENV_KEY_CACHE: dict[tuple, tuple[str, str] | None] = {}
 
 
+
+@_forwarding(_backend_dispatch._which)
+def _which(name: str) -> str:
+    return _backend_dispatch._which(sys.modules[__name__], name)
+
+
+@_forwarding(_backend_dispatch._which_optional)
+def _which_optional(name: str) -> str | None:
+    return _backend_dispatch._which_optional(sys.modules[__name__], name)
+
+
+@_forwarding(_backend_dispatch._payload)
+def _payload(prompt: str, diff: str='') -> str:
+    return _backend_dispatch._payload(sys.modules[__name__], prompt, diff)
+
+
+@_forwarding(_backend_dispatch._claude_api_model)
+def _claude_api_model(model: str) -> str:
+    return _backend_dispatch._claude_api_model(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_dispatch._claude_api_command)
+def _claude_api_command(model: str) -> str:
+    return _backend_dispatch._claude_api_command(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_dispatch._prompt_with_effort)
+def _prompt_with_effort(prompt: str, effort: str | None) -> str:
+    return _backend_dispatch._prompt_with_effort(sys.modules[__name__], prompt, effort)
+
+
+@_forwarding(_backend_dispatch._codex_reasoning_effort)
+def _codex_reasoning_effort(effort: str | None) -> str | None:
+    return _backend_dispatch._codex_reasoning_effort(sys.modules[__name__], effort)
+
+
+@_forwarding(_backend_dispatch._claude_reasoning_effort)
+def _claude_reasoning_effort(effort: str | None) -> str | None:
+    return _backend_dispatch._claude_reasoning_effort(sys.modules[__name__], effort)
+
+
+@_forwarding(_backend_dispatch._opencode_variant)
+def _opencode_variant(effort: str | None) -> str | None:
+    return _backend_dispatch._opencode_variant(sys.modules[__name__], effort)
+
+
+@_forwarding(_backend_dispatch._http_error_text)
+def _http_error_text(exc: urllib.error.HTTPError) -> str:
+    return _backend_dispatch._http_error_text(sys.modules[__name__], exc)
+
+
+@_forwarding(_backend_dispatch.call_backend)
+def call_backend(backend: Callable[..., ReviewResult], model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, *, effort: str | None=None) -> ReviewResult:
+    return _backend_dispatch.call_backend(sys.modules[__name__], backend, model, prompt, diff, cwd, timeout, round_no, effort=effort)
+
+
+@_forwarding(_backend_dispatch._availability_methods)
+def _availability_methods(model: str) -> tuple[str, ...]:
+    return _backend_dispatch._availability_methods(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_dispatch.availability_exclusion)
+def availability_exclusion(model: str) -> availability.Exclusion | None:
+    return _backend_dispatch.availability_exclusion(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_dispatch.note_availability)
+def note_availability(model: str, result: ReviewResult) -> None:
+    return _backend_dispatch.note_availability(sys.modules[__name__], model, result)
+
+
+@_forwarding(_backend_dispatch._availability_skip_result)
+def _availability_skip_result(model: str, round_no: int, excluded: availability.Exclusion) -> ReviewResult:
+    return _backend_dispatch._availability_skip_result(sys.modules[__name__], model, round_no, excluded)
+
+
+@_forwarding(_backend_dispatch._admission_skip_result)
+def _admission_skip_result(model: str, round_no: int, reason: str) -> ReviewResult:
+    return _backend_dispatch._admission_skip_result(sys.modules[__name__], model, round_no, reason)
+
+
+@_forwarding(_backend_dispatch._call_backend_now)
+def _call_backend_now(backend: Callable[..., ReviewResult], model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, *, effort: str | None=None) -> ReviewResult:
+    return _backend_dispatch._call_backend_now(sys.modules[__name__], backend, model, prompt, diff, cwd, timeout, round_no, effort=effort)
+
+
+@_forwarding(_backend_dispatch.review_with_images)
+def review_with_images(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, images: tuple[Path, ...]=(), effort: str | None=None) -> ReviewResult:
+    return _backend_dispatch.review_with_images(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, images, effort)
+
+
+@_forwarding(_backend_dispatch._ensure_codex_recursion_guard)
+def _ensure_codex_recursion_guard() -> None:
+    return _backend_dispatch._ensure_codex_recursion_guard(sys.modules[__name__])
+
+
+@_forwarding(_backend_dispatch._cwd_is_git_repo)
+def _cwd_is_git_repo(cwd: Path) -> bool:
+    return _backend_dispatch._cwd_is_git_repo(sys.modules[__name__], cwd)
+
+
+@_forwarding(_backend_dispatch.review_codex)
+def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_dispatch.review_codex(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_opencode._frontmatter_yaml)
+def _frontmatter_yaml(text: str) -> str | None:
+    return _backend_opencode._frontmatter_yaml(sys.modules[__name__], text)
+
+
+@_forwarding(_backend_opencode._agent_frontmatter)
+def _agent_frontmatter(text: str) -> dict | None:
+    return _backend_opencode._agent_frontmatter(sys.modules[__name__], text)
+
+
+@_forwarding(_backend_opencode._permission_value_is_fully_denied)
+def _permission_value_is_fully_denied(value: object) -> bool:
+    return _backend_opencode._permission_value_is_fully_denied(sys.modules[__name__], value)
+
+
+@_forwarding(_backend_opencode._agent_is_strictly_readonly)
+def _agent_is_strictly_readonly(text: str) -> bool:
+    return _backend_opencode._agent_is_strictly_readonly(sys.modules[__name__], text)
+
+
+@_forwarding(_backend_opencode._ensure_opencode_readonly_agent)
+def _ensure_opencode_readonly_agent(_project: Path, _oc_model: str) -> None:
+    return _backend_opencode._ensure_opencode_readonly_agent(sys.modules[__name__], _project, _oc_model)
+
+
+@_forwarding(_backend_opencode._atomic_write_text)
+def _atomic_write_text(path: Path, text: str) -> None:
+    return _backend_opencode._atomic_write_text(sys.modules[__name__], path, text)
+
+
+@_forwarding(_backend_opencode._opencode_has_project_config)
+def _opencode_has_project_config(cwd: Path) -> bool:
+    return _backend_opencode._opencode_has_project_config(sys.modules[__name__], cwd)
+
+
+@_forwarding(_backend_opencode._opencode_runs_in_repo)
+def _opencode_runs_in_repo(cwd: Path) -> bool:
+    return _backend_opencode._opencode_runs_in_repo(sys.modules[__name__], cwd)
+
+
+@_forwarding(_backend_opencode._opencode_model_needs_stall_watchdog)
+def _opencode_model_needs_stall_watchdog(model: str) -> bool:
+    return _backend_opencode._opencode_model_needs_stall_watchdog(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_opencode._opencode_stall_seconds)
+def _opencode_stall_seconds() -> int | None:
+    return _backend_opencode._opencode_stall_seconds(sys.modules[__name__])
+
+
+@_forwarding(_backend_opencode._opencode_call_stalled)
+def _opencode_call_stalled(proc: subprocess.CompletedProcess[str]) -> bool:
+    return _backend_opencode._opencode_call_stalled(sys.modules[__name__], proc)
+
+
+@_forwarding(_backend_opencode._run_opencode_with_stall_retry)
+def _run_opencode_with_stall_retry(argv: list[str], *, cwd: Path, timeout: int, round_no: int, header_argv0: str, model: str, true_silence_timeout: int | None=None) -> subprocess.CompletedProcess[str]:
+    return _backend_opencode._run_opencode_with_stall_retry(sys.modules[__name__], argv, cwd=cwd, timeout=timeout, round_no=round_no, header_argv0=header_argv0, model=model, true_silence_timeout=true_silence_timeout)
+
+
+@_forwarding(_backend_opencode._record_true_silence_if_needed)
+def _record_true_silence_if_needed(model: str, proc, *, access_method: str) -> None:
+    return _backend_opencode._record_true_silence_if_needed(sys.modules[__name__], model, proc, access_method=access_method)
+
+
+@_forwarding(_backend_opencode.review_opencode)
+def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_opencode.review_opencode(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_omp._omp_model_hosts_claude)
+def _omp_model_hosts_claude(omp_model: str | None) -> bool:
+    return _backend_omp._omp_model_hosts_claude(sys.modules[__name__], omp_model)
+
+
+@_forwarding(_backend_omp._review_omp_claude_profiles)
+def _review_omp_claude_profiles() -> list[str | None]:
+    return _backend_omp._review_omp_claude_profiles(sys.modules[__name__])
+
+
+@_forwarding(_backend_omp._omp_model_hosts_openai_codex)
+def _omp_model_hosts_openai_codex(omp_model: str | None) -> bool:
+    return _backend_omp._omp_model_hosts_openai_codex(sys.modules[__name__], omp_model)
+
+
+@_forwarding(_backend_omp._review_omp_openai_codex_credentials)
+def _review_omp_openai_codex_credentials() -> list[int | None]:
+    return _backend_omp._review_omp_openai_codex_credentials(sys.modules[__name__])
+
+
+@_forwarding(_backend_omp._review_omp_with_codex_credential_fallback)
+def _review_omp_with_codex_credential_fallback(model, omp_model, prompt, diff, cwd, timeout, round_no, effort) -> ReviewResult:
+    return _backend_omp._review_omp_with_codex_credential_fallback(sys.modules[__name__], model, omp_model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_omp._review_omp_with_account_fallback)
+def _review_omp_with_account_fallback(model, omp_model, prompt, diff, cwd, timeout, round_no, effort) -> ReviewResult:
+    return _backend_omp._review_omp_with_account_fallback(sys.modules[__name__], model, omp_model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_omp._omp_selector_is_anthropic)
+def _omp_selector_is_anthropic(omp_model: str | None) -> bool:
+    return _backend_omp._omp_selector_is_anthropic(sys.modules[__name__], omp_model)
+
+
+@_forwarding(_backend_omp._omp_account_cooldown_key)
+def _omp_account_cooldown_key(account: omp_accounts.OmpAccount) -> str:
+    return _backend_omp._omp_account_cooldown_key(sys.modules[__name__], account)
+
+
+@_forwarding(_backend_omp._omp_accounts_limited_until)
+def _omp_accounts_limited_until(accounts: list[omp_accounts.OmpAccount]) -> dict[int, float]:
+    return _backend_omp._omp_accounts_limited_until(sys.modules[__name__], accounts)
+
+
+@_forwarding(_backend_omp._omp_account_failure)
+def _omp_account_failure(result: ReviewResult) -> tuple[str, str | None] | None:
+    return _backend_omp._omp_account_failure(sys.modules[__name__], result)
+
+
+@_forwarding(_backend_omp._omp_pool_refusal)
+def _omp_pool_refusal(model: str, round_no: int, reason: str) -> ReviewResult:
+    return _backend_omp._omp_pool_refusal(sys.modules[__name__], model, round_no, reason)
+
+
+@_forwarding(_backend_omp._review_omp_with_anthropic_pool)
+def _review_omp_with_anthropic_pool(model, omp_model, prompt, diff, cwd, timeout, round_no, effort) -> ReviewResult:
+    return _backend_omp._review_omp_with_anthropic_pool(sys.modules[__name__], model, omp_model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_omp.review_omp)
+def review_omp(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_omp.review_omp(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_omp._remove_sandbox_best_effort)
+def _remove_sandbox_best_effort(path: Path) -> None:
+    return _backend_omp._remove_sandbox_best_effort(sys.modules[__name__], path)
+
+
+@_forwarding(_backend_omp._review_omp_once)
+def _review_omp_once(model: str, omp_model: str | None, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int, effort: str | None, profile: str | None, credential_id: int | None=None, anthropic_account: omp_accounts.OmpAccount | None=None, oauth_token: str | None=None, launcher: omp_accounts.OmpLauncher | None=None) -> ReviewResult:
+    return _backend_omp._review_omp_once(sys.modules[__name__], model, omp_model, prompt, diff, cwd, timeout, round_no, effort, profile, credential_id, anthropic_account, oauth_token, launcher)
+
+
+@_forwarding(_backend_rest._read_env_key)
+def _read_env_key(env_file: Path, var: str='GEMINI_API_KEY') -> str | None:
+    return _backend_rest._read_env_key(sys.modules[__name__], env_file, var)
+
+
+@_forwarding(_backend_rest._resolve_key)
+def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
+    return _backend_rest._resolve_key(sys.modules[__name__], env_names, fallback_var)
+
+
+@_forwarding(_backend_rest._env_key_files)
+def _env_key_files() -> tuple[Path, ...]:
+    return _backend_rest._env_key_files(sys.modules[__name__])
+
+
+@_forwarding(_backend_rest.resolve_key_source)
+def resolve_key_source(env_names: tuple, fallback_var: str) -> tuple[str, str, str] | None:
+    return _backend_rest.resolve_key_source(sys.modules[__name__], env_names, fallback_var)
+
+
+@_forwarding(_backend_rest._gemini_key)
+def _gemini_key() -> str:
+    return _backend_rest._gemini_key(sys.modules[__name__])
+
+
+@_forwarding(_backend_rest.review_gemini)
+def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_rest.review_gemini(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_rest._is_timeout_error)
+def _is_timeout_error(exc: BaseException) -> bool:
+    return _backend_rest._is_timeout_error(sys.modules[__name__], exc)
+
+
+@_forwarding(_backend_rest._emit_rest_log)
+def _emit_rest_log(backend: str, argv0: str, *, round_no: int, returncode: int, stdout: str, stderr: str, started: datetime | None=None, timed_out: bool=False, timeout_secs: int | None=None, prompt_tokens: int=0, output_tokens: int=0) -> None:
+    return _backend_rest._emit_rest_log(sys.modules[__name__], backend, argv0, round_no=round_no, returncode=returncode, stdout=stdout, stderr=stderr, started=started, timed_out=timed_out, timeout_secs=timeout_secs, prompt_tokens=prompt_tokens, output_tokens=output_tokens)
+
+
+@_forwarding(_backend_rest._mode_env_var)
+def _mode_env_var(name: str) -> str:
+    return _backend_rest._mode_env_var(sys.modules[__name__], name)
+
+
+@_forwarding(_backend_rest.resolve_backend_mode)
+def resolve_backend_mode(name: str, supported: tuple[str, ...], default: str) -> str:
+    return _backend_rest.resolve_backend_mode(sys.modules[__name__], name, supported, default)
+
+
+@_forwarding(_backend_rest._parse_openai_choice)
+def _parse_openai_choice(payload: object) -> str:
+    return _backend_rest._parse_openai_choice(sys.modules[__name__], payload)
+
+
+@_forwarding(_backend_rest._valid_token_count)
+def _valid_token_count(count: object) -> bool:
+    return _backend_rest._valid_token_count(sys.modules[__name__], count)
+
+
+@_forwarding(_backend_rest._usage_dict)
+def _usage_dict(payload: object, key: str) -> dict:
+    return _backend_rest._usage_dict(sys.modules[__name__], payload, key)
+
+
+@_forwarding(_backend_rest._validated_usage_pair)
+def _validated_usage_pair(prompt: object, output: object, *, completed: bool) -> tuple[int, int]:
+    return _backend_rest._validated_usage_pair(sys.modules[__name__], prompt, output, completed=completed)
+
+
+@_forwarding(_backend_rest._parse_openai_usage)
+def _parse_openai_usage(payload: object, *, completed: bool=True) -> tuple[int, int]:
+    return _backend_rest._parse_openai_usage(sys.modules[__name__], payload, completed=completed)
+
+
+@_forwarding(_backend_rest._openai_compatible_request)
+def _openai_compatible_request(*, model: str, api_model: str, label: str, base_url: str, key: str, prompt: str, diff: str, timeout: int, backend: str, round_no: int=0, extra_body: dict | None=None, extra_headers: dict | None=None) -> ReviewResult:
+    return _backend_rest._openai_compatible_request(sys.modules[__name__], model=model, api_model=api_model, label=label, base_url=base_url, key=key, prompt=prompt, diff=diff, timeout=timeout, backend=backend, round_no=round_no, extra_body=extra_body, extra_headers=extra_headers)
+
+
+@_forwarding(_backend_api._zai_key)
+def _zai_key() -> str:
+    return _backend_api._zai_key(sys.modules[__name__])
+
+
+@_forwarding(_backend_api.review_zai)
+def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_api.review_zai(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_api._commandcode_key)
+def _commandcode_key() -> str:
+    return _backend_api._commandcode_key(sys.modules[__name__])
+
+
+@_forwarding(_backend_api.review_commandcode)
+def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_api.review_commandcode(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_api._openrouter_key)
+def _openrouter_key() -> str:
+    return _backend_api._openrouter_key(sys.modules[__name__])
+
+
+@_forwarding(_backend_api._openrouter_extra_headers)
+def _openrouter_extra_headers() -> dict:
+    return _backend_api._openrouter_extra_headers(sys.modules[__name__])
+
+
+@_forwarding(_backend_api._header_value_is_safe)
+def _header_value_is_safe(value: str) -> bool:
+    return _backend_api._header_value_is_safe(sys.modules[__name__], value)
+
+
+@_forwarding(_backend_api.review_openrouter)
+def review_openrouter(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_api.review_openrouter(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_api._anthropic_api_config)
+def _anthropic_api_config() -> dict | None:
+    return _backend_api._anthropic_api_config(sys.modules[__name__])
+
+
+@_forwarding(_backend_api._anthropic_base_url_from_env)
+def _anthropic_base_url_from_env() -> str | None:
+    return _backend_api._anthropic_base_url_from_env(sys.modules[__name__])
+
+
+@_forwarding(_backend_api._base_url_hostname)
+def _base_url_hostname(base_url: str) -> str:
+    return _backend_api._base_url_hostname(sys.modules[__name__], base_url)
+
+
+@_forwarding(_backend_api._anthropic_gateway_provider)
+def _anthropic_gateway_provider(base_url: str) -> str | None:
+    return _backend_api._anthropic_gateway_provider(sys.modules[__name__], base_url)
+
+
+@_forwarding(_backend_api.review_claude_api)
+def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_api.review_claude_api(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_claude._have_claude_cli)
+def _have_claude_cli() -> bool:
+    return _backend_claude._have_claude_cli(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._claude_api_available_for_model)
+def _claude_api_available_for_model(model: str) -> bool:
+    return _backend_claude._claude_api_available_for_model(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_claude._claude_gateway_provider_from_env)
+def _claude_gateway_provider_from_env() -> str | None:
+    return _backend_claude._claude_gateway_provider_from_env(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._claude_runtime_gateway_provider)
+def _claude_runtime_gateway_provider() -> str | None:
+    return _backend_claude._claude_runtime_gateway_provider(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._login_failure_line)
+def _login_failure_line(result: ReviewResult) -> str | None:
+    return _backend_claude._login_failure_line(sys.modules[__name__], result)
+
+
+@_forwarding(_backend_claude._account_should_advance)
+def _account_should_advance(result: ReviewResult) -> bool:
+    return _backend_claude._account_should_advance(sys.modules[__name__], result)
+
+
+@_forwarding(_backend_claude._claude_account_dir)
+def _claude_account_dir(config_dir: str | None) -> Path | None:
+    return _backend_claude._claude_account_dir(sys.modules[__name__], config_dir)
+
+
+@_forwarding(_backend_claude._remember_claude_login)
+def _remember_claude_login(config_dir: str | None, result: ReviewResult) -> None:
+    return _backend_claude._remember_claude_login(sys.modules[__name__], config_dir, result)
+
+
+@_forwarding(_backend_claude._claude_cli_login_reason)
+def _claude_cli_login_reason() -> str | None:
+    return _backend_claude._claude_cli_login_reason(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._claude_account_candidates)
+def _claude_account_candidates() -> list[tuple[str | None, str | None]]:
+    return _backend_claude._claude_account_candidates(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._redacted_claude_account)
+def _redacted_claude_account(email: str | None, config_dir: str | None) -> str:
+    return _backend_claude._redacted_claude_account(sys.modules[__name__], email, config_dir)
+
+
+@_forwarding(_backend_claude._review_claude_cli_with_account_fallback)
+def _review_claude_cli_with_account_fallback(model, prompt, diff, cwd, timeout, round_no, *, effort) -> ReviewResult:
+    return _backend_claude._review_claude_cli_with_account_fallback(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort=effort)
+
+
+@_forwarding(_backend_claude.claude_access_method)
+def claude_access_method() -> str:
+    return _backend_claude.claude_access_method(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude.review_claude)
+def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_claude.review_claude(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_cooldown._chronic_cause)
+def _chronic_cause(reason: str) -> str | None:
+    return _backend_cooldown._chronic_cause(sys.modules[__name__], reason)
+
+
+@_forwarding(_backend_cooldown._cooldown_after_recovery_probe)
+def _cooldown_after_recovery_probe(model: str, *, access_method: str) -> dict | None:
+    return _backend_cooldown._cooldown_after_recovery_probe(sys.modules[__name__], model, access_method=access_method)
+
+
+@_forwarding(_backend_cooldown._looks_transient)
+def _looks_transient(haystack: str, returncode: int) -> bool:
+    return _backend_cooldown._looks_transient(sys.modules[__name__], haystack, returncode)
+
+
+@_forwarding(_backend_cooldown._is_seat_fatal)
+def _is_seat_fatal(haystack: str, returncode: int) -> bool:
+    return _backend_cooldown._is_seat_fatal(sys.modules[__name__], haystack, returncode)
+
+
+@_forwarding(_backend_cooldown._chronic_unavailable_reason)
+def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
+    return _backend_cooldown._chronic_unavailable_reason(sys.modules[__name__], result)
+
+
+@_forwarding(_backend_cooldown._clears_cooldown_history)
+def _clears_cooldown_history(result: ReviewResult) -> bool:
+    return _backend_cooldown._clears_cooldown_history(sys.modules[__name__], result)
+
+
+@_forwarding(_backend_cooldown._bounded_cooldown_skip_body)
+def _bounded_cooldown_skip_body(model: str, reason: str, remaining: int) -> str:
+    return _backend_cooldown._bounded_cooldown_skip_body(sys.modules[__name__], model, reason, remaining)
+
+
+@_forwarding(_backend_cooldown._usage_limit_skip_result)
+def _usage_limit_skip_result(model: str, round_no: int, reason: str, *, backend: str) -> ReviewResult:
+    return _backend_cooldown._usage_limit_skip_result(sys.modules[__name__], model, round_no, reason, backend=backend)
+
+
+@_forwarding(_backend_cooldown._cooldown_skip_result)
+def _cooldown_skip_result(model: str, round_no: int, cooldown: dict, *, backend: str) -> ReviewResult:
+    return _backend_cooldown._cooldown_skip_result(sys.modules[__name__], model, round_no, cooldown, backend=backend)
+
+
+@_forwarding(_backend_claude._claude_project_key)
+def _claude_project_key(cwd: Path) -> str:
+    return _backend_claude._claude_project_key(sys.modules[__name__], cwd)
+
+
+@_forwarding(_backend_claude._open_trust_lock)
+def _open_trust_lock(cfg: Path):
+    return _backend_claude._open_trust_lock(sys.modules[__name__], cfg)
+
+
+@_forwarding(_backend_claude._release_trust_lock)
+def _release_trust_lock(lock) -> None:
+    return _backend_claude._release_trust_lock(sys.modules[__name__], lock)
+
+
+@_forwarding(_backend_claude._ensure_workspace_trusted)
+def _ensure_workspace_trusted(cwd: Path) -> None:
+    return _backend_claude._ensure_workspace_trusted(sys.modules[__name__], cwd)
+
+
+@_forwarding(_backend_claude._is_review_seeded_trust_entry)
+def _is_review_seeded_trust_entry(entry: object) -> bool:
+    return _backend_claude._is_review_seeded_trust_entry(sys.modules[__name__], entry)
+
+
+@_forwarding(_backend_claude._remove_workspace_trust)
+def _remove_workspace_trust(cwd: Path) -> None:
+    return _backend_claude._remove_workspace_trust(sys.modules[__name__], cwd)
+
+
+@_forwarding(_backend_claude._claude_cli_binary)
+def _claude_cli_binary() -> str:
+    return _backend_claude._claude_cli_binary(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._claude_cli_argv)
+def _claude_cli_argv(binary: str, model: str | None, *, image_dir: Path | None=None, effort: str | None=None) -> list[str]:
+    return _backend_claude._claude_cli_argv(sys.modules[__name__], binary, model, image_dir=image_dir, effort=effort)
+
+
+@_forwarding(_backend_claude._stage_panel_images)
+def _stage_panel_images(images: tuple[Path, ...], tmp: Path) -> list[Path]:
+    return _backend_claude._stage_panel_images(sys.modules[__name__], images, tmp)
+
+
+@_forwarding(_backend_claude._prompt_with_panel_images)
+def _prompt_with_panel_images(prompt: str, images: list[Path]) -> str:
+    return _backend_claude._prompt_with_panel_images(sys.modules[__name__], prompt, images)
+
+
+@_forwarding(_backend_claude._claude_cli_env)
+def _claude_cli_env() -> dict[str, str]:
+    return _backend_claude._claude_cli_env(sys.modules[__name__])
+
+
+@_forwarding(_backend_claude._claude_cli_log_header)
+def _claude_cli_log_header(claude_model: str | None) -> str | None:
+    return _backend_claude._claude_cli_log_header(sys.modules[__name__], claude_model)
+
+
+@_forwarding(_backend_claude.review_claude_cli)
+def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None, config_dir: str | None=None) -> ReviewResult:
+    return _backend_claude.review_claude_cli(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort, config_dir)
+
+
+@_forwarding(_backend_claude._claude_cli_env_for)
+def _claude_cli_env_for(config_dir: str | None) -> dict[str, str]:
+    return _backend_claude._claude_cli_env_for(sys.modules[__name__], config_dir)
+
+
+@_forwarding(_backend_claude.review_claude_cli_with_images)
+def review_claude_cli_with_images(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, images: tuple[Path, ...]=(), effort: str | None=None, config_dir: str | None=None) -> ReviewResult:
+    return _backend_claude.review_claude_cli_with_images(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, images, effort, config_dir)
+
+
+@_forwarding(_backend_dispatch._fake_backend_enabled)
+def _fake_backend_enabled() -> bool:
+    return _backend_dispatch._fake_backend_enabled(sys.modules[__name__])
+
+
+@_forwarding(_backend_dispatch.review_fake)
+def review_fake(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int=0, effort: str | None=None) -> ReviewResult:
+    return _backend_dispatch.review_fake(sys.modules[__name__], model, prompt, diff, cwd, timeout, round_no, effort)
+
+
+@_forwarding(_backend_dispatch._match_named_backend)
+def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
+    return _backend_dispatch._match_named_backend(sys.modules[__name__], lowered)
+
+
+@_forwarding(_backend_provider._peel_oc_transport)
+def _peel_oc_transport(lowered: str) -> str | None:
+    return _backend_provider._peel_oc_transport(sys.modules[__name__], lowered)
+
+
+@_forwarding(_backend_provider._oc_selector_is_well_formed)
+def _oc_selector_is_well_formed(selector: str, provider: str) -> bool:
+    return _backend_provider._oc_selector_is_well_formed(sys.modules[__name__], selector, provider)
+
+
+@_forwarding(_backend_provider.effective_provider)
+def effective_provider(model: str) -> str:
+    return _backend_provider.effective_provider(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider._canonical_provider)
+def _canonical_provider(provider: str) -> str:
+    return _backend_provider._canonical_provider(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._parse_provider_names)
+def _parse_provider_names(raw: object) -> frozenset[str]:
+    return _backend_provider._parse_provider_names(sys.modules[__name__], raw)
+
+
+@_forwarding(_backend_provider.configure_unpaid_providers)
+def configure_unpaid_providers(raw: object) -> None:
+    return _backend_provider.configure_unpaid_providers(sys.modules[__name__], raw)
+
+
+@_forwarding(_backend_provider.unpaid_providers)
+def unpaid_providers() -> frozenset[str]:
+    return _backend_provider.unpaid_providers(sys.modules[__name__])
+
+
+@_forwarding(_backend_provider.provider_marked_unpaid)
+def provider_marked_unpaid(model: str) -> bool:
+    return _backend_provider.provider_marked_unpaid(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider._runtime_unpaid_provider)
+def _runtime_unpaid_provider(model: str) -> str | None:
+    return _backend_provider._runtime_unpaid_provider(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider.runtime_provider_marked_unpaid)
+def runtime_provider_marked_unpaid(model: str) -> bool:
+    return _backend_provider.runtime_provider_marked_unpaid(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider.runtime_unpaid_provider_error)
+def runtime_unpaid_provider_error(model: str) -> str:
+    return _backend_provider.runtime_unpaid_provider_error(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider._matched_unpaid_provider)
+def _matched_unpaid_provider(model: str, provider: str | None=None) -> str | None:
+    return _backend_provider._matched_unpaid_provider(sys.modules[__name__], model, provider)
+
+
+@_forwarding(_backend_provider.unpaid_provider_error)
+def unpaid_provider_error(model: str, provider: str | None=None) -> str:
+    return _backend_provider.unpaid_provider_error(sys.modules[__name__], model, provider)
+
+
+@_forwarding(_backend_provider.unpaid_provider_result)
+def unpaid_provider_result(model: str, *, backend: str, command: str, round_no: int=0, started: datetime | None=None, provider: str | None=None) -> ReviewResult | None:
+    return _backend_provider.unpaid_provider_result(sys.modules[__name__], model, backend=backend, command=command, round_no=round_no, started=started, provider=provider)
+
+
+@_forwarding(_backend_provider._provider_preflight_url)
+def _provider_preflight_url(provider: str) -> str | None:
+    return _backend_provider._provider_preflight_url(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_auth_provider_key)
+def _oc_auth_provider_key(provider: str) -> str | None:
+    return _backend_provider._oc_auth_provider_key(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_config_provider_key)
+def _oc_config_provider_key(provider: str) -> str | None:
+    return _backend_provider._oc_config_provider_key(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_config_provider_credentials)
+def _oc_config_provider_credentials(provider: str) -> tuple[str | None, str | None]:
+    return _backend_provider._oc_config_provider_credentials(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_env_provider_key)
+def _oc_env_provider_key(provider: str) -> str | None:
+    return _backend_provider._oc_env_provider_key(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_provider_key)
+def _oc_provider_key(provider: str) -> str | None:
+    return _backend_provider._oc_provider_key(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._models_url_from_base)
+def _models_url_from_base(base_url: str | None, provider: str) -> str | None:
+    return _backend_provider._models_url_from_base(sys.modules[__name__], base_url, provider)
+
+
+@_forwarding(_backend_provider._payment_preflight_credentials)
+def _payment_preflight_credentials(model: str, provider: str) -> tuple[str | None, str | None]:
+    return _backend_provider._payment_preflight_credentials(sys.modules[__name__], model, provider)
+
+
+@_forwarding(_backend_provider._payment_preflight_cache_key)
+def _payment_preflight_cache_key(provider: str, url: str, key: str, scope: str=_PAYMENT_PREFLIGHT_PROVIDER_SCOPE) -> tuple[str, str, str, str]:
+    return _backend_provider._payment_preflight_cache_key(sys.modules[__name__], provider, url, key, scope)
+
+
+@_forwarding(_backend_provider._is_payment_preflight_denial)
+def _is_payment_preflight_denial(code: int | None, body: str) -> bool:
+    return _backend_provider._is_payment_preflight_denial(sys.modules[__name__], code, body)
+
+
+@_forwarding(_backend_provider._payment_denial_cache_scope)
+def _payment_denial_cache_scope(model: str, code: int | None, body: str) -> str:
+    return _backend_provider._payment_denial_cache_scope(sys.modules[__name__], model, code, body)
+
+
+@_forwarding(_backend_provider._payment_preflight_reason)
+def _payment_preflight_reason(provider: str, model: str, code: int | None) -> str:
+    return _backend_provider._payment_preflight_reason(sys.modules[__name__], provider, model, code)
+
+
+@_forwarding(_backend_provider._cache_payment_preflight_denial)
+def _cache_payment_preflight_denial(model: str, code: int | None, body: str='') -> None:
+    return _backend_provider._cache_payment_preflight_denial(sys.modules[__name__], model, code, body)
+
+
+@_forwarding(_backend_provider._cached_payment_preflight_result)
+def _cached_payment_preflight_result(provider: str, model: str, url: str, key: str) -> tuple[bool, int | None] | None:
+    return _backend_provider._cached_payment_preflight_result(sys.modules[__name__], provider, model, url, key)
+
+
+@_forwarding(_backend_provider.cached_payment_preflight_unavailable_reason)
+def cached_payment_preflight_unavailable_reason(model: str) -> str | None:
+    return _backend_provider.cached_payment_preflight_unavailable_reason(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider._provider_payment_preflight_unavailable_reason)
+def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
+    return _backend_provider._provider_payment_preflight_unavailable_reason(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_provider.provider_preflight_result)
+def provider_preflight_result(model: str, *, backend: str, command: str, round_no: int=0, started: datetime | None=None) -> ReviewResult | None:
+    return _backend_provider.provider_preflight_result(sys.modules[__name__], model, backend=backend, command=command, round_no=round_no, started=started)
+
+
+@_forwarding(_backend_provider._oc_auth_file)
+def _oc_auth_file() -> Path:
+    return _backend_provider._oc_auth_file(sys.modules[__name__])
+
+
+@_forwarding(_backend_provider._oc_config_file)
+def _oc_config_file() -> Path:
+    return _backend_provider._oc_config_file(sys.modules[__name__])
+
+
+@_forwarding(_backend_provider._oc_auth_has_provider)
+def _oc_auth_has_provider(provider: str) -> bool:
+    return _backend_provider._oc_auth_has_provider(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_config_has_provider_key)
+def _oc_config_has_provider_key(provider: str) -> bool:
+    return _backend_provider._oc_config_has_provider_key(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_env_has_provider_key)
+def _oc_env_has_provider_key(provider: str) -> bool:
+    return _backend_provider._oc_env_has_provider_key(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_provider._oc_provider_auth_available)
+def _oc_provider_auth_available(provider: str) -> bool:
+    return _backend_provider._oc_provider_auth_available(sys.modules[__name__], provider)
+
+
+@_forwarding(_backend_omp_registry.configure_omp_bin)
+def configure_omp_bin(raw: object) -> None:
+    return _backend_omp_registry.configure_omp_bin(sys.modules[__name__], raw)
+
+
+@_forwarding(_backend_omp_registry.configure_omp_accounts)
+def configure_omp_accounts(raw: object) -> None:
+    return _backend_omp_registry.configure_omp_accounts(sys.modules[__name__], raw)
+
+
+@_forwarding(_backend_omp_registry._omp_account_policy)
+def _omp_account_policy() -> omp_accounts.AccountPolicy:
+    return _backend_omp_registry._omp_account_policy(sys.modules[__name__])
+
+
+@_forwarding(_backend_omp_registry._omp_profiles_policy_reason)
+def _omp_profiles_policy_reason(omp_model: str | None) -> str | None:
+    return _backend_omp_registry._omp_profiles_policy_reason(sys.modules[__name__], omp_model)
+
+
+@_forwarding(_backend_omp_registry._omp_launcher)
+def _omp_launcher() -> omp_accounts.OmpLauncher:
+    return _backend_omp_registry._omp_launcher(sys.modules[__name__])
+
+
+@_forwarding(_backend_omp_registry._omp_agent_dir)
+def _omp_agent_dir(profile: str | None=None) -> Path:
+    return _backend_omp_registry._omp_agent_dir(sys.modules[__name__], profile)
+
+
+@_forwarding(_backend_omp_registry._omp_auth_db)
+def _omp_auth_db() -> Path:
+    return _backend_omp_registry._omp_auth_db(sys.modules[__name__])
+
+
+@_forwarding(_backend_omp_registry._omp_provider_from_model)
+def _omp_provider_from_model(model: str) -> str | None:
+    return _backend_omp_registry._omp_provider_from_model(sys.modules[__name__], model)
+
+
+@_forwarding(_backend_omp_registry._omp_db_stamp)
+def _omp_db_stamp(db: Path) -> tuple[int, int] | None:
+    return _backend_omp_registry._omp_db_stamp(sys.modules[__name__], db)
+
+
+@_forwarding(_backend_omp_registry._omp_auth_probe)
+def _omp_auth_probe(db: Path) -> frozenset[str] | None:
+    return _backend_omp_registry._omp_auth_probe(sys.modules[__name__], db)
+
+
+@_forwarding(_backend_omp_registry._mtime_ns)
 def _mtime_ns(path: Path) -> int | None:
-    try:
-        return path.stat().st_mtime_ns
-    except OSError:
-        return None
+    return _backend_omp_registry._mtime_ns(sys.modules[__name__], path)
 
 
+@_forwarding(_backend_omp_registry.omp_env_key)
 def omp_env_key(provider: str | None) -> tuple[str, str] | None:
-    """(env var, key) review-cli hands an omp seat on `provider`, resolved from the env
-    or review-cli's .env files; None for a provider omp has no env key for, or no key."""
-    spec = _OMP_ENV_KEY_PROVIDERS.get(provider or "")
-    if spec is None:
-        return None
-    var, names = spec
-    files = _env_key_files()
-    stamp = (
-        var,
-        tuple(os.environ.get(n) for n in names),
-        tuple((str(p), _mtime_ns(p)) for p in files),
-    )
-    if stamp not in _OMP_ENV_KEY_CACHE:
-        key = _resolve_key(names, var)
-        _OMP_ENV_KEY_CACHE[stamp] = (var, key) if key else None
-    return _OMP_ENV_KEY_CACHE[stamp]
+    return _backend_omp_registry.omp_env_key(sys.modules[__name__], provider)
 
 
+@_forwarding(_backend_omp_registry._omp_auth_available)
 def _omp_auth_available(provider: str | None) -> bool:
-    """Cheap OFFLINE omp auth probe: True iff the seat's provider has a usable
-    credential (or ANY provider does, for a bare `omp` seat) — a stored one, else for an
-    env-key provider a key review-cli passes the seat (`omp_env_key`, which reads the
-    small .env only when no stored credential answered)."""
-    if _omp_stored_auth(provider):
-        return True
-    return provider is not None and omp_env_key(provider) is not None
+    return _backend_omp_registry._omp_auth_available(sys.modules[__name__], provider)
 
 
+@_forwarding(_backend_omp_registry._omp_stored_auth)
 def _omp_stored_auth(provider: str | None) -> bool:
-    """True iff omp's auth db holds a usable credential for `provider` (any provider
-    for None). One stamp miss hydrates every live provider in a single db read
-    (`_OMP_AUTH_CACHE`), so probing N omp seats costs one db read per board pass; see
-    `_omp_auth_probe` for the read itself."""
-    db = _omp_auth_db()
-    stamp = _omp_db_stamp(db)
-    if stamp is None:
-        return False
-    key = str(db)
-    entry = _OMP_AUTH_CACHE.get(key)
-    if entry is None or entry[0] != stamp:
-        live = _omp_auth_probe(db)
-        if live is None:
-            return False  # probe failure — deliberately NOT cached (retry next time)
-        entry = (stamp, live)
-        _OMP_AUTH_CACHE[key] = entry
-    providers = entry[1]
-    return bool(providers) if provider is None else provider in providers
+    return _backend_omp_registry._omp_stored_auth(sys.modules[__name__], provider)
 
 
+@_forwarding(_backend_provider._oc_provider_from_model)
 def _oc_provider_from_model(model: str) -> str | None:
-    """Extract the underlying provider from an oc:/opencode: model string.
-
-    Returns None for a bare 'opencode' (no provider-scoped prefix — binary check only).
-    'oc:anthropic/claude-3-5-sonnet' → 'anthropic';
-    'opencode:deepseek/deepseek-v3' → 'deepseek';
-    'opencode' → None.
-    """
-    lowered = model.lower()
-    if not lowered.startswith(("oc:", "opencode:")):
-        return None
-    return effective_provider(lowered)
+    return _backend_provider._oc_provider_from_model(sys.modules[__name__], model)
 
 
+@_forwarding(_backend_provider.default_routes_live)
 def default_routes_live(model: str) -> bool:
-    """True iff `model` is safe to ship as a DEFAULT (flat panel or board seat): the FULL id
-    takes a real named route AND its effective provider is not known-dead.
-
-    This is the #25 anti-rot guard's single check. It validates the WHOLE id against the
-    SAME matcher the dispatcher uses, not just the collapsed provider token (codex review):
-      * `_match_named_backend(model)` must be non-None — the full id resolves to a named
-        backend, NOT `resolve_backend`'s opencode catch-all. This is the real test: it
-        mirrors what `resolve_backend` does (minus the fallthrough), so a default whose full
-        id only the catch-all would accept fails. This is why checking the COLLAPSED provider
-        is not enough: `gemini-api:gemini-2.5-flash` collapses to the named token
-        `gemini-api`, but `resolve_backend` matches gemini only as the bare `gemini-api` or a
-        `gemini:` prefix — the `gemini-api:` form falls through to opencode, so the full-id
-        check is what catches it (the silent-rot #25 is about).
-      * For an `oc:`/`opencode:` AGENTIC id the matcher returns `review_opencode` for ANY
-        under-provider, so the full-id check alone can't see a dead/typo'd provider beneath
-        the transport. So the provider UNDER the transport (`effective_provider`) must ALSO
-        name a backend (rejects `oc:comandcode/...`) — checked only when a transport prefix
-        is present, since for a flat id the full-id check already covers it.
-      * `effective_provider(model)` must not be in `_DEAD_PROVIDERS` — the forward-looking
-        half: when a CURRENTLY named provider (e.g. `commandcode`) is suspended, add it here
-        and its defaults trip immediately, without also editing `_match_named_backend`.
-    It checks real named routing + a curated dead-provider denylist, NOT live network
-    reachability — a probe would need keys and can't run in CI.
-
-    CONTRACT + scope: enforced ONLY by the CI guard test
-    (`test_every_default_model_routes_live`), not at runtime — `resolve_backend` still sends
-    an unknown id to opencode (back-compat). So the guard is the single line of defense, and
-    it constrains DEFAULTS to ids `_match_named_backend` resolves to a named backend: an
-    opencode-only provider valid at runtime but not a named branch gets a (false) `False`
-    here. That is intentional — every shipped default routes through a named provider today,
-    and adding one on a new provider means giving it a named branch (or, for a provider that
-    is legitimately agentic-only with no bare/colon-form route — e.g. xai/GROK_SEAT — adding
-    it to `_AGENTIC_ONLY_PROVIDERS` instead of a bare-token branch that would expose a
-    broken invocation shape). Every `oc:` id, exempt or not, must also be a well-formed
-    `provider/model` selector (`_oc_selector_is_well_formed`)."""
-    # Lowercase ONCE and use it for every check, so the guard mirrors `resolve_backend`
-    # (which dispatches on `model.lower()`) exactly — a mixed-case id can't pass the guard
-    # while routing differently at runtime (codex review of #49).
-    lowered = model.lower()
-    if _match_named_backend(lowered) is None:
-        return False
-    provider = effective_provider(lowered)
-    selector = _peel_oc_transport(lowered)
-    if selector is not None:
-        # Agentic transport: the full id matched only the opencode branch. Every `oc:` id
-        # — named provider or not — must be the exact `provider/model` selector opencode's
-        # CLI wants (an `oc:zai/` or `oc:zai//glm-5.3` default would otherwise pass the
-        # named-provider half and rot at runtime), AND the provider under the transport
-        # must itself be a named backend or a documented agentic-only one.
-        if not _oc_selector_is_well_formed(selector, provider):
-            return False
-        if (
-            _match_named_backend(provider) is None
-            and provider not in _AGENTIC_ONLY_PROVIDERS
-        ):
-            return False
-    return provider not in _DEAD_PROVIDERS
+    return _backend_provider.default_routes_live(sys.modules[__name__], model)
 
 
+@_forwarding(_backend_provider.resolve_backend)
 def resolve_backend(model: str) -> Callable[..., ReviewResult]:
-    # TEST-ONLY: with REVIEW_FAKE_BACKEND set, every model routes to the deterministic
-    # in-process fake (no network/CLI). Unset (the default) -> real backends, unchanged.
-    if _fake_backend_enabled():
-        return review_fake
-    # Catch-all: an UNRECOGNIZED id still runs via opencode (back-compat with arbitrary
-    # `provider/model` selectors). The #25 default-model guard (`default_routes_live`)
-    # instead checks each default's under-transport provider is a named backend and not in
-    # the dead-provider denylist, so a stale default can't ride this fallthrough silently.
-    return _match_named_backend(model.lower()) or review_opencode
+    return _backend_provider.resolve_backend(sys.modules[__name__], model)
 
 
+@_forwarding(_backend_provider.provider_route_name)
 def provider_route_name(model: str) -> str:
-    """Canonical backend-route name for a model id, reusing `resolve_backend`.
-
-    Maps a model string to the name of the backend it actually runs on — `codex`,
-    `claude`, `gemini`, `opencode` (incl. every `oc:`/unknown-fallthrough seat),
-    `commandcode`, `zai`, `openrouter`. This is the route KEY a run-scoped `--effort`
-    override matches on (config.EffortOverride) and the same mapping the visual path uses
-    (`features/visual/vision_client._route_name`)."""
-    return {
-        review_claude: "claude",
-        review_gemini: "gemini",
-        review_codex: "codex",
-        review_opencode: "opencode",
-        review_omp: "omp",
-        review_commandcode: "commandcode",
-        review_zai: "zai",
-        review_openrouter: "openrouter",
-    }.get(resolve_backend(model), "opencode")
+    return _backend_provider.provider_route_name(sys.modules[__name__], model)
 
 
+@_forwarding(_backend_provider.is_known_backend_token)
 def is_known_backend_token(token: str) -> bool:
-    """Whether a bare token names a backend review RECOGNISES — as opposed to falling
-    through `resolve_backend`'s opencode catch-all. opencode itself (`opencode`/`oc`, or an
-    `opencode:`/`oc:` prefix) counts as recognised; an unknown word does NOT.
-
-    Used to validate a user-supplied `--effort <provider>=<level>` token so a typo
-    (`claud=high`) fails loudly instead of silently landing on the opencode route."""
-    lowered = token.strip().lower()
-    if lowered in ("opencode", "oc") or lowered.startswith(("opencode:", "oc:")):
-        return True
-    return _match_named_backend(lowered) is not None
+    return _backend_provider.is_known_backend_token(sys.modules[__name__], token)
 
 
+@_forwarding(_backend_provider.backend_available)
 def backend_available(model: str) -> bool:
-    """Cheap availability probe so moderator selection never picks a dead backend.
-
-    Thin boolean over `backend_unavailable_reason` (the single source of truth for BOTH
-    "is it live?" and "why not?") so the two can never drift."""
-    return backend_unavailable_reason(model) is None
+    return _backend_provider.backend_available(sys.modules[__name__], model)
 
 
-def backend_unavailable_reason(
-    model: str, *, honor_exclusions: bool = True
-) -> str | None:
-    """Human-readable reason `model`'s backend is NOT live right now, or None if it is.
+@_forwarding(_backend_provider.backend_unavailable_reason)
+def backend_unavailable_reason(model: str, *, honor_exclusions: bool=True) -> str | None:
+    return _backend_provider.backend_unavailable_reason(sys.modules[__name__], model, honor_exclusions=honor_exclusions)
 
-    `honor_exclusions=False` skips the stored availability exclusion (a quota/credit/login
-    window or escalating cooldown): `review capacity-check` reads those records itself, with
-    their typed cause, so a quota exclusion is evidence there rather than a probe failure.
 
-    Mirrors `backend_available`'s probe exactly but surfaces WHY a seat is dead so the
-    pool-selection guard (reviewlib.pool_guard) can annotate every printed model list with
-    per-seat health (live / down + reason). Never raises: a probe RuntimeError (missing
-    key/CLI) becomes its message; unpaid/paywalled providers get their dedicated reason."""
-    # TEST-ONLY: under the fake backend EVERY model is reachable (it is faked in-process,
-    # no key/CLI needed). Without this the panel/moderator selection would prune the faked
-    # models as "unavailable" on a host lacking the real CLIs (e.g. CI), defeating the e2e.
-    if _fake_backend_enabled():
-        return None
-    if runtime_provider_marked_unpaid(model):
-        return runtime_unpaid_provider_error(model)
-    preflight = cached_payment_preflight_unavailable_reason(model)
-    if preflight is not None:
-        return preflight
-    excluded = availability_exclusion(model) if honor_exclusions else None
-    if excluded is not None:
-        return f"unavailable: {excluded.describe()}"
-    backend = resolve_backend(model)
-    try:
-        if backend is review_gemini:
-            _gemini_key()
-            return None
-        if backend is review_zai:
-            # Honor a forced mode: REVIEW_ZAI_MODE=cli makes review_zai a dead
-            # backend, so it must NOT report available (resolve_backend_mode raises
-            # on the unsupported mode → caught below → reason). Codex P2.
-            resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
-            _zai_key()
-            return None
-        if backend is review_commandcode:
-            # Same as z.ai: a forced REVIEW_COMMANDCODE_MODE=cli is unrunnable, so the
-            # probe must reflect that instead of selecting a backend that only fails.
-            resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
-            _commandcode_key()
-            return None
-        if backend is review_openrouter:
-            # Same api-only contract: a forced REVIEW_OPENROUTER_MODE=cli is unrunnable, so
-            # the probe reports unavailable rather than selecting a backend that only fails.
-            resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
-            _openrouter_key()
-            return None
-        if backend is review_codex:
-            _which("codex")
-            return None
-        if backend is review_claude:
-            # Mirror the dispatcher so availability matches what would actually run:
-            # a forced mode is available only via that one variant; otherwise it's
-            # available via EITHER the API key or the `claude` CLI binary.
-            mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
-            if mode == "api":
-                if _claude_api_available_for_model(model):
-                    return None
-                return "claude: no API key for this model (REVIEW_CLAUDE_MODE=api)"
-            # With the CLI transport, a login that failed on every account the CLI
-            # rotates through makes the seat unusable too (review-cli#596), so a board
-            # hands it to its omp twin without paying the failed call again.
-            if mode == "cli":
-                if _have_claude_cli():
-                    return _claude_cli_login_reason()
-                return "claude: CLI not found on PATH (REVIEW_CLAUDE_MODE=cli)"
-            if _have_claude_cli():
-                return _claude_cli_login_reason()
-            if _claude_api_available_for_model(model):
-                return None
-            return "claude: no `claude` CLI on PATH and no API key"
-        if backend is review_opencode:
-            _which("opencode")
-            provider = _oc_provider_from_model(model)
-            if provider is None:
-                # Bare 'opencode' (no oc: prefix) — binary check is sufficient.
-                return None
-            if _oc_provider_auth_available(provider):
-                return None
-            return f"opencode: provider {provider!r} not authenticated (run `opencode auth login`)"
-        if backend is review_omp:
-            # Same contract as z.ai/commandcode: a forced REVIEW_OMP_MODE=api is
-            # unrunnable, so the probe reports unavailable instead of selecting a
-            # backend that only fails (the raise is caught below → reason).
-            resolve_backend_mode("omp", OMP_SUPPORTED_MODES, "cli")
-            _omp_launcher()
-            provider = _omp_provider_from_model(model)
-            if _omp_selector_is_anthropic(
-                model.split(":", 1)[1] if ":" in model else None
-            ):
-                # an unqualified `omp:claude-sonnet-5-5` runs on the anthropic accounts too
-                provider = omp_accounts.PROVIDER
-            if _omp_auth_available(provider):
-                return None
-            if provider is None:
-                return "omp: no usable credentials in ~/.omp/agent/agent.db (run `omp setup`)"
-            return (
-                f"omp: provider {provider!r} not authenticated "
-                f"(run `omp setup`; check `omp token {provider}`)"
-            )
-    except RuntimeError as exc:
-        return str(exc)
-    return "backend unavailable"
+# Preserve the existing wildcard/public import surface explicitly.
+__all__ = [
+    'CAUSE_AUTH',
+    'CAUSE_QUOTA',
+    'CAUSE_STALL',
+    'CAUSE_UNAVAILABLE',
+    'CHRONIC_QUOTA_MARKERS',
+    'COMMANDCODE_DEFAULT_BASE_URL',
+    'COMMANDCODE_DEFAULT_MODEL',
+    'COMMANDCODE_SUPPORTED_MODES',
+    'Callable',
+    'GEMINI_ENV_FALLBACKS',
+    'Iterator',
+    'OMP_SUPPORTED_MODES',
+    'OPENROUTER_DEFAULT_BASE_URL',
+    'OPENROUTER_DEFAULT_MODEL',
+    'OPENROUTER_SUPPORTED_MODES',
+    'Path',
+    'ReviewResult',
+    'TIMEOUT_KIND_STALL',
+    'ZAI_DEFAULT_BASE_URL',
+    'ZAI_DEFAULT_MODEL',
+    'ZAI_SUPPORTED_MODES',
+    'account_budget',
+    'active_cooldown',
+    'admission',
+    'annotations',
+    'availability',
+    'availability_exclusion',
+    'backend_available',
+    'backend_unavailable_reason',
+    'cached_payment_preflight_unavailable_reason',
+    'call_backend',
+    'claude_access_method',
+    'clear_cooldown',
+    'configure_omp_accounts',
+    'configure_omp_bin',
+    'configure_unpaid_providers',
+    'contextlib',
+    'dataclass',
+    'dataclasses',
+    'datetime',
+    'default_routes_live',
+    'effective_provider',
+    'git_repo_env',
+    'hashlib',
+    'inspect',
+    'install_codex_recursion_guard',
+    'is_known_backend_token',
+    'json',
+    'lock_file',
+    'lru_cache',
+    'math',
+    'note_availability',
+    'omp_accounts',
+    'omp_env_key',
+    'os',
+    'provider_marked_unpaid',
+    'provider_preflight_result',
+    'provider_route_name',
+    're',
+    'record_cooldown',
+    'resolve_backend',
+    'resolve_backend_mode',
+    'resolve_key_source',
+    'review_claude',
+    'review_claude_api',
+    'review_claude_cli',
+    'review_claude_cli_with_images',
+    'review_codex',
+    'review_commandcode',
+    'review_fake',
+    'review_gemini',
+    'review_omp',
+    'review_opencode',
+    'review_openrouter',
+    'review_with_images',
+    'review_zai',
+    'run_deadline_remaining',
+    'runtime_provider_marked_unpaid',
+    'runtime_unpaid_provider_error',
+    'shutil',
+    'socket',
+    'spawn_refuse_reason',
+    'strip_control_sequences',
+    'subprocess',
+    'sys',
+    'tempfile',
+    'threading',
+    'time',
+    'timezone',
+    'true_silence_timeout_seconds',
+    'unlock_file',
+    'unpaid_provider_error',
+    'unpaid_provider_result',
+    'unpaid_providers',
+    'urllib',
+    'usage_percent_for_model',
+    'write_sidecar_log',
+]
