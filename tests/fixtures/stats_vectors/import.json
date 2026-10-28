@@ -1,0 +1,42 @@
+{
+ "again": {
+  "imported": 0,
+  "rejected": 3,
+  "skipped": 6
+ },
+ "empty": {
+  "imported": 0,
+  "rejected": 0,
+  "skipped": 0
+ },
+ "filtered": {
+  "imported": 1,
+  "rejected": 8,
+  "skipped": 0
+ },
+ "filtered_lines": [
+  "{\"v\":5,\"ts\":\"2026-09-01T00:04:00+00:00\",\"mode\":\"review\",\"pool_size\":3,\"models\":[\"m-a\",\"m-b\",\"m-c\"],\"duration_seconds\":14.0,\"ok_count\":3,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"passed\":true,\"task_code\":\"105\"}"
+ ],
+ "first": {
+  "imported": 4,
+  "rejected": 3,
+  "skipped": 2
+ },
+ "first_lines": [
+  "{\"v\":5,\"ts\":\"2026-09-01T00:01:00+00:00\",\"mode\":\"review\",\"pool_size\":3,\"models\":[\"m-a\",\"m-b\",\"m-c\"],\"duration_seconds\":11.0,\"ok_count\":3,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"passed\":true,\"task_code\":\"T-1\",\"remote_host\":\"box\"}",
+  "{\"v\":5,\"ts\":\"2026-09-01T00:02:00+00:00\",\"mode\":\"review\",\"pool_size\":3,\"models\":[\"m-a\",\"m-b\",\"m-c\"],\"duration_seconds\":12.0,\"ok_count\":3,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"passed\":true,\"task_code\":\"T-1\",\"remote_host\":\"old-host\"}",
+  "{\"v\":5,\"ts\":\"2026-09-01T00:03:00+00:00\",\"mode\":\"review\",\"pool_size\":3,\"models\":[\"m-a\",\"m-b\",\"m-c\"],\"duration_seconds\":13.0,\"ok_count\":3,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"passed\":true,\"task_code\":\"T-2\",\"remote_host\":\"box\"}",
+  "{\"v\":5,\"ts\":\"2026-09-01T00:04:00+00:00\",\"mode\":\"review\",\"pool_size\":3,\"models\":[\"m-a\",\"m-b\",\"m-c\"],\"duration_seconds\":14.0,\"ok_count\":3,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"passed\":true,\"task_code\":\"105\",\"remote_host\":\"box\"}"
+ ],
+ "lock_exists": true,
+ "mode_bits": 384,
+ "torn": {
+  "imported": 1,
+  "rejected": 0,
+  "skipped": 0
+ },
+ "torn_lines": [
+  "{\"v\": 5, \"ts\": \"2026-09-01T00:00:00+00:00\", \"mode\": \"review\", \"pool_size\": 3, \"models\": [\"m-a\", \"m-b\", \"m-c\"], \"duration_seconds\": 10.0, \"ok_count\": 3, \"fail_count\": 0, \"prompt_tokens\": 0, \"output_tokens\": 0, \"passed\": true, \"task_code\": \"T-0\"}",
+  "{\"v\":5,\"ts\":\"2026-09-01T00:01:00+00:00\",\"mode\":\"review\",\"pool_size\":3,\"models\":[\"m-a\",\"m-b\",\"m-c\"],\"duration_seconds\":11.0,\"ok_count\":3,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"passed\":true,\"task_code\":\"T-1\"}"
+ ]
+}

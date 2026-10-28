@@ -1,0 +1,195 @@
+{
+ "buckets/diff": [
+  [
+   {
+    "diff_files": [
+     "a.py"
+    ],
+    "iteration": 1,
+    "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "t1"
+   }
+  ],
+  [
+   {
+    "iteration": 2,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "a.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "t2"
+   },
+   {
+    "iteration": 3,
+    "reason": "diff_mismatch",
+    "recorded_diff_files": [
+     "z.py"
+    ],
+    "recorded_repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "t3"
+   }
+  ],
+  [
+   {
+    "iteration": 4,
+    "ts": "t4"
+   }
+  ]
+ ],
+ "buckets/none": [
+  [
+   {
+    "diff_files": [
+     "a.py"
+    ],
+    "iteration": 1,
+    "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "t1"
+   },
+   {
+    "diff_files": [
+     "a.py"
+    ],
+    "iteration": 2,
+    "repo_id": "github.com/other/thing",
+    "ts": "t2"
+   },
+   {
+    "diff_files": [
+     "z.py"
+    ],
+    "iteration": 3,
+    "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "t3"
+   },
+   {
+    "iteration": 4,
+    "ts": "t4"
+   }
+  ],
+  [],
+  []
+ ],
+ "buckets/repo": [
+  [
+   {
+    "diff_files": [
+     "a.py"
+    ],
+    "iteration": 1,
+    "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "t1"
+   },
+   {
+    "diff_files": [
+     "z.py"
+    ],
+    "iteration": 3,
+    "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "t3"
+   }
+  ],
+  [
+   {
+    "iteration": 2,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "a.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "t2"
+   }
+  ],
+  [
+   {
+    "iteration": 4,
+    "ts": "t4"
+   }
+  ]
+ ],
+ "excluding/diff": [
+  {
+   "diff_files": [
+    "a.py"
+   ],
+   "iteration": 1,
+   "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+   "ts": "t1"
+  },
+  {
+   "iteration": 4,
+   "ts": "t4"
+  }
+ ],
+ "excluding/none": [
+  {
+   "diff_files": [
+    "a.py"
+   ],
+   "iteration": 1,
+   "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+   "ts": "t1"
+  },
+  {
+   "diff_files": [
+    "a.py"
+   ],
+   "iteration": 2,
+   "repo_id": "github.com/other/thing",
+   "ts": "t2"
+  },
+  {
+   "diff_files": [
+    "z.py"
+   ],
+   "iteration": 3,
+   "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+   "ts": "t3"
+  },
+  {
+   "iteration": 4,
+   "ts": "t4"
+  }
+ ],
+ "excluding/repo": [
+  {
+   "diff_files": [
+    "a.py"
+   ],
+   "iteration": 1,
+   "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+   "ts": "t1"
+  },
+  {
+   "diff_files": [
+    "z.py"
+   ],
+   "iteration": 3,
+   "repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+   "ts": "t3"
+  },
+  {
+   "iteration": 4,
+   "ts": "t4"
+  }
+ ],
+ "foreign": [
+  [
+   [
+    {
+     "iteration": 2,
+     "passed": null,
+     "repo_id": "github.com/other/thing",
+     "task_code": null,
+     "ts": "t2"
+    }
+   ],
+   1
+  ]
+ ],
+ "foreign_many": [
+  50,
+  60
+ ]
+}

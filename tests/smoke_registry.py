@@ -128,6 +128,8 @@ _UNIT_FILES = [
     ("test_install_review_remote.py", {}),
     # `review task --export / --import / --import-from`: iterations recorded on another machine (#659).
     ("test_task_export_import.py", {}),
+    # reviewlib.stats characterization vectors pinned from the pre-split implementation (#721).
+    ("test_stats_characterization.py", {}),
     # The composer-stage review gate driven through REAL git commit/rebase/cherry-pick
     # (review-cli#396). Needs git; runs under pytest itself (see the file's own
     # `if __name__ == "__main__":`) because it uses capsys/monkeypatch/parametrize.

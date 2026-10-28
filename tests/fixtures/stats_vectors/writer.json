@@ -1,0 +1,13 @@
+{
+ "lines": [
+  "{\"v\":5,\"ts\":\"2026-09-01T12:00:00+00:00\",\"mode\":\"review\",\"pool_size\":2,\"models\":[\"m-a\",\"m-b\"],\"duration_seconds\":1.235,\"ok_count\":2,\"fail_count\":1,\"prompt_tokens\":7,\"output_tokens\":9,\"run_id\":\"0e426b2b8c8b757f\",\"task_code\":\"T-9\",\"passed\":true,\"repo_id\":\"git.hyperide.ai/ultrabricks/review-cli\",\"diff_files\":[\"b.py\",\"a.py\"],\"diff_sha256\":\"ff\",\"level\":\"L2\",\"roles\":[\"correctness\",\"security\"],\"usable_roles\":[\"correctness\"]}"
+ ],
+ "lines_after": [
+  "{\"v\":5,\"ts\":\"2026-09-01T12:00:00+00:00\",\"mode\":\"review\",\"pool_size\":2,\"models\":[\"m-a\",\"m-b\"],\"duration_seconds\":1.235,\"ok_count\":2,\"fail_count\":1,\"prompt_tokens\":7,\"output_tokens\":9,\"run_id\":\"0e426b2b8c8b757f\",\"task_code\":\"T-9\",\"passed\":true,\"repo_id\":\"git.hyperide.ai/ultrabricks/review-cli\",\"diff_files\":[\"b.py\",\"a.py\"],\"diff_sha256\":\"ff\",\"level\":\"L2\",\"roles\":[\"correctness\",\"security\"],\"usable_roles\":[\"correctness\"]}",
+  "{\"v\":5,\"ts\":\"2026-09-01T12:00:00+00:00\",\"mode\":\"qa\",\"pool_size\":1,\"models\":[\"m-a\"],\"duration_seconds\":0.0,\"ok_count\":0,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"run_id\":\"pinned\",\"diff_files\":[],\"usable_roles\":[]}",
+  "{\"v\":5,\"ts\":\"2026-09-01T12:00:00+00:00\",\"mode\":\"just-ask\",\"pool_size\":0,\"models\":[],\"duration_seconds\":2.0,\"ok_count\":1,\"fail_count\":0,\"prompt_tokens\":0,\"output_tokens\":0,\"run_id\":\"c64bea3f429f5177\",\"passed\":false,\"roles\":[]}"
+ ],
+ "mode_bits": 384,
+ "mode_bits_after_rewrite": 384,
+ "ok": true
+}

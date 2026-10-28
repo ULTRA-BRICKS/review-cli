@@ -1,0 +1,86 @@
+{
+ "diff_mismatch/a": [
+  "mismatched",
+  "diff_mismatch"
+ ],
+ "diff_mismatch/empty": [
+  "verified",
+  null
+ ],
+ "diff_mismatch/none": [
+  "verified",
+  null
+ ],
+ "files_not_list/a": [
+  "verified",
+  null
+ ],
+ "files_not_list/empty": [
+  "verified",
+  null
+ ],
+ "files_not_list/none": [
+  "verified",
+  null
+ ],
+ "no_repo/a": [
+  "unverifiable",
+  null
+ ],
+ "no_repo/empty": [
+  "unverifiable",
+  null
+ ],
+ "no_repo/none": [
+  "unverifiable",
+  null
+ ],
+ "repo_mismatch/a": [
+  "mismatched",
+  "repo_mismatch"
+ ],
+ "repo_mismatch/empty": [
+  "mismatched",
+  "repo_mismatch"
+ ],
+ "repo_mismatch/none": [
+  "mismatched",
+  "repo_mismatch"
+ ],
+ "verified_empty_files/a": [
+  "verified",
+  null
+ ],
+ "verified_empty_files/empty": [
+  "verified",
+  null
+ ],
+ "verified_empty_files/none": [
+  "verified",
+  null
+ ],
+ "verified_no_files/a": [
+  "verified",
+  null
+ ],
+ "verified_no_files/empty": [
+  "verified",
+  null
+ ],
+ "verified_no_files/none": [
+  "verified",
+  null
+ ],
+ "verified_overlap/a": [
+  "verified",
+  null
+ ],
+ "verified_overlap/empty": [
+  "verified",
+  null
+ ],
+ "verified_overlap/none": [
+  "verified",
+  null
+ ]
+}

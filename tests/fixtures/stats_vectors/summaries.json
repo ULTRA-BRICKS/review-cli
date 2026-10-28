@@ -1,0 +1,199 @@
+{
+ "modes": [
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 41.0,
+   "fail_count": 1,
+   "fail_rate": 0.143,
+   "mode": "review",
+   "ok_count": 6,
+   "runs": 3
+  },
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 14.0,
+   "fail_count": 0,
+   "fail_rate": 0.0,
+   "mode": "brainstorm",
+   "ok_count": 3,
+   "runs": 1
+  },
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 12.0,
+   "fail_count": 2,
+   "fail_rate": 0.4,
+   "mode": "quorum",
+   "ok_count": 3,
+   "runs": 1
+  },
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 0.0,
+   "fail_count": 0,
+   "fail_rate": null,
+   "mode": "qa",
+   "ok_count": 0,
+   "runs": 1
+  }
+ ],
+ "modes_missing": [],
+ "modes_records": [
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 24.0,
+   "fail_count": 0,
+   "fail_rate": 0.0,
+   "mode": "review",
+   "ok_count": 6,
+   "runs": 2
+  },
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 12.0,
+   "fail_count": 2,
+   "fail_rate": 0.4,
+   "mode": "quorum",
+   "ok_count": 3,
+   "runs": 1
+  }
+ ],
+ "modes_since": [
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 30.0,
+   "fail_count": 1,
+   "fail_rate": 0.25,
+   "mode": "review",
+   "ok_count": 3,
+   "runs": 2
+  },
+  {
+   "avg_pool_size": 3.0,
+   "duration_seconds": 0.0,
+   "fail_count": 0,
+   "fail_rate": null,
+   "mode": "qa",
+   "ok_count": 0,
+   "runs": 1
+  }
+ ],
+ "repos": [
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "repo_id": "git.hyperide.ai/ultrabricks/dev-cli",
+   "runs": 1
+  },
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "repo_id": "github.com/other/thing",
+   "runs": 1
+  }
+ ],
+ "repos_missing": [],
+ "repos_records": [
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "repo_id": "git.hyperide.ai/ultrabricks/dev-cli",
+   "runs": 1
+  },
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "repo_id": "github.com/other/thing",
+   "runs": 1
+  }
+ ],
+ "repos_top0": [
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "repo_id": "github.com/other/thing",
+   "runs": 1
+  }
+ ],
+ "repos_top1": [
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "repo_id": "git.hyperide.ai/ultrabricks/dev-cli",
+   "runs": 1
+  }
+ ],
+ "tasks": [
+  {
+   "duration_seconds": 27.0,
+   "fail_count": 0,
+   "first_ts": "2026-08-01T00:00:00",
+   "iterations": 2,
+   "last_ts": "2026-09-02T00:00:00Z",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "modes": [
+    "brainstorm",
+    "review"
+   ],
+   "ok_count": 6,
+   "output_tokens": 0,
+   "prompt_tokens": 0,
+   "task_code": "B"
+  },
+  {
+   "duration_seconds": 51.0,
+   "fail_count": 1,
+   "first_ts": "2026-09-01T00:06:00+00:00",
+   "iterations": 3,
+   "last_ts": "2026-09-01T00:08:00+00:00",
+   "models": [
+    "m-z",
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "modes": [
+    "review"
+   ],
+   "ok_count": 6,
+   "output_tokens": 0,
+   "prompt_tokens": 0,
+   "task_code": "C"
+  },
+  {
+   "duration_seconds": 23.0,
+   "fail_count": 2,
+   "first_ts": "2026-09-01T00:01:00+00:00",
+   "iterations": 2,
+   "last_ts": "2026-09-01T00:02:00+00:00",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "modes": [
+    "quorum",
+    "review"
+   ],
+   "ok_count": 6,
+   "output_tokens": 6,
+   "prompt_tokens": 5,
+   "task_code": "A"
+  }
+ ],
+ "tasks_missing": [],
+ "ts_ge": [
+  false,
+  false,
+  true,
+  true,
+  false,
+  false,
+  false,
+  true
+ ]
+}

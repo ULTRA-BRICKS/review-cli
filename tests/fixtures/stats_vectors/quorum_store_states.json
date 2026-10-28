@@ -1,0 +1,53 @@
+{
+ "junk_only_store": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "error": "no recorded review iterations for T-1",
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 0
+ },
+ "missing_store_bare": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "error": "stats store unreadable: [Errno 2] No such file or directory: '<TMP>/missing.jsonl'",
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 0
+ },
+ "missing_store_models": {
+  "distinct_models_passed": 0,
+  "error": "stats store unreadable: [Errno 2] No such file or directory: '<TMP>/missing.jsonl'",
+  "min_iter": 1,
+  "min_models": 2,
+  "min_models_source": "explicit",
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "task_code": "T-1",
+  "total_iterations": 0
+ },
+ "unreadable_store": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "error": "stats store unreadable: [Errno 21] Is a directory: '<TMP>'",
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 0
+ }
+}

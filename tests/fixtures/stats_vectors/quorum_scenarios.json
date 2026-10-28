@@ -1,0 +1,2394 @@
+{
+ "bare_all_mismatched_keeps_role_mode": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "error": "2 recorded iteration(s) for T-1 were excluded: recorded in another repository (see foreign_repo_iterations)",
+  "excluded_foreign_repo_iterations": 2,
+  "excluded_mismatched_iterations": 2,
+  "foreign_repo_iterations": [
+   {
+    "iteration": 1,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:01:00+00:00"
+   }
+  ],
+  "min_iter": 1,
+  "min_roles": 3,
+  "mismatch_details": [
+   {
+    "iteration": 1,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:01:00+00:00"
+   }
+  ],
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 2,
+  "unverifiable_iterations": 0,
+  "verified_iterations": 0
+ },
+ "bare_failed_only": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_failed_role_iteration_blocks_fallback": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 3,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 4
+ },
+ "bare_gap_board_and_panel": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 2,
+  "role_tracking_gap": "T-1 has 2 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under `review quorum`, `review diff` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): configure a reviewer board for this repo (see `review --show-board` / config.yaml's `board:` entry) and re-run `review diff --task T-1` through it -- a role-less run with no board config records no per-seat roles; the other iteration(s) need a role-tracking `review diff` run instead regardless of board config (quorum/just-ask/brainstorm/qa never record roles at all) to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 2
+ },
+ "bare_gap_mixed_legacy_and_quorum": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 2,
+  "role_tracking_gap": "T-1 has 1 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under `review quorum` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): run `review diff --task T-1` through a role-tracking board (quorum/just-ask/brainstorm/qa never record roles at all) to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 2
+ },
+ "bare_gap_naive_ts": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "role_tracking_gap": "T-1 has 1 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under `review diff` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): configure a reviewer board for this repo (see `review --show-board` / config.yaml's `board:` entry) and re-run `review diff --task T-1` through it -- a role-less run with no board config records no per-seat roles to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_gap_quorum": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 3,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 3,
+  "role_tracking_gap": "T-1 has 3 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under `review quorum` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): run `review diff --task T-1` through a role-tracking board (quorum/just-ask/brainstorm/qa never record roles at all) to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 3
+ },
+ "bare_gap_review_roleless": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "excluded_foreign_repo_iterations": 0,
+  "excluded_mismatched_iterations": 0,
+  "foreign_repo_iterations": [],
+  "min_iter": 1,
+  "min_roles": 3,
+  "mismatch_details": [],
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "role_tracking_gap": "T-1 has 1 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older against the current repo -- yet none carry role data: they ran under `review diff` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): configure a reviewer board for this repo (see `review --show-board` / config.yaml's `board:` entry) and re-run `review diff --task T-1` through it -- a role-less run with no board config records no per-seat roles to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1,
+  "unverifiable_iterations": 1,
+  "verified_iterations": 0
+ },
+ "bare_gap_review_seats_failed": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "role_tracking_gap": "T-1 has 1 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under `review diff` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): either configure a reviewer board for this repo (see `review --show-board` / config.yaml's `board:` entry) or, if one is already configured, restore its seats to health (dead API keys, missing CLI auth, and an unpaid provider are the usual causes) -- then re-run `review diff --task T-1` -- this run recorded zero usable seats, which happens either way and records no per-seat roles to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_gap_unknown_mode": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "role_tracking_gap": "T-1 has 1 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under an unverified mode without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): run `review diff --task T-1` through a role-tracking board to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_gap_visual_and_review": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 2,
+  "role_tracking_gap": "T-1 has 2 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older -- yet none carry role data: they ran under `review diff`, `review visual` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): configure a reviewer board for this repo (see `review --show-board` / config.yaml's `board:` entry) and re-run `review diff --task T-1` (or `review visual IMAGE --task T-1` for screenshot review) through it -- a role-less run with no board config records no per-seat roles to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 2
+ },
+ "bare_gap_visual_roleless": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "excluded_foreign_repo_iterations": 0,
+  "excluded_mismatched_iterations": 0,
+  "foreign_repo_iterations": [],
+  "min_iter": 1,
+  "min_roles": 3,
+  "mismatch_details": [],
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "role_tracking_gap": "T-1 has 1 review iteration(s) not confirmed to predate role-tracking (review-cli#246, merged 2026-08-21) -- either recorded after it became available, or with a timestamp that can't be verified as older against the current repo/diff -- yet none carry role data: they ran under `review visual` without recording per-seat roles. This is NOT eligible for the legacy model-counting fallback (that only covers history verifiably predating role-tracking entirely): configure a reviewer board for this repo (see `review --show-board` / config.yaml's `board:` entry) and re-run `review visual IMAGE --task T-1` (IMAGE is the screenshot you're reviewing) through it -- a role-less run with no board config records no per-seat roles to record real role coverage -- 3 distinct role(s) are required.",
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1,
+  "unverifiable_iterations": 1,
+  "verified_iterations": 0
+ },
+ "bare_gap_z_ts_legacy_falls_back": {
+  "distinct_models_passed": 3,
+  "min_iter": 1,
+  "min_models": 3,
+  "min_models_source": "fallback",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 1,
+  "quorum_mode_fallback": "no role-tagged review history recorded for T-1; fell back to the pre-review-cli#246 model-counting default (min_models=3) since there is no role data to count against the new role-based default (every in-scope iteration predates role-tracking)",
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_legacy_fallback": {
+  "distinct_models_passed": 3,
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_source": "fallback",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 3,
+  "quorum_mode_fallback": "no role-tagged review history recorded for T-1; fell back to the pre-review-cli#246 model-counting default (min_models=3) since there is no role data to count against the new role-based default (every in-scope iteration predates role-tracking)",
+  "task_code": "T-1",
+  "total_iterations": 3
+ },
+ "bare_legacy_fallback_diff_ctx": {
+  "distinct_models_passed": 3,
+  "excluded_foreign_repo_iterations": 0,
+  "excluded_mismatched_iterations": 0,
+  "foreign_repo_iterations": [],
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_source": "fallback",
+  "mismatch_details": [],
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 3,
+  "quorum_mode_fallback": "no role-tagged review history recorded for T-1 against the current repo/diff; fell back to the pre-review-cli#246 model-counting default (min_models=3) since there is no role data to count against the new role-based default (every in-scope iteration -- excluding any recorded for a different repo/diff -- predates role-tracking)",
+  "task_code": "T-1",
+  "total_iterations": 3,
+  "unverifiable_iterations": 3,
+  "verified_iterations": 0
+ },
+ "bare_legacy_fallback_repo_ctx": {
+  "distinct_models_passed": 3,
+  "excluded_foreign_repo_iterations": 0,
+  "excluded_mismatched_iterations": 0,
+  "foreign_repo_iterations": [],
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_source": "fallback",
+  "mismatch_details": [],
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 3,
+  "quorum_mode_fallback": "no role-tagged review history recorded for T-1 against the current repo; fell back to the pre-review-cli#246 model-counting default (min_models=3) since there is no role data to count against the new role-based default (every in-scope iteration -- excluding any recorded for a different repository -- predates role-tracking)",
+  "task_code": "T-1",
+  "total_iterations": 3,
+  "unverifiable_iterations": 3,
+  "verified_iterations": 0
+ },
+ "bare_no_history_for_task": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "error": "no recorded review iterations for T-1",
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 0
+ },
+ "bare_three_roles_one_iter": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 3,
+  "min_iter": 3,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_two_roles": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 2,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_unknown_roles_not_credited": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "bare_unverdicted_roles_pre137": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "both_floors_met": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 3,
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 3,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 3
+ },
+ "both_floors_models_short": {
+  "distinct_models_passed": 1,
+  "distinct_roles_passed": 3,
+  "min_iter": 1,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "min_roles": 3,
+  "models": [
+   "m-a"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "identity_alias_moved_repo_matches": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 3,
+  "excluded_foreign_repo_iterations": 0,
+  "excluded_mismatched_iterations": 0,
+  "foreign_repo_iterations": [],
+  "min_iter": 1,
+  "min_roles": 3,
+  "mismatch_details": [],
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1,
+  "unverifiable_iterations": 0,
+  "verified_iterations": 1
+ },
+ "identity_foreign_details_capped": {
+  "distinct_models_passed": 0,
+  "error": "53 recorded iteration(s) for T-1 were excluded: recorded in another repository (see foreign_repo_iterations)",
+  "excluded_foreign_repo_iterations": 53,
+  "excluded_mismatched_iterations": 53,
+  "foreign_repo_iterations": [
+   {
+    "iteration": 1,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:01:00+00:00"
+   },
+   {
+    "iteration": 3,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:02:00+00:00"
+   },
+   {
+    "iteration": 4,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:03:00+00:00"
+   },
+   {
+    "iteration": 5,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:04:00+00:00"
+   },
+   {
+    "iteration": 6,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:05:00+00:00"
+   },
+   {
+    "iteration": 7,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:06:00+00:00"
+   },
+   {
+    "iteration": 8,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:07:00+00:00"
+   },
+   {
+    "iteration": 9,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:08:00+00:00"
+   },
+   {
+    "iteration": 10,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:09:00+00:00"
+   },
+   {
+    "iteration": 11,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:10:00+00:00"
+   },
+   {
+    "iteration": 12,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:11:00+00:00"
+   },
+   {
+    "iteration": 13,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:12:00+00:00"
+   },
+   {
+    "iteration": 14,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:13:00+00:00"
+   },
+   {
+    "iteration": 15,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:14:00+00:00"
+   },
+   {
+    "iteration": 16,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:15:00+00:00"
+   },
+   {
+    "iteration": 17,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:16:00+00:00"
+   },
+   {
+    "iteration": 18,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:17:00+00:00"
+   },
+   {
+    "iteration": 19,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:18:00+00:00"
+   },
+   {
+    "iteration": 20,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:19:00+00:00"
+   },
+   {
+    "iteration": 21,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:20:00+00:00"
+   },
+   {
+    "iteration": 22,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:21:00+00:00"
+   },
+   {
+    "iteration": 23,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:22:00+00:00"
+   },
+   {
+    "iteration": 24,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:23:00+00:00"
+   },
+   {
+    "iteration": 25,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:24:00+00:00"
+   },
+   {
+    "iteration": 26,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:25:00+00:00"
+   },
+   {
+    "iteration": 27,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:26:00+00:00"
+   },
+   {
+    "iteration": 28,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:27:00+00:00"
+   },
+   {
+    "iteration": 29,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:28:00+00:00"
+   },
+   {
+    "iteration": 30,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:29:00+00:00"
+   },
+   {
+    "iteration": 31,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:30:00+00:00"
+   },
+   {
+    "iteration": 32,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:31:00+00:00"
+   },
+   {
+    "iteration": 33,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:32:00+00:00"
+   },
+   {
+    "iteration": 34,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:33:00+00:00"
+   },
+   {
+    "iteration": 35,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:34:00+00:00"
+   },
+   {
+    "iteration": 36,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:35:00+00:00"
+   },
+   {
+    "iteration": 37,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:36:00+00:00"
+   },
+   {
+    "iteration": 38,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:37:00+00:00"
+   },
+   {
+    "iteration": 39,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:38:00+00:00"
+   },
+   {
+    "iteration": 40,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:39:00+00:00"
+   },
+   {
+    "iteration": 41,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:40:00+00:00"
+   },
+   {
+    "iteration": 42,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:41:00+00:00"
+   },
+   {
+    "iteration": 43,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:42:00+00:00"
+   },
+   {
+    "iteration": 44,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:43:00+00:00"
+   },
+   {
+    "iteration": 45,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:44:00+00:00"
+   },
+   {
+    "iteration": 46,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:45:00+00:00"
+   },
+   {
+    "iteration": 47,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:46:00+00:00"
+   },
+   {
+    "iteration": 48,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:47:00+00:00"
+   },
+   {
+    "iteration": 49,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:48:00+00:00"
+   },
+   {
+    "iteration": 50,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:49:00+00:00"
+   }
+  ],
+  "foreign_repo_iterations_truncated": true,
+  "min_iter": 1,
+  "min_models": 1,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "mismatch_details": [
+   {
+    "iteration": 1,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:01:00+00:00"
+   },
+   {
+    "iteration": 3,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:02:00+00:00"
+   },
+   {
+    "iteration": 4,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:03:00+00:00"
+   },
+   {
+    "iteration": 5,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:04:00+00:00"
+   },
+   {
+    "iteration": 6,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:05:00+00:00"
+   },
+   {
+    "iteration": 7,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:06:00+00:00"
+   },
+   {
+    "iteration": 8,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:07:00+00:00"
+   },
+   {
+    "iteration": 9,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:08:00+00:00"
+   },
+   {
+    "iteration": 10,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:09:00+00:00"
+   },
+   {
+    "iteration": 11,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:10:00+00:00"
+   },
+   {
+    "iteration": 12,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:11:00+00:00"
+   },
+   {
+    "iteration": 13,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:12:00+00:00"
+   },
+   {
+    "iteration": 14,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:13:00+00:00"
+   },
+   {
+    "iteration": 15,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:14:00+00:00"
+   },
+   {
+    "iteration": 16,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:15:00+00:00"
+   },
+   {
+    "iteration": 17,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:16:00+00:00"
+   },
+   {
+    "iteration": 18,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:17:00+00:00"
+   },
+   {
+    "iteration": 19,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:18:00+00:00"
+   },
+   {
+    "iteration": 20,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:19:00+00:00"
+   },
+   {
+    "iteration": 21,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:20:00+00:00"
+   },
+   {
+    "iteration": 22,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:21:00+00:00"
+   },
+   {
+    "iteration": 23,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:22:00+00:00"
+   },
+   {
+    "iteration": 24,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:23:00+00:00"
+   },
+   {
+    "iteration": 25,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:24:00+00:00"
+   },
+   {
+    "iteration": 26,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:25:00+00:00"
+   },
+   {
+    "iteration": 27,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:26:00+00:00"
+   },
+   {
+    "iteration": 28,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:27:00+00:00"
+   },
+   {
+    "iteration": 29,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:28:00+00:00"
+   },
+   {
+    "iteration": 30,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:29:00+00:00"
+   },
+   {
+    "iteration": 31,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:30:00+00:00"
+   },
+   {
+    "iteration": 32,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:31:00+00:00"
+   },
+   {
+    "iteration": 33,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:32:00+00:00"
+   },
+   {
+    "iteration": 34,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:33:00+00:00"
+   },
+   {
+    "iteration": 35,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:34:00+00:00"
+   },
+   {
+    "iteration": 36,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:35:00+00:00"
+   },
+   {
+    "iteration": 37,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:36:00+00:00"
+   },
+   {
+    "iteration": 38,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:37:00+00:00"
+   },
+   {
+    "iteration": 39,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:38:00+00:00"
+   },
+   {
+    "iteration": 40,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:39:00+00:00"
+   },
+   {
+    "iteration": 41,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:40:00+00:00"
+   },
+   {
+    "iteration": 42,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:41:00+00:00"
+   },
+   {
+    "iteration": 43,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:42:00+00:00"
+   },
+   {
+    "iteration": 44,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:43:00+00:00"
+   },
+   {
+    "iteration": 45,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:44:00+00:00"
+   },
+   {
+    "iteration": 46,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:45:00+00:00"
+   },
+   {
+    "iteration": 47,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:46:00+00:00"
+   },
+   {
+    "iteration": 48,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:47:00+00:00"
+   },
+   {
+    "iteration": 49,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:48:00+00:00"
+   },
+   {
+    "iteration": 50,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:49:00+00:00"
+   }
+  ],
+  "mismatch_details_truncated": true,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "task_code": "T-1",
+  "total_iterations": 53,
+  "unverifiable_iterations": 0,
+  "verified_iterations": 0
+ },
+ "identity_mismatch_details_capped": {
+  "distinct_models_passed": 0,
+  "error": "57 recorded iteration(s) for T-1 were excluded: recorded repo/diff did not match the code currently being checked (see mismatch_details)",
+  "excluded_foreign_repo_iterations": 57,
+  "excluded_mismatched_iterations": 57,
+  "foreign_repo_iterations": [
+   {
+    "iteration": 1,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:01:00+00:00"
+   },
+   {
+    "iteration": 3,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:02:00+00:00"
+   },
+   {
+    "iteration": 4,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:03:00+00:00"
+   },
+   {
+    "iteration": 5,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:04:00+00:00"
+   },
+   {
+    "iteration": 6,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:05:00+00:00"
+   },
+   {
+    "iteration": 7,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:06:00+00:00"
+   },
+   {
+    "iteration": 8,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:07:00+00:00"
+   },
+   {
+    "iteration": 9,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:08:00+00:00"
+   },
+   {
+    "iteration": 10,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:09:00+00:00"
+   },
+   {
+    "iteration": 11,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:10:00+00:00"
+   },
+   {
+    "iteration": 12,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:11:00+00:00"
+   },
+   {
+    "iteration": 13,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:12:00+00:00"
+   },
+   {
+    "iteration": 14,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:13:00+00:00"
+   },
+   {
+    "iteration": 15,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:14:00+00:00"
+   },
+   {
+    "iteration": 16,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:15:00+00:00"
+   },
+   {
+    "iteration": 17,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:16:00+00:00"
+   },
+   {
+    "iteration": 18,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:17:00+00:00"
+   },
+   {
+    "iteration": 19,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:18:00+00:00"
+   },
+   {
+    "iteration": 20,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:19:00+00:00"
+   },
+   {
+    "iteration": 21,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:20:00+00:00"
+   },
+   {
+    "iteration": 22,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:21:00+00:00"
+   },
+   {
+    "iteration": 23,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:22:00+00:00"
+   },
+   {
+    "iteration": 24,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:23:00+00:00"
+   },
+   {
+    "iteration": 25,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:24:00+00:00"
+   },
+   {
+    "iteration": 26,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:25:00+00:00"
+   },
+   {
+    "iteration": 27,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:26:00+00:00"
+   },
+   {
+    "iteration": 28,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:27:00+00:00"
+   },
+   {
+    "iteration": 29,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:28:00+00:00"
+   },
+   {
+    "iteration": 30,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:29:00+00:00"
+   },
+   {
+    "iteration": 31,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:30:00+00:00"
+   },
+   {
+    "iteration": 32,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:31:00+00:00"
+   },
+   {
+    "iteration": 33,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:32:00+00:00"
+   },
+   {
+    "iteration": 34,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:33:00+00:00"
+   },
+   {
+    "iteration": 35,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:34:00+00:00"
+   },
+   {
+    "iteration": 36,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:35:00+00:00"
+   },
+   {
+    "iteration": 37,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:36:00+00:00"
+   },
+   {
+    "iteration": 38,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:37:00+00:00"
+   },
+   {
+    "iteration": 39,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:38:00+00:00"
+   },
+   {
+    "iteration": 40,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:39:00+00:00"
+   },
+   {
+    "iteration": 41,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:40:00+00:00"
+   },
+   {
+    "iteration": 42,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:41:00+00:00"
+   },
+   {
+    "iteration": 43,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:42:00+00:00"
+   },
+   {
+    "iteration": 44,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:43:00+00:00"
+   },
+   {
+    "iteration": 45,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:44:00+00:00"
+   },
+   {
+    "iteration": 46,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:45:00+00:00"
+   },
+   {
+    "iteration": 47,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:46:00+00:00"
+   },
+   {
+    "iteration": 48,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:47:00+00:00"
+   },
+   {
+    "iteration": 49,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:48:00+00:00"
+   },
+   {
+    "iteration": 50,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:49:00+00:00"
+   }
+  ],
+  "foreign_repo_iterations_truncated": true,
+  "min_iter": 1,
+  "min_models": 1,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "mismatch_details": [
+   {
+    "iteration": 1,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:01:00+00:00"
+   },
+   {
+    "iteration": 3,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:02:00+00:00"
+   },
+   {
+    "iteration": 4,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:03:00+00:00"
+   },
+   {
+    "iteration": 5,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:04:00+00:00"
+   },
+   {
+    "iteration": 6,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:05:00+00:00"
+   },
+   {
+    "iteration": 7,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:06:00+00:00"
+   },
+   {
+    "iteration": 8,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:07:00+00:00"
+   },
+   {
+    "iteration": 9,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:08:00+00:00"
+   },
+   {
+    "iteration": 10,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:09:00+00:00"
+   },
+   {
+    "iteration": 11,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:10:00+00:00"
+   },
+   {
+    "iteration": 12,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:11:00+00:00"
+   },
+   {
+    "iteration": 13,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:12:00+00:00"
+   },
+   {
+    "iteration": 14,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:13:00+00:00"
+   },
+   {
+    "iteration": 15,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:14:00+00:00"
+   },
+   {
+    "iteration": 16,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:15:00+00:00"
+   },
+   {
+    "iteration": 17,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:16:00+00:00"
+   },
+   {
+    "iteration": 18,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:17:00+00:00"
+   },
+   {
+    "iteration": 19,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:18:00+00:00"
+   },
+   {
+    "iteration": 20,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:19:00+00:00"
+   },
+   {
+    "iteration": 21,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:20:00+00:00"
+   },
+   {
+    "iteration": 22,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:21:00+00:00"
+   },
+   {
+    "iteration": 23,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:22:00+00:00"
+   },
+   {
+    "iteration": 24,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:23:00+00:00"
+   },
+   {
+    "iteration": 25,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:24:00+00:00"
+   },
+   {
+    "iteration": 26,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:25:00+00:00"
+   },
+   {
+    "iteration": 27,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:26:00+00:00"
+   },
+   {
+    "iteration": 28,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:27:00+00:00"
+   },
+   {
+    "iteration": 29,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:28:00+00:00"
+   },
+   {
+    "iteration": 30,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:29:00+00:00"
+   },
+   {
+    "iteration": 31,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:30:00+00:00"
+   },
+   {
+    "iteration": 32,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:31:00+00:00"
+   },
+   {
+    "iteration": 33,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:32:00+00:00"
+   },
+   {
+    "iteration": 34,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:33:00+00:00"
+   },
+   {
+    "iteration": 35,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:34:00+00:00"
+   },
+   {
+    "iteration": 36,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:35:00+00:00"
+   },
+   {
+    "iteration": 37,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:36:00+00:00"
+   },
+   {
+    "iteration": 38,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:37:00+00:00"
+   },
+   {
+    "iteration": 39,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:38:00+00:00"
+   },
+   {
+    "iteration": 40,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:39:00+00:00"
+   },
+   {
+    "iteration": 41,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:40:00+00:00"
+   },
+   {
+    "iteration": 42,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:41:00+00:00"
+   },
+   {
+    "iteration": 43,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:42:00+00:00"
+   },
+   {
+    "iteration": 44,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:43:00+00:00"
+   },
+   {
+    "iteration": 45,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:44:00+00:00"
+   },
+   {
+    "iteration": 46,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:45:00+00:00"
+   },
+   {
+    "iteration": 47,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:46:00+00:00"
+   },
+   {
+    "iteration": 48,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:47:00+00:00"
+   },
+   {
+    "iteration": 49,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:48:00+00:00"
+   },
+   {
+    "iteration": 50,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "q.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:49:00+00:00"
+   }
+  ],
+  "mismatch_details_truncated": true,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "task_code": "T-1",
+  "total_iterations": 57,
+  "unverifiable_iterations": 0,
+  "verified_iterations": 0
+ },
+ "identity_mismatch_repo_and_diff": {
+  "distinct_models_passed": 3,
+  "error": "2 recorded iteration(s) for T-1 were excluded: recorded repo/diff did not match the code currently being checked (see mismatch_details)",
+  "excluded_foreign_repo_iterations": 1,
+  "excluded_mismatched_iterations": 2,
+  "foreign_repo_iterations": [
+   {
+    "iteration": 1,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:00:00+00:00"
+   }
+  ],
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "mismatch_details": [
+   {
+    "iteration": 1,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": [
+     "a.py"
+    ],
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "reason": "diff_mismatch",
+    "recorded_diff_files": [
+     "z.py"
+    ],
+    "recorded_repo_id": "git.hyperide.ai/ultrabricks/review-cli",
+    "ts": "2026-09-01T00:01:00+00:00"
+   }
+  ],
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 2,
+  "task_code": "T-1",
+  "total_iterations": 4,
+  "unverifiable_iterations": 1,
+  "verified_iterations": 1
+ },
+ "identity_no_ctx_counts_everything": {
+  "distinct_models_passed": 3,
+  "min_iter": 2,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 2,
+  "task_code": "T-1",
+  "total_iterations": 2
+ },
+ "identity_repo_only_foreign_error": {
+  "distinct_models_passed": 0,
+  "error": "2 recorded iteration(s) for T-1 were excluded: recorded in another repository (see foreign_repo_iterations)",
+  "excluded_foreign_repo_iterations": 2,
+  "excluded_mismatched_iterations": 1,
+  "foreign_repo_iterations": [
+   {
+    "iteration": 1,
+    "passed": false,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:00:00+00:00"
+   },
+   {
+    "iteration": 2,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "T-1",
+    "ts": "2026-09-01T00:01:00+00:00"
+   }
+  ],
+  "min_iter": 1,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "mismatch_details": [
+   {
+    "iteration": 2,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:01:00+00:00"
+   }
+  ],
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "task_code": "T-1",
+  "total_iterations": 2,
+  "unverifiable_iterations": 0,
+  "verified_iterations": 0
+ },
+ "models_only_failed_models_dont_count": {
+  "distinct_models_passed": 1,
+  "min_iter": 1,
+  "min_models": 2,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [
+   "m-a"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "task_code": "T-1",
+  "total_iterations": 2
+ },
+ "models_only_no_history": {
+  "distinct_models_passed": 0,
+  "error": "no recorded review iterations for T-1",
+  "min_iter": 1,
+  "min_models": 2,
+  "min_models_source": "explicit",
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "task_code": "T-1",
+  "total_iterations": 0
+ },
+ "models_only_pass_with_advisory": {
+  "distinct_models_passed": 3,
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 3,
+  "task_code": "T-1",
+  "total_iterations": 3
+ },
+ "models_only_short_iter": {
+  "distinct_models_passed": 3,
+  "min_iter": 3,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "models_only_suggestion_fires": {
+  "distinct_models_passed": 2,
+  "min_iter": 2,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "min_roles_suggestion": "3 distinct models required, only 2 found. If review passes duplicated a model onto multiple roles (see PR #207), replace --min-models 3 with --min-roles 3 (review-cli#246: keeping both now requires BOTH to pass), which covers 4 distinct roles rather than unique model names.",
+  "models": [
+   "m-a",
+   "m-b"
+  ],
+  "passed": false,
+  "passed_iterations": 2,
+  "task_code": "T-1",
+  "total_iterations": 2
+ },
+ "models_only_suggestion_monoculture_suppressed": {
+  "distinct_models_passed": 1,
+  "min_iter": 1,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [
+   "m-a"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "roles_explicit_min_roles_only": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 3,
+  "min_iter": 5,
+  "min_roles": 2,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "roles_misaligned_models_roles": {
+  "distinct_models_passed": 1,
+  "distinct_roles_passed": 2,
+  "min_iter": 1,
+  "min_roles": 2,
+  "models": [
+   "m-a"
+  ],
+  "passed": true,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "roles_pre137_failed_roles_not_credited": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 0,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "roles": [],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "roles_usable_roles_credit_failed_run": {
+  "distinct_models_passed": 0,
+  "distinct_roles_passed": 3,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [],
+  "passed": true,
+  "passed_iterations": 0,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "stalled_models_listed": {
+  "distinct_models_passed": 0,
+  "min_iter": 1,
+  "min_models": 2,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [],
+  "passed": false,
+  "passed_iterations": 0,
+  "stalled_models": [
+   {
+    "consecutive_failures": 2,
+    "model": "m-a",
+    "reason": "usage limit",
+    "remaining_seconds": 61
+   }
+  ],
+  "task_code": "T-1",
+  "total_iterations": 1
+ },
+ "twin_hash_code_counted": {
+  "distinct_models_passed": 3,
+  "distinct_roles_passed": 3,
+  "min_iter": 1,
+  "min_roles": 3,
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "passed": true,
+  "passed_iterations": 1,
+  "roles": [
+   "correctness",
+   "performance",
+   "security"
+  ],
+  "task_code": "#105",
+  "total_iterations": 1
+ },
+ "twin_near_miss_counted": {
+  "distinct_models_passed": 3,
+  "min_iter": 5,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "near_miss_counted": true,
+  "near_miss_ever_passed": true,
+  "near_miss_keys": [
+   "105"
+  ],
+  "passed": false,
+  "passed_iterations": 1,
+  "searched_key": "#105",
+  "task_code": "#105",
+  "total_iterations": 2
+ },
+ "twin_near_miss_not_passed": {
+  "distinct_models_passed": 0,
+  "min_iter": 1,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "models": [],
+  "near_miss_counted": false,
+  "near_miss_ever_passed": false,
+  "near_miss_keys": [
+   "#105"
+  ],
+  "passed": false,
+  "passed_iterations": 0,
+  "searched_key": "105",
+  "task_code": "105",
+  "total_iterations": 2
+ },
+ "twin_near_miss_passed_but_mismatched": {
+  "distinct_models_passed": 0,
+  "error": "1 recorded iteration(s) for #105 were excluded: recorded in another repository (see foreign_repo_iterations)",
+  "excluded_foreign_repo_iterations": 1,
+  "excluded_mismatched_iterations": 1,
+  "foreign_repo_iterations": [
+   {
+    "iteration": 1,
+    "passed": true,
+    "repo_id": "github.com/other/thing",
+    "task_code": "105",
+    "ts": "2026-09-01T00:00:00+00:00"
+   }
+  ],
+  "min_iter": 1,
+  "min_models": 3,
+  "min_models_advisory": "an explicit min_models floor is set; role-based coverage (min_roles) is generally sufficient and this explicit floor may not be needed unless you have a specific reason to require distinct models",
+  "min_models_source": "explicit",
+  "mismatch_details": [
+   {
+    "iteration": 1,
+    "reason": "repo_mismatch",
+    "recorded_diff_files": null,
+    "recorded_repo_id": "github.com/other/thing",
+    "ts": "2026-09-01T00:00:00+00:00"
+   }
+  ],
+  "models": [],
+  "near_miss_counted": false,
+  "near_miss_ever_passed": true,
+  "near_miss_keys": [
+   "105"
+  ],
+  "passed": false,
+  "passed_iterations": 0,
+  "searched_key": "#105",
+  "task_code": "#105",
+  "total_iterations": 2,
+  "unverifiable_iterations": 0,
+  "verified_iterations": 0
+ }
+}

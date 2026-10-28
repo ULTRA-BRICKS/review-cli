@@ -1,0 +1,323 @@
+{
+ "export": [
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r1",
+   "task_code": "#105",
+   "ts": "2026-09-01T00:01:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r3",
+   "task_code": "105",
+   "ts": "2026-09-01T00:03:00+00:00",
+   "v": 5
+  }
+ ],
+ "export_blank": [],
+ "export_missing": "no error",
+ "find_derived": {
+  "duration_seconds": 14.0,
+  "fail_count": 0,
+  "mode": "review",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "ok_count": 3,
+  "output_tokens": 0,
+  "passed": true,
+  "pool_size": 3,
+  "prompt_tokens": 0,
+  "task_code": "T-1",
+  "ts": "2026-09-01T00:04:00+00:00",
+  "v": 5
+ },
+ "find_in_missing": null,
+ "find_missing": null,
+ "find_pinned": {
+  "duration_seconds": 11.0,
+  "fail_count": 0,
+  "mode": "review",
+  "models": [
+   "m-a",
+   "m-b",
+   "m-c"
+  ],
+  "ok_count": 3,
+  "output_tokens": 0,
+  "passed": true,
+  "pool_size": 3,
+  "prompt_tokens": 0,
+  "run_id": "r1",
+  "task_code": "#105",
+  "ts": "2026-09-01T00:01:00+00:00",
+  "v": 5
+ },
+ "iterations_105": [
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "iteration": 1,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r1",
+   "task_code": "#105",
+   "ts": "2026-09-01T00:01:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "iteration": 2,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r3",
+   "task_code": "105",
+   "ts": "2026-09-01T00:03:00+00:00",
+   "v": 5
+  }
+ ],
+ "iterations_bad": [],
+ "iterations_blank": [],
+ "iterations_hash": [
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "iteration": 1,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r1",
+   "task_code": "#105",
+   "ts": "2026-09-01T00:01:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "iteration": 2,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r3",
+   "task_code": "105",
+   "ts": "2026-09-01T00:03:00+00:00",
+   "v": 5
+  }
+ ],
+ "load": [
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r3",
+   "task_code": "105",
+   "ts": "2026-09-01T00:03:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r1",
+   "task_code": "#105",
+   "ts": "2026-09-01T00:01:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 12.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "task_code": "OTHER",
+   "ts": "2026-09-01T00:02:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 14.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "task_code": "T-1",
+   "ts": "2026-09-01T00:04:00+00:00",
+   "v": 5
+  }
+ ],
+ "load_missing": [],
+ "public_load": [
+  {
+   "duration_seconds": 13.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r3",
+   "task_code": "105",
+   "ts": "2026-09-01T00:03:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 11.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "run_id": "r1",
+   "task_code": "#105",
+   "ts": "2026-09-01T00:01:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 12.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "task_code": "OTHER",
+   "ts": "2026-09-01T00:02:00+00:00",
+   "v": 5
+  },
+  {
+   "duration_seconds": 14.0,
+   "fail_count": 0,
+   "mode": "review",
+   "models": [
+    "m-a",
+    "m-b",
+    "m-c"
+   ],
+   "ok_count": 3,
+   "output_tokens": 0,
+   "passed": true,
+   "pool_size": 3,
+   "prompt_tokens": 0,
+   "task_code": "T-1",
+   "ts": "2026-09-01T00:04:00+00:00",
+   "v": 5
+  }
+ ],
+ "unhashable_task_export": []
+}

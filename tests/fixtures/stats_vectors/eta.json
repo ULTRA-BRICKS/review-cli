@@ -1,0 +1,21 @@
+{
+ "announce": "[review] pool=4 (review) \u2014 typically ~2m30s based on 2 past runs of this size; do NOT timeout.\n",
+ "bad_durations": null,
+ "empty_line": "[review] pool=4 (review) \u2014 no history yet for this size; this is multi-model / multi-round, expect MINUTES. Do NOT timeout.",
+ "empty_store": null,
+ "exact": {
+  "avg_seconds": 150.0,
+  "basis": "mode+pool",
+  "samples": 2
+ },
+ "line_exact": "[review] pool=4 (review) \u2014 typically ~2m30s based on 2 past runs of this size; do NOT timeout.",
+ "line_none": "[review] pool=9 (review) \u2014 no history yet for this size; this is multi-model / multi-round, expect MINUTES. Do NOT timeout.",
+ "line_pool": "[review] pool=4 (brainstorm) \u2014 typically ~1m50s based on 3 past runs of pool=4 (any mode); do NOT timeout.",
+ "line_single": "[review] pool=4 (quorum) \u2014 typically ~30s based on 1 past run of this size; do NOT timeout.",
+ "none": null,
+ "pool_only": {
+  "avg_seconds": 110.0,
+  "basis": "pool",
+  "samples": 3
+ }
+}

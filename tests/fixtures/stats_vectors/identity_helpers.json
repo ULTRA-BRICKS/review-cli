@@ -1,0 +1,86 @@
+{
+ "comparable": [
+  "git.hyperide.ai/ultrabricks/rig-cli",
+  "path:/tmp/x"
+ ],
+ "durations": [
+  "0s",
+  "0s",
+  "0s",
+  "47s",
+  "6m12s",
+  "1h03m",
+  "25h01m"
+ ],
+ "files": [
+  "\"weird\"",
+  "dev/null",
+  "gone.py",
+  "new.py",
+  "old.py",
+  "x.py"
+ ],
+ "files_empty": [],
+ "files_none": [],
+ "hash": "baffbee8265c13dad5aff250ea14c06b201068841fdffa6971ecf7e7b045b3d8",
+ "keys": {
+  "#105": [
+   "#105",
+   "105"
+  ],
+  "105": [
+   "#105",
+   "105"
+  ],
+  "abc": [
+   "abc"
+  ]
+ },
+ "parse_ts": {
+  "": null,
+  "2026-01-01T00:00:00+02:00": "2026-01-01T00:00:00+02:00",
+  "2026-01-01T00:00:00Z": "2026-01-01T00:00:00+00:00",
+  "5": null,
+  "None": null,
+  "x": null
+ },
+ "recorded": [
+  "github.com/org/repo",
+  null,
+  null,
+  null
+ ],
+ "remotes": {
+  "": null,
+  "   ": null,
+  "/local/path/repo": null,
+  "git@git.hyperide.ai:ultrabricks/sme-archiving-gc-tmp.git": "github.com/alex-mextner/sme-archiving-gc",
+  "git@github.com:org/repo.git": "github.com/org/repo",
+  "https://github.com/alex-mextner/review-cli/": "git.hyperide.ai/ultrabricks/review-cli",
+  "https://host": null,
+  "https://host/": null,
+  "https://x-access-token:ghp_abc@github.com/org/repo.git": "github.com/org/repo",
+  "nonsense": null,
+  "ssh://git@Host.COM:22/org/repo": "host.com/org/repo",
+  "ssh://git@host.com:2222/org/repo": "host.com:2222/org/repo"
+ },
+ "run_id": "07ec2152befd0365",
+ "run_id_no_task": "532bc64dd3a9c42b",
+ "task_codes": {
+  "": null,
+  " X ": "X",
+  "#105": "#105",
+  "#HYP-742": "#HYP-742",
+  "105": "105",
+  "HYP-742": "HYP-742",
+  "None": null,
+  "\uff11\uff10\uff15": "\uff11\uff10\uff15"
+ },
+ "twins": {
+  "#105": "105",
+  "#abc": null,
+  "105": "#105",
+  "abc": null,
+  "\uff11\uff10\uff15": null
+ }
+}
