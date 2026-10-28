@@ -90,9 +90,8 @@ def test_model_help_reflects_configured_models():
 
 
 def test_model_default_is_mode_aware_not_board_for_panel_modes():
-    """The `--model` default is MODE-AWARE (codex review): only `review diff` runs the
-    reviewer board. `review just-ask`/`quorum`/`brainstorm` must NOT claim the board as
-    their default — they use config models / DEFAULT_MODELS (brainstorm: brainstorm_models)."""
+    """Panel help describes the configured capability level, while diff help names
+    its reviewer board. Explicit legacy model rosters keep their separate precedence."""
     saved = cli.load_config
     cli.load_config = lambda: {}
     try:
@@ -101,8 +100,8 @@ def test_model_default_is_mode_aware_not_board_for_panel_modes():
             # board, so a whole-help check would false-positive.
             line = _model_line(_mode_help(sub))
             assert "active reviewer board" not in line, (sub, line)
-            # The built-in defaults are named instead (codex is in DEFAULT_MODELS).
-            assert "built-in defaults" in line, (sub, line)
+            # All text panels now share the shipped default capability level.
+            assert "'routine' level" in line and "--level" in line, (sub, line)
         # And the diff subcommand DOES claim the default preset board on its --model line.
         line = _model_line(_mode_help("diff"))
         assert "default" in line and "level reviewer board" in line, line

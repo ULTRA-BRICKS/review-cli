@@ -131,6 +131,18 @@ def _moderator_candidates(_api, /, config: dict, level: str | None) -> tuple[str
     return chain
 
 
+def _panel_level_selection_help(mode: ModeSpec) -> str:
+    if mode.name in ("quorum", "brainstorm"):
+        return (
+            "Selects this panel's models, pool, effort and moderator chain "
+            "(explicit `-m`, `--pool`, `--effort` and `--moderator` still win). "
+        )
+    return (
+        "Selects this panel's models, pool and effort "
+        "(explicit `-m`, `--pool` and `--effort` still win). "
+    )
+
+
 def _add_global_options(_api, /, parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
     """Add the TRULY-GLOBAL options — the only ones the top-level `review --help` should
     list (ROADMAP "Subcommand-only options belong in the subcommand help, not the global
@@ -221,8 +233,7 @@ def _add_global_options(_api, /, parser: argparse.ArgumentParser, *, mode: ModeS
                     "(a recorded `--task` run floors the pool to 3 distinct roles so gh ship "
                     "can pass). "
                     if review_level
-                    else "Selects this panel's models, pool, effort and moderator chain "
-                    "(explicit `-m`, `--pool`, `--effort` and `--moderator` still win). "
+                    else _panel_level_selection_help(mode)
                 )
                 + f"Default: {_api._default_level_for_help()!r}, definitions in the shipped "
                 "reviewlib/levels.yaml plus your config `levels:`."
