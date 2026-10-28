@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,7 +57,11 @@ def _isolated_home(tmp: str) -> dict:
     (this one included) would silently delegate here instead of exercising the code under test.
     A non-executable `RIG_BIN` short-circuits find_rig to None (robust to the helper's
     well-known-bin probes like /opt/homebrew/bin/rig that a mere PATH trim would miss); PATH is
-    trimmed too as belt-and-suspenders (git still resolves at /usr/bin/git)."""
+    trimmed too, while preserving the Git executable resolved before isolation."""
+    git_path = shutil.which("git")
+    isolated_path = "/usr/bin:/bin:/usr/sbin:/sbin"
+    if git_path:
+        isolated_path = str(Path(git_path).parent) + os.pathsep + isolated_path
     keys = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "GIT_CONFIG_GLOBAL", "RIG_BIN", "PATH")
     saved = {k: os.environ.get(k) for k in keys}
     os.environ["HOME"] = tmp
@@ -64,7 +69,7 @@ def _isolated_home(tmp: str) -> dict:
     os.environ["XDG_DATA_HOME"] = str(Path(tmp) / ".local" / "share")
     os.environ["GIT_CONFIG_GLOBAL"] = str(Path(tmp) / ".gitconfig")
     os.environ["RIG_BIN"] = str(Path(tmp) / "no-rig-here")  # non-executable -> find_rig None
-    os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    os.environ["PATH"] = isolated_path
     (Path(tmp) / ".claude").mkdir(parents=True, exist_ok=True)
     return saved
 
@@ -75,6 +80,23 @@ def _restore(saved: dict) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def test_isolated_home_preserves_git_outside_system_directories():
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / "private-bin"
+        bin_dir.mkdir()
+        git = bin_dir / "git"
+        git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        git.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
+            saved = _isolated_home(str(Path(tmp) / "home"))
+            try:
+                assert shutil.which("git") == str(git)
+                assert not Path(os.environ["RIG_BIN"]).exists()
+            finally:
+                _restore(saved)
+            assert os.environ["PATH"] == str(bin_dir)
 
 
 def test_write_if_changed_returns_false_and_does_not_rewrite_identical_content():

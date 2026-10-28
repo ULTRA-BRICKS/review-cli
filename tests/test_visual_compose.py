@@ -221,13 +221,17 @@ def test_default_review_with_diff_threads_visual():
 
     old = _review_mod.mode_review
     old_stdin = cli._read_stdin_if_piped
+    old_available = cli._chain_aware_available
     _review_mod.mode_review = fake_review
     cli._read_stdin_if_piped = lambda: "diff --git a/x b/x\n+change\n"
+    # This fixture tests visual context wiring to a fake handler, not real seats.
+    cli._chain_aware_available = lambda _model: True
     try:
         rc = cli.main(["diff", *TASK_ARGS, "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _review_mod.mode_review = old
         cli._read_stdin_if_piped = old_stdin
+        cli._chain_aware_available = old_available
     assert rc == 0
     assert "ATTACHED RENDER" in captured["prompt"], "diff-review companion must carry visual context"
     assert "+change" in captured["diff"]
