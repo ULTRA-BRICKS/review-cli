@@ -744,6 +744,9 @@ def test_e2e_just_ask_rotates_past_a_limited_account_through_the_wrapper():
             "--timeout",
             "60",
             FAKE_OMP_LIMITED="tok-1",
+            # a is the emptiest account, so it is tried first (review-cli#709), is limited
+            # and the seat rotates on to b
+            FAKE_OMP_USAGE=_usage_report(a=0.1, b=0.5),
         )
         calls = world.calls()
     out = proc.stdout + proc.stderr

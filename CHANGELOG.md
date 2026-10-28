@@ -3,6 +3,19 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.66.3 — 2026-10-28
+
+- **Feat(omp): omp:anthropic seats take the lowest-usage account first**
+  ([review-cli#709](https://git.hyperide.ai/ultrabricks/review-cli/issues/709)).
+  Dispatch used omp's account order, so the first free account was spent up to the cap while
+  emptier ones idled. Free accounts (neither blocked by omp nor recorded as limited) are now
+  tried by their highest live 5h/7d window, lowest first, so spend spreads and rotates as
+  readings move; a model tier's window (Fable's) counts only for that tier's models, a window
+  that already reset is not a reading, a tie or an account without a reading keeps omp's order,
+  and blocked/limited accounts still go last. `omp usage` is now read once per dispatch whenever
+  more than one account could answer (before: only with a usage threshold); if it does not
+  answer, omp's order applies. `review seats` ranks the same way.
+
 ## 0.66.2 — 2026-10-28
 
 - **Feat(seats): per-seat account, usage, cap, reset and reason**

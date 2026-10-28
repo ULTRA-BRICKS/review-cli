@@ -64,6 +64,8 @@ number of working reviewers even when models drop:
   policy with no account list to apply it to fails it too, and while an exclude list is
   set an account without a known email is skipped. `review seats` shows the seat
   UNUSABLE, the policy and each account's skip reason.
+  Among the accounts it may use, a seat tries the one with the lowest usage first (highest
+  live 5h/7d window; ties keep omp's order; unknown usage goes after known) -- review-cli#709.
 - **Per-seat account view (review-cli#707)** — `review seats` also prints SEAT ACCOUNTS, one
   row per seat: status, the account the seat would use (lowest 5-hour/7-day usage below the
   cap), both usages, the cap, the reset time and the reason. A cap refusal reads

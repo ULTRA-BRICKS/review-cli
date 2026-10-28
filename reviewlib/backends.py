@@ -1506,14 +1506,11 @@ def _review_omp_with_anthropic_pool(
     policy = _omp_account_policy()
     db = _omp_auth_db()
     accounts = None if policy.problems else omp_accounts.anthropic_accounts(db)
-    # usage is read once per dispatch, and only when a non-excluded account could be
-    # over a threshold
+    # usage is read once per dispatch: to apply a usage threshold, and to try the emptiest
+    # account first when more than one account could answer (review-cli#709)
     usage = None
-    if (
-        accounts
-        and policy.needs_usage
-        and any(not policy.is_excluded(a) for a in accounts)
-    ):
+    usable_accounts = [a for a in accounts or () if not policy.is_excluded(a)]
+    if usable_accounts and (policy.needs_usage or len(usable_accounts) > 1):
         usage = omp_accounts.usage_by_email(_omp_launcher())
     refusal, eligible, skipped = omp_accounts.pool_refusal(
         policy, accounts, db, usage, omp_model, int(time.time() * 1000)
@@ -1527,7 +1524,11 @@ def _review_omp_with_anthropic_pool(
     launcher = _omp_launcher()
     total = len(accounts)
     ordered = omp_accounts.dispatch_order(
-        eligible, omp_model, _omp_accounts_limited_until(eligible)
+        eligible,
+        omp_model,
+        _omp_accounts_limited_until(eligible),
+        usage=usage,
+        now_ms=int(time.time() * 1000),
     )
     skipped_note = f"; skipped: {'; '.join(skipped)}" if skipped else ""
     failed: list[str] = []

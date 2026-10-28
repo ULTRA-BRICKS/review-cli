@@ -165,13 +165,37 @@ def anthropic_accounts(
     return accounts
 
 
+def usage_rank(
+    windows: "list[UsageWindow] | None", omp_model: str | None, now_ms: int
+) -> tuple[int, float]:
+    """Sort key for spreading spend: (0, highest live window fraction) for an account whose
+    usage is known, (1, 0) when it is not. A window that already reset is not a reading
+    (it would still show its old, high value), and a model tier's window (Fable's) counts
+    only for that tier's models, like the account policy treats them."""
+    live = [
+        w.used_fraction
+        for w in windows or ()
+        if tier_applies(w.tier, omp_model)
+        and (w.resets_at_ms is None or w.resets_at_ms > now_ms)
+    ]
+    return (0, max(live)) if live else (1, 0.0)
+
+
 def dispatch_order(
-    accounts: list[OmpAccount], omp_model: str | None, limited_until: dict[int, float]
+    accounts: list[OmpAccount],
+    omp_model: str | None,
+    limited_until: dict[int, float],
+    usage: dict[str, list["UsageWindow"]] | None = None,
+    now_ms: int = 0,
 ) -> list[OmpAccount]:
     """The order to try `accounts` in: those neither blocked by omp nor recorded as
-    limited by review-cli (`limited_until`: credential id -> epoch seconds) first, in omp's
-    order; the limited ones after them, soonest-free first. Limited accounts are still
-    tried last: a block can be stale, and nothing else can answer once the rest failed."""
+    limited by review-cli (`limited_until`: credential id -> epoch seconds) first; the
+    limited ones after them, soonest-free first. Limited accounts are still tried last: a
+    block can be stale, and nothing else can answer once the rest failed.
+
+    The free accounts go lowest usage first (`usage_rank`, from a `usage_by_email` map), so
+    spend spreads to the emptiest account and rotates as the readings move; a tie, an
+    account without a reading, and a call without a `usage` map keep omp's order."""
     free: list[OmpAccount] = []
     limited: list[tuple[float, int, OmpAccount]] = []
     for account in accounts:
@@ -184,6 +208,8 @@ def dispatch_order(
             limited.append((until, account.position, account))
         else:
             free.append(account)
+    if usage is not None:
+        free.sort(key=lambda a: usage_rank(usage_of(usage, a), omp_model, now_ms))
     return free + [account for _until, _pos, account in sorted(limited)]
 
 
@@ -697,7 +723,9 @@ def account_policy(raw: object, env: Mapping[str, str]) -> AccountPolicy:
     max_percent: float | None = None
     per_account: dict[str, float] = {}
     exclude_source = max_source = ""
-    env_tokens = [e.strip() for e in (env.get(EXCLUDE_ENV) or "").split(",") if e.strip()]
+    env_tokens = [
+        e.strip() for e in (env.get(EXCLUDE_ENV) or "").split(",") if e.strip()
+    ]
     env_exclude = tuple(
         dict.fromkeys(e.lower() for e in env_tokens if _is_email_token(e))
     )

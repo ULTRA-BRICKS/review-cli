@@ -83,6 +83,8 @@ _UNIT_FILES = [
     # threshold, env overrides, skip reasons). Unit tests patch attributes; the e2e runs
     # bin/review against a fake omp wrapper + fake real binary + fake agent.db in a temp HOME.
     ("test_omp_account_pool.py", {}),
+    # review-cli#709: omp:anthropic seats try the lowest-usage free account first.
+    ("test_dispatch_lowest_usage.py", {}),
     # Every harness login in `review seats` (review-cli#646: Claude Code, Codex, omp,
     # opencode, review-cli keys; no secret printed) and omp:zai seats on review-cli's
     # .env z.ai key. e2e runs bin/review in a temp HOME with fake claude/omp binaries.
